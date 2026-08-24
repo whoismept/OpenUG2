@@ -26,6 +26,8 @@
 
 #include "nfsu2.h"
 #include "render.h"
+#include "sfx/post.h"
+#include "sfx/envcube.h"
 #include "physics.h"
 #include "ai.h"
 #include "audio.h"
@@ -33,6 +35,8 @@
 #include "world.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "debug.h"
+#include "car_setup.h"      /* per-car parameters out of the shipped table */
+#include "vehicle_model.h"  /* single-track dynamics driven by those parameters */
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
@@ -366,6 +370,19 @@ static int dump_car_info(const char *dataroot, const char *car) {
 }
 
 
+/* Named places to start from, measured from world objects rather than chosen:
+ * each is the position of an entrance light beam in the shipped scene. The
+ * free-roam start is the one exception -- five independent reference
+ * recordings all begin at the same position on a heading of -10.2 degrees. */
+static const struct { const char *name; float x, y; } N2_SPAWNS[] = {
+    { "start",        1695.2f,  -883.6f },
+    { "garage",        660.7f,  -120.2f },
+    /* Airport: the welcome sign stands at (1718.6, -1002.9); backed off by
+       35 m so it sits in frame ahead of the car. */
+    { "airport",      1685.0f, -1009.0f },
+    { "airport_sign", 1718.6f, -1002.9f },
+};
+
 /* ---- static-capture spawn safety (Milestone 80) ---------------------------
  * Used ONLY by --shot-static / --static-spawn-audit. The interactive, menu and
  * race spawn paths are left exactly as they were: this runs after them and
@@ -628,6 +645,29 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
     return n;
 }
 static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
+/* The dynamics model that runs off the car's own shipped parameters. It sits
+   alongside the older kinematic one rather than replacing it: --oldphys puts
+   the previous behaviour back, so the two can be driven one after the other
+   on the same road. Falls back on its own if the car is not in the table. */
+static N2CarSetup g_carsetup;
+/* ---- the new chase camera (NFSU2-flavoured) ----
+   It follows the direction the car TRAVELS, not the way the nose points.
+   Those are the same thing on a straight, slightly apart in a corner -- so
+   the body yaws in frame and you see some flank -- and completely different
+   mid-doughnut, where the nose sweeps but the travel direction crawls: the
+   camera hangs off to the side and you watch the car rotate. Distance
+   breathes with speed, tucks in under braking; the FOV opens a touch as the
+   speed rises. --oldcam puts the previous rigid follower back. */
+static int   g_newcam = 1;
+static float g_cam_az, g_cam_dist = 6.0f, g_fov = 0.90f;
+static int   g_cam_init = 0;
+static VehModel   g_vehmodel;
+static int        g_newphys = 1;      /* --oldphys clears it */
+static int        g_newphys_ok = 0;   /* parameters actually loaded */
+/* --telemetry FILE: one CSV row per frame of the player's car. Driving feel
+   is hard to argue about from memory -- this makes it arguable from data. */
+static FILE      *g_tel = NULL;
+static float      g_tel_t = 0.0f;
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
 
@@ -1229,6 +1269,29 @@ int main(int argc, char **argv) {
     const char *matdump = NULL, *matmesh = NULL;     /* --mesh-material PREFIX NAME (M100) */
     int fbcensus = 0;   /* --fallback-census (M102): who still takes the old path */
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
+    int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
+    static N2Paint pal[512]; int npal = 0;        /* body paints, from GLOBALB */
+    /* (350Z default wired below once carname is final) */
+    float paint_rgb[3] = { 0.70f, 0.70f, 0.75f }; /* until the record is read */
+    const char *paint_name = NULL;                /* --paint NAME */
+    /* Showroom default for the default car: the attribute DB pairs the 350Z's
+       stock record with MATERIAL REGPAINTORANGE (145,35,17). Until the per-car
+       default-paint chain is parsed end to end, pin the one car we boot into;
+       --paint still overrides. */
+    const char *paint_default_350z = "REGPAINTORANGE";
+    const char *g_sky_name = NULL;     /* --sky NAME */
+    int   no_post = 0;                 /* --no-post: skip the tone pass */
+    float post_amount = 1.0f;          /* --post N: scale it */
+    int   post_on = 0;                 /* the pass is live this frame */
+/* Resolving has to happen after everything is drawn and before anything reads
+   the pixels, and there are several places that read them. A macro keeps the
+   three lines identical at every one of them rather than trusting a single
+   spot in a 7000-line frame to be on the live path -- an earlier attempt put
+   it in what looked like the right place and it never ran. */
+#define POST_RESOLVE() do { if (post_on) { \
+        pp_end_and_draw(&quad, post_amount); glUseProgram(rp.prog); post_on = 0; } \
+    } while (0)
+    int head_set = 0;  float head_deg = 0;               /* --heading DEG */
     const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
     int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
@@ -1244,7 +1307,7 @@ int main(int argc, char **argv) {
     int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
-    const char *carname = "HUMMER", *trackname = "ALL";
+    const char *carname = "350Z", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
@@ -1252,6 +1315,14 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
+        else if (!strcmp(argv[i], "--oldphys")) g_newphys = 0;   /* previous kinematic model */
+        else if (!strcmp(argv[i], "--oldcam"))  g_newcam = 0;    /* previous chase camera */
+        else if (!strcmp(argv[i], "--telemetry") && i+1 < argc) {
+            g_tel = fopen(argv[++i], "w");
+            if (g_tel) fprintf(g_tel, "t,x,y,z,speed_kmh,heading_deg,yaw_rate_degs,"
+                                      "slip_deg,wheel_slip,throttle,steer,handbrake,gear,rpm,"
+                                      "pitch_deg,roll_deg\n");
+        }
         else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames")  && i+1 < argc) shotframes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--laps")    && i+1 < argc) want_laps = atoi(argv[++i]);
@@ -1343,6 +1414,41 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--b02-probe") && i+1 < argc) {
             b02probe = argv[++i]; fbcensus = 1; n2_m102 = 1; }
+        /* --world2: assemble the scene from instance records instead of from
+           models with their matrix baked in. See world2.c. */
+        else if (!strcmp(argv[i], "--world2")) world2_on = 1;
+        /* --no-post / --post N: the bloom-and-tone pass, and how much of it. */
+        /* --paint NAME: body paint by material name (METPAINTSILVER, ...). */
+        else if (!strcmp(argv[i], "--paint") && i+1 < argc) paint_name = argv[++i];
+        /* --sky sunrise|sunset|night: which shipped sky to hang overhead. */
+        else if (!strcmp(argv[i], "--sky") && i+1 < argc) g_sky_name = argv[++i];
+        else if (!strcmp(argv[i], "--no-post")) no_post = 1;
+        else if (!strcmp(argv[i], "--post") && i+1 < argc)
+            post_amount = (float)atof(argv[++i]);
+        /* --spawn NAME: start at a named place; --spawn list prints them. */
+        else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
+            const char *nm = argv[++i];
+            int nsp = (int)(sizeof N2_SPAWNS / sizeof N2_SPAWNS[0]);
+            if (!strcmp(nm, "list")) {
+                printf("spawn points:\n");
+                for (int k = 0; k < nsp; k++)
+                    printf("  %-13s X=%9.1f  Y=%9.1f\n",
+                           N2_SPAWNS[k].name, N2_SPAWNS[k].x, N2_SPAWNS[k].y);
+                return 0;
+            }
+            int found = 0;
+            for (int k = 0; k < nsp; k++)
+                if (!strcmp(nm, N2_SPAWNS[k].name)) {
+                    spawn_set = 1; spawn_x = N2_SPAWNS[k].x;
+                    spawn_y = N2_SPAWNS[k].y; found = 1; break;
+                }
+            if (!found) fprintf(stderr, "--spawn: no such place '%s'"
+                                        " (try --spawn list)\n", nm);
+        }
+        /* --heading DEG: set the starting heading outright. */
+        else if (!strcmp(argv[i], "--heading") && i+1 < argc) {
+            head_set = 1; head_deg = (float)atof(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--cam-at") && i+2 < argc) {
             camat = 1; camx = (float)atof(argv[++i]); camy = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--mesh-material") && i+2 < argc) {
@@ -1960,6 +2066,11 @@ int main(int argc, char **argv) {
     }
 
     static World world;
+    /* Instance placement only reads the sections within range, so it has to be
+       told where that is before the world is loaded. */
+    if (spawn_set && world2_on) {
+        world_inst_x = spawn_x; world_inst_y = spawn_y; world_inst_r = 600.0f;
+    }
     int nm = world_load(&world, troot, trackname);
 
     /* --objdump: write the exact post-dedup, world-space scene the GPU batches
@@ -2609,9 +2720,83 @@ int main(int argc, char **argv) {
         }
         printf("\n");
     }
+    static N2LightSrc lsrc[16384]; int nlsrc = 0; /* district light sources */
+    GLuint tex_glow = 0;                          /* SFX_FLARE_GLOWA: the lamp halo */
+    /* SHARED LIGHT TEXTURES. Headlight and tail-light meshes name texture keys
+       that exist in no texture pack at all. They are not meant to be resolved
+       that way: the game binds these BY NAME from the global bundle and plugs
+       them straight into the shader.
+         HEADLIGHTS    128x64   uncompressed BGRA
+         BRAKE_GLOBAL  128x128  DXT1, with BRAKE_GLOBAL_LEFT beside it
+         HEADLIGHTGLOW          the glow around a lit lamp */
+    GLuint tex_headlights = 0, tex_brake = 0, tex_brake_l = 0, tex_hlglow = 0;
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
-    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
+    static unsigned char tmapalpha[2048];   /* draw mode per texture */
+    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapalpha, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+
+    /* Shared effect textures. Spotlight and shop-front beams all share one
+       texture key that no track texture pack carries, which is why they were
+       loading untextured: it lives in the common in-game bundle as
+       SFX_LIGHT_BEAMA, 32x256 DXT3, drawn in the topmost additive layer. */
+    static const char *extra_packs[] = {
+        "GLOBAL/InGameCommon.bun",   /* SFX_LIGHT_BEAMA: spotlight beams */
+        "TRACKS/LOC4DYNTEX.BIN",     /* sky: SKY_SUNRISE_A/_CAP, SKY_SUNSET_A, SKY_NIGHT_A */
+    };
+    for (int xf = 0; xf < (int)(sizeof extra_packs / sizeof *extra_packs); xf++)
+    {   char cp2[1024];
+        snprintf(cp2, sizeof cp2, "%s/%s", dataroot, extra_packs[xf]);
+        long cl2 = 0; unsigned char *cd2 = n2_read_file(cp2, &cl2);
+        if (cd2) {
+            N2Tpk ct2 = n2_tpk_open(cd2, cl2);
+            int added = 0;
+            for (int i = 0; i < scene.count && ntmap < 2048; i++) {
+                uint32_t tk = scene.meshes[i].texkey; if (!tk) continue;
+                int have = 0;
+                for (int j = 0; j < ntmap; j++) if (tmapkey[j] == tk) { have = 1; break; }
+                if (have) continue;
+                N2Tex t = {0};
+                /* This file is laid out like a car's texture file: a slot
+                   table plus compressed blocks, which an ordinary texture-pack
+                   walk does not read. */
+                if (n2_tpk_decode(cd2, cl2, ct2, tk, &t)
+                    || n2_load_car_tex_by_key(cd2, cl2, tk, &t)) {
+                    tmapkey[ntmap] = tk; tmaptex[ntmap] = upload_tex(&t);
+                    tmapalpha[ntmap] = (unsigned char)n2_tex_mode(&t);
+                    ntmap++; added++;
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                }
+            }
+            if (added) printf("%s: %d textures added\n", extra_packs[xf], added);
+            free(ct2.blk); free(cd2);
+        }
+    }
+
+    /* THE LAMP HALO. Its texture is the flare sheet the game ships; the key is
+       looked up rather than the texture built, so what is drawn is the game's
+       own glow. */
+    for (int q = 0; q < ntmap; q++)
+        if (tmapkey[q] == 0x17e5ebd2u) { tex_glow = tmaptex[q];
+            printf("lamp flare: SFX_FLARE_GLOWA bound (mode %d)\n", tmapalpha[q]); break; }
+
+    /* LIGHT SOURCES drive those halos. Much lamp geometry is a flat quad that
+       all but vanishes seen from the side, so at driving height the light
+       seemed to switch off while it was still visible from above; the halo is
+       drawn from the source record instead, and stays visible from any angle.
+       The whole district is kept -- a couple of thousand records is tens of
+       kilobytes, and the distance cull runs from the CAMERA every frame, so
+       culling once around the spawn point would make halos run out as soon as
+       you drove away. */
+    if (world2_on && world2_bundle[0]) {
+        char lp[1024];
+        snprintf(lp, sizeof lp, "%s/TRACKS/%s.BUN", dataroot, world2_bundle);
+        long ll = 0; unsigned char *ld = n2_read_file(lp, &ll);
+        if (ld) {
+            nlsrc = n2_load_lights(ld, ll, lsrc, 16384);
+            printf("district light sources: %d\n", nlsrc);
+            free(ld);
+        }
+    }
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
         printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
@@ -2645,6 +2830,14 @@ int main(int argc, char **argv) {
        where the on-circuit sample finds no reroutable pair) and flooded the
        console -- exactly the automated race telemetry the manual-testing
        protocol drops. The barrier/checkpoint logic in world.c is unchanged. */
+    /* A named start point means free roam: the shipped events are not armed
+       and the car is not moved to a start grid. Asking for both is a
+       contradiction, and the grid would silently win. */
+    if (spawn_set && want_event_id) {
+        fprintf(stderr, "--spawn and --event are exclusive; ignoring --event %d\n",
+                want_event_id);
+        want_event_id = 0;
+    }
     if (want_event_id && world.nev > 0) {
         int wi = -1;
         for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
@@ -2800,6 +2993,7 @@ int main(int argc, char **argv) {
                                                     flag: 0 front-L, 1 front-R, 2 rear-L, 3 rear-R */
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
+    static N2LightMat lmat[256]; int nlmat = 0;   /* material records, from GLOBALB */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
     float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
     if (cdata) {
@@ -2883,8 +3077,104 @@ int main(int argc, char **argv) {
             }
             free(cz);
         }
+        /* MATERIAL RECORDS. Each car submesh names a material, and that record
+           carries the shading it should get -- chrome with no diffuse and a
+           strong reflection, metallic paint with its own specular, rubber with
+           neither. Reading them here means the car is lit by what the data
+           says instead of by per-class constants. */
+        nlmat = n2_load_lightmats(globdata, globlen, lmat, 256);
+        if (nlmat) printf("material records: %d\n", nlmat);
+
+        /* BODY COLOUR FROM THE DATA. The paint table pairs a material hash
+           with the actual RGB the game paints that car in. Without it the body
+           keeps a hand-picked near-white, and near-white metallic under a
+           specular highlight is what blows out. */
+        npal = n2_load_paints(globdata, globlen, pal, 512);
+        if (!paint_name && !strcmp(carname, "350Z")) paint_name = paint_default_350z;
+        if (paint_name) n2_carskin_mat = n2_str_hash(paint_name);
+        {   uint32_t want = n2_carskin_mat ? n2_carskin_mat
+                                           : n2_str_hash("METPAINTSILVER");
+            for (int q = 0; q < npal; q++) if (pal[q].mat == want) {
+                paint_rgb[0] = pal[q].r / 255.0f;
+                paint_rgb[1] = pal[q].g / 255.0f;
+                paint_rgb[2] = pal[q].b / 255.0f;
+                printf("paint: %s RGB=(%d,%d,%d)\n",
+                       paint_name ? paint_name : "METPAINTSILVER",
+                       pal[q].r, pal[q].g, pal[q].b);
+                break;
+            }
+            printf("paints in the palette: %d\n", npal);
+        }
+
+        {   N2Tpk gt = n2_tpk_open(globdata, globlen);
+            struct { uint32_t key; GLuint *dst; const char *nm; } need[] = {
+                { 0x28eefa9cu, &tex_headlights, "HEADLIGHTS"        },
+                { 0x17f9f794u, &tex_brake,      "BRAKE_GLOBAL"      },
+                { 0x85e9c79eu, &tex_brake_l,    "BRAKE_GLOBAL_LEFT" },
+                { 0x3394fe62u, &tex_hlglow,     "HEADLIGHTGLOW"     },
+            };
+            for (int q = 0; q < 4; q++) {
+                N2Tex t; memset(&t, 0, sizeof t);
+                if (n2_tpk_decode(globdata, globlen, gt, need[q].key, &t)) {
+                    *need[q].dst = upload_tex(&t);
+                    printf("texture %s: %dx%d\n", need[q].nm, t.w, t.h);
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                } else printf("texture %s failed to decode\n", need[q].nm);
+            }
+            free(gt.blk);
+        }
+
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
+        /* The new dynamics run entirely off this car's own shipped record. */
+        if (n2_car_setup_load(&g_carsetup, globdata, globlen, carname)) {
+            veh_model_init(&g_vehmodel, &g_carsetup);
+            g_newphys_ok = 1;
+            printf("car setup %-12s %.0f kg  %s  %d-speed  peak %.0f N*m  "
+                   "tyre mu %.2f->%.2f at %.0f deg\n", carname,
+                   g_carsetup.mass * 1000.0f,
+                   g_carsetup.drive.split_rear > 0.9f ? "RWD" :
+                   g_carsetup.drive.split_rear < 0.1f ? "FWD" : "AWD",
+                   g_carsetup.drive.num_gears,
+                   g_carsetup.motor.torque[4] * 1000.0f,
+                   g_carsetup.tyre[1].mu_static, g_carsetup.tyre[1].mu_slide,
+                   g_carsetup.tyre[1].slip_angle_deg);
+            printf("physics: %s (--oldphys for the previous one)\n",
+                   g_newphys ? "new single-track model" : "old kinematic model");
+
+            /* WHEEL GEOMETRY COMES FROM THE RECORD TOO. wheel_config_for()
+               took the axle lines and track from the car table but left the
+               hub HEIGHT, the radius and the width to whatever could be
+               measured off the tyre mesh -- and the mesh is the rim plus a
+               tyre of unknown section, so the car ends up standing on stilts
+               with wheels too wide for their arches. The record carries all
+               four hub positions, each wheel's radius and its width outright,
+               so use them: the 350Z's hubs sit at 0.171 with 0.328 front and
+               0.334 rear wheels, and nothing about that needs measuring.
+               A tighter, correctly-seated wheel also lets the springs show:
+               with the body sitting where it should, pitch and roll have room
+               to be visible instead of looking bolted solid. */
+            {   VehicleWheelConfig *w = &g_dbg.wheel;
+                printf("wheels: mesh gave hub %.3f r %.3f w %.3f  ->  "
+                       "record gives hub %.3f r %.3f/%.3f w %.3f/%.3f\n",
+                       w->ride_y, carprof.wheel_r, carprof.wheel_w,
+                       g_carsetup.wheel[0].pos[2],
+                       g_carsetup.wheel[0].radius, g_carsetup.wheel[2].radius,
+                       g_carsetup.wheel[0].width,  g_carsetup.wheel[2].width);
+                w->front_axle  = g_carsetup.wheel[0].pos[0];
+                w->rear_axle   = g_carsetup.wheel[2].pos[0];
+                w->front_track = fabsf(g_carsetup.wheel[0].pos[1]
+                                     - g_carsetup.wheel[1].pos[1]);
+                w->rear_track  = fabsf(g_carsetup.wheel[2].pos[1]
+                                     - g_carsetup.wheel[3].pos[1]);
+                w->ride_y      = g_carsetup.wheel[0].pos[2];
+                carprof.wheel_r = 0.5f * (g_carsetup.wheel[0].radius
+                                        + g_carsetup.wheel[2].radius);
+                carprof.wheel_w = g_carsetup.wheel[0].width;
+            }
+        } else {
+            printf("car setup: %s is not in the table -- staying on the old model\n", carname);
+        }
         free(globdata);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
@@ -4040,6 +4330,38 @@ int main(int argc, char **argv) {
        clear colour, which is correct but worth knowing about. */
     N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch);
     N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch);
+    /* SKY TEXTURE. The dome mesh names a key that the regional packs do not
+       carry -- the skies live in the shared dynamic-texture file, one dome and
+       one cap per time of day. Without this the dome draws untextured and the
+       top of the frame is flat black. Default is the evening sky the game
+       ships free roam in; --sky picks another. */
+    {   const char *want = g_sky_name ? g_sky_name : "sunset";
+        struct { const char *nm; uint32_t dome, cap; } sk[] = {
+            { "sunrise", 0x2414a01eu, 0x5fb8bcd1u },
+            { "sunset",  0x27f186b7u, 0x3e6947eau },
+            { "night",   0x8a9a05cfu, 0xb0eb9302u },
+        };
+        for (int a = 0; a < 3 && nsky; a++) {
+            if (strcmp(want, sk[a].nm)) continue;
+            char dp2[1024]; snprintf(dp2, sizeof dp2, "%s/TRACKS/LOC4DYNTEX.BIN", dataroot);
+            long dl2 = 0; unsigned char *dd2 = n2_read_file(dp2, &dl2);
+            if (!dd2) { printf("sky: LOC4DYNTEX.BIN did not open\n"); break; }
+            N2Tpk dt = n2_tpk_open(dd2, dl2);
+            for (int q = 0; q < nsky; q++) {
+                uint32_t key = (q == 0) ? sk[a].dome : sk[a].cap;
+                N2Tex t; memset(&t, 0, sizeof t);
+                if (n2_tpk_decode(dd2, dl2, dt, key, &t)
+                    || n2_load_car_tex_by_key(dd2, dl2, key, &t)) {
+                    skybatch[q].tex = upload_tex(&t);
+                    printf("sky %s: batch %d -> %#x (%dx%d)\n",
+                           sk[a].nm, q, key, t.w, t.h);
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                } else printf("sky %s: key %#x failed to decode\n", sk[a].nm, key);
+            }
+            free(dt.blk); free(dd2);
+            break;
+        }
+    }
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
@@ -4171,16 +4493,68 @@ int main(int argc, char **argv) {
 
     /* unit-quad for the 2D HUD (drawn in NDC via uMVP) */
     GpuMesh quad = make_quad();
+    /* Live reflection cube. 128 px a face is enough for a clear coat: it is
+       reflected, blurred by the mip chain and never seen directly. */
+    int g_envcube_ready = env_cube_init(128);
+    if (g_envcube_ready) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+        glActiveTexture(GL_TEXTURE0);
+        glUseProgram(rp.prog);
+        glUniform1i(rp.uEnvCube, 1);       /* the cube lives on unit 1 */
+        printf("reflections: 128x128 cube map ready\n");
+    }
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);   /* coplanar re-draws (last write wins) pass cleanly */
     /* Stock showroom paint: metallic silver (the files carry no chosen
        colour; badges/vinyls overlay as decals). The debug pane's paint
        override still allows any colour live. */
-    float paint[3] = { 0.70f, 0.70f, 0.75f };
+    float paint[3] = { paint_rgb[0], paint_rgb[1], paint_rgb[2] };
+    /* A named start point has the last word. Several rules ahead of this one
+       move the car -- the density spawn, the static-capture picker, the
+       showcase pose, an armed race grid -- and each is right for its own mode,
+       so rather than guarding every one of them the explicit request is simply
+       applied after them all. Ground Z is taken here because by now the scene,
+       its instances and the ground grid are all final. */
+    /* Free roam starts at the free-roam start. With no place asked for, no
+       event and no capture mode running, the car would otherwise be put
+       wherever the density picker landed -- which is somewhere different on
+       every region and is not a place anyone drives from. N2_SPAWNS[0] is that
+       start; if the loaded region does not cover it, nothing changes. */
+    if (!spawn_set && !shot && !want_event_id && !sstatic && !daudit && !raudit) {
+        float gz = world_ground_z(&scene, N2_SPAWNS[0].x, N2_SPAWNS[0].y,
+                                  N2_GROUND_HIGHEST);
+        if (gz > -2000.0f && gz < 4000.0f) {
+            spawn_set = 1;
+            spawn_x = N2_SPAWNS[0].x; spawn_y = N2_SPAWNS[0].y;
+            if (!head_set) { head_set = 1; head_deg = -10.2f; }
+            printf("free roam: starting at '%s'\n", N2_SPAWNS[0].name);
+        }
+    }
+
+    if (spawn_set) {
+        spawn[0] = spawn_x; spawn[1] = spawn_y;
+        float gz = world_ground_z(&scene, spawn_x, spawn_y, N2_GROUND_HIGHEST);
+        if (gz > -2000.0f && gz < 4000.0f) spawn[2] = gz;
+        else fprintf(stderr, "--spawn: no ground at (%.1f, %.1f) -- is the "
+                             "region loaded that covers it?\n", spawn_x, spawn_y);
+        printf("--spawn: (%.1f, %.1f, %.3f)\n", spawn[0], spawn[1], spawn[2]);
+        /* Re-arm the sprung ride: it holds the wheel heights from wherever the
+           car was placed before, and moving the body without telling it leaves
+           the wheels reaching for ground that is no longer under them. The car
+           then falls through the world -- which looks like the lighting going
+           out, because what you are seeing is the city from underneath. */
+        g_ride_ready = 0;
+    }
+    if (head_set) {
+        heading0 = head_deg * 0.0174533f;
+        printf("--heading: %.1f deg\n", head_deg);
+    }
+
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && !daudit && aipath.n > 0) {
+    if (shot && !sstatic && !daudit && !spawn_set && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -4190,7 +4564,7 @@ int main(int argc, char **argv) {
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
     /* an armed race wins: start on its own grid, facing through the start line */
-    if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
+    if (!sstatic && !spawn_set) race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
@@ -4221,7 +4595,11 @@ int main(int argc, char **argv) {
     /* tyre skid marks: a ring buffer of oriented ground SEGMENTS (ax,ay,az,
        bx,by,bz, life) — life starts at 1 and decays so marks fade over time.
        bx,by,bz) forming continuous ribbons; plus drift smoke particles. */
-    #define MAXSKID 700
+    /* A minute of rubber. Two segments a frame at 60 Hz is 7200 for sixty
+       seconds; at 28 bytes each that is 200 kB, which is nothing, and it
+       means a doughnut leaves a full circle you can still see when you drive
+       back past it rather than a few metres that vanish while you watch. */
+    #define MAXSKID 7200
     static float skid[MAXSKID][7]; int skidn = 0, skidhead = 0;
     float prevL[3] = {0,0,0}, prevR[3] = {0,0,0}; int skidpen = 0;  /* pen-down state */
     #define MAXSMOKE 512
@@ -4373,6 +4751,12 @@ int main(int argc, char **argv) {
                         carpos[0]=spawn[0]; carpos[1]=spawn[1]; carpos[2]=spawn[2];
         g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
                         heading=heading0; vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                    } else if ((k==SDLK_RETURN || k==SDLK_SPACE) && spawn_set) {
+                        /* Free roam: the start was asked for explicitly, so
+                           this only drops the countdown and lets the car go.
+                           Snapping to a start line here is what teleported the
+                           player away from the place they had chosen. */
+                        race_state = 0; racetimer = 0;
                     } else if (k==SDLK_RETURN || k==SDLK_SPACE) {
                         /* Snap the player from the showcase spot to the circuit
                            start line so the race itself is fair. start_idx is
@@ -4382,7 +4766,7 @@ int main(int argc, char **argv) {
                            footprint (M91). Take the first waypoint AHEAD of it
                            whose own road layer passes the footprint, wall and
                            headroom tests, and start the lap there. */
-                        if (!aipath.n && nsprint > 0) {
+                        if (!aipath.n && nsprint > 0 && !spawn_set) {
                             /* No closed circuit here: arm the selected shipped
                                event through the same world_race_start() the
                                --event path uses, then place the player with the
@@ -4500,7 +4884,15 @@ int main(int argc, char **argv) {
             else               { throttle =  0.0f; steer = 0.0f; }
             handbrake = 0;
         }
-        steer_filtered=phys_steer_response(steer_filtered,steer);
+        /* ONE steering filter, not two. The old model had no rack of its own,
+           so this exponential smoother stood in for one. The new model has a
+           real rate-limited rack (140 deg/s at the road wheels, quicker back
+           to centre), and running both in series just makes the wheel vague:
+           full lock arrived a third of a second late, which is a long time
+           when you are trying to break the back loose. Pass the input
+           straight through and let the rack shape it. */
+        steer_filtered = (g_newphys && g_newphys_ok)
+                       ? steer : phys_steer_response(steer_filtered, steer);
         /* Surface-aware handling (M114): query the selected centre contact layer,
            then EASE the active profile toward that surface's
            profile over ~0.15 s. Blending the profile (not the velocity) means
@@ -4621,13 +5013,46 @@ int main(int argc, char **argv) {
         }
         float dmag = sstatic ? 0.0f
                    : race_auto ? speed/60.0f
+                   : (g_newphys && g_newphys_ok)
+                   ? veh_bridge_step(carpos, vel, &heading, &speed,
+                                     throttle, steer_filtered, handbrake ? 1 : 0, &g_vehmodel)
                    : phys_car_step(carpos, vel, &heading, &speed,
-                                   throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
+                                   throttle, steer_filtered, handbrake ? 1 : 0, &surf_now, &g_vehicle);
+        if (g_tel && !sstatic) {
+            g_tel_t += 1.0f/60.0f;
+            fprintf(g_tel, "%.3f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,"
+                           "%.2f,%.2f,%d,%d,%.0f,%.2f,%.2f\n",
+                    g_tel_t, carpos[0], carpos[1], carpos[2],
+                    speed * 60.0f * 3.6f, heading * 57.29578f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_yaw_rate()*57.29578f : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_slip_deg() : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_slip_ratio() : 0.0f,
+                    throttle, steer_filtered, handbrake ? 1 : 0,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_gear() : gear,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_rpm() : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_pitch()*57.29578f : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_roll()*57.29578f : 0.0f);
+        }
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the
            countdown, since throttle is locked out until GO). */
         { float sp = (speed < 0 ? -speed : speed) / PHYS_MAXSPD;
+          /* THE ENGINE NOTE HAS TO COME FROM THE ENGINE. eng_gearbox_step
+             runs a virtual six-speed off road speed alone, which was fine
+             when the physics had no engine at all -- but now there is a real
+             one, with the car's own ratios and its own rev counter, and the
+             two disagreed audibly: the model would hold a gear through a
+             slide while the sound shifted up and down anyway. Worse, in a
+             doughnut you could HEAR the revs climb and fall while the car
+             was in fact sitting on one gear the whole time. Drive the note
+             from the model and the ear matches the car. */
+          if (g_newphys && g_newphys_ok) {
+              g_engine.target_rpm = veh_bridge_rpm();
+              g_engine.load = throttle > 0.0f ? throttle : 0.0f;
+              gear = veh_bridge_gear() - 1;      /* model counts neutral as 1 */
+              if (gear < 1) gear = 1;
+          } else
           eng_gearbox_step(sp, throttle, 1.0f/60.0f, &gear, &shift_t);
           g_engine.master_volume = (race_state==0 ? 0.16f : 0.16f + sp*0.5f);
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
@@ -4667,6 +5092,7 @@ int main(int argc, char **argv) {
             (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
+            veh_bridge_adopt();      /* the resolved velocity is the truth now */
             if (raudit) {
                 float dx = carpos[0]-m94_prex, dy = carpos[1]-m94_prey;
                 float corr = sqrtf(dx*dx+dy*dy);
@@ -4684,6 +5110,7 @@ int main(int argc, char **argv) {
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
                         world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
+          if (rpushed) veh_bridge_adopt();
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
           if (rpushed) {
@@ -4692,6 +5119,44 @@ int main(int argc, char **argv) {
           }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
+        /* KERB STOP. The wall probes look for tall near-vertical faces and
+           deliberately skip short seams -- which is what a kerb face is, so
+           the car drove straight into kerbs, half-sank, and sat there tilted.
+           A kerb is not a wall, it is a STEP in the ground: measured on this
+           map, the steepest drivable ramp gains 0.09 m per 0.25 m sample and
+           the lowest kerb jumps 0.16, so a rise above 0.12 per quarter-metre
+           step is a kerb face. Probe just past the bumper along the travel
+           direction; hitting one removes the into-step velocity and nudges
+           the car back, like a wheel striking the stone does. */
+        if (race_state == 1 && !race_auto && !sstatic && fabsf(speed) > 0.02f) {
+            /* A kerb is a JUMP inside one quarter-metre step; a ramp is a
+               SLOPE spread over all of them. The first cut of this also
+               compared the ground 2.2 m ahead against the ground under the
+               car -- and over 2.2 m even a drivable ramp legitimately gains
+               most of a metre, so the car nosed at every on-ramp convinced
+               it was a wall. Walk a ladder of quarter-metre samples and
+               judge only the per-step jumps; the total climb proves nothing. */
+            float sgn = (speed >= 0.0f) ? 1.0f : -1.0f;
+            float dirx = cosf(heading) * sgn, diry = sinf(heading) * sgn;
+            float step = 0.0f, gprev = 0.0f;
+            for (int q = 0; q < 4; q++) {
+                float d = 1.6f + 0.25f * (float)q;
+                float g = world_ground_z(&scene, carpos[0] + dirx * d,
+                                         carpos[1] + diry * d, carpos[2]);
+                if (q && g - gprev > step) step = g - gprev;
+                gprev = g;
+            }
+            if (step > 0.12f && step < 1.4f) {
+                float into = vel[0] * dirx + vel[1] * diry;
+                if (into > 0.0f) {
+                    vel[0] -= dirx * into * 0.9f;
+                    vel[1] -= diry * into * 0.9f;
+                    carpos[0] -= dirx * 0.06f; carpos[1] -= diry * 0.06f;
+                    g_hit = 0.3f;
+                    veh_bridge_adopt();
+                }
+            }
+        }
         if (race_state == 1 && !race_auto && !sstatic && world_barrier_push(&world, carpos, 1.3f)) {
             vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
@@ -4723,10 +5188,37 @@ int main(int argc, char **argv) {
         if (!sstatic && !race_auto) {
             ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
+            /* A CAR SPANS A HOLE (Nik's hardcode, and a sound one: the car
+               only ever jumps vertically and never rolls over, so nothing is
+               lost by refusing crazy supports). If some wheels stand on road
+               and another's query fell into a gap in the mesh -- or onto a
+               surface a storey below -- the body would tip nose-first into
+               the hole and stick there. A real car bridges it on the wheels
+               that DO touch: any support more than 0.7 m below the highest
+               contacted one is not the ground this car is standing on. */
+            {   float zhi = -1e9f; int any = 0;
+                for (int w = 0; w < 4; w++)
+                    if (g_sup.valid[w] && g_sup.z[w] > zhi) { zhi = g_sup.z[w]; any = 1; }
+                if (any)
+                    for (int w = 0; w < 4; w++)
+                        if (g_sup.valid[w] && g_sup.z[w] < zhi - 0.7f)
+                            g_sup.z[w] = zhi - 0.7f;
+            }
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
             float zprev = g_ride.z;
             phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
+            /* Upright, always: vertical travel is free, the BODY never tips
+               past what suspension geometry could give. Anything beyond a
+               ~7 degree ride tilt is a glitch state, not a stance. */
+            if (g_ride.pitch >  0.12f) { g_ride.pitch =  0.12f; g_ride.pitch_rate = 0.0f; }
+            if (g_ride.pitch < -0.12f) { g_ride.pitch = -0.12f; g_ride.pitch_rate = 0.0f; }
+            if (g_ride.roll  >  0.14f) { g_ride.roll  =  0.14f; g_ride.roll_rate  = 0.0f; }
+            if (g_ride.roll  < -0.14f) { g_ride.roll  = -0.14f; g_ride.roll_rate  = 0.0f; }
             carpos[2] = g_ride.z;
+            { static int n=0; if (n<8 && getenv("N2_RIDE_TRACE")) { n++;
+                printf("ride %d: z=%.3f contacts=0x%x sup z=%.3f/%.3f/%.3f/%.3f\n",
+                       n, g_ride.z, g_ride.contact_mask,
+                       g_sup.z[0], g_sup.z[1], g_sup.z[2], g_sup.z[3]); } }
             float dzf = g_ride.z - zprev; if (dzf < 0) dzf = -dzf;
             if (dzf > g_ride_maxdz) g_ride_maxdz = dzf;
             if (!g_ride.contact_mask) g_ride_air++;
@@ -5014,7 +5506,18 @@ int main(int argc, char **argv) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
             float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
-            float sp=sinf(g_ride.pitch), sr=sinf(g_ride.roll);
+            /* The ride model answers to the GROUND -- bumps, kerbs, a wheel
+               dropping off a deck. It knows nothing about acceleration, so
+               the car never squatted, never dived under braking and never
+               leaned in a corner: the springs looked welded solid. The
+               dynamics model carries exactly that missing part, so the two
+               add: terrain from below, weight transfer from the driving. */
+            float body_pitch = g_ride.pitch, body_roll = g_ride.roll;
+            if (g_newphys && g_newphys_ok) {
+                body_pitch += veh_bridge_pitch();
+                body_roll  += veh_bridge_roll();
+            }
+            float sp=sinf(body_pitch), sr=sinf(body_roll);
             float u[3] = { -fx*sp - lx*sr, -fy*sp - ly*sr, 1.0f };
             float ul=sqrtf(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
             if (ul>1e-6f){ car_up[0]=u[0]/ul; car_up[1]=u[1]/ul; car_up[2]=u[2]/ul; }
@@ -5069,15 +5572,36 @@ int main(int argc, char **argv) {
         }
 
         /* drifting? extend the tyre ribbons + puff smoke at the rear wheels */
-        int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f);
+        /* Sliding sideways OR spinning the wheels both lay rubber -- a
+           standing burnout leaves the blackest marks of all, and until now
+           only sideways motion counted, so a doughnut drew nothing. */
+        int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f)
+                     || ((g_newphys && g_newphys_ok)
+                         && fabsf(veh_bridge_slip_ratio()) > 0.35f);
         /* tyre screech scales with how hard the back is sliding */
         g_skid = (race_state==1 && drifting)
                ? (0.12f + 0.45f*(dmag - PHYS_MAXSPD*0.2f)/PHYS_MAXSPD) : 0.0f;
         if (g_skid > 0.35f) g_skid = 0.35f;
         if (drifting) {
-            float rx = carpos[0]-nf[0]*1.6f, ry = carpos[1]-nf[1]*1.6f;
+            /* The marks come off the ACTUAL rear wheels. They were drawn at a
+               hard-coded 1.6 m behind the origin and a full metre out each
+               side -- outside the 350Z's real track, so the rubber floated
+               beside the tyres. The wheel config now carries the record's own
+               axle line and track; use them. */
+            float rax = -g_dbg.wheel.rear_axle;          /* record X is negative */
+            float rht = 0.5f * g_dbg.wheel.rear_track;
+            if (rax < 0.5f || rax > 3.0f) rax = 1.6f;    /* sane fallback */
+            if (rht < 0.4f || rht > 1.2f) rht = 0.8f;
+            float rx = carpos[0]-nf[0]*rax, ry = carpos[1]-nf[1]*rax;
             float rz = carpos[2]+0.05f;
-            float curL[3]={rx+nr[0], ry+nr[1], rz}, curR[3]={rx-nr[0], ry-nr[1], rz};
+            float curL[3]={rx+nr[0]*rht, ry+nr[1]*rht, rz},
+                  curR[3]={rx-nr[0]*rht, ry-nr[1]*rht, rz};
+            /* A segment is only a segment if the wheel actually rolled there:
+               after a respawn or a teleport the previous point is somewhere
+               else entirely, and connecting it drew a single black band tens
+               of metres long across the car park. Lift the pen instead. */
+            if (skidpen && (fabsf(curL[0]-prevL[0]) + fabsf(curL[1]-prevL[1]) > 2.0f))
+                skidpen = 0;
             if (skidpen) {   /* connect last frame's wheel points into ribbon segments */
                 float *seg;
                 seg=skid[skidhead]; seg[0]=prevL[0];seg[1]=prevL[1];seg[2]=prevL[2];
@@ -5162,6 +5686,34 @@ int main(int argc, char **argv) {
             want[0] = carpos[0]-cosf(shotyaw)*g_dbg.chase_distance;
             want[1] = carpos[1]-sinf(shotyaw)*g_dbg.chase_distance;
             want[2] = carpos[2]+g_dbg.chase_height;
+        } else if (g_newcam) {              /* chase, NFSU2-flavoured */
+            /* Which way is the car actually going? Below walking pace the
+               velocity is noise, so ease back onto the nose; in reverse stay
+               behind the nose too (a backing car is watched over its boot). */
+            float vwx = vel[0]*60.0f, vwy = vel[1]*60.0f;
+            float vg = sqrtf(vwx*vwx + vwy*vwy);
+            float along = vwx*fwd[0] + vwy*fwd[1];
+            float az_want = (vg > 2.5f && along > 0.0f)
+                          ? atan2f(vwy, vwx) : heading;
+            if (!g_cam_init) { g_cam_az = heading; g_cam_init = 1; }
+            /* ease the azimuth with wrap; the lag IS the side view */
+            float d_az = az_want - g_cam_az;
+            while (d_az >  3.14159f) d_az -= 6.28318f;
+            while (d_az < -3.14159f) d_az += 6.28318f;
+            g_cam_az += d_az * 0.085f;
+
+            /* distance breathes: further with speed, tucked in on the brakes */
+            float dwant = 5.8f * (1.0f + 0.38f * fminf(vg / 50.0f, 1.0f));
+            if (throttle < -0.05f) dwant = 5.2f;
+            g_cam_dist += (dwant - g_cam_dist) * 0.06f;
+
+            /* FOV opens with speed -- the cheap way to make speed feel fast */
+            float fov_want = 0.88f + 0.24f * fminf(vg / 50.0f, 1.0f);
+            g_fov += (fov_want - g_fov) * 0.05f;
+
+            want[0] = carpos[0] - cosf(g_cam_az) * g_cam_dist;
+            want[1] = carpos[1] - sinf(g_cam_az) * g_cam_dist;
+            want[2] = carpos[2] + 2.35f + 0.35f * fminf(vg / 50.0f, 1.0f);
         } else {                            /* chase: behind + above, tunable */
             want[0] = carpos[0]-fwd[0]*g_dbg.chase_distance;
             want[1] = carpos[1]-fwd[1]*g_dbg.chase_distance;
@@ -5174,7 +5726,8 @@ int main(int argc, char **argv) {
         if (shotyaw < 1e8f) k = 1.0f;   /* capture pose must be exact, not eased */
         for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*k;
         static float camtgt[3]; static int camtgt_init = 0;
-        float idealtgt[3] = { carpos[0], carpos[1], carpos[2]+1.5f };  /* car centre, slightly up */
+        float idealtgt[3] = { carpos[0], carpos[1],
+                              carpos[2] + (g_newcam ? 1.15f : 1.5f) };  /* car centre, slightly up */
         if (!camtgt_init) { camtgt[0]=idealtgt[0]; camtgt[1]=idealtgt[1]; camtgt[2]=idealtgt[2]; camtgt_init=1; }
         for (int c=0;c<3;c++) camtgt[c] += (idealtgt[c]-camtgt[c])*k;
         float look[3] = { camtgt[0]-cam[0], camtgt[1]-cam[1], camtgt[2]-cam[2] };
@@ -5186,10 +5739,127 @@ int main(int argc, char **argv) {
 
         int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         glViewport(0, 0, W, H);
+        /* LIVE REFLECTION. There is no environment texture in the data -- the
+           slot exists and nothing fills it, which is why the game's options
+           expose a reflection rate at all. Six faces are rendered around the
+           car instead, low resolution, one face per frame. */
+        {   static int envtick = 0;
+            /* ONE FACE PER FRAME. Refreshing all six at once costs the same
+               overall but visibly jumps: the map holds for five frames and
+               then changes completely. One face per frame takes the same six
+               frames and spreads the change out. */
+            if (g_envcube_ready && ncar) {
+                /* Unbind the map from unit 1 while rendering into it: it
+                   cannot be a shader source and a framebuffer target at the
+                   same time -- the driver marks such a texture unloadable and
+                   substitutes a null one. */
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+                glActiveTexture(GL_TEXTURE0);
+                float eye[3] = { carpos[0], carpos[1], carpos[2] + 1.0f };
+                {   int f = envtick++ % 6;
+                    float fwd[3], upv[3];
+                    env_cube_face_dirs(f, fwd, upv);
+                    float Vf[16], Pf[16], MVPf[16];
+                    mat_lookat_up(eye, fwd, upv, Vf);
+                    mat_persp(1.5708f, 1.0f, 1.0f, 30000.0f, Pf);
+                    mat_mul(Pf, Vf, MVPf);
+                    env_cube_begin(f);
+                    glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPf);
+                    glUniform1f(rp.uEnv, 0.0f); glUniform1f(rp.uMatOn, 0.0f);
+                    glUniform1f(uSpec, 0.0f);
+                    /* sky: no fog, no depth writes */
+                    glUniform1f(uUnlit, 1.0f); glUniform1f(rp.uFogDensity, 0.0f);
+                    glUniform3f(uColor, 1.0f, 1.0f, 1.0f); glUniform1f(uAlpha, 1.0f);
+                    glDepthMask(GL_FALSE);
+                    for (int k = 0; k < nsky; k++) {
+                        if (!skybatch[k].tex) continue;
+                        glUniform1f(uUseTex, 1.0f);
+                        glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
+                        draw_batch(&skybatch[k]);
+                    }
+                    glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+                    /* the world around the car: what actually reflects */
+                    glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+                    glUniform1f(rp.uVColor, g_dbg.vcolor);
+                    for (int k = 0; k < nbatch; k++) {
+                        N2Batch *b = &wbatch[k];
+                        float dx = eye[0] < b->bbox_min[0] ? b->bbox_min[0]-eye[0]
+                                 : (eye[0] > b->bbox_max[0] ? eye[0]-b->bbox_max[0] : 0);
+                        float dy = eye[1] < b->bbox_min[1] ? b->bbox_min[1]-eye[1]
+                                 : (eye[1] > b->bbox_max[1] ? eye[1]-b->bbox_max[1] : 0);
+                        if (dx*dx + dy*dy > 250.0f*250.0f) continue;
+                        if (b->tex) { glUniform1f(uUseTex, 1.0f);
+                                      glBindTexture(GL_TEXTURE_2D, b->tex); }
+                        else { glUniform1f(uUseTex, 0.0f);
+                               glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                        draw_batch(b);
+                    }
+                    glUniform1f(rp.uVColor, 0.0f);
+                }
+                env_cube_end(W, H);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+                glGenerateMipmap(GL_TEXTURE_CUBE_MAP);   /* smooths the sampling */
+                glActiveTexture(GL_TEXTURE0);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+                glActiveTexture(GL_TEXTURE0);
+            }
+        }
+
+        /* The frame is drawn into a texture so it can be toned afterwards;
+           see src/sfx/post.c. Without it the picture is the raw scene, which
+           reads cold and flat. */
+        if (!no_post && pp_init(W, H)) { post_on = 1; pp_begin(); }
+        else post_on = 0;
         /* the sky is cleared to the fog colour: distant geometry dissolves
            into exactly what the horizon shows */
         glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        /* The material model belongs to the car: leave it on and the world is
+           multiplied by whatever the last panel's record said, which turns the
+           road black. Off at the top of every frame, on only where a submesh
+           names a material. */
+        glUniform1f(rp.uMatOn, 0.0f);
+        /* And the flat-colour flags, for the same reason: the billboard passes
+           (shadow, lamp halos, glow quads, HUD) all raise them deliberately,
+           and any one of them left raised sends the whole next frame down the
+           shader's unlit early-return -- no texturing, no specular, no
+           reflection. It reads as "the lighting turned off". */
+        /* FULL RESET OF THE SHADER STATE, every frame.
+         *
+         * A dozen passes raise these deliberately -- shadows, halos, tail
+         * lights, headlight pools, tyre smoke, skid marks, the HUD -- and any
+         * one of them that forgets to lower a flag corrupts everything drawn
+         * after it. Worse, several of those passes only run while DRIVING, so
+         * the corruption appears the moment the menu is left and never in the
+         * menu itself: "the lights go out when the chase camera starts".
+         * Rather than audit every pass for what it restores, the frame begins
+         * from a known state. */
+        glUniform1f(rp.uUnlit, 0.0f);
+        glUniform1f(rp.uSoft, 0.0f);
+        glUniform1f(rp.uAlpha, 1.0f);
+        glUniform1f(rp.uUseTex, 0.0f);
+        glUniform1f(rp.uVColor, 0.0f);
+        glUniform1f(rp.uEnv, 0.0f);
+        glUniform1f(rp.uSpec, 0.0f);
+        glUniform1f(rp.uDecal, 0.0f);
+        glUniform1f(rp.uAlphaTest, 0.0f);
+        glUniform1f(rp.uVista, 0.0f);
+        glUniform1f(rp.uEnvCubeOn, 0.0f);
+        glUniform3f(rp.uColor, 1.0f, 1.0f, 1.0f);
+        glUniform3f(rp.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
+        glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        /* Culling OFF: the car, glass and the glow billboards are all
+           single-sided geometry meant to be seen from either face. It is
+           enabled only for the world pass, and only on request. Turning it on
+           here made the lamp halos vanish as soon as the camera moved behind
+           them -- which is every frame once the chase camera starts. */
+        glDisable(GL_CULL_FACE);
         glUniform3f(rp.uFogColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
         glUniform1f(rp.uUVCheck, (float)g_dbg.show_uv_checker);
@@ -5212,7 +5882,7 @@ int main(int argc, char **argv) {
         float zfar = g_dbg.fog_density > 1e-5f
                    ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
         if (zfar < 500.0f) zfar = 500.0f;
-        mat_persp(0.9f, (float)W/H, znear, zfar, P);
+        mat_persp(g_fov, (float)W/H, znear, zfar, P);
         mat_lookat(cam, look, V);
         mat_mul(P, V, MVP);
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
@@ -5231,28 +5901,50 @@ int main(int argc, char **argv) {
            the depth test alone. Falls back to nothing (flat fog clear
            colour shows through) when the region has no SKYDOME mesh. */
         if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0)) {   /* M78/M79 */
-            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16], Psky[16];
-            mat_lookat(zero, look, Vsky);
-            mat_persp(0.9f, (float)W/H, znear, maxr*30, Psky);  /* deep: dome ~16 km */
+            /* The dome is seen from INSIDE, so back-face culling must be
+               disabled explicitly: GL state is global and may still be on from
+               the previous pass. */
+            glDisable(GL_CULL_FACE);
+            /* THE DOME SITS IN WORLD COORDINATES, not around the origin: it
+               spans the whole map, centred near (-842, 285), a hemisphere some
+               9700 units across and 8000 tall. The usual "camera at the
+               origin" trick moves it aside and the sky misses the frame
+               entirely. It is an ordinary world object with no camera
+               attachment, so it is drawn with the ordinary camera -- only the
+               far plane has to be widened to fit it, and depth writes are
+               off. */
+            float Vsky[16], MVPsky[16], Psky[16];
+            mat_lookat(cam, look, Vsky);
+            mat_persp(g_fov, (float)W/H, znear, 30000.0f, Psky);
             mat_mul(Psky, Vsky, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 1.0f);
+            /* No fog on the sky. The dome is thousands of metres away and
+               exp(-(depth*density)^2) is zero at that range, so the whole dome
+               paints in the fog colour -- which is the clear colour, and looks
+               exactly like having no sky at all. */
+            glUniform1f(rp.uFogDensity, 0.0f);
             glDepthMask(GL_FALSE);
-            /* The unlit path outputs mix(uFogColor,uColor,fog) and never
-               samples the texture, so every sky batch is flat-shaded to
-               uColor. It MUST be set here: the loop used to set it only for
-               untextured batches, so a textured sky mesh (region D has one)
-               inherited whatever uColor the previous frame last left -- the
-               red brake-light/neon colour -- and, being camera-locked, drew a
-               fixed red block at the top of the frame. Pin it to the fog
-               colour so the dome always dissolves into the horizon. */
-            glUniform1f(uUseTex, 0.0f);
-            glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
+            /* The sky is textured: the emissive shader path samples its
+               texture (see render.c), and the images come from the shared
+               dynamic texture file by name. The main texture covers the dome,
+               the _CAP one the zenith. An untextured batch falls back to the
+               fog colour so it dissolves into the horizon rather than
+               inheriting whatever uColor the previous pass left behind -- that
+               used to paint a red block across the top of the frame. */
+            glUniform3f(uColor, 1.0f, 1.0f, 1.0f);
+            glUniform1f(uAlpha, 1.0f);
             for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].tex) { glUniform1f(uUseTex, 1.0f);
+                                       glBindTexture(GL_TEXTURE_2D, skybatch[k].tex); }
+                else { glUniform1f(uUseTex, 0.0f);
+                       glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b); }
                 draw_batch(&skybatch[k]);
                 g_dbg.drawn++; skydraws++;
             }
+            glUniform1f(uUseTex, 0.0f);
             glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uFogDensity, g_dbg.fog_density);   /* fog back on */
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
         }
 
@@ -5297,7 +5989,7 @@ int main(int argc, char **argv) {
         if (nvista && tier == 2 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
-            mat_persp(0.9f, (float)W/H, znear, vista_far, Pv);
+            mat_persp(g_fov, (float)W/H, znear, vista_far, Pv);
             mat_mul(Pv, V, MVPv);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPv);
             float vd = vista_far > 1.0f
@@ -5409,6 +6101,20 @@ int main(int argc, char **argv) {
         if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
                          memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
+        /* DRAW MODE PER BATCH, taken from its texture's record. Drawing
+           everything opaque is what leaves foliage as solid rectangles and lit
+           windows black: the record already says which is which. */
+        static unsigned char *bmode = NULL; static int bmode_n = -1;
+        if (bmode_n != nbatch) {
+            bmode = (unsigned char *)realloc(bmode, (size_t)(nbatch > 0 ? nbatch : 1));
+            for (int k = 0; k < nbatch; k++) {
+                bmode[k] = 0;
+                for (int q = 0; q < ntmap; q++)
+                    if (tmapkey[q] == wbatch[k].texkey) { bmode[k] = tmapalpha[q]; break; }
+            }
+            bmode_n = nbatch;
+        }
+        static int blendlist[8192]; int nblend = 0;
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
@@ -5428,10 +6134,18 @@ int main(int argc, char **argv) {
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
+            if (bmode[k] >= N2_DRAW_BLEND) {      /* glass and neon: second pass */
+                if (nblend < 8192) blendlist[nblend++] = k;
+                continue;
+            }
             ndrawn += b->nmesh;
             if (b->tex != lasttex) {
                 if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
                 else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                /* alpha test only where the record says cutout -- foliage,
+                   railings, frames. Applied to an opaque texture it punches
+                   holes in the road. */
+                glUniform1f(rp.uAlphaTest, bmode[k] == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
                 lasttex = b->tex;
             }
             draw_batch(b);
@@ -5448,6 +6162,30 @@ int main(int argc, char **argv) {
             glDepthMask(GL_TRUE);
             glUniform1f(uUnlit, 0.0f);
         }
+        /* SECOND PASS: translucent geometry. These textures carry a draw order
+           of 5..7 and do not write depth. Additive ones are the neon and the
+           lit building windows -- what makes the night city glow; without this
+           pass the facades stay black. */
+        if (nblend) {
+            glEnable(GL_BLEND); glDepthMask(GL_FALSE);
+            glUniform1f(rp.uAlphaTest, 0.0f); glUniform1f(uUseTex, 1.0f);
+            int lastmode = -1; lasttex = (GLuint)-1;
+            for (int q = 0; q < nblend; q++) {
+                N2Batch *b = &wbatch[blendlist[q]];
+                int md = bmode[blendlist[q]];
+                if (md != lastmode) {
+                    glBlendFunc(GL_SRC_ALPHA, md == N2_DRAW_ADD ? GL_ONE
+                                                                : GL_ONE_MINUS_SRC_ALPHA);
+                    lastmode = md;
+                }
+                if (b->tex != lasttex) { glBindTexture(GL_TEXTURE_2D, b->tex); lasttex = b->tex; }
+                draw_batch(b);
+                ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+            }
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+        }
+        glUniform1f(rp.uAlphaTest, 0.0f);
         glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
                                             prelight; their attrib-3 default is black) */
         } else if (g_dbg.show_track) {   /* --- F3 debug view: prelight/normals/wire --- */
@@ -5553,26 +6291,10 @@ int main(int argc, char **argv) {
         /* headlights: warm soft light-pools cast on the road ahead (it's night),
            three overlapping ground glows that widen + fade with distance to read
            as a headlight cone. Additive blend. Night only. */
-        if (race_state != 3 && g_dbg.night_mode) {
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDepthMask(GL_FALSE);
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor, 0.60f, 0.56f, 0.42f);
-            float fx=cosf(heading), fy=sinf(heading);
-            for (int s=0;s<3;s++){
-                float dist=3.0f+s*3.5f, size=3.0f+s*2.4f;
-                float px=carpos[0]+fx*dist, py=carpos[1]+fy*dist;
-                float pz=world_ground_z(&scene,px,py,carpos[2])+0.06f;
-                float M[16]={size,0,0,0, 0,size,0,0, 0,0,1,0, px-size*0.5f, py-size*0.5f, pz, 1};
-                float MV[16]; mat_mul(MVP, M, MV);
-                glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
-                glUniform1f(uAlpha, 0.5f - s*0.13f);
-                draw_gpumesh(&quad);
-                g_dbg.drawn++;
-            }
-            glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
-            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
-        }
+        /* Likewise the headlight ground pools: three additive quads laid on
+           the road at fixed distances ahead. Same objection -- the shape came
+           from constants, not from the car or its lamps. */
+
 
         /* tyre skid marks: flat dark quads on the ground, alpha-blended */
         if (skidn > 0) {
@@ -5582,7 +6304,7 @@ int main(int argc, char **argv) {
             glUniform3f(uColor, 0.04f, 0.04f, 0.05f);
             for (int i = 0; i < skidn; i++) {
                 float *s = skid[i];                          /* ax,ay,az, bx,by,bz, life */
-                if (race_state != 3) s[6] -= 0.0018f;        /* ~9s to fade (frozen on menu) */
+                if (race_state != 3) s[6] -= 0.00028f;       /* ~60 s to fade (frozen on menu) */
                 if (s[6] <= 0.0f) continue;
                 float dx=s[3]-s[0], dy=s[4]-s[1];            /* segment direction */
                 float len2=sqrtf(dx*dx+dy*dy); if(len2<1e-4f) continue;
@@ -5686,6 +6408,24 @@ int main(int argc, char **argv) {
                       memcpy(M, m2, sizeof M);
                   }
                   memcpy(wheelT[k],M,sizeof(M)); } }
+            /* Car reflections come from the cube rendered around the car
+               itself. uEnvYaw turns the reflected ray from car axes into world
+               axes: normals and positions here are model-space, the map is
+               world-space. */
+            if (g_envcube_ready) {
+                glUniform1f(rp.uEnvCubeOn, 1.0f);
+                glUniform1f(rp.uEnvYaw, heading);
+            }
+            /* uUnlit/uSoft are left ON (1.0) by the shadow, headlight-glow
+               and skid-mark billboards drawn just above -- all three
+               deliberately use the unlit flat-colour path for those quads.
+               Without resetting them here every car mesh below hits the
+               shader's unlit early-return and skips texture sampling, decal
+               blending, specular AND environment mapping entirely. One leaked
+               uniform is enough to keep every lit-path feature off the screen:
+               gloss, badges and reflections all vanish at once, which looks
+               exactly like "the lighting switched off". */
+            glUniform1f(uUnlit, 0.0f); glUniform1f(uSoft, 0.0f);
             float *pnt = g_dbg.paint_override ? g_dbg.paint : paint;
             /* uUnlit/uSoft were left ON (1.0) by the shadow/headlight-glow/
                skid-mark billboards drawn just above (all three intentionally
@@ -5719,20 +6459,70 @@ int main(int argc, char **argv) {
                 float specv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?g_dbg.body_spec
                             : is_light?0.45f : c==N2_CAR_MECH?0.05f : 0.0f;
                 if (cgm[i].trim) specv *= 0.4f;
+                float glossv = cgm[i].trim ? 6.0f : 20.0f;
+                float envv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
+                           : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f;
+
+                /* MATERIAL FROM THE DATA. When a submesh names a material, its
+                   diffuse, specular and reflection come from that record rather
+                   than from per-class constants: chrome has no diffuse and a
+                   1.14 reflection, metallic paint 1.12 specular with 0.372
+                   reflection, rubber 0.248 specular and no reflection at all.
+                   The curves go to the shader unchanged -- it evaluates
+                   Min + dot(V,N)*Range. Averaging them into one number and
+                   adding hand-made edge darkening instead is what makes paint
+                   read flat. The exponent multiplier of 6 is our own scale fit:
+                   the stored exponent belongs to a different lighting model and
+                   used directly gives a highlight the size of a body panel. */
+                const N2LightMat *lm = (nlmat && cgm[i].matkey)
+                                     ? n2_find_lightmat(lmat, nlmat, cgm[i].matkey) : NULL;
+                if (lm) {
+                    float dr[3], se[4];
+                    for (int q = 0; q < 3; q++) dr[q] = lm->dif_max[q] - lm->dif_min[q];
+                    se[0] = (lm->spec_min[0]+lm->spec_min[1]+lm->spec_min[2]) / 3.0f;
+                    se[1] = (lm->spec_max[0]+lm->spec_max[1]+lm->spec_max[2]) / 3.0f - se[0];
+                    se[2] = (lm->env_min[0] +lm->env_min[1] +lm->env_min[2])  / 3.0f;
+                    se[3] = (lm->env_max[0] +lm->env_max[1] +lm->env_max[2])  / 3.0f - se[2];
+                    glUniform1f(rp.uMatOn, 1.0f);
+                    glUniform3fv(rp.uMatDifMin, 1, lm->dif_min);
+                    glUniform3fv(rp.uMatDifRange, 1, dr);
+                    glUniform4fv(rp.uMatSE, 1, se);
+                    specv = c==N2_CAR_BODY ? g_dbg.body_spec * 1.2f : 0.5f;
+                    envv  = c==N2_CAR_BODY ? g_dbg.body_env  * 2.0f : 1.5f;
+                    if (lm->spec_pow > 0.01f) glossv = 6.0f * lm->spec_pow;
+                } else {
+                    glUniform1f(rp.uMatOn, 0.0f);
+                }
                 glUniform1f(uSpec, specv);
-                glUniform1f(uGloss, cgm[i].trim ? 6.0f : 20.0f);
+                glUniform1f(uGloss, glossv);
                 /* no diffuse texture exists for any light part (verified
                    exhaustively against the data, see n2_car_category) — chrome
                    housing + coloured lens read entirely through reflection.
                    Mechanical compartment parts (engine/exhaust) are unpainted
                    metal/plastic when they have no texture of their own — no
                    body-paint gloss or reflection either. */
-                glUniform1f(rp.uEnv, (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
-                                   : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f);
+                glUniform1f(rp.uEnv, envv);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
                 GLuint tex = 0; int hasalpha = 0;
                 for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
                     tex = maptex[j]; hasalpha = mapalpha[j]; break; }
+                /* SHARED LAMP TEXTURE, bound by name. The key these parts
+                   carry resolves nowhere, and is not meant to.
+                   It belongs to the LENS, and only the lens is unwrapped for
+                   it. A light part also contains its housing and the body
+                   slice around it, which carry the same class but ordinary
+                   body UVs -- putting the lamp texture on those samples it at
+                   meaningless coordinates and the panel comes out dark. So it
+                   is bound only where the material says glass; everything else
+                   takes the flat emissive colour.
+                   The sheets are greyscale masks -- BRAKE_GLOBAL averages
+                   60/60/59 -- so they carry the SHAPE of the lens, not its
+                   colour: the emissive colour has to survive and the texture
+                   multiplies it. */
+                int lens = (cgm[i].matkey == n2_str_hash("HEADLIGHTGLASS") ||
+                            cgm[i].matkey == n2_str_hash("BRAKELIGHTGLASS"));
+                if (!tex && lens && c == N2_CAR_LIGHT)      tex = tex_headlights;
+                if (!tex && lens && c == N2_CAR_BRAKELIGHT) tex = tex_brake;
                 if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
@@ -5768,22 +6558,35 @@ int main(int argc, char **argv) {
                             glBindTexture(GL_TEXTURE_2D, tex);
                         } else glUniform1f(uUseTex, 0.0f);
                     }
-                } else if (tex) {
-                    glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);  /* wheel/brake */
                 } else {
-                    glUniform1f(uUseTex, 0.0f);
-                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 1.0f, 0.94f, 0.78f);  /* headlight ON: warm emissive lens */
+                    /* Emissive colour FIRST, texture second: the shared lamp
+                       textures are greyscale masks (BRAKE_GLOBAL averages
+                       60/60/59), carrying the shape of the lens, not its
+                       colour. The old order bound the mask and left uColor at
+                       whatever the previous mesh set -- a red tail lamp came
+                       out grey. And a mask averaging a quarter of full scale
+                       dims the lens four-fold, so a textured lens gets the
+                       colour scaled back up to read at the same brightness as
+                       a plain one. */
+                    int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
+                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 1.0f, 0.94f, 0.78f);
                     else if (c == N2_CAR_BRAKELIGHT) {
-                        /* lens glows hot while braking (S, rolling forward) or the
-                           handbrake (SPACE) is pulled; otherwise a dim red running
-                           light (still emissive, so it reads as "on" at night). */
-                        int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
                         if (braking) glUniform3f(uColor, 1.0f, 0.16f, 0.10f);
                         else         glUniform3f(uColor, 0.62f, 0.05f, 0.04f);
                     }
                     else if (c == N2_CAR_TIRE)       glUniform3f(uColor, 0.05f, 0.05f, 0.06f);
                     else if (c == N2_CAR_MECH)       glUniform3f(uColor, 0.05f, 0.05f, 0.05f);  /* unpainted metal/plastic */
-                    else                              glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
+                    else if (!tex)                   glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
+
+                    if (tex) {
+                        if (is_light) {
+                            float bo = 3.5f;
+                            if (c == N2_CAR_LIGHT)  glUniform3f(uColor, 1.0f*bo, 0.94f*bo, 0.78f*bo);
+                            else if (braking)       glUniform3f(uColor, 1.0f*bo, 0.16f*bo, 0.10f*bo);
+                            else                    glUniform3f(uColor, 0.62f*bo, 0.05f*bo, 0.04f*bo);
+                        }
+                        glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);
+                    } else glUniform1f(uUseTex, 0.0f);
                 }
 #ifdef DEBUG_UI
                 /* Mesh Inspector overlay: purely a draw-state override on the
@@ -5861,35 +6664,13 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (g_dbg.show_lights && g_dbg.night_mode) {   /* lens bloom: night only */
-                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                glDepthMask(GL_FALSE);
-                glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-                for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f) continue;
-                    float lx=bloomc[b][0], ly=bloomc[b][1], lz=bloomc[b][2];
-                    float wx=Model[0]*lx+Model[4]*ly+Model[8]*lz+Model[12];
-                    float wy=Model[1]*lx+Model[5]*ly+Model[9]*lz+Model[13];
-                    float wz=Model[2]*lx+Model[6]*ly+Model[10]*lz+Model[14];
-                    float vd[3]={wx-cam[0],wy-cam[1],wz-cam[2]};
-                    float vl=sqrtf(vd[0]*vd[0]+vd[1]*vd[1]+vd[2]*vd[2]); if (vl<1e-3f) continue;
-                    vd[0]/=vl; vd[1]/=vl; vd[2]/=vl;
-                    wx-=vd[0]*0.08f; wy-=vd[1]*0.08f; wz-=vd[2]*0.08f;   /* over its lens */
-                    float rt[3]={vd[1],-vd[0],0};                        /* = vd x worldUp(0,0,1) */
-                    float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if (rl<1e-3f) continue;
-                    rt[0]/=rl; rt[1]/=rl;
-                    float u2[3]={rt[1]*vd[2]-rt[2]*vd[1], rt[2]*vd[0]-rt[0]*vd[2], rt[0]*vd[1]-rt[1]*vd[0]};
-                    float sz=0.5f;
-                    float M[16]={ rt[0]*sz,rt[1]*sz,rt[2]*sz,0,  u2[0]*sz,u2[1]*sz,u2[2]*sz,0,  0,0,1,0,
-                                  wx-(rt[0]+u2[0])*sz*0.5f, wy-(rt[1]+u2[1])*sz*0.5f, wz-(rt[2]+u2[2])*sz*0.5f, 1 };
-                    float MV[16]; mat_mul(MVP,M,MV); glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
-                    if (b<2) glUniform3f(uColor, 0.90f,0.82f,0.55f);     /* front: warm white */
-                    else     glUniform3f(uColor, 0.90f,0.08f,0.05f);     /* rear: red */
-                    glUniform1f(uAlpha, 0.55f); draw_gpumesh(&quad); g_dbg.drawn++;
-                }
-                glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f); glUniform1f(uUnlit,0.0f);
-                glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
-                glDepthMask(GL_TRUE); glDisable(GL_BLEND);
-            }
+            /* The lens-bloom discs that used to sit here are gone. They were
+               drawn at cluster centroids derived from the geometry, which put
+               a soft disc in the middle of each light unit -- over the glass
+               rather than in it. The lens now carries its own emissive colour
+               and the shared lamp texture, so it lights up as a shape instead
+               of wearing a sticker. */
+
             /* procedural tyres at the 4 arches (the game rims render as urchins);
                the radial rim texture gives them a hub + spokes instead of a void */
             if (have_wheel && g_dbg.show_tires) {
@@ -5979,50 +6760,24 @@ int main(int argc, char **argv) {
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
+            glUniform1f(rp.uEnvCubeOn, 0.0f);
         }
+        /* And once more OUTSIDE that block. The restore above only runs when a
+           car was drawn, and which passes run at all depends on the mode --
+           which is how the world lights ended up visible in one camera mode and
+           missing in the other, twice, in opposite directions. */
+        glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+        glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
 
         /* tail lights: red camera-facing glows at each car's rear (night) */
-        if (race_state != 3 && ncar) {
-            float lz=sqrtf(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]); if(lz<1e-4f)lz=1;
-            float ld[3]={look[0]/lz,look[1]/lz,look[2]/lz};
-            float rt[3]={ld[1],-ld[0],0}; float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if(rl<1e-4f)rl=1;
-            rt[0]/=rl; rt[1]/=rl;
-            float up[3]={rt[1]*ld[2], -rt[0]*ld[2], rt[0]*ld[1]-rt[1]*ld[0]};
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDepthMask(GL_FALSE); glDisable(GL_DEPTH_TEST);   /* glow overlay on the rear */
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor, 1.0f, 0.12f, 0.06f); glUniform1f(uAlpha, 0.9f);
-            for (int c=0; c<=nai; c++) {
-                float *cp = c==0 ? carpos : ais[c-1].pos;
-                float hd = c==0 ? heading : ais[c-1].head;
-                float fx=cosf(hd), fy=sinf(hd), rx=-fy, ry=fx;
-                for (int side=-1; side<=1; side+=2) {
-                    float bx,by,bz;
-                    int bi = side < 0 ? 2 : 3;   /* car-local rear light clusters */
-                    if (c==0 && player_body_model_valid && bloomc[bi][3]>0.5f) {
-                        float lx=bloomc[bi][0], ly=bloomc[bi][1], lz2=bloomc[bi][2];
-                        bx=player_body_model[0]*lx+player_body_model[4]*ly+
-                           player_body_model[8]*lz2+player_body_model[12];
-                        by=player_body_model[1]*lx+player_body_model[5]*ly+
-                           player_body_model[9]*lz2+player_body_model[13];
-                        bz=player_body_model[2]*lx+player_body_model[6]*ly+
-                           player_body_model[10]*lz2+player_body_model[14];
-                    } else {
-                        bx=cp[0]-fx*1.9f+rx*0.6f*side;
-                        by=cp[1]-fy*1.9f+ry*0.6f*side;
-                        bz=cp[2]+0.5f;
-                    }
-                    float s=1.1f;
-                    float cxp=bx-(rt[0]+up[0])*s*0.5f, cyp=by-(rt[1]+up[1])*s*0.5f, czp=bz-(rt[2]+up[2])*s*0.5f;
-                    float M[16]={rt[0]*s,rt[1]*s,rt[2]*s,0, up[0]*s,up[1]*s,up[2]*s,0, 0,0,1,0, cxp,cyp,czp,1};
-                    float MV[16]; mat_mul(MVP,M,MV);
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad);
-                    g_dbg.drawn++;
-                }
-            }
-            glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
-            glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND);
-        }
+        /* The painted-on tail-light glows are gone. They were two additive
+           discs placed by fixed offsets from the car's centre -- 1.9 m back,
+           0.6 m out, 0.5 m up -- which lands on a low coupe's lamps and misses
+           on anything taller: on the Hummer they sat under the bumper. The
+           lens lights itself through its material and the shared lamp texture;
+           real light sources for the car belong here later, placed from the
+           data rather than from guessed offsets. */
+
 
         /* drift smoke: camera-facing billboards, light + fading, additive-ish */
         if (smoken > 0) {
@@ -6058,6 +6813,15 @@ int main(int argc, char **argv) {
            be occluded); only the write is off, so overlapping glows blend
            into each other instead of fighting on depth. */
         if (nglow && g_dbg.show_track && (passmode == 0 || passmode == 2)) {   /* M78 */
+            /* BACK TO WORLD SPACE FIRST. Everything between the car and this
+               pass draws billboards -- tail lights, headlight pools, tyre
+               smoke, skid marks -- and each sets its own matrix; the last one
+               does not put the world matrix back. Without this the whole glow
+               pass is drawn in the coordinates of a quad stuck to the car,
+               i.e. off screen. And since those billboards only run while
+               DRIVING, the lights are there in the menu orbit and gone the
+               moment the chase camera starts. */
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
             glUniform1f(uUnlit, 1.0f);
@@ -6065,7 +6829,12 @@ int main(int argc, char **argv) {
             for (int k = 0; k < nglow; k++) {
                 N2Batch *b = &glowbatch[k];
                 if (b->tex != lastglowtex) {
-                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    /* White, because the unlit path MULTIPLIES the texture by
+                       uColor: left as it was, the glow inherits whatever the
+                       last pass set -- the tail lights leave it red, and every
+                       street lamp and lit window comes out orange. */
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex);
+                                  glUniform3f(uColor, 1.0f, 1.0f, 1.0f); }
                     else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 1.0f, 0.85f, 0.5f); }
                     lastglowtex = b->tex;
                 }
@@ -6073,6 +6842,58 @@ int main(int argc, char **argv) {
                 g_dbg.drawn++;
             }
             glUniform1f(uUnlit, 0.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+        }
+
+        /* LAMP HALOS, drawn from the district's LIGHT SOURCES rather than from
+           lamp geometry: many lamp meshes are flat quads that all but vanish
+           seen from the side, so at driving height the light seemed to switch
+           off while it was still visible from above. Additive, billboarded to
+           the camera. The halo RADIUS is not in the data -- the record carries
+           falloff radii only -- so the 0.35 factor on the inner radius is ours;
+           what is in the data is the difference between a street lamp and a car
+           park floodlight, and that comes through. */
+        if (nlsrc && tex_glow && g_dbg.night_mode && g_dbg.show_track) {
+            float vx = camtgt[0]-cam[0], vy = camtgt[1]-cam[1], vz = camtgt[2]-cam[2];
+            float vl = sqrtf(vx*vx+vy*vy+vz*vz); if (vl < 1e-4f) vl = 1.0f;
+            vx/=vl; vy/=vl; vz/=vl;
+            float rx = vy, ry = -vx, rz = 0.0f;                  /* screen right */
+            float rl = sqrtf(rx*rx+ry*ry); if (rl < 1e-4f) { rx=1; ry=0; rl=1; }
+            rx/=rl; ry/=rl;
+            float ux = ry*vz - rz*vy, uy = rz*vx - rx*vz, uz = rx*vy - ry*vx;
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
+            /* The halo is the game's own flare sheet. Its alpha survives now
+               that the decoder keeps a plane whenever the texture record says
+               the texture is not opaque -- the flare is additive, so it is
+               kept even though its alpha is close to uniform. */
+            glUniform1f(uUnlit, 1.0f);
+            glUniform1f(uUseTex, 1.0f); glUniform1f(rp.uSoft, 0.0f);
+            glBindTexture(GL_TEXTURE_2D, tex_glow);
+            for (int q = 0; q < nlsrc; q++) {
+                const N2LightSrc *L = &lsrc[q];
+                float dx = L->x-cam[0], dy = L->y-cam[1], dz = L->z-cam[2];
+                float d2 = dx*dx+dy*dy+dz*dz;
+                if (d2 > VIEW_DIST*VIEW_DIST) continue;   /* same range as the world */
+                float HALO = L->r_in * 0.35f; if (HALO < 1.0f) HALO = 1.0f;
+                float M[16] = {
+                    rx*HALO, ry*HALO, rz*HALO, 0,
+                    ux*HALO, uy*HALO, uz*HALO, 0,
+                    0,0,1,0,
+                    L->x - (rx+ux)*HALO*0.5f,
+                    L->y - (ry+uy)*HALO*0.5f,
+                    L->z - (rz+uz)*HALO*0.5f, 1 };
+                float MV[16]; mat_mul(MVP, M, MV);
+                glUniformMatrix4fv(uMVP, 1, GL_FALSE, MV);
+                glUniform3f(uColor, L->cr/255.0f, L->cg/255.0f, L->cb/255.0f);
+                float fade = 1.0f - sqrtf(d2)/VIEW_DIST; if (fade < 0) fade = 0;
+                glUniform1f(rp.uAlpha, fade*fade + 0.25f*fade);
+                draw_gpumesh(&quad);
+                g_dbg.drawn++;
+            }
+            glUniform1f(rp.uAlpha, 1.0f); glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uSoft, 0.0f);
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
         /* HUD: race-position leaderboard — one colour bar per car, ordered by
@@ -6462,7 +7283,9 @@ int main(int argc, char **argv) {
             if (cap >= 0) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", smaudit, vn[cap]);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
                 printf("SM captured %s (frame %ld, car stationary during countdown)\n", sp, f);
@@ -6498,7 +7321,9 @@ int main(int argc, char **argv) {
                                                  "C_tangent_reversed" };
                     char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", shaudit, hn[shot107]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
                     printf("M107 capture %s  heading %+.4f  car(%.3f %.3f %.3f) "
@@ -6695,7 +7520,9 @@ int main(int argc, char **argv) {
                     char sp[1024];
                     snprintf(sp, sizeof sp, "%s_yaw%d.png", poseshot, YAW[slot]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
                     printf("POSE frame written: %s\n", sp);
@@ -6707,7 +7534,9 @@ int main(int argc, char **argv) {
             if (tag) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s%s.png", raudit, tag);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
                 printf("RA frame written: %s\n", sp);
@@ -6738,6 +7567,7 @@ int main(int argc, char **argv) {
         if (daudit && shotframe == 2) {   /* one normal rendered frame at spawn */
             char sp[1024]; snprintf(sp, sizeof sp, "%s_spawn.png", daudit);
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(sp, W, H, fl); free(px); free(fl);
@@ -6745,6 +7575,7 @@ int main(int argc, char **argv) {
         }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(shot, W, H, fl);
@@ -6870,6 +7701,7 @@ int main(int argc, char **argv) {
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }
+        POST_RESOLVE();
         SDL_GL_SwapWindow(win);
     }
 

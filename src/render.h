@@ -24,7 +24,9 @@
 #include "nfsu2.h"
 
 /* per-mesh GPU buffers + computed normals */
-typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim; uint32_t texkey; } GpuMesh;
+typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim;
+                 uint32_t texkey;
+                 uint32_t matkey; /* material record key, 0 = none */ } GpuMesh;
 
 /* ---- static-world batching: meshes merged per (256m grid cell, texture) ----
  * One interleaved VBO per batch kills the per-mesh bind/attrib overhead;
@@ -69,7 +71,17 @@ typedef struct {
           uFlipN,   /* 1 = negate the vertex normal (inspector diagnostic) */
           uGloss,   /* specular pow() exponent: high = tight metallic-paint
                        highlight, low = broad plastic/trim sheen (cars only) */
-          uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          uRimTint, /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          /* Material response taken from the shipped material record rather
+             than from per-class constants: each term is a Min/Range pair the
+             shader interpolates by dot(V,N). uMatOn selects it. */
+          /* 1 = discard texels below half alpha. Only for textures the record
+             calls cutout: applied to an opaque one it punches holes. */
+          uAlphaTest,
+          uMatOn, uMatDifMin, uMatDifRange, uMatSE,
+          /* live environment cube: 0 = procedural night sphere, 1 = sample the
+             cube, 2 = show the reflection alone (diagnostic) */
+          uEnvCubeOn, uEnvYaw, uEnvCube;
 } RProg;
 
 /* world-space sun direction (night scene key light) */
@@ -83,6 +95,10 @@ void mat_persp(float fov, float aspect, float znear, float zfar, float *m);
 void mat_trans(float x, float y, float z, float *m);
 void mat_rotz(float a, float *m);
 void mat_car(const float *pos, float heading, const float *up, float rideh, float *m);
+/* Look-at with an explicit up vector: the cube's top and bottom faces need
+   one, since the usual world-up is degenerate there. */
+void mat_lookat_up(const float eye[3], const float fwd[3], const float up[3],
+                   float out[16]);
 void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +Z */
 
 /* ---- GPU objects ---- */
@@ -129,5 +145,6 @@ float text_width(const char *s, float px);
 
 /* dev screenshot: rgb is top-left origin, w*h*3 */
 void write_png(const char *path, int w, int h, const unsigned char *rgb);
+
 
 #endif

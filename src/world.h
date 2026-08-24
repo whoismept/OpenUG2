@@ -175,7 +175,11 @@ int world_load(World *w, const char *troot, const char *trackname);
 /* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master),
  * writing the key->GL map, then free the region buffers. Needs a GL context.
  * Returns the number of textures bound. */
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
+/* Bind every distinct world texture. `mode` receives each one's draw mode
+   from its record (0 opaque, 1 cutout, 2 blended, 3 additive); pass NULL if
+   the caller does not care. */
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *mode, int cap);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
@@ -264,5 +268,21 @@ extern float world_rc_min[2], world_rc_max[2];
  * or mesh (see docs/FORMATS.md). Returns the number written (<= cap). */
 int world_scripted_defs(const World *w, const char *troot,
                         ScriptedDef *out, int cap);
+
+/* Build the scene from instance records: models stay in local coordinates and
+ * each placement supplies its own transform, so a model that appears many
+ * times is drawn once per placement instead of once overall. The older loader
+ * bakes each model's matrix into its vertices, which then has to be undone for
+ * every further copy; here there is nothing to undo. */
+int world2_build(N2Scene *out, const char *troot,
+                 const char *const *bundles, int nbundles,
+                 float sx, float sy, float viewdist,
+                 const unsigned char *loc4, long loc4len);
+extern int  world2_on;
+extern char world2_bundle[64];   /* district chosen by world2_build */
+
+extern float world_inst_x, world_inst_y, world_inst_r;
+int world_instantiate(World *w, const char *troot, float sx, float sy,
+                      float viewdist);
 
 #endif

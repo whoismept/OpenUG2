@@ -199,7 +199,8 @@ int world_load(World *w, const char *troot, const char *trackname) {
             }
         }
         n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
-        n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+        if (!world2_on)
+            n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
         n2_vista_out = NULL;
         g->mesh1 = w->scene.count;
         if (!w->have_grass)
@@ -217,6 +218,22 @@ int world_load(World *w, const char *troot, const char *trackname) {
        This handles the overlapping-superset bundles under --track ALL: the 8
        bundles re-ship the same tiles byte-identically, so the exact key
        (texkey,bbox,tri,vert) fuses them to one clean layer (residual == 0). */
+    /* Instance-driven builder: the scene is assembled from the instance
+       records, with the models taken in local coordinates. Runs instead of the
+       prototype walk above, and before dedup, bounds, the ground grid and
+       batching -- all of which read the finished scene. */
+    if (world2_on) {
+        static const char *bl[WORLD_MAXREG];
+        for (int r = 0; r < w->nreg; r++) bl[r] = w->rgn[r].name;
+        world2_build(&w->scene, troot, bl, w->nreg,
+                     world_inst_x, world_inst_y,
+                     world_inst_r > 0 ? world_inst_r : 600.0f,
+                     w->loc4, w->loc4len);
+        for (int r = 0; r < w->nreg; r++) {
+            w->rgn[r].mesh0 = 0; w->rgn[r].mesh1 = w->scene.count;
+        }
+    }
+
     world_dedup(w);
 
     /* Terrain/road de-fighting (Phase 73.5). The paved ROAD strips and the
@@ -269,7 +286,8 @@ int world_load(World *w, const char *troot, const char *trackname) {
 }
 
 int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *mode, int cap) {
     int n = 0;
     for (int r = 0; r < w->nreg; r++) {
         WRegion *g = &w->rgn[r];
@@ -284,7 +302,15 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
                 ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
             if (!ok && w->master)
                 ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
-            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
+            if (ok && !n2_tex_noise(&tt)) {
+                keys[n] = tk; texs[n] = upload_tex(&tt);
+                /* How this texture is meant to be drawn, from its own record:
+                   0 opaque, 1 cutout, 2 blended, 3 additive. Without it every
+                   texture is drawn opaque -- foliage comes out as solid
+                   rectangles and lit windows stay black. */
+                if (mode) mode[n] = (unsigned char)n2_tex_mode(&tt);
+                n++;
+            }
             else if (g_world_texaudit) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different

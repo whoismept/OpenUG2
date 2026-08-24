@@ -25,8 +25,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
+SRC  := src/main.c src/render.c src/sfx/post.c src/sfx/envcube.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world2.c src/world_mesh.c src/car_setup.c src/vehicle_model.c src/abs.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h src/car_setup.h src/vehicle_model.h src/abs.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 

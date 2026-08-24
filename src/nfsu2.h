@@ -26,6 +26,9 @@ typedef struct {
     int      nidx;
     int      cat;     /* N2_ROAD / N2_TERRAIN / N2_OTHER, from material name */
     uint32_t texkey;  /* car meshes: bound TPK diffuse key (0x134012), 0 if none */
+    uint32_t matkey;  /* car meshes: the submesh's material key, 0 = none. This
+                         is what ties a panel to its material record, and so to
+                         the shading the data asks for rather than a guess. */
     int      trim;    /* car BODY meshes only: 1 = plastic bumper/skirt (verified
                           real per-part name tokens, e.g. GOLF_KIT00_FRONT_BUMPER_A),
                           duller/broader specular than the metallic paint panels */
@@ -43,6 +46,18 @@ typedef struct {
     char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
     unsigned char vrepair; /* 1 = this mesh kept its good geometry after corrupt
                               source vertices were excluded (M133) */
+    /* --- instance placement (world2) --- */
+    char     aname[28];  /* asset name of the model this came from */
+    unsigned char inst;  /* 1 = a copy placed from an instance record. Not fed
+                            to collision: walls are derived from geometry, and
+                            thousands of trees and parked cars would seal the
+                            player in. */
+    unsigned char hasm;  /* the model HAS a matrix of its own. If not, its
+                            vertices are already in world space and it must not
+                            be placed from instances. */
+    float objm[16];      /* that matrix. The vertices are already transformed by
+                            it, so placing the same model elsewhere needs a
+                            RELATIVE transform: instance matrix * inverse(objm). */
 } N2Mesh;
 
 /* Active customization profile.
@@ -93,7 +108,31 @@ typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
        fallback. Set only by n2_load_car_tex_by_key for straight DXT1/DXT3
        slots. dxtfmt: 0 = none (use rgb), 1 = DXT1, 3 = DXT3. */
     unsigned char *dxt; int dxtlen, dxtfmt;
-    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */ } N2Tex;
+    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */
+    /* HOW THE TEXTURE IS MEANT TO BE DRAWN, straight from its record. These
+       four bytes are what decide whether alpha means anything -- see the note
+       where the alpha plane is kept or freed.
+         order   draw order: 0 opaque layer, 5..7 transparent
+         usage   0 none, 1 cutout (alpha test), 2 blending
+         blend   0 none, 1 ordinary src/1-src, 2 additive (neon, glow)
+         wz      1 write depth (opaque), 0 do not
+       Measured over one district's 1595 unique textures, the combinations are
+       exactly:
+         (0,0,0,1) x1236  opaque
+         (0,1,0,1) x 158  cutout: barriers, frames, foliage
+         (5,2,2,0) x  87  additive: neon and lit windows
+         (5,2,1,0) x  46  blended: shop windows, clock faces, glass
+         (0,2,0,1) x  53  has alpha but draws opaque (water) */
+    unsigned char order, usage, blend, wz; } N2Tex;
+
+/* Draw mode derived from the fields above. */
+enum { N2_DRAW_OPAQUE = 0, N2_DRAW_CUTOUT = 1, N2_DRAW_BLEND = 2, N2_DRAW_ADD = 3 };
+static int n2_tex_mode(const N2Tex *t) {
+    if (t->usage == 1) return N2_DRAW_CUTOUT;
+    if (t->usage == 2 && t->blend == 1) return N2_DRAW_BLEND;
+    if (t->blend == 2) return N2_DRAW_ADD;
+    return N2_DRAW_OPAQUE;
+}
 
 /* ---- file I/O ---- */
 static unsigned char *n2_read_file(const char *path, long *out_len) {
@@ -118,6 +157,92 @@ static int n2_skip_filler(const unsigned char *p, int n) {
 }
 
 /* ---- mesh extraction ---- */
+/* A mesh with a NaN or an absurd coordinate anywhere in it. Isolated bad
+ * vertices are a source defect and are repaired per vertex elsewhere; this is
+ * the last check before a mesh is accepted at all. */
+static uint32_t n2_str_hash(const char *s) {
+    uint32_t h = 0xFFFFFFFFu;
+    for (; *s; s++) h = h * 33u + (unsigned char)*s;
+    return h;
+}
+
+/* Material parameters, 160 bytes per record. Each scale-and-colour pair gives
+   one bound, and the shader interpolates between the two by dot(V, N). */
+typedef struct {
+    char     name[28];
+    uint32_t hash;
+    float    dif_min[3], dif_max[3];   /* colour * scale */
+    float    spec_min[3], spec_max[3];
+    float    env_min[3],  env_max[3];  /* already scaled by 0.5 */
+    float    spec_pow;                 /* specular exponent for the shader path */
+    float    env_pow;                  /* (+0x7c) */
+} N2LightMat;
+
+static int n2_load_lightmats(const unsigned char *d, long len, N2LightMat *out, int cap) {
+    int n = 0;
+    for (long i = 0; i + 168 <= len && n < cap; i++) {
+        if (n2_u32(d + i) != 0x00135200u || n2_u32(d + i + 4) != 160) continue;
+        const unsigned char *r = d + i + 8;
+        N2LightMat *m = &out[n];
+        memset(m, 0, sizeof *m);
+        memcpy(m->name, r + 0x14, 27);
+        m->hash = n2_u32(r + 0x0c);
+        #define N2F(o) (*(const float *)(r + (o)))
+        for (int k = 0; k < 3; k++) {
+            m->dif_min[k]  = N2F(0x34 + k*4) * N2F(0x30);
+            m->dif_max[k]  = N2F(0x44 + k*4) * N2F(0x40);
+            m->spec_min[k] = N2F(0x60 + k*4) * N2F(0x5c);
+            m->spec_max[k] = N2F(0x70 + k*4) * N2F(0x6c);
+            m->env_min[k]  = N2F(0x84 + k*4) * N2F(0x80) * 0.5f;
+            m->env_max[k]  = N2F(0x94 + k*4) * N2F(0x90) * 0.5f;
+        }
+        m->spec_pow = 1.1f * N2F(0x58);
+        m->env_pow  = N2F(0x7c);
+        #undef N2F
+        n++; i += 160;
+    }
+    return n;
+}
+
+typedef struct { float x, y, z, r_in, r_out; unsigned char cr, cg, cb; } N2LightSrc;
+
+static int n2_load_lights(const unsigned char *d, long len, N2LightSrc *out, int cap) {
+    int n = 0;
+    for (long i = 0; i + 8 <= len && n < cap; i++) {
+        if (n2_u32(d + i) != 0x00135003u) continue;
+        long sz = (long)n2_u32(d + i + 4);
+        if (sz < 96 || i + 8 + sz > len) continue;
+        long p = i + 8, e = p + sz;
+        while (p < e && d[p] == 0x11) p++;
+        for (; p + 96 <= e && n < cap; p += 96) {
+            if (d[p + 0x07] != 1) continue;              /* disabled */
+            float ro = *(const float *)(d + p + 0x1c);
+            float ri = *(const float *)(d + p + 0x30);
+            if (!(ro > 0.0f) || ro > 5000.0f) continue;  /* skip map-wide sources such as the moon */
+            uint32_t c = n2_u32(d + p + 0x0c);
+            out[n].x = *(const float *)(d + p + 0x10);
+            out[n].y = *(const float *)(d + p + 0x14);
+            out[n].z = *(const float *)(d + p + 0x18);
+            out[n].r_in = ri; out[n].r_out = ro;
+            out[n].cr = (unsigned char)(c & 0xff);
+            out[n].cg = (unsigned char)((c >> 8) & 0xff);
+            out[n].cb = (unsigned char)((c >> 16) & 0xff);
+            n++;
+        }
+        i += 8 + sz - 1;
+    }
+    return n;
+}
+
+static int n2_mesh_is_broken(const N2Mesh *m) {
+    for (int v = 0; v < m->nverts; v++) {
+        const float *q = m->verts + v*5;
+        for (int k = 0; k < 3; k++)
+            if (!(q[k] == q[k]) || q[k] > 1e8f || q[k] < -1e8f) return 1;
+    }
+    return 0;
+}
+
 static void n2_push_mesh(N2Scene *s, N2Mesh m) {
     if (s->count == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 64;
@@ -197,7 +322,16 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                 while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
                 if (j - i >= 5) {
                     const unsigned char *n = p + i; long L = j - i;
-                    if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
+                    /* Matching "SKY" as a substring also catches the stadium,
+                       whose texture is named for the sky it reflects but which
+                       is a building: it then joins the sky pass, is drawn with
+                       the sky's matrix and far plane, and blacks out half the
+                       screen. The dome is a 101-vertex mesh thousands of
+                       metres up; the stadium sits at ground level. The dome's
+                       name is exactly SKYDOME. */
+                    if ((L == 7 && n2_contains(n, L, "SKYDOME"))
+                        || (L > 4 && n[0]=='S' && n[1]=='K' && n[2]=='Y' && n[3]=='_'))
+                        return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
@@ -677,9 +811,19 @@ static void n2_m102_note(int why, const char *anm, int cat, int nslot, int nsub,
     }
 }
 
+/* REPLACEABLE SLOTS. Two materials are not fixed by the model: the paint
+   (CARSKIN) and the glass (WINDSHIELD) are substituted at runtime from the
+   player's choices. That is also why the second word of every material record
+   is zero in the file -- it is a slot for a material pointer filled in later. */
+#define N2_MAT_CARSKIN    0xd6d6080au
+#define N2_MAT_WINDSHIELD 0x471a1dcau
+
+/* Selected body paint: material hash, 0 = the silver default. */
+static uint32_t n2_carskin_mat = 0;
+
 /* Declared here because n2_walk_meshes' per-submesh road path (M101) needs
  * them; the definitions stay with the car material code further down. */
-typedef struct { uint32_t start, count, mat; } N2Sub;
+typedef struct { uint32_t start, count, mat, matid; } N2Sub;
 static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
                              N2Sub *out, int cap);
 static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
@@ -1314,34 +1458,61 @@ static float n2_bbox_overlap(const float *a, const float *b) {
  * proved why neither alone is safe:
  *   - name alone is wrong: truncation makes L/R pairs collide (LANCEREVO8 and
  *     IMPREZAWRX both have SIX meshes reading "..._KIT00_HEADLIGHT_"), and on
- *     HUMMER/GOLF/MUSTANGGT/NAVIGATOR some same-named DOOR_PANEL / DOOR_SILL /
+ *     on several cars some same-named DOOR_PANEL / DOOR_SILL /
  *     BRAKELIGHT nodes are distinct parts sitting apart. Deduping those by
  *     name would delete real geometry. The overlap gate keeps them: the
  *     anchor only absorbs meshes sharing its space, so the right-hand
  *     headlight simply starts its own group.
  *   - file order is wrong: keeping the first occurrence loses detail, because
  *     the tiers are NOT always stored best-first. Seven parts across the fleet
- *     (GOLF/PEUGOT/RSX roofs, CIVIC/RX8 brakelights, SUPRA/FOCUS skirts) store
+ *     (roofs, brake lights and skirts on a number of cars) store
  *     a later tier with MORE vertices than the one named _A.
- * Hence: group spatially, then keep max vertex count. */
+ * Hence: group spatially, then keep the tier with the most detail.
+ *
+ * The unit of the decision is the PART, not the mesh: a part is split into one
+ * mesh per material, and two tiers of the same part need not split the same
+ * way. Comparing meshes individually drops a slice the winning tier has no
+ * counterpart for, and the bodywork ends up with holes in it. So slices are
+ * grouped by part name, tiers are compared by their total vertex count, and
+ * the losing tiers go out whole. */
 #define N2_LOD_OVERLAP 0.4f
 static void n2_car_dedupe_lod(N2Scene *s) {
     int n = s->count;
     if (n < 2) return;
     float (*bb)[6] = (float (*)[6])malloc((size_t)n * sizeof *bb);
     char *drop = (char *)calloc((size_t)n, 1);
-    if (!bb || !drop) { free(bb); free(drop); return; }   /* OOM: keep everything */
+    char *done = (char *)calloc((size_t)n, 1);
+    if (!bb || !drop || !done) { free(bb); free(drop); free(done); return; }
     for (int i = 0; i < n; i++) n2_mesh_bbox(&s->meshes[i], bb[i]);
+
     for (int i = 0; i < n; i++) {
-        if (drop[i] || !s->meshes[i].namekey) continue;
-        int best = i;                       /* i stays the spatial anchor */
-        for (int j = i + 1; j < n; j++) {
-            if (drop[j] || s->meshes[j].namekey != s->meshes[i].namekey) continue;
+        if (done[i] || drop[i] || !s->meshes[i].namekey) continue;
+
+        /* This family: same key, sharing the anchor's space. */
+        int member[256], nmem = 0;
+        member[nmem++] = i; done[i] = 1;
+        for (int j = i + 1; j < n && nmem < 256; j++) {
+            if (done[j] || drop[j]) continue;
+            if (s->meshes[j].namekey != s->meshes[i].namekey) continue;
             if (n2_bbox_overlap(bb[i], bb[j]) < N2_LOD_OVERLAP) continue;
-            if (s->meshes[j].nverts > s->meshes[best].nverts) { drop[best] = 1; best = j; }
-            else drop[j] = 1;
+            member[nmem++] = j; done[j] = 1;
         }
+        if (nmem < 2) continue;
+
+        /* Score each tier by all of its slices together. */
+        long best_score = -1; const char *best_name = s->meshes[i].aname;
+        for (int a = 0; a < nmem; a++) {
+            const char *name = s->meshes[member[a]].aname;
+            long score = 0;
+            for (int b = 0; b < nmem; b++)
+                if (!strcmp(s->meshes[member[b]].aname, name))
+                    score += s->meshes[member[b]].nverts;
+            if (score > best_score) { best_score = score; best_name = name; }
+        }
+        for (int a = 0; a < nmem; a++)
+            if (strcmp(s->meshes[member[a]].aname, best_name)) drop[member[a]] = 1;
     }
+
     int w = 0;
     for (int i = 0; i < n; i++) {
         if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
@@ -1349,8 +1520,9 @@ static void n2_car_dedupe_lod(N2Scene *s) {
         w++;
     }
     s->count = w;
-    free(bb); free(drop);
+    free(bb); free(drop); free(done);
 }
+
 
 /* Plastic trim within N2_CAR_BODY: bumpers and rocker skirts are moulded
  * polyurethane, not the metal body shell, and carry their own name tokens
@@ -1448,6 +1620,7 @@ static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
         const unsigned char *q = p + pad + i*60;
         out[i].count = n2_u32(q + 12);
         out[i].mat   = n2_u32(q + 28);
+        out[i].matid = n2_u32(q + 32);   /* index into the object's material list */
         out[i].start = n2_u32(q + 52);
     }
     return n;
@@ -1483,6 +1656,119 @@ static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
  * it isn't done. If a future car is found with >1 material/texslot block
  * per object, THAT would be the real signal this is worth revisiting.
  * removed vinyl/badge fallback, not a real submesh material). */
+static int n2_mat_class(uint32_t h, int fallback) {
+    if (!h) return fallback;
+    /* Leave wheels alone. A rim carries several metal materials on one part,
+       and the moment the class changes mid-part the mesh is split and its
+       spokes stop being drawn. */
+    if (fallback == N2_CAR_TIRE) return fallback;
+    if (h == n2_str_hash("WINDSHIELD"))       return N2_CAR_GLASS;
+    /* Only the LENS emits. A headlight assembly is mostly metal -- chrome,
+       aluminium and mouldings -- with a single glass submesh. Filling the
+       whole part with one emissive colour turns the lamp into a bright blob
+       with no shape. */
+    /* The lens is GLASS, not a flat fill: its material carries a strong
+       grazing-angle reflection (0.180 rising to 0.703 on the brake lens) and
+       its name says GLASS. Drawn in the transparent pass with the body
+       glazing. */
+    /* The lens also emits: white at the front, red at the rear. It cannot be
+       folded into the general glass pass or the lamps go dark. */
+    if (h == n2_str_hash("BRAKELIGHTGLASS") ||
+        h == n2_str_hash("BRAKELIGHT"))       return N2_CAR_BRAKELIGHT;
+    if (h == n2_str_hash("HEADLIGHTGLASS"))   return N2_CAR_LIGHT;
+    if (h == n2_str_hash("CHROME") ||
+        h == n2_str_hash("HEADLIGHTREFLECTOR") ||
+        h == n2_str_hash("ALUMINUM") ||
+        h == n2_str_hash("MOLDINGS") ||
+        h == n2_str_hash("CLEARPLASTIC") ||
+        h == n2_str_hash("DULLPLASTIC"))      return N2_CAR_MISC;
+    if (h == N2_MAT_CARSKIN)                  return N2_CAR_BODY;
+    return fallback;
+}
+
+static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
+                            uint32_t *out, int cap) {
+    N2Leaf t13[4]; int n13 = 0, n = 0;
+    n2_find_leaves(d, beg, end, 0x00134013u, t13, &n13, 4);
+    for (int a = 0; a < n13; a++) {
+        const unsigned char *p = d + t13[a].off; long ls = t13[a].size;
+        for (long b = 0; b + 8 <= ls && n < cap; b += 8) out[n++] = n2_u32(p + b);
+    }
+    return n;
+}
+
+static int n2_car_part_name(const unsigned char *d, long beg, long end,
+                            char *out, int cap) {
+    N2Leaf mat[4]; int nm = 0;
+    if (cap > 0) out[0] = 0;
+    n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
+    for (int k = 0; k < nm; k++) {
+        const unsigned char *p = d + mat[k].off; long s = mat[k].size;
+        for (long i = 0; i + 5 < s; i++) {
+            if (p[i] >= 'A' && p[i] <= 'Z') {
+                long j = i;
+                while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
+                if (j - i >= 5) {
+                    int n = (int)(j - i); if (n > cap - 1) n = cap - 1;
+                    for (int q = 0; q < n; q++) out[q] = (char)p[i+q];
+                    out[n] = 0;
+                    return 1;
+                }
+                i = j;
+            }
+        }
+    }
+    return 0;
+}
+
+typedef struct { uint32_t mat; unsigned char r, g, b; } N2Paint;
+
+static int n2_load_paints(const unsigned char *d, long len, N2Paint *out, int cap) {
+    long pairs = -1, np = 0, tbl = -1, ts = 0;
+    for (long i = 0; i + 8 <= len; i++) {
+        uint32_t m = n2_u32(d + i); long sz = (long)n2_u32(d + i + 4);
+        if (sz <= 0 || i + 8 + sz > len) continue;
+        if (m == 0x00034605u && pairs < 0) { pairs = i + 8; np = sz / 8; }
+        else if (m == 0x0003460Cu && tbl < 0) { tbl = i + 8; ts = sz; }
+        if (pairs >= 0 && tbl >= 0) break;
+    }
+    if (pairs < 0 || tbl < 0) return 0;
+    int n = 0;
+    for (long p = tbl; p + 2 <= tbl + ts && n < cap; ) {
+        short ln = (short)(d[p] | (d[p+1] << 8));
+        if (ln < 1 || ln > 40 || p + 2 + ln*2 > tbl + ts) { p += 2; continue; }
+        uint32_t mat = 0; int have = 0; unsigned char rgb[3] = {0,0,0};
+        int ok = 1;
+        for (int k = 0; k < ln; k++) {
+            short ix = (short)(d[p+2+k*2] | (d[p+3+k*2] << 8));
+            if (ix < 0 || ix >= np) { ok = 0; break; }
+            uint32_t key = n2_u32(d + pairs + (long)ix*8);
+            uint32_t val = n2_u32(d + pairs + (long)ix*8 + 4);
+            if (key == 0x6ba02c05u) mat = val;
+            else if (key == 0x0000d99au) { rgb[0] = (unsigned char)val; have |= 1; }
+            else if (key == 0x02ddc8f0u) { rgb[1] = (unsigned char)val; have |= 2; }
+            else if (key == 0x00136707u) { rgb[2] = (unsigned char)val; have |= 4; }
+        }
+        if (ok && mat && have == 7) {
+            out[n].mat = mat; out[n].r = rgb[0]; out[n].g = rgb[1]; out[n].b = rgb[2];
+            n++;
+        }
+        p += ok ? 2 + ln*2 : 2;
+    }
+    return n;
+}
+
+static const N2LightMat *n2_find_lightmat(const N2LightMat *m, int n, uint32_t hash) {
+    /* STOCK PAINT PER CAR. Chunk 0x00034601 holds 106 records of 64 bytes:
+       +0x00 paint material hash, +0x14 car number, +0x18 variant number,
+       +0x1c colour name. Car numbers 1..30 are the playable cars, one colour
+       each; 31..45 are traffic, with eight variants apiece. */
+    if (hash == N2_MAT_CARSKIN)
+        hash = n2_carskin_mat ? n2_carskin_mat : n2_str_hash("METPAINTSILVER");
+    for (int i = 0; i < n; i++) if (m[i].hash == hash) return &m[i];
+    return NULL;
+}
+
 static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *scene,
                         const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
     long o = beg;
@@ -1493,6 +1779,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             int vkind = 0, vnum = 0; uint32_t vfam = 0;
             if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
             int cat = n2_car_category(d, ds, ds + s);
+            char pname[28]; n2_car_part_name(d, ds, ds + s, pname, sizeof pname);
             int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
                         uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
             uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
@@ -1505,37 +1792,59 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                bumper is mostly body paint with a small badge patch, and its
                0x134012 list carries a key per material. Binding the ONE key
                we can resolve to the whole object smears the badge atlas over
-               the entire panel (MIATA's front bumper: the badge owns 18 of
+               the entire panel (one front bumper: the badge owns 18 of
                1143 indices, 1.6%, but was painting 100% of it dark). So when
                the records actually resolve to different textures, emit one
                mesh per record instead. */
             uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
             N2Sub sub[32]; int nsub = pairs == 1 ? n2_mesh_submeshes(d, ds, ds + s, sub, 32) : 0;
-            uint32_t subtex[32]; int differ = 0, big = 0;
+            /* Submesh material. The same id also indexes the material list,
+               whose entries are name hashes (WINDSHIELD, CHROME, MOULDINGS and
+               so on). Without this link the glass is indistinguishable from
+               the bodywork. */
+            uint32_t mslots[32]; int nmslot = n2_mesh_matslots(d, ds, ds + s, mslots, 32);
+            uint32_t subtex[32], submat[32]; int differ = 0, big = 0;
             for (int k = 0; k < nsub; k++) {
                 subtex[k] = sub[k].mat < (uint32_t)nslot
                           ? n2_resolve_key(slots[sub[k].mat], keys, nkeys) : 0;
-                if (subtex[k] != subtex[0]) differ = 1;
+                submat[k] = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
+                /* Split only on a MEANINGFUL difference: another texture, or
+                   another class by material. Splitting on any material change
+                   at all breaks a wheel rim into pieces -- it carries several
+                   metal materials on one part -- and its spokes stop being
+                   drawn. */
+                if (subtex[k] != subtex[0]
+                    || n2_mat_class(submat[k], cat) != n2_mat_class(submat[0], cat)) differ = 1;
                 if (sub[k].count > sub[big].count) big = k;
             }
             if (nsub > 1 && differ) {
                 for (int k = 0; k < nsub; k++) {
                     int before = scene->count;
-                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 36, 28, 0,
+                    /* class comes from the submesh MATERIAL, not the part name */
+                    int kcat = n2_mat_class(submat[k], cat);
+                    n2_add_pair(d, vtx[0], idx[0], kcat, scene, 36, 28, 0,
                                 subtex[k], NULL, sub[k].start, sub[k].count);
                     if (scene->count > before) {
-                        scene->meshes[before].trim = trim;
+                        scene->meshes[before].trim = trim && kcat == N2_CAR_BODY;
+                        scene->meshes[before].matkey = submat[k];
                                                 /* The dominant slice keeps the plain family key so it
                            still dedupes against LOD tiers that never split
                            (a lower tier can lack the badge slot entirely, so
                            it stays whole); the small extra slices get their
                            own keys and only ever match the same slice of
                            another tier. */
-                        scene->meshes[before].namekey =
-                            k == big ? nk2 : nk2 ^ (0x9e3779b9u * (sub[k].mat + 1));
+                        /* Every slice of a part carries the SAME family key.
+                           Giving each slice its own key made the tier choice
+                           run slice against slice, and tiers do not split the
+                           same way: a slice with no counterpart in the winning
+                           tier was simply dropped, which punched holes in the
+                           bodywork. */
+                        scene->meshes[before].namekey = nk2;
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
+                        snprintf(scene->meshes[before].aname,
+                                 sizeof scene->meshes[before].aname, "%s", pname);
                     }
                 }
             } else {
@@ -1544,10 +1853,15 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                     n2_add_pair(d, vtx[k], idx[k], cat, scene, 36, 28, 0, tk, NULL, 0, -1);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
+                        /* an unsplit mesh takes the material of its largest submesh */
+                        scene->meshes[before].matkey = nsub ? submat[big] :
+                            (nmslot ? mslots[0] : 0);
                                                 scene->meshes[before].namekey = nk2;
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
+                        snprintf(scene->meshes[before].aname,
+                                 sizeof scene->meshes[before].aname, "%s", pname);
                     }
                 }
             }
@@ -1557,6 +1871,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
         o = ds + s;
     }
 }
+
 static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
                        const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
     static const N2CarConfig stock = { 0, 0, 0, 0 };
@@ -2314,6 +2629,8 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
             if (w<=0 || hh<=0 || w>4096 || hh>4096) continue;
             tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
+            tex->order = d[i+0x45]; tex->usage = d[i+0x49];
+            tex->blend = d[i+0x4a]; tex->wz = d[i+0x4b];
             tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
             /* M132-R2: alpha is DECODED, not discarded. The palettes are RGBA
                and the DXT blocks carry real alpha; throwing it away was why a
@@ -2324,7 +2641,27 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             unsigned char *alf = (unsigned char *)malloc((long)w*hh);
             tex->alpha = NULL;
             tex->afmt = 0;
-            if (palsz >= 1024 && dbase+paloff+1024 <= len && dbase+off+(long)w*hh <= len) {
+            /* THE FORMAT IS IN THE RECORD. Guessing it -- palette if a palette
+               is present, otherwise DXT3 or DXT1 by size -- is wrong for the
+               uncompressed ones: a 32-bit BGRA sheet read as DXT1 comes out as
+               noise with its red and blue swapped, which is exactly the pink
+               signage. It also decodes the shared headlight texture to solid
+               black, putting the lamps out. */
+            unsigned fmt = d[i+0x3e];
+            if (fmt == 0x20) {                       /* uncompressed BGRA */
+                if (dbase + off + (long)w*hh*4 > len) { free(tex->rgb); free(alf); continue; }
+                const unsigned char *px = d + dbase + off;
+                for (long p = 0; p < (long)w*hh; p++) {
+                    tex->rgb[p*3+0] = px[p*4+2];     /* B,G,R,A -> R,G,B */
+                    tex->rgb[p*3+1] = px[p*4+1];
+                    tex->rgb[p*3+2] = px[p*4+0];
+                    if (alf) alf[p]  = px[p*4+3];
+                }
+                tex->afmt = 8;
+            } else if (fmt == 0x08 || (palsz >= 1024 && dbase+paloff+1024 <= len
+                                       && dbase+off+(long)w*hh <= len)) {
+                if (palsz < 1024 || dbase+paloff+1024 > len
+                    || dbase+off+(long)w*hh > len) { free(tex->rgb); free(alf); continue; }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
@@ -2333,17 +2670,43 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                 }
                 tex->afmt = 8;                      /* P8 */
             } else if (dbase + off + (long)w*hh/2 <= len) {
-                int dxt3 = (long)sz > (long)w*hh*9/10;
-                if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
-                else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                if      (fmt == 0x24) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else if (fmt == 0x26) { n2_dxt5(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else if (fmt == 0x22) { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                else {   /* record says nothing usable: fall back to the old guess */
+                    int dxt3 = (long)sz > (long)w*hh*9/10;
+                    if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                    else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                }
             } else { free(tex->rgb); free(alf); continue; }
             if (alf) {
 #ifdef N2_NO_WORLD_ALPHA
                 free(alf);        /* A/B control build: pre-M132-R2 behaviour */
 #else
-                int meaningful = 0;
-                for (long p = 0; p < (long)w*hh; p++) if (alf[p] != 255) { meaningful = 1; break; }
-                if (meaningful) tex->alpha = alf; else free(alf);
+                /* WHETHER ALPHA MEANS ANYTHING IS IN THE RECORD, not in the
+                   image. In an opaque texture the fourth byte is not
+                   transparency but leftover data, and cutting on it punches
+                   holes in the road; scanning the plane instead is guesswork
+                   that gets it wrong both ways -- an opaque asset whose spare
+                   byte happens to vary keeps a plane it should not have, and a
+                   flare sheet that is genuinely uniform loses the one it
+                   needs. usage and blend say outright which it is. */
+                if (n2_tex_mode(tex) == N2_DRAW_OPAQUE) {
+                    free(alf);
+                } else {
+                    tex->alpha = alf;
+                    /* Normalise to 0..255: some palettes never reach full
+                       alpha -- measured peaks of 79, 190, 191 and 217 -- and
+                       left as they are, a sheet that should be solid draws
+                       washed out. */
+                    long tot = (long)w * hh, amax = 0;
+                    for (long p = 0; p < tot; p++) if (alf[p] > amax) amax = alf[p];
+                    if (amax > 0 && amax < 255)
+                        for (long p = 0; p < tot; p++) {
+                            long v = (long)alf[p] * 255 / amax;
+                            alf[p] = (unsigned char)(v > 255 ? 255 : v);
+                        }
+                }
 #endif
             }
             return 1;
