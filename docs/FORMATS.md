@@ -258,11 +258,13 @@ A placement record has `f32[3]` AABB minimum at `+0x00`, AABB maximum at
 `+0x0c`, `u16 type_index` at `+0x18`, `u16 flags` at `+0x1a`, translation
 `f32[3]` at `+0x20`, and a 3×3 signed-`i16` row-major rotation/scale block at
 `+0x2c`. Each rotation/scale cell is divided by 8192.0; negative values stay
-negative. The runtime transposes that row-major 3×3 block into its
-column-major affine matrix, keeps the translation at matrix elements 12–14,
-and uses identity for the last row/column. A type index outside the type table,
-malformed bounds, or a non-finite/absurd transformed vertex rejects that
-placement rather than guessing another model.
+negative. The runtime keeps that binary row-major 3×3 ordering in the matching
+`WInstPlacement.matrix` slots; it does not transpose the block. Translation is
+kept at matrix elements 12–14, with identity for the last row/column. This
+record convention is required for the decoded placement to match authored
+instance bounds when the engine's direct placement multiplication is applied.
+A type index outside the type table, malformed bounds, or a non-finite/absurd
+transformed vertex rejects that placement rather than guessing another model.
 
 Districts may overlap. For an explicit focus point, OpenUG2 chooses the
 smallest containing polygon as the home district and marks every district

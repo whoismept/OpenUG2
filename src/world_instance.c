@@ -517,7 +517,7 @@ int winst_decode_placement(const unsigned char *record, long len,
     for (int i = 0; i < 16; i++) out->matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
     for (int row = 0; row < 3; row++)
         for (int col = 0; col < 3; col++)
-            out->matrix[col * 4 + row] =
+            out->matrix[row * 4 + col] =
                 (float)winst_s16(record + 0x2c + (row * 3 + col) * 2) / 8192.0f;
     out->matrix[12] = winst_f32(record + 0x20);
     out->matrix[13] = winst_f32(record + 0x24);

@@ -159,13 +159,60 @@ static void test_placement(void) {
     assert(near(p.bounds_max[0], 100.0f) && near(p.bounds_max[1], -25.0f));
     assert(near(p.bounds_max[2], 7.5f));
     const float want[16] = {
-        0, 1, 0, 0, -1, 0, 0, 0,
+        0, -1, 0, 0, 1, 0, 0, 0,
         0, 0, 1, 0, 100, -25, 7.5f, 1
     };
     for (int i = 0; i < 16; i++) assert(near(p.matrix[i], want[i]));
 
     memset(&p, 0, sizeof p);
     assert(winst_decode_placement(record, (long)sizeof record - 1, &p) == 0);
+}
+
+static void test_decoded_asymmetric_placement(void) {
+    unsigned char record[64];
+    memset(record, 0, sizeof record);
+    put_f32(record + 0x00, 99.5f);
+    put_f32(record + 0x04, -25.0f);
+    put_f32(record + 0x08, 7.5f);
+    put_f32(record + 0x0c, 104.0f);
+    put_f32(record + 0x10, -23.0f);
+    put_f32(record + 0x14, 7.5f);
+    put_u16(record + 0x18, 3);
+    put_f32(record + 0x20, 100.0f);
+    put_f32(record + 0x24, -25.0f);
+    put_f32(record + 0x28, 7.5f);
+    const int rot[9] = {8192, 4096, 0, -4096, 8192, 0, 0, 0, 8192};
+    for (int i = 0; i < 9; i++) put_s16(record + 0x2c + 2 * i, rot[i]);
+
+    WInstPlacement placement;
+    assert(winst_decode_placement(record, (long)sizeof record, &placement) == 1);
+    assert(close3(placement.bounds_min, 99.5f, -25.0f, 7.5f));
+    assert(close3(placement.bounds_max, 104.0f, -23.0f, 7.5f));
+
+    float verts[] = {
+        0, 0, 0, 0, 0,
+        4, 0, 0, 1, 0,
+        4, 1, 0, 1, 1,
+        0, 1, 0, 0, 1,
+    };
+    uint16_t idx[] = {0, 1, 2, 0, 2, 3};
+    N2Mesh src;
+    memset(&src, 0, sizeof src);
+    src.verts = verts;
+    src.idx = idx;
+    src.nverts = 4;
+    src.nidx = 6;
+    N2Scene dst;
+    WInstStats stats;
+    memset(&dst, 0, sizeof dst);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_place_mesh(&dst, &src, placement.matrix, "XO_ASYMMETRIC", &stats) == 1);
+    assert(dst.count == 1);
+    assert(close3(dst.meshes[0].verts + 0, 100.0f, -25.0f, 7.5f));
+    assert(close3(dst.meshes[0].verts + 5, 104.0f, -23.0f, 7.5f));
+    assert(close3(dst.meshes[0].verts + 10, 103.5f, -22.0f, 7.5f));
+    assert(close3(dst.meshes[0].verts + 15, 99.5f, -24.0f, 7.5f));
+    free_scene(&dst);
 }
 
 static void test_direct_placement(void) {
@@ -716,6 +763,7 @@ static void test_world2_capture_policy(void) {
 int main(void) {
     test_regions();
     test_placement();
+    test_decoded_asymmetric_placement();
     test_direct_placement();
     test_private_prototype_paths();
     test_section_collection();
