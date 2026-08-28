@@ -263,13 +263,15 @@ negative. The runtime keeps that binary row-major 3×3 ordering in the matching
 kept at matrix elements 12–14, with identity for the last row/column. This
 record convention is required for the decoded placement to match authored
 instance bounds when the engine's direct placement multiplication is applied.
-A type index outside the type table or a bbox outside the requested range is
-skipped and never placed. Malformed or truncated chunk/section data makes the
-corresponding parser/walk fail according to its API. Once a selected placement
-reaches `winst_place_mesh`, an allocation/copy failure, a non-finite or
-absurd transformed vertex, or a scene-append failure aborts the entire staged
-build atomically; destination scenes remain untouched rather than receiving a
-partial placement set.
+Malformed or truncated chunk/section data makes the corresponding parser/walk
+fail according to its API. Records are skipped and never placed when
+`type_index >= type_count`, any placement AABB coordinate is non-finite, an
+AABB minimum exceeds its maximum, or the bbox lies outside the requested focus
+radius. Once an eligible selected placement reaches `winst_place_mesh`, an
+allocation/copy failure, a non-finite transformed coordinate, an absolute-limit
+failure, or a scene-append failure aborts the entire staged build atomically;
+destination scenes remain untouched rather than receiving a partial placement
+set.
 
 Districts may overlap. For an explicit focus point, OpenUG2 chooses the
 smallest containing polygon as the home district and marks every district
