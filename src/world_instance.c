@@ -7,6 +7,273 @@
 
 #include "nfsu2.h"
 
+#define WINST_WORLD_LIMIT 1e8f
+
+typedef struct {
+    N2Scene scene;
+    float matrix[16];
+    uint32_t name_hash;
+    char name[28];
+    unsigned char has_matrix;
+} WInstProto;
+
+typedef struct {
+    WInstProto *items;
+    int count, cap;
+} WInstLibrary;
+
+static void winst_reject(WInstStats *stats) {
+    if (stats) stats->rejected_meshes++;
+}
+
+static int winst_push_mesh(N2Scene *dst, N2Mesh mesh) {
+    if (dst->count == dst->cap) {
+        int next = dst->cap ? dst->cap * 2 : 64;
+        if (next <= dst->cap || (size_t)next > SIZE_MAX / sizeof *dst->meshes)
+            return 0;
+        N2Mesh *grown = (N2Mesh *)realloc(dst->meshes,
+                                           (size_t)next * sizeof *dst->meshes);
+        if (!grown) return 0;
+        dst->meshes = grown;
+        dst->cap = next;
+    }
+    dst->meshes[dst->count++] = mesh;
+    return 1;
+}
+
+int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
+                     const float matrix[16], const char *asset_name,
+                     WInstStats *stats) {
+    if (!dst || !src || !matrix || !src->verts || !src->idx ||
+        src->nverts <= 0 || src->nidx <= 0) {
+        winst_reject(stats);
+        return 0;
+    }
+    size_t nverts = (size_t)src->nverts, nidx = (size_t)src->nidx;
+    if (nverts > SIZE_MAX / (5 * sizeof *src->verts) ||
+        nidx > SIZE_MAX / sizeof *src->idx ||
+        (src->vcol && nverts > SIZE_MAX / (4 * sizeof *src->vcol))) {
+        winst_reject(stats);
+        return 0;
+    }
+
+    N2Mesh placed = *src;
+    placed.verts = (float *)malloc(nverts * 5 * sizeof *placed.verts);
+    placed.idx = (uint16_t *)malloc(nidx * sizeof *placed.idx);
+    placed.vcol = src->vcol ? (unsigned char *)malloc(nverts * 4) : NULL;
+    if (!placed.verts || !placed.idx || (src->vcol && !placed.vcol)) {
+        free(placed.verts);
+        free(placed.idx);
+        free(placed.vcol);
+        winst_reject(stats);
+        return 0;
+    }
+
+    memcpy(placed.idx, src->idx, nidx * sizeof *placed.idx);
+    if (placed.vcol) memcpy(placed.vcol, src->vcol, nverts * 4);
+    for (int i = 0; i < src->nverts; i++) {
+        const float *in = src->verts + i * 5;
+        float *out = placed.verts + i * 5;
+        out[0] = in[0] * matrix[0] + in[1] * matrix[4] + in[2] * matrix[8] + matrix[12];
+        out[1] = in[0] * matrix[1] + in[1] * matrix[5] + in[2] * matrix[9] + matrix[13];
+        out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10] + matrix[14];
+        out[3] = in[3];
+        out[4] = in[4];
+        if (!isfinite(out[0]) || !isfinite(out[1]) || !isfinite(out[2]) ||
+            fabsf(out[0]) > WINST_WORLD_LIMIT || fabsf(out[1]) > WINST_WORLD_LIMIT ||
+            fabsf(out[2]) > WINST_WORLD_LIMIT) {
+            free(placed.verts);
+            free(placed.idx);
+            free(placed.vcol);
+            winst_reject(stats);
+            return 0;
+        }
+    }
+    placed.inst = 1;
+    snprintf(placed.aname, sizeof placed.aname, "%.27s", asset_name ? asset_name : "");
+    if (!winst_push_mesh(dst, placed)) {
+        free(placed.verts);
+        free(placed.idx);
+        free(placed.vcol);
+        winst_reject(stats);
+        return 0;
+    }
+    if (stats) stats->meshes_placed++;
+    return 1;
+}
+
+static unsigned char winst_fold_char(unsigned char c) {
+    return c >= 'a' && c <= 'z' ? (unsigned char)(c - ('a' - 'A')) : c;
+}
+
+static uint32_t winst_name_key(const char *name, char folded[28]) {
+    uint32_t h = 2166136261u;
+    int i = 0;
+    if (name) {
+        while (i < 27 && name[i]) {
+            unsigned char c = winst_fold_char((unsigned char)name[i]);
+            folded[i++] = (char)c;
+            h = (h ^ c) * 16777619u;
+        }
+    }
+    folded[i] = 0;
+    return h;
+}
+
+static void winst_free_scene(N2Scene *scene) {
+    if (!scene) return;
+    for (int i = 0; i < scene->count; i++) {
+        free(scene->meshes[i].verts);
+        free(scene->meshes[i].idx);
+        free(scene->meshes[i].vcol);
+    }
+    free(scene->meshes);
+    memset(scene, 0, sizeof *scene);
+}
+
+static void winst_library_free(WInstLibrary *library) {
+    if (!library) return;
+    for (int i = 0; i < library->count; i++) winst_free_scene(&library->items[i].scene);
+    free(library->items);
+    memset(library, 0, sizeof *library);
+}
+
+static int winst_library_add(WInstLibrary *library, N2Scene *scene,
+                             const char *name, const float matrix[16], int has_matrix) {
+    if (library->count == library->cap) {
+        int next = library->cap ? library->cap * 2 : 64;
+        if (next <= library->cap || (size_t)next > SIZE_MAX / sizeof *library->items)
+            return 0;
+        WInstProto *grown = (WInstProto *)realloc(
+            library->items, (size_t)next * sizeof *library->items);
+        if (!grown) return 0;
+        library->items = grown;
+        library->cap = next;
+    }
+    WInstProto *proto = &library->items[library->count++];
+    memset(proto, 0, sizeof *proto);
+    proto->scene = *scene;
+    proto->name_hash = winst_name_key(name, proto->name);
+    memcpy(proto->matrix, matrix, sizeof proto->matrix);
+    proto->has_matrix = (unsigned char)(has_matrix != 0);
+    memset(scene, 0, sizeof *scene);
+    return 1;
+}
+
+/* Hashes narrow candidate lookup only: the folded name comparison is mandatory
+ * so two names with an equal 32-bit hash can never share a prototype. */
+static const WInstProto *winst_library_find(const WInstLibrary *library,
+                                            const char *asset_name,
+                                            WInstStats *stats) {
+    char folded[28];
+    uint32_t key = winst_name_key(asset_name, folded);
+    if (library) for (int i = 0; i < library->count; i++) {
+        const WInstProto *proto = &library->items[i];
+        if (proto->name_hash == key && !strcmp(proto->name, folded)) return proto;
+    }
+    if (stats) stats->missing_models++;
+    return NULL;
+}
+
+/* An object's authored matrix belongs to the prototype, never a final mesh.
+ * It is only a later fallback candidate when this is the unique ROAD/TERRAIN
+ * prototype for a requested asset. */
+static int winst_proto_has_own_matrix(const WInstLibrary *library,
+                                      const WInstProto *proto) {
+    if (!library || !proto || !proto->has_matrix || proto->scene.count != 1)
+        return 0;
+    int cat = proto->scene.meshes[0].cat;
+    if (cat != N2_ROAD && cat != N2_TERRAIN) return 0;
+    for (int i = 0; i < library->count; i++)
+        if (&library->items[i] != proto &&
+            !strcmp(library->items[i].name, proto->name)) return 0;
+    return 1;
+}
+
+static void winst_collect_model(WInstLibrary *library, const unsigned char *data,
+                                long begin, long end,
+                                const uint32_t *keys, int nkeys) {
+    N2Scene local;
+    memset(&local, 0, sizeof local);
+    int cat = n2_mesh_category(data, begin, end);
+    char name[40];
+    n2_mesh_name(data, begin, end, name, sizeof name);
+    int scen = n2_scen_class(name);
+    float matrix[16];
+    int has_matrix = n2_obj_matrix(data, begin, end, matrix);
+    uint32_t texkey = n2_mesh_texkey_cat(data, begin, end, cat, keys, nkeys);
+    N2Leaf vtx[64], idx[64];
+    int nv = 0, ni = 0;
+    n2_find_leaves(data, begin, end, 0x00134B01u, vtx, &nv, 64);
+    n2_find_leaves(data, begin, end, 0x00134B03u, idx, &ni, 64);
+    int pairs = nv < ni ? nv : ni;
+
+    /* This deliberately mirrors n2_walk_meshes' verified ROAD/TERRAIN
+     * material partition gate. A malformed partition falls through to the
+     * identical whole-object path instead of silently losing geometry. */
+    int sub_ok = 0;
+    N2Sub sub[64];
+    uint32_t slot[64];
+    int nsub = 0, nslot = 0;
+    if ((cat == N2_ROAD || cat == N2_TERRAIN) && pairs == 1) {
+        nsub = n2_mesh_submeshes(data, begin, end, sub, 64);
+        nslot = n2_mesh_texslots(data, begin, end, slot, 64);
+        if (nsub > 0 && nslot > 0) {
+            const unsigned char *ib0 = data + idx[0].off;
+            int ibytes = (int)idx[0].size, ip = 0;
+            while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip + 1] == 0x11)
+                ip += 2;
+            long available = (ibytes - ip) / 2;
+            long chain = 0;
+            sub_ok = 1;
+            for (int i = 0; i < nsub && sub_ok; i++) {
+                if (sub[i].mat >= (uint32_t)nslot || !slot[sub[i].mat] ||
+                    (long)sub[i].start != chain || sub[i].count < 3 ||
+                    chain + (long)sub[i].count > available)
+                    sub_ok = 0;
+                else chain += (long)sub[i].count;
+            }
+            if (sub_ok && chain != available - available % 3) sub_ok = 0;
+        }
+    }
+    if (sub_ok) {
+        for (int i = 0; i < nsub; i++) {
+            uint32_t subkey = n2_resolve_key(slot[sub[i].mat], keys, nkeys);
+            n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, cat != N2_SKY,
+                        subkey ? subkey : texkey, NULL,
+                        (long)sub[i].start, (long)sub[i].count);
+        }
+    } else {
+        for (int i = 0; i < pairs; i++)
+            n2_add_pair(data, vtx[i], idx[i], cat, &local, 24, 16, cat != N2_SKY,
+                        texkey, NULL, 0, -1);
+    }
+    for (int i = 0; i < local.count; i++) {
+        local.meshes[i].scen = (unsigned char)scen;
+        snprintf(local.meshes[i].sname, sizeof local.meshes[i].sname, "%.31s", name);
+    }
+    if (local.count && winst_library_add(library, &local, name, matrix, has_matrix)) return;
+    winst_free_scene(&local);
+}
+
+static void winst_collect_models(WInstLibrary *library, const unsigned char *data,
+                                 long begin, long end,
+                                 const uint32_t *keys, int nkeys) {
+    if (!library || !data || begin < 0 || end < begin) return;
+    for (long offset = begin; offset + 8 <= end;) {
+        uint32_t magic = n2_u32(data + offset);
+        uint32_t size = n2_u32(data + offset + 4);
+        long payload = offset + 8;
+        if ((uint64_t)size > (uint64_t)(end - payload)) return;
+        long object_end = payload + (long)size;
+        if (magic == 0x80134010u)
+            winst_collect_model(library, data, payload, object_end, keys, nkeys);
+        else if (magic != 0 && (magic >> 28) == 8)
+            winst_collect_models(library, data, payload, object_end, keys, nkeys);
+        offset = object_end;
+    }
+}
+
 static int chunk_end(long off, uint32_t size, long limit, long *end) {
     if (off < 0 || off > limit || (long)size < 0) return 0;
     if ((uint64_t)size > (uint64_t)(limit - off)) return 0;

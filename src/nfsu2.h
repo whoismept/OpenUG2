@@ -43,6 +43,8 @@ typedef struct {
     char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
     unsigned char vrepair; /* 1 = this mesh kept its good geometry after corrupt
                               source vertices were excluded (M133) */
+    char aname[28];        /* instance asset name (27 chars + terminator) */
+    unsigned char inst;    /* mesh was placed from an instance matrix */
 } N2Mesh;
 
 /* Active customization profile.

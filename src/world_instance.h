@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "nfsu2.h"
+
 typedef struct {
     int id;
     float bb[4];
@@ -17,6 +19,19 @@ typedef struct {
     float matrix[16];
 } WInstPlacement;
 
+typedef struct {
+    long instances_seen;
+    long instances_in_range;
+    long meshes_placed;
+    long missing_models;
+    long own_matrix_meshes;
+    long rejected_meshes;
+    int regions_total;
+    int regions_selected;
+    int home_region;
+    char bundle[64];
+} WInstStats;
+
 int  winst_parse_regions(const unsigned char *data, long len,
                          WInstRegion **out, int *count);
 void winst_free_regions(WInstRegion *regions, int count);
@@ -26,5 +41,8 @@ int  winst_select_regions(const WInstRegion *regions, int count,
                           int *home_index);
 int  winst_decode_placement(const unsigned char *record, long len,
                             WInstPlacement *out);
+int  winst_place_mesh(N2Scene *dst, const N2Mesh *src,
+                      const float matrix[16], const char *asset_name,
+                      WInstStats *stats);
 
 #endif
