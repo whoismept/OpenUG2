@@ -15,6 +15,7 @@ typedef struct {
     uint32_t name_hash;
     char name[28];
     unsigned char has_matrix;
+    unsigned char is_vista;
 } WInstProto;
 
 typedef struct {
@@ -160,7 +161,8 @@ static void winst_library_free(WInstLibrary *library) {
 }
 
 static int winst_library_add(WInstLibrary *library, N2Scene *scene,
-                             const char *name, const float matrix[16], int has_matrix) {
+                             const char *name, const float matrix[16], int has_matrix,
+                             int is_vista) {
     if (library->count == library->cap) {
         int next = library->cap ? library->cap * 2 : 64;
         if (next <= library->cap || (size_t)next > SIZE_MAX / sizeof *library->items)
@@ -177,6 +179,7 @@ static int winst_library_add(WInstLibrary *library, N2Scene *scene,
     proto->name_hash = winst_name_key(name, proto->name);
     memcpy(proto->matrix, matrix, sizeof proto->matrix);
     proto->has_matrix = (unsigned char)(has_matrix != 0);
+    proto->is_vista = (unsigned char)(is_vista != 0);
     memset(scene, 0, sizeof *scene);
     return 1;
 }
@@ -224,6 +227,12 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     int scen = n2_scen_class(name);
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
+    int is_vista = 0;
+    if (n2_vista_family(name)) {
+        N2Geom geometry;
+        is_vista = n2_obj_geom(data, begin, end, matrix, &geometry) &&
+                   n2_is_vista_impostor(name, &geometry);
+    }
     uint32_t texkey = n2_mesh_texkey_cat(data, begin, end, cat, keys, nkeys);
     N2Leaf vtx[64], idx[64];
     int nv = 0, ni = 0;
@@ -275,7 +284,8 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         local.meshes[i].scen = (unsigned char)scen;
         snprintf(local.meshes[i].sname, sizeof local.meshes[i].sname, "%.31s", name);
     }
-    if (local.count && winst_library_add(library, &local, name, matrix, has_matrix)) return;
+    if (local.count && winst_library_add(library, &local, name, matrix,
+                                         has_matrix, is_vista)) return;
     winst_free_scene(&local);
 }
 
@@ -469,9 +479,20 @@ int winst_select_regions(const WInstRegion *regions, int count,
     memset(selected, 0, (size_t)selected_cap);
     float radius2 = radius * radius;
     int nselected = 0;
+    double home_area = 0.0;
     for (int i = 0; i < count; i++) {
         const WInstRegion *r = &regions[i];
-        if (in_polygon(r, x, y) && home_index && *home_index < 0) *home_index = i;
+        if (in_polygon(r, x, y) && home_index) {
+            double twice_area = 0.0;
+            for (int p = 0, q = r->nxy - 1; p < r->nxy; q = p++)
+                twice_area += (double)r->xy[2 * q] * r->xy[2 * p + 1] -
+                              (double)r->xy[2 * p] * r->xy[2 * q + 1];
+            double area = fabs(twice_area);
+            if (*home_index < 0 || area < home_area) {
+                *home_index = i;
+                home_area = area;
+            }
+        }
 
         float dx = x < r->bb[0] ? r->bb[0] - x : x > r->bb[2] ? x - r->bb[2] : 0.0f;
         float dy = y < r->bb[1] ? r->bb[1] - y : y > r->bb[3] ? y - r->bb[3] : 0.0f;
@@ -490,17 +511,401 @@ int winst_decode_placement(const unsigned char *record, long len,
     out->type_index = winst_u16(record + 0x18);
     out->flags = winst_u16(record + 0x1a);
     for (int i = 0; i < 3; i++) {
-        float v = winst_f32(record + 0x20 + i * 4);
-        out->bounds_min[i] = v;
-        out->bounds_max[i] = v;
+        out->bounds_min[i] = winst_f32(record + i * 4);
+        out->bounds_max[i] = winst_f32(record + 0x0c + i * 4);
     }
     for (int i = 0; i < 16; i++) out->matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
     for (int row = 0; row < 3; row++)
         for (int col = 0; col < 3; col++)
             out->matrix[col * 4 + row] =
                 (float)winst_s16(record + 0x2c + (row * 3 + col) * 2) / 8192.0f;
-    out->matrix[12] = out->bounds_min[0];
-    out->matrix[13] = out->bounds_min[1];
-    out->matrix[14] = out->bounds_min[2];
+    out->matrix[12] = winst_f32(record + 0x20);
+    out->matrix[13] = winst_f32(record + 0x24);
+    out->matrix[14] = winst_f32(record + 0x28);
     return 1;
+}
+
+typedef struct {
+    int region_id;
+    const unsigned char *types;
+    int type_count;
+    const unsigned char *placements;
+    int placement_count;
+} WInstSection;
+
+typedef int (*WInstInternalVisitFn)(const WInstPlacement *placement,
+                                    const char *type_name, void *userdata);
+
+static int winst_fixed_records(const unsigned char *data, long len, int stride,
+                               const unsigned char **records, int *count) {
+    if (!data || len < 0 || stride <= 0 || !records || !count) return 0;
+    long filler = len % stride == 0 ? 0 : skip_filler(data, len);
+    long body = len - filler;
+    if (body < 0 || body % stride || body / stride > INT_MAX) return 0;
+    *records = data + filler;
+    *count = (int)(body / stride);
+    return 1;
+}
+
+static int winst_parse_section(const unsigned char *data, long begin, long end,
+                               WInstSection *section) {
+    if (!data || !section || begin < 0 || end < begin) return 0;
+    memset(section, 0, sizeof *section);
+    section->region_id = -1;
+    const unsigned char *info = NULL, *types = NULL, *placements = NULL;
+    long info_len = 0, type_len = 0, placement_len = 0;
+    for (long pos = begin; pos < end;) {
+        if (end - pos < 8) return 0;
+        uint32_t magic = n2_u32(data + pos);
+        long child_end = 0;
+        if (!chunk_end(pos + 8, n2_u32(data + pos + 4), end, &child_end)) return 0;
+        if (magic == 0x00034101u) { info = data + pos + 8; info_len = child_end - pos - 8; }
+        else if (magic == 0x00034102u) { types = data + pos + 8; type_len = child_end - pos - 8; }
+        else if (magic == 0x00034103u) {
+            placements = data + pos + 8;
+            placement_len = child_end - pos - 8;
+        }
+        pos = child_end;
+    }
+    if (!info || info_len < 0x10 || !types || !placements) return 0;
+    uint32_t region_id = n2_u32(info + 0x0c);
+    if (region_id > INT_MAX) return 0;
+    section->region_id = (int)region_id;
+    if (!winst_fixed_records(types, type_len, 68,
+                             &section->types, &section->type_count) ||
+        !winst_fixed_records(placements, placement_len, 64,
+                             &section->placements, &section->placement_count))
+        return 0;
+    return section->type_count > 0;
+}
+
+static int winst_bbox_in_range(const WInstPlacement *placement,
+                               float x, float y, float radius) {
+    if (!placement || !isfinite(x) || !isfinite(y) || !isfinite(radius) ||
+        radius < 0.0f) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!isfinite(placement->bounds_min[i]) ||
+            !isfinite(placement->bounds_max[i]) ||
+            placement->bounds_min[i] > placement->bounds_max[i]) return 0;
+    float dx = x < placement->bounds_min[0] ? placement->bounds_min[0] - x
+             : x > placement->bounds_max[0] ? x - placement->bounds_max[0] : 0.0f;
+    float dy = y < placement->bounds_min[1] ? placement->bounds_min[1] - y
+             : y > placement->bounds_max[1] ? y - placement->bounds_max[1] : 0.0f;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static int winst_visit_section(const WInstSection *section,
+                               float focus_x, float focus_y, float view_radius,
+                               WInstInternalVisitFn visit, void *userdata,
+                               WInstStats *stats) {
+    for (int i = 0; i < section->placement_count; i++) {
+        WInstPlacement placement;
+        const unsigned char *record = section->placements + (long)i * 64;
+        if (stats) stats->instances_seen++;
+        if (!winst_decode_placement(record, 64, &placement)) {
+            winst_reject(stats);
+            continue;
+        }
+        if (!winst_bbox_in_range(&placement, focus_x, focus_y, view_radius)) continue;
+        if (stats) stats->instances_in_range++;
+        if (placement.type_index >= (unsigned)section->type_count) {
+            winst_reject(stats);
+            continue;
+        }
+        char type_name[33];
+        memcpy(type_name, section->types + (long)placement.type_index * 68, 32);
+        type_name[32] = 0;
+        if (visit && !visit(&placement, type_name, userdata)) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    const unsigned char *selected;
+    int selected_cap;
+    int find_region;
+    int found_region;
+    float focus_x, focus_y, view_radius;
+    WInstInternalVisitFn visit;
+    void *userdata;
+    WInstStats *stats;
+} WInstWalk;
+
+static int winst_walk_sections(const unsigned char *data, long begin, long end,
+                               WInstWalk *walk) {
+    for (long pos = begin; pos < end;) {
+        if (end - pos < 8) return 0;
+        uint32_t magic = n2_u32(data + pos);
+        long child_end = 0;
+        if (!chunk_end(pos + 8, n2_u32(data + pos + 4), end, &child_end)) return 0;
+        if (magic == 0x80034100u) {
+            WInstSection section;
+            if (!winst_parse_section(data, pos + 8, child_end, &section)) return 0;
+            if (section.region_id == walk->find_region) walk->found_region = 1;
+            int selected = !walk->selected ||
+                (section.region_id >= 0 && section.region_id < walk->selected_cap &&
+                 walk->selected[section.region_id]);
+            if (selected && walk->visit &&
+                !winst_visit_section(&section, walk->focus_x, walk->focus_y,
+                                     walk->view_radius, walk->visit,
+                                     walk->userdata, walk->stats)) return 0;
+        } else if (magic != 0 && (magic >> 28) == 8) {
+            if (!winst_walk_sections(data, pos + 8, child_end, walk)) return 0;
+        }
+        pos = child_end;
+    }
+    return 1;
+}
+
+#ifdef WORLD_INSTANCE_TESTING
+int winst_test_collect_placements(const unsigned char *section_data,
+                                  long section_len,
+                                  float focus_x, float focus_y,
+                                  float view_radius,
+                                  WInstVisitFn visit, void *userdata,
+                                  WInstStats *stats) {
+    if (!section_data || section_len < 0 || !visit) return 0;
+    WInstWalk walk;
+    memset(&walk, 0, sizeof walk);
+    walk.find_region = -1;
+    walk.focus_x = focus_x;
+    walk.focus_y = focus_y;
+    walk.view_radius = view_radius;
+    walk.visit = visit;
+    walk.userdata = userdata;
+    walk.stats = stats;
+    return winst_walk_sections(section_data, 0, section_len, &walk);
+}
+#endif
+
+typedef struct {
+    const WInstLibrary *library;
+    N2Scene *scene;
+    N2Scene *vista;
+    WInstStats *stats;
+} WInstBuildVisit;
+
+static int winst_build_visit(const WInstPlacement *placement,
+                             const char *type_name, void *userdata) {
+    WInstBuildVisit *build = (WInstBuildVisit *)userdata;
+    const WInstProto *proto = winst_library_find(build->library, type_name,
+                                                 build->stats);
+    if (!proto) return 1;
+    N2Scene *dst = proto->is_vista ? build->vista : build->scene;
+    for (int i = 0; i < proto->scene.count; i++) {
+        const N2Mesh *mesh = &proto->scene.meshes[i];
+        if (mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN) continue;
+        (void)winst_place_mesh(dst, mesh, placement->matrix, type_name,
+                              build->stats);
+    }
+    return 1;
+}
+
+static int winst_move_regions(WInstRegion **all, int *count, int *cap,
+                              WInstRegion *add, int nadd) {
+    if (nadd < 0 || *count > INT_MAX - nadd) return 0;
+    int need = *count + nadd;
+    if (need > *cap) {
+        int next = *cap ? *cap : 64;
+        while (next < need) {
+            if (next > INT_MAX / 2) { next = need; break; }
+            next *= 2;
+        }
+        if ((size_t)next > SIZE_MAX / sizeof **all) return 0;
+        WInstRegion *grown = (WInstRegion *)realloc(
+            *all, (size_t)next * sizeof **all);
+        if (!grown) return 0;
+        *all = grown;
+        *cap = next;
+    }
+    memcpy(*all + *count, add, (size_t)nadd * sizeof *add);
+    *count = need;
+    free(add);
+    return 1;
+}
+
+static int winst_has_suffix(const char *text, const char *suffix) {
+    size_t n = strlen(text), s = strlen(suffix);
+    return n >= s && !strcmp(text + n - s, suffix);
+}
+
+static unsigned char *winst_read_named(const char *root, const char *name,
+                                       long *len) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s%s", root, name,
+             winst_has_suffix(name, ".BUN") ? "" : ".BUN");
+    return n2_read_file(path, len);
+}
+
+static int winst_prepare_combined(const N2Scene *dst, const N2Scene *add,
+                                  N2Mesh **combined, int *count) {
+    if (!dst || !add || !combined || !count || dst->count < 0 || add->count < 0 ||
+        dst->count > INT_MAX - add->count) return 0;
+    *count = dst->count + add->count;
+    *combined = NULL;
+    if (!*count) return 1;
+    if ((size_t)*count > SIZE_MAX / sizeof **combined) return 0;
+    *combined = (N2Mesh *)malloc((size_t)*count * sizeof **combined);
+    if (!*combined) return 0;
+    if (dst->count)
+        memcpy(*combined, dst->meshes, (size_t)dst->count * sizeof **combined);
+    if (add->count)
+        memcpy(*combined + dst->count, add->meshes,
+               (size_t)add->count * sizeof **combined);
+    return 1;
+}
+
+static int winst_commit_scenes(N2Scene *scene, N2Scene *vista,
+                               N2Scene *add_scene, N2Scene *add_vista) {
+    N2Mesh *combined_scene = NULL, *combined_vista = NULL;
+    int scene_count = 0, vista_count = 0;
+    if (!winst_prepare_combined(scene, add_scene, &combined_scene, &scene_count) ||
+        !winst_prepare_combined(vista, add_vista, &combined_vista, &vista_count)) {
+        free(combined_scene);
+        free(combined_vista);
+        return 0;
+    }
+    free(scene->meshes);
+    free(vista->meshes);
+    free(add_scene->meshes);
+    free(add_vista->meshes);
+    scene->meshes = combined_scene;
+    scene->count = scene->cap = scene_count;
+    vista->meshes = combined_vista;
+    vista->count = vista->cap = vista_count;
+    memset(add_scene, 0, sizeof *add_scene);
+    memset(add_vista, 0, sizeof *add_vista);
+    return 1;
+}
+
+int world_instance_build(N2Scene *scene, N2Scene *vista,
+                         const char *track_root,
+                         const char *const *bundles, int bundle_count,
+                         float focus_x, float focus_y, float view_radius,
+                         const unsigned char *shared, long shared_len,
+                         WInstStats *stats) {
+    WInstStats local_stats;
+    WInstRegion *regions = NULL;
+    int region_count = 0, region_cap = 0;
+    unsigned char *selected = NULL, *bundle_data = NULL;
+    long bundle_len = 0;
+    WInstLibrary library;
+    N2Scene built_scene, built_vista;
+    int ok = 0;
+    memset(&local_stats, 0, sizeof local_stats);
+    local_stats.home_region = -1;
+    memset(&library, 0, sizeof library);
+    memset(&built_scene, 0, sizeof built_scene);
+    memset(&built_vista, 0, sizeof built_vista);
+    if (stats) *stats = local_stats;
+    if (!scene || !vista || !track_root || !bundles || bundle_count <= 0 ||
+        !isfinite(focus_x) || !isfinite(focus_y) || !isfinite(view_radius) ||
+        view_radius < 0.0f || shared_len < 0) goto cleanup;
+
+    for (int i = 0; i < bundle_count; i++) {
+        const char *bundle = bundles[i];
+        if (!bundle || !bundle[0] || !strcmp(bundle, "ALL")) goto cleanup;
+        const char *stem = !strncmp(bundle, "STREAM", 6) ? bundle + 6 : bundle;
+        char companion[64];
+        snprintf(companion, sizeof companion, "%s", stem);
+        char *dot = strrchr(companion, '.');
+        if (dot && !strcmp(dot, ".BUN")) *dot = 0;
+        long companion_len = 0;
+        unsigned char *companion_data = winst_read_named(track_root, companion,
+                                                         &companion_len);
+        if (!companion_data) goto cleanup;
+        WInstRegion *part = NULL;
+        int npart = 0;
+        int parsed = winst_parse_regions(companion_data, companion_len,
+                                         &part, &npart);
+        free(companion_data);
+        if (!parsed || !winst_move_regions(&regions, &region_count, &region_cap,
+                                           part, npart)) {
+            winst_free_regions(part, npart);
+            goto cleanup;
+        }
+    }
+
+    selected = (unsigned char *)calloc(65536, 1);
+    if (!selected) goto cleanup;
+    int home_index = -1;
+    int nselected = winst_select_regions(regions, region_count, focus_x, focus_y,
+                                         view_radius, selected, 65536, &home_index);
+    local_stats.regions_total = region_count;
+    local_stats.regions_selected = nselected;
+    if (home_index < 0 || home_index >= region_count) goto cleanup;
+    local_stats.home_region = regions[home_index].id;
+
+    for (int i = 0; i < bundle_count && !bundle_data; i++) {
+        long candidate_len = 0;
+        unsigned char *candidate = winst_read_named(track_root, bundles[i],
+                                                     &candidate_len);
+        if (!candidate) continue;
+        WInstWalk find;
+        memset(&find, 0, sizeof find);
+        find.find_region = local_stats.home_region;
+        int walked = winst_walk_sections(candidate, 0, candidate_len, &find);
+        if (walked && find.found_region) {
+            bundle_data = candidate;
+            bundle_len = candidate_len;
+            snprintf(local_stats.bundle, sizeof local_stats.bundle, "%s", bundles[i]);
+        } else free(candidate);
+    }
+    /* The home section is the atomic gate: destination scenes are untouched
+     * until a complete temporary assembly has been built and committed. */
+    if (!bundle_data) goto cleanup;
+
+    uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
+    if (!keys) goto cleanup;
+    N2Tpk tpk = n2_tpk_open(bundle_data, bundle_len);
+    int nkeys = n2_tpk_keys(bundle_data, tpk, keys, 16384);
+    if (shared && nkeys < 16384)
+        nkeys += n2_car_tex_keys(shared, shared_len, keys + nkeys, 16384 - nkeys);
+    winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
+    free(keys);
+
+    static const float identity[16] = {
+        1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 1, 0, 0, 0, 0, 1,
+    };
+    for (int i = 0; i < library.count; i++) {
+        const WInstProto *proto = &library.items[i];
+        const float *matrix = proto->has_matrix ? proto->matrix : identity;
+        N2Scene *dst = proto->is_vista ? &built_vista : &built_scene;
+        for (int mesh = 0; mesh < proto->scene.count; mesh++) {
+            const N2Mesh *source = &proto->scene.meshes[mesh];
+            if (source->cat != N2_ROAD && source->cat != N2_TERRAIN) continue;
+            if (winst_place_mesh(dst, source, matrix, proto->name, &local_stats) &&
+                proto->has_matrix) local_stats.own_matrix_meshes++;
+        }
+    }
+
+    WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats };
+    WInstWalk collect;
+    memset(&collect, 0, sizeof collect);
+    collect.selected = selected;
+    collect.selected_cap = 65536;
+    collect.find_region = local_stats.home_region;
+    collect.focus_x = focus_x;
+    collect.focus_y = focus_y;
+    collect.view_radius = view_radius;
+    collect.visit = winst_build_visit;
+    collect.userdata = &visit;
+    collect.stats = &local_stats;
+    if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
+        !collect.found_region) goto cleanup;
+    if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;
+    ok = 1;
+
+cleanup:
+    if (!ok) {
+        winst_free_scene(&built_scene);
+        winst_free_scene(&built_vista);
+    }
+    winst_library_free(&library);
+    free(bundle_data);
+    free(selected);
+    winst_free_regions(regions, region_count);
+    if (stats) *stats = local_stats;
+    return ok;
 }

@@ -154,8 +154,15 @@ static int world_dedup(World *w) {
  * physics ground query, and the GPU batches all see one clean surface
  * layer. It keeps the first copy of each (texkey, xyz-bbox, tri, vert)
  * and drops the rest. */
-int world_load(World *w, const char *troot, const char *trackname) {
+int world_load_ex(World *w, const char *troot, const char *trackname,
+                  const WLoadOptions *options) {
     memset(w, 0, sizeof *w);
+    const int instance_world = options && options->enabled;
+    if (instance_world && !strcmp(trackname, "ALL")) {
+        fprintf(stderr, "instance world requires one explicit STREAM bundle; "
+                        "--track ALL is not a production composition\n");
+        return 0;
+    }
 
     /* Region set. ALL is a diagnostic union, not the retail open world:
        STREAM bundles overlap as route/event supersets and can author
@@ -198,19 +205,46 @@ int world_load(World *w, const char *troot, const char *trackname) {
                     ntk += n2_tpk_keys(w->master, w->mastertpk, tkeys + ntk, 16384 - ntk);
             }
         }
-        n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
-        n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
-        n2_vista_out = NULL;
+        if (!instance_world) {
+            n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
+            n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+            n2_vista_out = NULL;
+        }
         g->mesh1 = w->scene.count;
         if (!w->have_grass)
             w->have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->grass);
-        printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
-               regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
-        printf("objects: %ld seen = %ld emitted + %ld routed to vista + %ld emitted "
-               "nothing (%ld of them had no 0x134B01/B03 leaf pair)  %s\n",
-               n2_obj_seen, n2_obj_emit, n2_obj_vista, n2_obj_nomesh, n2_obj_nopair,
-               n2_obj_seen == n2_obj_emit + n2_obj_vista + n2_obj_nomesh
-                   ? "(closed)" : "(LEAK)");
+        if (!instance_world) {
+            printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
+                   regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
+            printf("objects: %ld seen = %ld emitted + %ld routed to vista + %ld emitted "
+                   "nothing (%ld of them had no 0x134B01/B03 leaf pair)  %s\n",
+                   n2_obj_seen, n2_obj_emit, n2_obj_vista, n2_obj_nomesh, n2_obj_nopair,
+                   n2_obj_seen == n2_obj_emit + n2_obj_vista + n2_obj_nomesh
+                       ? "(closed)" : "(LEAK)");
+        }
+    }
+
+    if (instance_world) {
+        const char *bundle_names[WORLD_MAXREG];
+        for (int r = 0; r < nreg; r++) bundle_names[r] = regs[r];
+        if (!world_instance_build(&w->scene, &w->vista, troot,
+                                  bundle_names, nreg,
+                                  options->focus_x, options->focus_y,
+                                  options->view_radius,
+                                  w->loc4, w->loc4len, &w->inst_stats)) {
+            fprintf(stderr, "instance world: no complete home district at "
+                            "(%.1f, %.1f)\n",
+                    options->focus_x, options->focus_y);
+            return 0;
+        }
+        for (int r = 0; r < nreg; r++) {
+            w->rgn[r].mesh0 = 0;
+            w->rgn[r].mesh1 = !strcmp(w->rgn[r].name, w->inst_stats.bundle)
+                            ? w->scene.count : 0;
+            printf("region %-12s: %3ld MB, %5d instance meshes\n",
+                   w->rgn[r].name, w->rgn[r].len >> 20,
+                   w->rgn[r].mesh1 - w->rgn[r].mesh0);
+        }
     }
 
     /* strip coplanar duplicates before anything downstream sees the scene.
@@ -266,6 +300,10 @@ int world_load(World *w, const char *troot, const char *trackname) {
                w->dist[i].medz, w->dist[i].bb[0], w->dist[i].bb[1],
                w->dist[i].bb[2], w->dist[i].bb[3]);
     return nm;
+}
+
+int world_load(World *w, const char *troot, const char *trackname) {
+    return world_load_ex(w, troot, trackname, NULL);
 }
 
 int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;

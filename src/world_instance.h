@@ -44,5 +44,22 @@ int  winst_decode_placement(const unsigned char *record, long len,
 int  winst_place_mesh(N2Scene *dst, const N2Mesh *src,
                       const float matrix[16], const char *asset_name,
                       WInstStats *stats);
+int world_instance_build(N2Scene *scene, N2Scene *vista,
+                         const char *track_root,
+                         const char *const *bundles, int bundle_count,
+                         float focus_x, float focus_y, float view_radius,
+                         const unsigned char *shared, long shared_len,
+                         WInstStats *stats);
+
+#ifdef WORLD_INSTANCE_TESTING
+typedef int (*WInstVisitFn)(const WInstPlacement *placement,
+                            const char *type_name, void *userdata);
+int winst_test_collect_placements(const unsigned char *section_data,
+                                  long section_len,
+                                  float focus_x, float focus_y,
+                                  float view_radius,
+                                  WInstVisitFn visit, void *userdata,
+                                  WInstStats *stats);
+#endif
 
 #endif

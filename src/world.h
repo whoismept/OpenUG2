@@ -8,6 +8,7 @@
 #include "nfsu2.h"
 #include "render.h"
 #include "debug.h"   /* ScriptedDef, for world_scripted_defs */
+#include "world_instance.h"
 
 #define WORLD_MAXREG 16
 #define WORLD_MAXDIST 24
@@ -79,7 +80,14 @@ typedef struct {
      * deliberately invisible to ground selection, wheel support, collision,
      * navigation and spawn -- every one of those queries w->scene. */
     N2Scene vista;
+    WInstStats inst_stats;  /* populated only by explicit instance-world loads */
 } World;
+
+typedef struct {
+    int enabled;
+    float focus_x, focus_y;
+    float view_radius;
+} WLoadOptions;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/
  * Paths*.bin. Each file's 0x34148 leaf is an array of 24-byte records:
@@ -171,6 +179,8 @@ int world_barrier_push(const World *w, float *pos, float r);
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the
  * mesh count (0 = nothing readable). */
 int world_load(World *w, const char *troot, const char *trackname);
+int world_load_ex(World *w, const char *troot, const char *trackname,
+                  const WLoadOptions *options);
 
 /* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master),
  * writing the key->GL map, then free the region buffers. Needs a GL context.

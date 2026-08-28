@@ -14,11 +14,15 @@
 #define winst_select_regions winst_select_regions_test_copy
 #define winst_decode_placement winst_decode_placement_test_copy
 #define winst_place_mesh winst_place_mesh_test_copy
+#define world_instance_build world_instance_build_test_copy
+#define winst_test_collect_placements winst_test_collect_placements_test_copy
 #define winst_test_placement_live_allocations winst_test_placement_live_allocations_test_copy
 #define static
 #include "../src/world_instance.c"
 #undef static
 #undef winst_test_placement_live_allocations
+#undef winst_test_collect_placements
+#undef world_instance_build
 #undef winst_place_mesh
 #undef winst_decode_placement
 #undef winst_select_regions
@@ -131,6 +135,12 @@ static void test_placement(void) {
     memset(record, 0, sizeof record);
     put_u16(record + 0x18, 3);
     put_u16(record + 0x1a, 0x8040);
+    put_f32(record + 0x00, 100.0f);
+    put_f32(record + 0x04, -25.0f);
+    put_f32(record + 0x08, 7.5f);
+    put_f32(record + 0x0c, 100.0f);
+    put_f32(record + 0x10, -25.0f);
+    put_f32(record + 0x14, 7.5f);
     put_f32(record + 0x20, 100.0f);
     put_f32(record + 0x24, -25.0f);
     put_f32(record + 0x28, 7.5f);
@@ -228,6 +238,82 @@ static long add_leaf(unsigned char *buf, long pos, unsigned long magic,
     return pos + 8 + body_len;
 }
 
+static void make_instance_record(unsigned char record[64], int type,
+                                 float x0, float y0, float x1, float y1) {
+    memset(record, 0, 64);
+    put_f32(record + 0x00, x0);
+    put_f32(record + 0x04, y0);
+    put_f32(record + 0x08, -1.0f);
+    put_f32(record + 0x0c, x1);
+    put_f32(record + 0x10, y1);
+    put_f32(record + 0x14, 1.0f);
+    put_u16(record + 0x18, (unsigned int)type);
+    put_f32(record + 0x20, 0.5f * (x0 + x1));
+    put_f32(record + 0x24, 0.5f * (y0 + y1));
+    for (int i = 0; i < 3; i++) put_s16(record + 0x2c + 2 * (i * 3 + i), 8192);
+}
+
+static long add_section(unsigned char *buf, long pos, int region_id,
+                        const char *type_name,
+                        const unsigned char *placements, int placement_count) {
+    unsigned char info[60], type[68], instances[12 + 2 * 64];
+    memset(info, 0, sizeof info);
+    memset(type, 0, sizeof type);
+    memset(instances, 0x11, 12);
+    put_u32(info + 0x0c, (unsigned long)region_id);
+    snprintf((char *)type, 32, "%s", type_name);
+    memcpy(instances + 12, placements, (size_t)placement_count * 64);
+
+    long section = pos;
+    pos += 8;
+    pos = add_leaf(buf, pos, 0x00034101ul, info, sizeof info);
+    pos = add_leaf(buf, pos, 0x00034102ul, type, sizeof type);
+    pos = add_leaf(buf, pos, 0x00034103ul, instances,
+                   12 + (long)placement_count * 64);
+    put_u32(buf + section, 0x80034100ul);
+    put_u32(buf + section + 4, (unsigned long)(pos - section - 8));
+    return pos;
+}
+
+typedef struct {
+    int count;
+    char name[32];
+    WInstPlacement placement;
+} VisitCapture;
+
+static int capture_placement(const WInstPlacement *placement,
+                             const char *type_name, void *userdata) {
+    VisitCapture *capture = (VisitCapture *)userdata;
+    capture->count++;
+    capture->placement = *placement;
+    snprintf(capture->name, sizeof capture->name, "%s", type_name);
+    return 1;
+}
+
+static void test_section_collection(void) {
+    unsigned char data[1024], first[2 * 64], second[64];
+    memset(data, 0, sizeof data);
+    make_instance_record(first + 0, 0, -2.0f, -2.0f, 2.0f, 2.0f);
+    make_instance_record(first + 64, 0, 50.0f, 50.0f, 52.0f, 52.0f);
+    make_instance_record(second, 1, -1.0f, -1.0f, 1.0f, 1.0f);
+    long used = 0;
+    used = add_section(data, used, 17, "XO_NEAR", first, 2);
+    used = add_section(data, used, 23, "XO_INVALID", second, 1);
+
+    VisitCapture capture;
+    WInstStats stats;
+    memset(&capture, 0, sizeof capture);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_test_collect_placements(data, used, 0.0f, 0.0f, 5.0f,
+                                         capture_placement, &capture, &stats) == 1);
+    assert(capture.count == 1);
+    assert(strcmp(capture.name, "XO_NEAR") == 0);
+    assert(capture.placement.type_index == 0);
+    assert(stats.instances_seen == 3);
+    assert(stats.instances_in_range == 2);
+    assert(stats.rejected_meshes == 1);
+}
+
 static void test_private_prototype_paths(void) {
     WInstLibrary library;
     WInstProto proto[2];
@@ -297,6 +383,7 @@ int main(void) {
     test_placement();
     test_direct_placement();
     test_private_prototype_paths();
+    test_section_collection();
     puts("world_instance_test: PASS");
     return 0;
 }

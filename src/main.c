@@ -1185,7 +1185,11 @@ int main(int argc, char **argv) {
                           not a supported playable open-world composition.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit
-         --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free) */
+         --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
+         --world2         opt into diagnostic instance-driven world assembly
+         --spawn start|X,Y  focus/spawn for --world2 (required)
+         --heading DEG    requested --world2 heading
+         --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     const char *xaudit = NULL;   /* --transform-audit REGION: GL-free placement forensics */
@@ -1244,6 +1248,9 @@ int main(int argc, char **argv) {
     int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
+    int world2 = 0, instance_audit = 0;
+    int world2_spawn_set = 0, world2_heading_set = 0;
+    float world2_spawn_xy[2] = {0, 0}, world2_heading_deg = 0.0f;
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
@@ -1356,7 +1363,48 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vista-census")) { vcensus = 1;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
+        else if (!strcmp(argv[i], "--world2")) world2 = 1;
+        else if (!strcmp(argv[i], "--instance-audit")) instance_audit = 1;
+        else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
+            const char *value = argv[++i];
+            if (!strcmp(value, "start")) {
+                world2_spawn_xy[0] = 1695.2f;
+                world2_spawn_xy[1] = -883.6f;
+                world2_spawn_set = 1;
+            } else {
+                char tail = 0;
+                if (sscanf(value, "%f,%f%c", &world2_spawn_xy[0],
+                           &world2_spawn_xy[1], &tail) != 2 ||
+                    !isfinite(world2_spawn_xy[0]) || !isfinite(world2_spawn_xy[1])) {
+                    fprintf(stderr, "invalid --spawn '%s' (expected start or X,Y)\n", value);
+                    return 2;
+                }
+                world2_spawn_set = 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--heading") && i+1 < argc) {
+            char *end = NULL;
+            world2_heading_deg = strtof(argv[++i], &end);
+            if (!end || *end || !isfinite(world2_heading_deg)) {
+                fprintf(stderr, "invalid --heading '%s'\n", argv[i]);
+                return 2;
+            }
+            world2_heading_set = 1;
+        }
         else dataroot = argv[i];
+    }
+    if (instance_audit && !world2) {
+        fprintf(stderr, "--instance-audit requires explicit --world2\n");
+        return 2;
+    }
+    if (world2 && !world2_spawn_set) {
+        fprintf(stderr, "--world2 requires --spawn start or --spawn X,Y\n");
+        return 2;
+    }
+    if (world2 && !strcmp(trackname, "ALL")) {
+        fprintf(stderr, "--world2 requires one explicit --track STREAM... bundle; "
+                        "ALL is only a legacy diagnostic union\n");
+        return 2;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
        capture tail, but every dynamic subsystem below is gated off it — no
@@ -1960,7 +2008,79 @@ int main(int argc, char **argv) {
     }
 
     static World world;
-    int nm = world_load(&world, troot, trackname);
+    WLoadOptions world_options = { world2, world2_spawn_xy[0], world2_spawn_xy[1], 700.0f };
+    int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
+                    : world_load(&world, troot, trackname);
+    float world2_spawn_z = 0.0f, world2_support_ref = 0.0f;
+    int world2_support_cat = WSURF_NONE;
+    if (world2 && nm > 0) {
+        float bestd = 1e30f;
+        int have_reference = 0;
+        for (int i = 0; i < world.scene.count; i++) {
+            const N2Mesh *mesh = &world.scene.meshes[i];
+            if (mesh->cat != N2_ROAD && mesh->cat != N2_TERRAIN) continue;
+            for (int v = 0; v < mesh->nverts; v++) {
+                const float *p = mesh->verts + v * 5;
+                float dx = p[0] - world2_spawn_xy[0];
+                float dy = p[1] - world2_spawn_xy[1];
+                float d2 = dx * dx + dy * dy;
+                if (d2 < bestd) {
+                    bestd = d2;
+                    world2_support_ref = p[2];
+                    have_reference = 1;
+                }
+            }
+        }
+        if (have_reference) {
+            WGroundHit support;
+            world2_support_cat = world_ground_hit(&world.scene,
+                                                   world2_spawn_xy[0],
+                                                   world2_spawn_xy[1],
+                                                   world2_support_ref, &support);
+            if (world2_support_cat != WSURF_NONE) world2_spawn_z = support.z;
+        }
+    }
+
+    if (instance_audit) {
+        const WInstStats *st = &world.inst_stats;
+        long triangles = 0, finite_failures = 0;
+        int classes[8] = {0};
+        for (int i = 0; i < world.scene.count; i++) {
+            const N2Mesh *mesh = &world.scene.meshes[i];
+            triangles += mesh->nidx / 3;
+            if (mesh->scen < 8) classes[mesh->scen]++;
+            for (int v = 0; v < mesh->nverts; v++)
+                for (int c = 0; c < 3; c++) {
+                    float q = mesh->verts[v * 5 + c];
+                    if (!isfinite(q) || fabsf(q) > 1e8f) finite_failures++;
+                }
+        }
+        printf("INSTANCE AUDIT bundle=%s home=%d regions=%d/%d radius=%.1f\n",
+               st->bundle[0] ? st->bundle : "-", st->home_region,
+               st->regions_selected, st->regions_total, world_options.view_radius);
+        printf("INSTANCE counts seen=%ld in-range=%ld meshes=%ld missing=%ld "
+               "own-matrix=%ld rejected=%ld triangles=%ld vista=%d\n",
+               st->instances_seen, st->instances_in_range, st->meshes_placed,
+               st->missing_models, st->own_matrix_meshes, st->rejected_meshes,
+               triangles, world.vista.count);
+        printf("INSTANCE scene classes none=%d terrain=%d building=%d prop=%d "
+               "tree=%d wall=%d struct=%d other=%d\n",
+               classes[0], classes[1], classes[2], classes[3],
+               classes[4], classes[5], classes[6], classes[7]);
+        printf("INSTANCE finite-coordinate-failures=%ld\n", finite_failures);
+        printf("INSTANCE support spawn=(%.3f,%.3f,%.3f) reference=%.3f category=%s\n",
+               world2_spawn_xy[0], world2_spawn_xy[1], world2_spawn_z,
+               world2_support_ref,
+               world2_support_cat == WSURF_ROAD ? "ROAD" :
+               world2_support_cat == WSURF_TERRAIN ? "TERRAIN" : "NONE");
+        return nm > 0 && !finite_failures && world2_support_cat != WSURF_NONE ? 0 : 1;
+    }
+    if (world2 && nm > 0 && world2_support_cat == WSURF_NONE) {
+        fprintf(stderr, "--world2 spawn (%.3f, %.3f) has no ROAD/TERRAIN support "
+                        "near the authored layer reference %.3f\n",
+                world2_spawn_xy[0], world2_spawn_xy[1], world2_support_ref);
+        return 1;
+    }
 
     /* --objdump: write the exact post-dedup, world-space scene the GPU batches
        are built from to a .obj, then exit. Independent parser-vs-renderer check:
@@ -2801,7 +2921,13 @@ int main(int argc, char **argv) {
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
-    float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
+    float spawn[3] = {
+        world2 ? world2_spawn_xy[0] : cx,
+        world2 ? world2_spawn_xy[1] : cy,
+        world2 ? world2_spawn_z : cz
+    };
+    float heading0 = world2 && world2_heading_set
+                   ? world2_heading_deg * 3.14159265f / 180.0f : 0.0f;
     if (cdata) {
         ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
         /* Wheels are modelled once at the origin (the SolidObject transform is
@@ -3006,14 +3132,16 @@ int main(int argc, char **argv) {
         }
         /* spawn on the road mesh nearest the track centre; aim inward so a
            straight run stays on the populated track (user steers in play). */
-        float bestd = 1e30f;
-        for (int i = 0; i < nm; i++) if (scene.meshes[i].cat == N2_ROAD) {
-            float vx = scene.meshes[i].verts[0], vy = scene.meshes[i].verts[1];
-            float d = (vx-cx)*(vx-cx) + (vy-cy)*(vy-cy);
-            if (d < bestd) { bestd = d;
-                spawn[0]=vx; spawn[1]=vy; spawn[2]=scene.meshes[i].verts[2]; }
+        if (!world2) {
+            float bestd = 1e30f;
+            for (int i = 0; i < nm; i++) if (scene.meshes[i].cat == N2_ROAD) {
+                float vx = scene.meshes[i].verts[0], vy = scene.meshes[i].verts[1];
+                float d = (vx-cx)*(vx-cx) + (vy-cy)*(vy-cy);
+                if (d < bestd) { bestd = d;
+                    spawn[0]=vx; spawn[1]=vy; spawn[2]=scene.meshes[i].verts[2]; }
+            }
+            heading0 = atan2f(cy - spawn[1], cx - spawn[0]);
         }
-        heading0 = atan2f(cy - spawn[1], cx - spawn[0]);
         printf("car: %d meshes, spawn (%.1f,%.1f) heading %.2f\n",
                ncar, spawn[0], spawn[1], heading0);
     }
@@ -3304,7 +3432,7 @@ int main(int argc, char **argv) {
     AiCar ais[N_AI]; int start_idx = 0;
     /* load_circuit also REWRITES spawn/heading0 to the circuit start; a static
        capture must keep the region's own showcase spawn, so skip it entirely. */
-    int nai = (ncirc && !sstatic) ? load_circuit(dataroot, circlist[selcirc], &scene, &aipath,
+    int nai = (ncirc && !sstatic && !world2) ? load_circuit(dataroot, circlist[selcirc], &scene, &aipath,
                                    ais, spawn, &heading0, &start_idx, densx, densy) : 0;
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
