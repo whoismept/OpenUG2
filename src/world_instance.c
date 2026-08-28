@@ -695,8 +695,31 @@ static int winst_build_visit(const WInstPlacement *placement,
     for (int i = 0; i < proto->scene.count; i++) {
         const N2Mesh *mesh = &proto->scene.meshes[i];
         if (mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN) continue;
-        (void)winst_place_mesh(dst, mesh, placement->matrix, type_name,
-                              build->stats);
+        if (!winst_place_mesh(dst, mesh, placement->matrix, type_name,
+                             build->stats)) return 0;
+    }
+    return 1;
+}
+
+static int winst_place_ground_prototypes(const WInstLibrary *library,
+                                         N2Scene *scene, N2Scene *vista,
+                                         WInstStats *stats) {
+    static const float identity[16] = {
+        1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 1, 0, 0, 0, 0, 1,
+    };
+    if (!library || !scene || !vista) return 0;
+    for (int i = 0; i < library->count; i++) {
+        const WInstProto *proto = &library->items[i];
+        int own_matrix = winst_proto_has_own_matrix(library, proto);
+        const float *matrix = own_matrix ? proto->matrix : identity;
+        N2Scene *dst = proto->is_vista ? vista : scene;
+        for (int mesh = 0; mesh < proto->scene.count; mesh++) {
+            const N2Mesh *source = &proto->scene.meshes[mesh];
+            if (source->cat != N2_ROAD && source->cat != N2_TERRAIN) continue;
+            if (!winst_place_mesh(dst, source, matrix, proto->name, stats)) return 0;
+            if (own_matrix && stats) stats->own_matrix_meshes++;
+        }
     }
     return 1;
 }
@@ -864,21 +887,8 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
     free(keys);
 
-    static const float identity[16] = {
-        1, 0, 0, 0, 0, 1, 0, 0,
-        0, 0, 1, 0, 0, 0, 0, 1,
-    };
-    for (int i = 0; i < library.count; i++) {
-        const WInstProto *proto = &library.items[i];
-        const float *matrix = proto->has_matrix ? proto->matrix : identity;
-        N2Scene *dst = proto->is_vista ? &built_vista : &built_scene;
-        for (int mesh = 0; mesh < proto->scene.count; mesh++) {
-            const N2Mesh *source = &proto->scene.meshes[mesh];
-            if (source->cat != N2_ROAD && source->cat != N2_TERRAIN) continue;
-            if (winst_place_mesh(dst, source, matrix, proto->name, &local_stats) &&
-                proto->has_matrix) local_stats.own_matrix_meshes++;
-        }
-    }
+    if (!winst_place_ground_prototypes(&library, &built_scene, &built_vista,
+                                       &local_stats)) goto cleanup;
 
     WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats };
     WInstWalk collect;

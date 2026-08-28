@@ -73,6 +73,23 @@ world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_
 	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
+world-cli-test: nfsu2
+	@set +e; \
+	./nfsu2 --spawn >/dev/null 2>&1; spawn_missing=$$?; \
+	./nfsu2 --heading >/dev/null 2>&1; heading_missing=$$?; \
+	./nfsu2 --spawn malformed >/dev/null 2>&1; spawn_bad=$$?; \
+	./nfsu2 --heading malformed >/dev/null 2>&1; heading_bad=$$?; \
+	./nfsu2 build/no-such-data-root --track STREAML4RA --world2 --spawn start \
+	  --objdump /dev/null >/dev/null 2>&1; world2_load_fail=$$?; \
+	if test $$spawn_missing -eq 2 && test $$heading_missing -eq 2 && \
+	   test $$spawn_bad -eq 2 && test $$heading_bad -eq 2 && \
+	   test $$world2_load_fail -eq 1; then \
+	  echo "world_cli_test: PASS"; \
+	else \
+	  echo "world_cli_test: FAIL missing-spawn=$$spawn_missing missing-heading=$$heading_missing bad-spawn=$$spawn_bad bad-heading=$$heading_bad world2-load=$$world2_load_fail"; \
+	  exit 1; \
+	fi
+
 # OpenGL ES 2.0 (embedded/mobile). Cross-compile e.g.:
 #   CC=aarch64-linux-gnu-gcc make gles
 gles: $(SRC) $(HDRS) $(GEN)
@@ -85,4 +102,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test
+.PHONY: run gles clean debug world-instance-test world-cli-test

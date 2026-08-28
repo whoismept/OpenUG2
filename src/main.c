@@ -1365,7 +1365,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
         else if (!strcmp(argv[i], "--world2")) world2 = 1;
         else if (!strcmp(argv[i], "--instance-audit")) instance_audit = 1;
-        else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
+        else if (!strcmp(argv[i], "--spawn")) {
+            if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
+                fprintf(stderr, "missing operand for --spawn (expected start or X,Y)\n");
+                return 2;
+            }
             const char *value = argv[++i];
             if (!strcmp(value, "start")) {
                 world2_spawn_xy[0] = 1695.2f;
@@ -1382,7 +1386,11 @@ int main(int argc, char **argv) {
                 world2_spawn_set = 1;
             }
         }
-        else if (!strcmp(argv[i], "--heading") && i+1 < argc) {
+        else if (!strcmp(argv[i], "--heading")) {
+            if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
+                fprintf(stderr, "missing operand for --heading (expected degrees)\n");
+                return 2;
+            }
             char *end = NULL;
             world2_heading_deg = strtof(argv[++i], &end);
             if (!end || *end || !isfinite(world2_heading_deg)) {
@@ -2011,6 +2019,12 @@ int main(int argc, char **argv) {
     WLoadOptions world_options = { world2, world2_spawn_xy[0], world2_spawn_xy[1], 700.0f };
     int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
                     : world_load(&world, troot, trackname);
+    if (world2 && nm <= 0) {
+        fprintf(stderr, "--world2 load failed for %s at requested focus "
+                        "(%.3f, %.3f); exiting before SDL/GL initialization\n",
+                trackname, world2_spawn_xy[0], world2_spawn_xy[1]);
+        return 1;
+    }
     float world2_spawn_z = 0.0f, world2_support_ref = 0.0f;
     int world2_support_cat = WSURF_NONE;
     if (world2 && nm > 0) {

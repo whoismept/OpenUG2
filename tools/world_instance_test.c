@@ -1,7 +1,10 @@
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "nfsu2.h"
 #include "world_instance.h"
@@ -312,6 +315,241 @@ static void test_section_collection(void) {
     assert(stats.instances_seen == 3);
     assert(stats.instances_in_range == 2);
     assert(stats.rejected_meshes == 1);
+
+    unsigned char nested[sizeof data + 8];
+    put_u32(nested, 0x80000001ul);
+    put_u32(nested + 4, (unsigned long)used);
+    memcpy(nested + 8, data, (size_t)used);
+    memset(&capture, 0, sizeof capture);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_test_collect_placements(nested, used + 8,
+                                         0.0f, 0.0f, 5.0f,
+                                         capture_placement, &capture, &stats) == 1);
+    assert(capture.count == 1 && stats.instances_seen == 3);
+    assert(winst_test_collect_placements(data, used - 1,
+                                         0.0f, 0.0f, 5.0f,
+                                         capture_placement, &capture, &stats) == 0);
+    assert(winst_test_collect_placements(nested, used + 7,
+                                         0.0f, 0.0f, 5.0f,
+                                         capture_placement, &capture, &stats) == 0);
+}
+
+static void test_instance_failure_aborts(void) {
+    float verts[] = {
+        NAN, 0, 0, 0, 0,
+        1, 0, 0, 0, 0,
+        0, 1, 0, 0, 0,
+    };
+    uint16_t idx[] = {0, 1, 2};
+    N2Mesh mesh;
+    WInstProto proto;
+    WInstLibrary library;
+    N2Scene scene, vista;
+    WInstStats stats;
+    WInstBuildVisit build;
+    WInstPlacement placement;
+    memset(&mesh, 0, sizeof mesh);
+    memset(&proto, 0, sizeof proto);
+    memset(&library, 0, sizeof library);
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    memset(&placement, 0, sizeof placement);
+    mesh.verts = verts;
+    mesh.nverts = 3;
+    mesh.idx = idx;
+    mesh.nidx = 3;
+    mesh.cat = N2_OTHER;
+    proto.scene.meshes = &mesh;
+    proto.scene.count = 1;
+    proto.name_hash = winst_name_key("XO_FAIL", proto.name);
+    library.items = &proto;
+    library.count = 1;
+    for (int i = 0; i < 16; i++) placement.matrix[i] = i % 5 == 0 ? 1.0f : 0.0f;
+    build.library = &library;
+    build.scene = &scene;
+    build.vista = &vista;
+    build.stats = &stats;
+
+    assert(winst_build_visit(&placement, "XO_FAIL", &build) == 0);
+    assert(scene.count == 0 && vista.count == 0);
+    assert(stats.rejected_meshes == 1);
+}
+
+static void test_ground_stage_eligibility_and_failure(void) {
+    float verts[] = {
+        0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0,
+        0, 1, 0, 0, 0,
+    };
+    uint16_t idx[] = {0, 1, 2};
+    N2Mesh mesh[2];
+    WInstProto proto[2];
+    WInstLibrary library;
+    N2Scene scene, vista;
+    WInstStats stats;
+    memset(mesh, 0, sizeof mesh);
+    memset(proto, 0, sizeof proto);
+    memset(&library, 0, sizeof library);
+    mesh[0].verts = verts;
+    mesh[0].nverts = 3;
+    mesh[0].idx = idx;
+    mesh[0].nidx = 3;
+    mesh[0].cat = N2_ROAD;
+    proto[0].scene.meshes = mesh;
+    proto[0].scene.count = 1;
+    proto[0].has_matrix = 1;
+    proto[0].matrix[0] = proto[0].matrix[5] = proto[0].matrix[10] =
+        proto[0].matrix[15] = 1.0f;
+    proto[0].matrix[12] = 7.0f;
+    winst_name_key("TRN_GROUND", proto[0].name);
+    library.items = proto;
+    library.count = 1;
+
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(scene.count == 1 && near(scene.meshes[0].verts[0], 7.0f));
+    assert(stats.own_matrix_meshes == 1);
+    free_scene(&scene);
+
+    proto[1] = proto[0];
+    library.count = 2;
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(scene.count == 2);
+    assert(near(scene.meshes[0].verts[0], 0.0f));
+    assert(near(scene.meshes[1].verts[0], 0.0f));
+    assert(stats.own_matrix_meshes == 0);
+    free_scene(&scene);
+
+    library.count = 1;
+    proto[0].scene.count = 2;
+    mesh[1] = mesh[0];
+    mesh[1].cat = N2_OTHER;
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(scene.count == 1 && near(scene.meshes[0].verts[0], 0.0f));
+    assert(stats.own_matrix_meshes == 0);
+    free_scene(&scene);
+
+    proto[0].scene.count = 1;
+    verts[0] = NAN;
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 0);
+    assert(scene.count == 0 && vista.count == 0);
+    assert(stats.rejected_meshes == 1);
+    verts[0] = 0.0f;
+}
+
+static int write_fixture_file(const char *path,
+                              const unsigned char *data, long len) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    size_t written = fwrite(data, 1, (size_t)len, file);
+    int closed = fclose(file);
+    return written == (size_t)len && closed == 0;
+}
+
+static void test_builder_home_atomicity_and_bundle_isolation(void) {
+    const char *root = "build/world_instance_fixture";
+    assert(mkdir(root, 0777) == 0 || errno == EEXIST);
+    unsigned char companion[256], stream_a[512], stream_b[512], stream_c[2048];
+    unsigned char placement[64];
+    long companion_len = make_regions(companion, sizeof companion);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+    long stream_a_len = add_section(stream_a, 0, 23, "XO_WRONG", placement, 1);
+    long stream_b_len = add_section(stream_b, 0, 17, "XO_HOME", placement, 1);
+    unsigned char model[512], header[128], verts[72], idx[6];
+    memset(model, 0, sizeof model);
+    memset(header, 0, sizeof header);
+    memset(verts, 0, sizeof verts);
+    memset(idx, 0, sizeof idx);
+    memcpy(header, "XO_FAIL", 8);
+    for (int i = 0; i < 16; i++) put_f32(header + 0x40 + i * 4,
+                                          i % 5 == 0 ? 1.0f : 0.0f);
+    put_f32(verts + 24, 1.0f);
+    put_f32(verts + 48 + 4, 1.0f);
+    put_u16(idx + 0, 0);
+    put_u16(idx + 2, 1);
+    put_u16(idx + 4, 2);
+    long model_len = 0;
+    model_len = add_leaf(model, model_len, 0x00134011ul, header, sizeof header);
+    model_len = add_leaf(model, model_len, 0x00134b01ul, verts, sizeof verts);
+    model_len = add_leaf(model, model_len, 0x00134b03ul, idx, sizeof idx);
+    put_u32(stream_c, 0x80134010ul);
+    put_u32(stream_c + 4, (unsigned long)model_len);
+    memcpy(stream_c + 8, model, (size_t)model_len);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+    put_f32(placement + 0x20, NAN);
+    long stream_c_len = add_section(stream_c, 8 + model_len, 17,
+                                    "XO_FAIL", placement, 1);
+    assert(write_fixture_file("build/world_instance_fixture/L4RA.BUN",
+                              companion, companion_len));
+    assert(write_fixture_file("build/world_instance_fixture/L4RB.BUN",
+                              companion, companion_len));
+    assert(write_fixture_file("build/world_instance_fixture/L4RC.BUN",
+                              companion, companion_len));
+    assert(write_fixture_file("build/world_instance_fixture/STREAML4RA.BUN",
+                              stream_a, stream_a_len));
+    assert(write_fixture_file("build/world_instance_fixture/STREAML4RB.BUN",
+                              stream_b, stream_b_len));
+    assert(write_fixture_file("build/world_instance_fixture/STREAML4RC.BUN",
+                              stream_c, stream_c_len));
+
+    N2Mesh scene_sentinel, vista_sentinel;
+    memset(&scene_sentinel, 0, sizeof scene_sentinel);
+    memset(&vista_sentinel, 0, sizeof vista_sentinel);
+    scene_sentinel.cat = 77;
+    vista_sentinel.cat = 88;
+    N2Scene scene = { &scene_sentinel, 1, 1 };
+    N2Scene vista = { &vista_sentinel, 1, 1 };
+    WInstStats stats;
+    const char *only_wrong[] = { "STREAML4RA" };
+    memset(&stats, 0, sizeof stats);
+    assert(world_instance_build(&scene, &vista, root, only_wrong, 1,
+                                0.0f, 0.0f, 5.0f,
+                                NULL, 0, &stats) == 0);
+    assert(scene.meshes == &scene_sentinel && scene.count == 1 && scene.cap == 1);
+    assert(vista.meshes == &vista_sentinel && vista.count == 1 && vista.cap == 1);
+    assert(scene.meshes[0].cat == 77 && vista.meshes[0].cat == 88);
+    assert(stats.home_region == 17 && stats.bundle[0] == 0);
+
+    const char *forced_failure[] = { "STREAML4RC" };
+    memset(&stats, 0, sizeof stats);
+    assert(world_instance_build(&scene, &vista, root, forced_failure, 1,
+                                0.0f, 0.0f, 5.0f,
+                                NULL, 0, &stats) == 0);
+    assert(scene.meshes == &scene_sentinel && scene.count == 1 && scene.cap == 1);
+    assert(vista.meshes == &vista_sentinel && vista.count == 1 && vista.cap == 1);
+    assert(scene.meshes[0].cat == 77 && vista.meshes[0].cat == 88);
+    assert(stats.rejected_meshes == 1);
+
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    const char *requested[] = { "STREAML4RA", "STREAML4RB" };
+    assert(world_instance_build(&scene, &vista, root, requested, 2,
+                                0.0f, 0.0f, 5.0f,
+                                NULL, 0, &stats) == 1);
+    assert(strcmp(stats.bundle, "STREAML4RB") == 0);
+    assert(stats.home_region == 17);
+    assert(scene.count == 0 && vista.count == 0);
+
+    remove("build/world_instance_fixture/L4RA.BUN");
+    remove("build/world_instance_fixture/L4RB.BUN");
+    remove("build/world_instance_fixture/L4RC.BUN");
+    remove("build/world_instance_fixture/STREAML4RA.BUN");
+    remove("build/world_instance_fixture/STREAML4RB.BUN");
+    remove("build/world_instance_fixture/STREAML4RC.BUN");
+    rmdir(root);
 }
 
 static void test_private_prototype_paths(void) {
@@ -384,6 +622,9 @@ int main(void) {
     test_direct_placement();
     test_private_prototype_paths();
     test_section_collection();
+    test_instance_failure_aborts();
+    test_ground_stage_eligibility_and_failure();
+    test_builder_home_atomicity_and_bundle_isolation();
     puts("world_instance_test: PASS");
     return 0;
 }
