@@ -6,6 +6,28 @@
 #include "nfsu2.h"
 #include "world_instance.h"
 
+/* Test the private prototype library without widening the production API. The
+ * normal translation unit is still linked by the Makefile; rename only its
+ * public functions in this isolated copy and expose its private helpers here. */
+#define winst_parse_regions winst_parse_regions_test_copy
+#define winst_free_regions winst_free_regions_test_copy
+#define winst_select_regions winst_select_regions_test_copy
+#define winst_decode_placement winst_decode_placement_test_copy
+#define winst_place_mesh winst_place_mesh_test_copy
+#define winst_test_placement_live_allocations winst_test_placement_live_allocations_test_copy
+#define static
+#include "../src/world_instance.c"
+#undef static
+#undef winst_test_placement_live_allocations
+#undef winst_place_mesh
+#undef winst_decode_placement
+#undef winst_select_regions
+#undef winst_free_regions
+#undef winst_parse_regions
+
+/* Test-only observation hook; it is deliberately not part of world_instance.h. */
+long winst_test_placement_live_allocations(void);
+
 static void put_u16(unsigned char *p, unsigned int v) {
     p[0] = (unsigned char)(v & 0xffu);
     p[1] = (unsigned char)((v >> 8) & 0xffu);
@@ -179,17 +201,102 @@ static void test_direct_placement(void) {
     assert(dst.meshes[0].scen == src.scen && dst.meshes[0].vrepair == src.vrepair);
     assert(strcmp(dst.meshes[0].sname, src.sname) == 0);
 
-    src.verts[0] = NAN;
-    assert(winst_place_mesh(&dst, &src, p.matrix, "XO_TEST", &st) == 0);
-    assert(dst.count == 1 && st.rejected_meshes == 1);
+    float identity[16] = {
+        1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 1, 0, 0, 0, 0, 1,
+    };
+    src.verts[0] = 100000000.0f;
+    assert(winst_place_mesh(&dst, &src, identity, "XO_TEST", &st) == 1);
+    assert(dst.count == 2);
+    long live_before_rejections = winst_test_placement_live_allocations();
+    const float invalid[] = { NAN, INFINITY, -INFINITY, 100000008.0f };
+    for (int i = 0; i < (int)(sizeof invalid / sizeof invalid[0]); i++) {
+        src.verts[0] = invalid[i];
+        assert(winst_place_mesh(&dst, &src, identity, "XO_TEST", &st) == 0);
+        assert(dst.count == 2 && st.rejected_meshes == i + 1);
+        assert(winst_test_placement_live_allocations() == live_before_rejections);
+    }
     src.verts[0] = 0;
     free_scene(&dst);
+}
+
+static long add_leaf(unsigned char *buf, long pos, unsigned long magic,
+                     const unsigned char *body, long body_len) {
+    put_u32(buf + pos, magic);
+    put_u32(buf + pos + 4, (unsigned long)body_len);
+    memcpy(buf + pos + 8, body, (size_t)body_len);
+    return pos + 8 + body_len;
+}
+
+static void test_private_prototype_paths(void) {
+    WInstLibrary library;
+    WInstProto proto[2];
+    N2Mesh ranges[2];
+    WInstStats st;
+    char folded[28];
+    memset(&library, 0, sizeof library);
+    memset(proto, 0, sizeof proto);
+    memset(ranges, 0, sizeof ranges);
+    memset(&st, 0, sizeof st);
+    library.items = proto;
+    library.count = 1;
+    proto[0].name_hash = winst_name_key("XO_TARGET", folded);
+    snprintf(proto[0].name, sizeof proto[0].name, "XO_OTHER");
+    assert(winst_library_find(&library, "xo_target", &st) == NULL);
+    assert(st.missing_models == 1);
+
+    proto[0].name_hash = winst_name_key("xo_target", proto[0].name);
+    proto[0].has_matrix = 1;
+    proto[0].scene.meshes = ranges;
+    proto[0].scene.count = 2;
+    ranges[0].cat = N2_ROAD;
+    ranges[1].cat = N2_ROAD;
+    assert(winst_library_find(&library, "XO_TARGET", &st) == &proto[0]);
+    assert(st.missing_models == 1);
+    assert(winst_proto_has_own_matrix(&library, &proto[0]) == 1);
+
+    proto[1] = proto[0];
+    library.count = 2;
+    assert(winst_proto_has_own_matrix(&library, &proto[0]) == 0);
+
+    unsigned char model[512], header[128], slot[8], sub[60], verts[72], idx[6];
+    memset(model, 0, sizeof model);
+    memset(header, 0, sizeof header);
+    memset(slot, 0, sizeof slot);
+    memset(sub, 0, sizeof sub);
+    memset(verts, 0, sizeof verts);
+    memset(idx, 0, sizeof idx);
+    memcpy(header, "TRN_ROAD_TEST", 13);
+    for (int i = 0; i < 16; i++) put_f32(header + 0x40 + i * 4,
+                                          i % 5 == 0 ? 1.0f : 0.0f);
+    put_u32(slot, 0x1234);
+    put_u32(sub + 12, 2); /* malformed: a material range cannot be a triangle */
+    put_u32(sub + 28, 0);
+    put_u32(sub + 52, 0);
+    put_f32(verts + 24, 1.0f);
+    put_f32(verts + 48 + 4, 1.0f);
+    put_u16(idx + 0, 0);
+    put_u16(idx + 2, 1);
+    put_u16(idx + 4, 2);
+    long used = 0;
+    used = add_leaf(model, used, 0x00134011ul, header, sizeof header);
+    used = add_leaf(model, used, 0x00134012ul, slot, sizeof slot);
+    used = add_leaf(model, used, 0x00134b02ul, sub, sizeof sub);
+    used = add_leaf(model, used, 0x00134b01ul, verts, sizeof verts);
+    used = add_leaf(model, used, 0x00134b03ul, idx, sizeof idx);
+    memset(&library, 0, sizeof library);
+    winst_collect_model(&library, model, 0, used, NULL, 0);
+    assert(library.count == 1 && library.items[0].scene.count == 1);
+    assert(library.items[0].scene.meshes[0].nidx == 3);
+    assert(library.items[0].scene.meshes[0].texkey == 0x1234u);
+    winst_library_free(&library);
 }
 
 int main(void) {
     test_regions();
     test_placement();
     test_direct_placement();
+    test_private_prototype_paths();
     puts("world_instance_test: PASS");
     return 0;
 }

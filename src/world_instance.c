@@ -22,6 +22,27 @@ typedef struct {
     int count, cap;
 } WInstLibrary;
 
+/* Kept out of the public header: the standalone regression uses this to prove
+ * a rejected placement releases every copy allocated for that attempted mesh. */
+static long winst_placement_live_allocations;
+
+static void *winst_place_alloc(size_t size) {
+    void *ptr = malloc(size);
+    if (ptr) winst_placement_live_allocations++;
+    return ptr;
+}
+
+static void winst_place_free(void *ptr) {
+    if (ptr) {
+        winst_placement_live_allocations--;
+        free(ptr);
+    }
+}
+
+long winst_test_placement_live_allocations(void) {
+    return winst_placement_live_allocations;
+}
+
 static void winst_reject(WInstStats *stats) {
     if (stats) stats->rejected_meshes++;
 }
@@ -58,13 +79,13 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
     }
 
     N2Mesh placed = *src;
-    placed.verts = (float *)malloc(nverts * 5 * sizeof *placed.verts);
-    placed.idx = (uint16_t *)malloc(nidx * sizeof *placed.idx);
-    placed.vcol = src->vcol ? (unsigned char *)malloc(nverts * 4) : NULL;
+    placed.verts = (float *)winst_place_alloc(nverts * 5 * sizeof *placed.verts);
+    placed.idx = (uint16_t *)winst_place_alloc(nidx * sizeof *placed.idx);
+    placed.vcol = src->vcol ? (unsigned char *)winst_place_alloc(nverts * 4) : NULL;
     if (!placed.verts || !placed.idx || (src->vcol && !placed.vcol)) {
-        free(placed.verts);
-        free(placed.idx);
-        free(placed.vcol);
+        winst_place_free(placed.verts);
+        winst_place_free(placed.idx);
+        winst_place_free(placed.vcol);
         winst_reject(stats);
         return 0;
     }
@@ -82,9 +103,9 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
         if (!isfinite(out[0]) || !isfinite(out[1]) || !isfinite(out[2]) ||
             fabsf(out[0]) > WINST_WORLD_LIMIT || fabsf(out[1]) > WINST_WORLD_LIMIT ||
             fabsf(out[2]) > WINST_WORLD_LIMIT) {
-            free(placed.verts);
-            free(placed.idx);
-            free(placed.vcol);
+            winst_place_free(placed.verts);
+            winst_place_free(placed.idx);
+            winst_place_free(placed.vcol);
             winst_reject(stats);
             return 0;
         }
@@ -92,9 +113,9 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
     placed.inst = 1;
     snprintf(placed.aname, sizeof placed.aname, "%.27s", asset_name ? asset_name : "");
     if (!winst_push_mesh(dst, placed)) {
-        free(placed.verts);
-        free(placed.idx);
-        free(placed.vcol);
+        winst_place_free(placed.verts);
+        winst_place_free(placed.idx);
+        winst_place_free(placed.vcol);
         winst_reject(stats);
         return 0;
     }
@@ -180,10 +201,12 @@ static const WInstProto *winst_library_find(const WInstLibrary *library,
  * prototype for a requested asset. */
 static int winst_proto_has_own_matrix(const WInstLibrary *library,
                                       const WInstProto *proto) {
-    if (!library || !proto || !proto->has_matrix || proto->scene.count != 1)
+    if (!library || !proto || !proto->has_matrix || proto->scene.count <= 0)
         return 0;
-    int cat = proto->scene.meshes[0].cat;
-    if (cat != N2_ROAD && cat != N2_TERRAIN) return 0;
+    for (int mesh = 0; mesh < proto->scene.count; mesh++) {
+        int cat = proto->scene.meshes[mesh].cat;
+        if (cat != N2_ROAD && cat != N2_TERRAIN) return 0;
+    }
     for (int i = 0; i < library->count; i++)
         if (&library->items[i] != proto &&
             !strcmp(library->items[i].name, proto->name)) return 0;
