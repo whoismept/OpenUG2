@@ -107,11 +107,11 @@ static void test_placement(void) {
     assert(near(p.bounds_min[2], 7.5f));
     assert(near(p.bounds_max[0], 100.0f) && near(p.bounds_max[1], -25.0f));
     assert(near(p.bounds_max[2], 7.5f));
-    const float want[9] = {0, 1, 0, 0, -1, 0, 0, 0, 0};
-    for (int i = 0; i < 9; i++) assert(near(p.matrix[i], want[i]));
-    assert(near(p.matrix[10], 1.0f));
-    assert(near(p.matrix[12], 100.0f) && near(p.matrix[13], -25.0f));
-    assert(near(p.matrix[14], 7.5f) && near(p.matrix[15], 1.0f));
+    const float want[16] = {
+        0, 1, 0, 0, -1, 0, 0, 0,
+        0, 0, 1, 0, 100, -25, 7.5f, 1
+    };
+    for (int i = 0; i < 16; i++) assert(near(p.matrix[i], want[i]));
 
     memset(&p, 0, sizeof p);
     assert(winst_decode_placement(record, (long)sizeof record - 1, &p) == 0);
