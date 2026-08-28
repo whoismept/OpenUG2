@@ -279,6 +279,30 @@ static long add_section(unsigned char *buf, long pos, int region_id,
     return pos;
 }
 
+static long add_model(unsigned char *buf, long pos, const char *name) {
+    unsigned char model[512], header[128], verts[72], idx[6];
+    memset(model, 0, sizeof model);
+    memset(header, 0, sizeof header);
+    memset(verts, 0, sizeof verts);
+    memset(idx, 0, sizeof idx);
+    snprintf((char *)header, 32, "%s", name);
+    for (int i = 0; i < 16; i++)
+        put_f32(header + 0x40 + i * 4, i % 5 == 0 ? 1.0f : 0.0f);
+    put_f32(verts + 24, 1.0f);
+    put_f32(verts + 48 + 4, 1.0f);
+    put_u16(idx + 0, 0);
+    put_u16(idx + 2, 1);
+    put_u16(idx + 4, 2);
+    long model_len = 0;
+    model_len = add_leaf(model, model_len, 0x00134011ul, header, sizeof header);
+    model_len = add_leaf(model, model_len, 0x00134b01ul, verts, sizeof verts);
+    model_len = add_leaf(model, model_len, 0x00134b03ul, idx, sizeof idx);
+    put_u32(buf + pos, 0x80134010ul);
+    put_u32(buf + pos + 4, (unsigned long)model_len);
+    memcpy(buf + pos + 8, model, (size_t)model_len);
+    return pos + 8 + model_len;
+}
+
 typedef struct {
     int count;
     char name[32];
@@ -457,6 +481,51 @@ static int write_fixture_file(const char *path,
     size_t written = fwrite(data, 1, (size_t)len, file);
     int closed = fclose(file);
     return written == (size_t)len && closed == 0;
+}
+
+static void test_builder_uses_bounds_across_unmapped_sections(void) {
+    const char *root = "build/world_instance_cross_section_fixture";
+    assert(mkdir(root, 0777) == 0 || errno == EEXIST);
+    unsigned char companion[256], stream[4096], car[64], decks[2 * 64];
+    long companion_len = make_regions(companion, sizeof companion);
+    memset(stream, 0, sizeof stream);
+    long stream_len = 0;
+    stream_len = add_model(stream, stream_len, "XO_CAR");
+    stream_len = add_model(stream, stream_len, "XB_DECK");
+    make_instance_record(car, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+    make_instance_record(decks, 0, -2.0f, -2.0f, 2.0f, 2.0f);
+    make_instance_record(decks + 64, 0, 50.0f, 50.0f, 52.0f, 52.0f);
+    stream_len = add_section(stream, stream_len, 17, "XO_CAR", car, 1);
+    stream_len = add_section(stream, stream_len, 23, "XB_DECK", decks, 2);
+    assert(write_fixture_file(
+        "build/world_instance_cross_section_fixture/L4RD.BUN",
+        companion, companion_len));
+    assert(write_fixture_file(
+        "build/world_instance_cross_section_fixture/STREAML4RD.BUN",
+        stream, stream_len));
+
+    N2Scene scene, vista;
+    WInstStats stats;
+    memset(&scene, 0, sizeof scene);
+    memset(&vista, 0, sizeof vista);
+    memset(&stats, 0, sizeof stats);
+    const char *requested[] = { "STREAML4RD" };
+    assert(world_instance_build(&scene, &vista, root, requested, 1,
+                                0.0f, 0.0f, 5.0f,
+                                NULL, 0, &stats) == 1);
+    assert(strcmp(stats.bundle, "STREAML4RD") == 0);
+    assert(stats.home_region == 17);
+    assert(stats.regions_total == 1 && stats.regions_selected == 1);
+    assert(scene.count == 2 && vista.count == 0);
+    assert(stats.instances_seen == 3 && stats.instances_in_range == 2);
+    assert(strcmp(scene.meshes[0].aname, "XO_CAR") == 0);
+    assert(strcmp(scene.meshes[1].aname, "XB_DECK") == 0);
+    free_scene(&scene);
+    free_scene(&vista);
+
+    remove("build/world_instance_cross_section_fixture/L4RD.BUN");
+    remove("build/world_instance_cross_section_fixture/STREAML4RD.BUN");
+    rmdir(root);
 }
 
 static void test_builder_home_atomicity_and_bundle_isolation(void) {
@@ -652,6 +721,7 @@ int main(void) {
     test_section_collection();
     test_instance_failure_aborts();
     test_ground_stage_eligibility_and_failure();
+    test_builder_uses_bounds_across_unmapped_sections();
     test_builder_home_atomicity_and_bundle_isolation();
     test_world2_capture_policy();
     puts("world_instance_test: PASS");

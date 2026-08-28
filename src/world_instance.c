@@ -893,8 +893,9 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
     WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats };
     WInstWalk collect;
     memset(&collect, 0, sizeof collect);
-    collect.selected = selected;
-    collect.selected_cap = 65536;
+    /* Companion polygons locate home and choose this one bundle, but are not a
+     * complete ownership index. Scan its sections and filter each record by
+     * authored bounds so nearby geometry from unmapped sections is retained. */
     collect.find_region = local_stats.home_region;
     collect.focus_x = focus_x;
     collect.focus_y = focus_y;
