@@ -32,6 +32,7 @@
 #include "resource.h"
 #include "world.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
+#include "world_capture_policy.h"
 #include "debug.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
@@ -1188,7 +1189,7 @@ int main(int argc, char **argv) {
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
          --world2         opt into diagnostic instance-driven world assembly
          --spawn start|X,Y  focus/spawn for --world2 (required)
-         --heading DEG    requested --world2 heading
+         --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
@@ -1428,6 +1429,10 @@ int main(int argc, char **argv) {
         shot = dashot; shotframes = 2220;
     }
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
+    const WorldCapturePolicy capture_policy = world_capture_policy(
+        world2, shot != NULL, sstatic, world2_heading_set);
+    if (capture_policy.fixed_camera)
+        shotyaw = world2_heading_deg * 3.14159265f / 180.0f;
     if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
     if (vcmpA) {   /* M121: same fixed input trace, two cars, flat ROAD. GL-free. */
         const char *nmv[2] = { vcmpA, vcmpB };
@@ -3716,7 +3721,7 @@ int main(int argc, char **argv) {
        away. Menu/showcase only: the Enter branch, sl_first_safe, the race route
        start and the --shot-static selector are all downstream and untouched, and
        if nothing passes, the shipped pose is left exactly as it was. */
-    if (!sstatic && !sspawn && !sstack &&
+    if (!capture_policy.preserve_explicit_pose && !sstatic && !sspawn && !sstack &&
         (citypose || !strcmp(trackname, "STREAML4RA"))) {
         const float (*wmbb)[4] = (const float (*)[4])world.mbb;
         float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
@@ -4322,7 +4327,7 @@ int main(int argc, char **argv) {
     float paint[3] = { 0.70f, 0.70f, 0.75f };
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && !daudit && aipath.n > 0) {
+    if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -4332,7 +4337,8 @@ int main(int argc, char **argv) {
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
     /* an armed race wins: start on its own grid, facing through the start line */
-    if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
+    if (!sstatic && !capture_policy.freeze_motion)
+        race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
@@ -4600,7 +4606,7 @@ int main(int argc, char **argv) {
            sideways component so hard cornering at speed slides/drifts). */
         float throttle = 0.0f;
         if (!g_dbg.freecam && race_state == 1) {
-            if      (ks[SDL_SCANCODE_W] || (shot && !sstatic)) throttle =  1.0f;
+            if      (ks[SDL_SCANCODE_W] || (shot && !sstatic && !capture_policy.freeze_motion)) throttle =  1.0f;
             else if (ks[SDL_SCANCODE_S])         throttle = -1.0f;
         }
         float steer = g_dbg.freecam ? 0.f
@@ -4673,7 +4679,8 @@ int main(int argc, char **argv) {
            snap lands the car inside geometry, so collide_walls holds it at
            0 km/h; pre-existing, not the race system). */
         static int rpath[8192]; static int rpn = 0, rp_gate = -1, rp_at = 0;
-        int race_auto = shot && !sstatic && world.race.active && !world.race.finished;
+        int race_auto = shot && !sstatic && !capture_policy.freeze_motion &&
+                        world.race.active && !world.race.finished;
         if (race_auto) {
             if (rp_gate != world.race.next) {
                 int s = world_nav_nearest(&world, carpos[0], carpos[1]);
@@ -4744,7 +4751,7 @@ int main(int argc, char **argv) {
               carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
-        else if (shot && !sstatic && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        else if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -4761,7 +4768,7 @@ int main(int argc, char **argv) {
             if (da> 0.06f) da= 0.06f; if (da<-0.06f) da=-0.06f;
             heading += da;
         }
-        float dmag = sstatic ? 0.0f
+        float dmag = (sstatic || capture_policy.freeze_motion) ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
                                    throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
@@ -4788,7 +4795,7 @@ int main(int argc, char **argv) {
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
         PhysWallContact wc[8]; int nwc = 0;
         float vpre[2] = { vel[0], vel[1] };
-        if (raudit && race_state == 1 && !race_auto && !sstatic) {
+        if (raudit && race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
             /* read-only: the same rects collide_walls is about to test, before it
                moves anything. Nothing here writes carpos or vel. */
             for (int o = 0; o < nobst; o++) {
@@ -4805,7 +4812,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (race_state == 1 && !race_auto && !sstatic &&
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion &&
             (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
@@ -4824,7 +4831,7 @@ int main(int argc, char **argv) {
             } }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
-          int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
+          int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) &&
                         world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
@@ -4834,11 +4841,12 @@ int main(int argc, char **argv) {
           }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
-        if (race_state == 1 && !race_auto && !sstatic && world_barrier_push(&world, carpos, 1.3f)) {
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion && world_barrier_push(&world, carpos, 1.3f)) {
             vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
         /* checkpoint / lap tracking, after the pushes so it sees the final XY */
-        if (race_state == 1 && !race_auto && !sstatic) world_race_update(&world, carpos[0], carpos[1]);
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion)
+            world_race_update(&world, carpos[0], carpos[1]);
         /* Stable contact pose: select ONE triangle using the same reference-Z
            rule for height, surface class and normal. The previous four-wheel
            experiment could combine four different stacked layers, making the
@@ -4862,7 +4870,7 @@ int main(int argc, char **argv) {
            climb toward it at 0.5 m per frame. */
         static WGroundHit ride_hit[4], ride_cand[4]; static int ride_reason[4];
         int ride_nsup = 0;
-        if (!sstatic && !race_auto) {
+        if (!sstatic && !capture_policy.freeze_motion && !race_auto) {
             ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
@@ -5152,7 +5160,7 @@ int main(int argc, char **argv) {
            to cover the centre this frame. This is rigid-body road alignment,
            not the later per-wheel suspension system. */
         int chassis_patch_ok=0;
-        if (!sstatic && !race_auto && g_ride_ready) {
+        if (!sstatic && !capture_policy.freeze_motion && !race_auto && g_ride_ready) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
             float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
@@ -5814,7 +5822,7 @@ int main(int argc, char **argv) {
                      grounded wheel stays on its contact while the sprung body
                      heaves, pitches and rolls above it. A single shared height
                      would float or sink tyres on every bump. */
-                  float wzk = wz + (g_ride_ready && !sstatic ? g_ride.compression[k] : 0.0f);
+                  float wzk = wz + (g_ride_ready && !sstatic && !capture_policy.freeze_motion ? g_ride.compression[k] : 0.0f);
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
                                wp[k][0],wp[k][1],wzk,1};

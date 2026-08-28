@@ -26,7 +26,7 @@ endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_instance.h src/world_mesh.h
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_instance.h src/world_mesh.h src/world_capture_policy.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -68,7 +68,7 @@ build/%.dbg.o: src/%.c $(HDRS) $(GEN)
 debug: $(DBG_OBJ) $(IMGUI_OBJ)
 	$(CXX) -O2 $(DBG_OBJ) $(IMGUI_OBJ) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
 
-world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_instance.h src/nfsu2.h
+world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_instance.h src/world_capture_policy.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c -o build/world_instance_test -lm
 	./build/world_instance_test

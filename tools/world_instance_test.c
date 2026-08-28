@@ -8,6 +8,7 @@
 
 #include "nfsu2.h"
 #include "world_instance.h"
+#include "world_capture_policy.h"
 
 /* Test the private prototype library without widening the production API. The
  * normal translation unit is still linked by the Makefile; rename only its
@@ -616,6 +617,33 @@ static void test_private_prototype_paths(void) {
     winst_library_free(&library);
 }
 
+static void test_world2_capture_policy(void) {
+    WorldCapturePolicy capture = world_capture_policy(1, 1, 0, 1);
+    assert(capture.preserve_explicit_pose);
+    assert(capture.fixed_camera);
+    assert(capture.freeze_motion);
+
+    WorldCapturePolicy interactive = world_capture_policy(1, 0, 0, 1);
+    assert(interactive.preserve_explicit_pose);
+    assert(!interactive.fixed_camera);
+    assert(!interactive.freeze_motion);
+
+    WorldCapturePolicy no_heading = world_capture_policy(1, 1, 0, 0);
+    assert(no_heading.preserve_explicit_pose);
+    assert(!no_heading.fixed_camera);
+    assert(!no_heading.freeze_motion);
+
+    WorldCapturePolicy legacy = world_capture_policy(0, 1, 0, 1);
+    assert(!legacy.preserve_explicit_pose);
+    assert(!legacy.fixed_camera);
+    assert(!legacy.freeze_motion);
+
+    WorldCapturePolicy legacy_static = world_capture_policy(0, 1, 1, 1);
+    assert(!legacy_static.preserve_explicit_pose);
+    assert(!legacy_static.fixed_camera);
+    assert(!legacy_static.freeze_motion);
+}
+
 int main(void) {
     test_regions();
     test_placement();
@@ -625,6 +653,7 @@ int main(void) {
     test_instance_failure_aborts();
     test_ground_stage_eligibility_and_failure();
     test_builder_home_atomicity_and_bundle_isolation();
+    test_world2_capture_policy();
     puts("world_instance_test: PASS");
     return 0;
 }

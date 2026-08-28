@@ -143,7 +143,11 @@ exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
 normalizing only machine-specific absolute paths or elapsed time if present.
 For a fixed render check, retain the same arguments, replace the audit switch
 with `--shot OUTPUT.png`, and change only `--heading` (for example `-101`,
-`-11`, `79`, or `169`). Keep generated logs and captures outside Git.
+`-11`, `79`, or `169`). In this explicit `--world2 --shot` mode, `--heading`
+is the fixed camera direction (and seeds the parked car yaw); the requested
+supported spawn is preserved, with no legacy showcase selection, race-grid
+placement, or capture autopilot. `--instance-audit` remains GL-free and has no
+camera output. Keep generated logs and captures outside Git.
 
 ### Region bytes and texture lifetime
 
