@@ -175,7 +175,7 @@ static void test_decoded_asymmetric_placement(void) {
     put_f32(record + 0x04, -25.0f);
     put_f32(record + 0x08, 7.5f);
     put_f32(record + 0x0c, 104.0f);
-    put_f32(record + 0x10, -23.0f);
+    put_f32(record + 0x10, -22.0f);
     put_f32(record + 0x14, 7.5f);
     put_u16(record + 0x18, 3);
     put_f32(record + 0x20, 100.0f);
@@ -187,7 +187,7 @@ static void test_decoded_asymmetric_placement(void) {
     WInstPlacement placement;
     assert(winst_decode_placement(record, (long)sizeof record, &placement) == 1);
     assert(close3(placement.bounds_min, 99.5f, -25.0f, 7.5f));
-    assert(close3(placement.bounds_max, 104.0f, -23.0f, 7.5f));
+    assert(close3(placement.bounds_max, 104.0f, -22.0f, 7.5f));
 
     float verts[] = {
         0, 0, 0, 0, 0,
@@ -212,6 +212,18 @@ static void test_decoded_asymmetric_placement(void) {
     assert(close3(dst.meshes[0].verts + 5, 104.0f, -23.0f, 7.5f));
     assert(close3(dst.meshes[0].verts + 10, 103.5f, -22.0f, 7.5f));
     assert(close3(dst.meshes[0].verts + 15, 99.5f, -24.0f, 7.5f));
+    float placed_min[3] = {dst.meshes[0].verts[0], dst.meshes[0].verts[1],
+                           dst.meshes[0].verts[2]};
+    float placed_max[3] = {placed_min[0], placed_min[1], placed_min[2]};
+    for (int i = 1; i < 4; i++) {
+        const float *v = dst.meshes[0].verts + i * 5;
+        for (int axis = 0; axis < 3; axis++) {
+            if (v[axis] < placed_min[axis]) placed_min[axis] = v[axis];
+            if (v[axis] > placed_max[axis]) placed_max[axis] = v[axis];
+        }
+    }
+    assert(close3(placed_min, 99.5f, -25.0f, 7.5f));
+    assert(close3(placed_max, 104.0f, -22.0f, 7.5f));
     free_scene(&dst);
 }
 

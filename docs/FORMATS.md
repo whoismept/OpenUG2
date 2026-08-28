@@ -265,6 +265,9 @@ record convention is required for the decoded placement to match authored
 instance bounds when the engine's direct placement multiplication is applied.
 A type index outside the type table, malformed bounds, or a non-finite/absurd
 transformed vertex rejects that placement rather than guessing another model.
+During the staged instance-world build, any such rejection aborts the entire
+build atomically; destination scenes remain untouched rather than receiving a
+partial placement set.
 
 Districts may overlap. For an explicit focus point, OpenUG2 chooses the
 smallest containing polygon as the home district and marks every district
