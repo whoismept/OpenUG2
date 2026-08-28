@@ -102,6 +102,49 @@ data root
        -> race state -> camera -> render passes -> optional diagnostics
 ```
 
+### Opt-in instance-driven district flow
+
+The legacy STREAM object walk remains the default. `--world2` is a diagnostic
+instance-world path and must be paired with one explicit `--track STREAM...`
+and `--spawn start` or `--spawn X,Y`; it refuses `--track ALL`. The named
+`start` pose is only a repeatable L4RA reference focus, not a new freeroam
+spawn policy.
+
+For this path, `main` resolves the requested XY before `world_load_ex`.
+`world_instance_build` reads companion district polygons, selects the smallest
+containing home district and nearby district ids, then chooses one bundle that
+has the home section. It builds a local prototype library from that bundle,
+places in-range non-ground instances with their instance matrices, and emits
+the one-time ROAD/TERRAIN fallback prototypes before the normal world pipeline:
+
+```text
+--world2 focus
+  -> companion polygon selection
+  -> one home-section STREAM bundle
+  -> local prototype library + instance placements
+  -> world_dedup -> terrain bias -> bounds/ground grid -> nav -> textures/batches
+```
+
+After the completed ground grid exists, the diagnostic spawn Z is resolved
+against the nearest authored ROAD/TERRAIN layer. This establishes load-time
+support evidence only; it does not establish vertical contact, collision,
+physics, alpha/glass, lighting, or vista behavior.
+
+Use the GL-free audit for deterministic assembly evidence:
+
+```sh
+./nfsu2 DATA_ROOT --track STREAML4RA --world2 --spawn start --heading -101 --instance-audit
+```
+
+It reports selected bundle/home district, region and instance totals, placed
+meshes, missing-model and rejected-placement counts, triangle and scene-class
+totals, finite-coordinate failures, and the ROAD/TERRAIN support result; it
+exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
+normalizing only machine-specific absolute paths or elapsed time if present.
+For a fixed render check, retain the same arguments, replace the audit switch
+with `--shot OUTPUT.png`, and change only `--heading` (for example `-101`,
+`-11`, `79`, or `169`). Keep generated logs and captures outside Git.
+
 ### Region bytes and texture lifetime
 
 `WRegion.data` owns each loaded STREAM buffer. Mesh parsing stores copied CPU

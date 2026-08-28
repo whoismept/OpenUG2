@@ -225,6 +225,62 @@ or draw them; the common texture-binding pass may still resolve a vista key
 before the tier gate. `--tier full` is experimental because some shipped
 sheets are fully opaque and still form hard horizon bands.
 
+### Instance-driven world districts (`0x341xx`)
+
+**PROVEN.** A companion regional bundle supplies polygonal districts through
+`0x80034150` → `0x00034152`. Its payload starts with a run of `0x11` filler;
+the following records are variable-length:
+
+| offset | type | meaning |
+|---:|---|---|
+| `+0x08` | `u16` | district id |
+| `+0x0a` | `u16` | polygon vertex count, 1–64 |
+| `+0x0c` | `f32[4]` | XY bounding rectangle `{min_x,min_y,max_x,max_y}` |
+| `+0x1c` | 8 B | not consumed by the current reader |
+| `+0x24` | `f32[vertex_count][2]` | polygon XY vertices |
+
+The complete record length is `0x24 + vertex_count * 8`; a run of `0x11`
+bytes may separate adjacent records. The loader validates both the enclosing
+chunk boundaries and this computed length before copying a polygon.
+
+The STREAM bundle contains one or more `0x80034100` sections. Each usable
+section has all three children below; their payloads may start with `0x11`
+filler, which is skipped only when that makes the remaining length an exact
+record stride.
+
+| child | layout used by OpenUG2 |
+|---|---|
+| `0x00034101` | at least 16 bytes; `u32` district id at `+0x0c` |
+| `0x00034102` | 68-byte type records; bounded NUL-terminated model name in the first 32 bytes, remainder not consumed |
+| `0x00034103` | 64-byte placement records |
+
+A placement record has `f32[3]` AABB minimum at `+0x00`, AABB maximum at
+`+0x0c`, `u16 type_index` at `+0x18`, `u16 flags` at `+0x1a`, translation
+`f32[3]` at `+0x20`, and a 3×3 signed-`i16` row-major rotation/scale block at
+`+0x2c`. Each rotation/scale cell is divided by 8192.0; negative values stay
+negative. The runtime transposes that row-major 3×3 block into its
+column-major affine matrix, keeps the translation at matrix elements 12–14,
+and uses identity for the last row/column. A type index outside the type table,
+malformed bounds, or a non-finite/absurd transformed vertex rejects that
+placement rather than guessing another model.
+
+Districts may overlap. For an explicit focus point, OpenUG2 chooses the
+smallest containing polygon as the home district and marks every district
+whose XY bounding rectangle is within the configured radius. It then selects
+one STREAM bundle that actually contains a section for that home id; it does
+not compose every overlapping bundle. If no such section exists, assembly
+fails without replacing the destination scenes.
+
+Models in the selected bundle are collected as local prototypes: their object
+matrix is retained as prototype metadata, not baked into the local vertices.
+An in-range non-ground placement applies its own decoded matrix directly to
+the matching named prototype. ROAD/TERRAIN prototypes are instead emitted once:
+a unique prototype with an authored object matrix uses that matrix; otherwise
+it uses identity and remains in its local/world coordinates. Unreferenced
+non-ground variants are not emitted. Existing vista classification still routes
+those prototypes to `World.vista`, and existing deduplication, terrain bias,
+ground-grid, collision, batching, and texture ownership rules run afterward.
+
 ## Textures
 
 Two TPK container variants are used. World textures may be P8, DXT1 or DXT3;
