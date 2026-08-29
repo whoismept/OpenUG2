@@ -307,7 +307,8 @@ int world_load(World *w, const char *troot, const char *trackname) {
 }
 
 int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *modes, int cap) {
     int n = 0;
     for (int r = 0; r < w->nreg; r++) {
         WRegion *g = &w->rgn[r];
@@ -322,7 +323,17 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
                 ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
             if (!ok && w->master)
                 ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
-            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
+            if (ok && !n2_tex_noise(&tt)) {
+                keys[n] = tk; texs[n] = upload_tex(&tt);
+                /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
+                   itself; a key that resolved via n2_load_car_tex_by_key (the
+                   shared LOC4 car-texture library) keeps them at their zero
+                   default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
+                   world texture had before this field existed, not a new
+                   misclassification. */
+                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                n++;
+            }
             else if (g_world_texaudit) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
@@ -346,7 +357,14 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
             if (!ok && w->loc4) ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
             if (!ok && w->master) ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
-            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
+            if (ok && !n2_tex_noise(&tt)) {
+                keys[n] = tk; texs[n] = upload_tex(&tt);
+                /* vista batches don't consult drawmode (the tier has its own
+                   uVista alpha-blend path), but fill it anyway so the slot
+                   never carries stale/uninitialised data. */
+                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                n++;
+            }
             else if (g_world_texaudit) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different

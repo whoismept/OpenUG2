@@ -38,6 +38,7 @@ static const char *FS =
     "uniform float uGloss; uniform float uFlipN;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
+    "uniform float uAlphaTest;\n" /* >0.5: discard below 0.5 texture alpha */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -90,6 +91,11 @@ static const char *FS =
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
+    /* N2_DRAW_CUTOUT world batches only (M135): uAlphaTest is 0.0 for every
+       other draw call, so this changes nothing anywhere else. Threshold 0.5
+       matches the authored railing/fence texture's own 1-bit DXT1 alpha
+       (fully 0 or 255, no partial value to tune against). */
+    "  if(uAlphaTest>0.5 && t.a<0.5) discard;\n"
     "  vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;\n"
     /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
        Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
@@ -246,6 +252,7 @@ RProg render_program(void) {
     r.uSpec    = glGetUniformLocation(r.prog, "uSpec");
     r.uDecal   = glGetUniformLocation(r.prog, "uDecal");
     r.uVista      = glGetUniformLocation(r.prog, "uVista");
+    r.uAlphaTest  = glGetUniformLocation(r.prog, "uAlphaTest");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
@@ -265,6 +272,7 @@ RProg render_program(void) {
     glUniform1f(r.uUVCheck, 0.0f);
     glUniform1f(r.uGloss, 20.0f);
     glUniform1f(r.uFlipN, 0.0f);
+    glUniform1f(r.uAlphaTest, 0.0f);
     glUniform3f(r.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
     return r;
 }
@@ -454,7 +462,8 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
 
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
 static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
-                       GLuint tex, N2Batch *b, int bidx, const char *audit) {
+                       GLuint tex, N2Batch *b, int bidx, const char *audit,
+                       const unsigned char *mtexmode) {
     int nv = 0, ni = 0;
     for (int k = i0; k < i1; k++) {
         nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx;
@@ -492,6 +501,7 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
+    b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
     for (int k = i0; k < i1; k++) {
         int sc = s->meshes[ent[k].idx].scen;
         if (sc >= 0 && sc < 8) b->scen_count[sc]++;
@@ -502,7 +512,8 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
 
 int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                          const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                         const char *audit, int *meshbatch) {
+                         const char *audit, int *meshbatch,
+                         const unsigned char *mtexmode) {
     int n = s->count;
     if (meshbatch) for (int i = 0; i < n; i++) meshbatch[i] = -1;
     /* world extent -> grid coords */
@@ -543,7 +554,7 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat);
                 run0 = (int *)realloc(run0, (size_t)cap * sizeof *run0);
                 run1 = (int *)realloc(run1, (size_t)cap * sizeof *run1); }
-            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit);
+            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit, mtexmode);
             run0[nb] = i0; run1[nb] = i; nb++;
             i0 = i; verts = 0;
         }
@@ -575,7 +586,8 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
 /* Same merge as above but for exactly one category, grouped by texture only
  * (no spatial grid — a city has a handful of skybox/neon meshes, not tens of
  * thousands, so there's nothing for a cell split to buy here). */
-int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out) {
+int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
+                       const unsigned char *mtexmode) {
     int n = s->count;
     BSortEnt *ent = (BSortEnt *)malloc((size_t)(n ? n : 1) * sizeof *ent);
     int m = 0;
@@ -590,7 +602,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }
-            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL);
+            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL, mtexmode);
             nb++;
             i0 = i; verts = 0;
         }

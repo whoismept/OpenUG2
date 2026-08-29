@@ -365,7 +365,16 @@ library, minus a `0x0C` padding prefix that this in-place variant omits):
 +0x30 PaletteSize (u32)     // 0 = not palettized; 1024 = 256-entry RGBA
 +0x38 Width  (u16)
 +0x3a Height (u16)
++0x45 order  (u8)           // draw-order hint (unused by OpenUG2)
++0x49 usage  (u8)           // PROVEN (M135): 0=opaque/normal, 1=cutout (alpha test)
++0x4a blend  (u8)           // PROVEN (M135): 1=source-alpha blend, 2=additive
++0x4b wz     (u8)           // depth-write hint (unused by OpenUG2)
 ```
+
+`order`/`usage`/`blend`/`wz` are only read when a **complete** `0x4c`-byte
+record is present (`i + 0x4c <= hend`); a truncated header leaves all four at
+their zero-initialized default, which maps to opaque — matching every other
+"missing data degrades to the safe/legacy behaviour" rule in this codebase.
 
 Pixels are in block `0xb3320000`, under its **`0x33320002`** sub-chunk payload
 (a `0x33320001` info sub-chunk comes first), and **`Offset`/`PaletteOffset` are
@@ -377,8 +386,14 @@ record, not the (always-0) compression byte:
   then 8-bit indices at `Offset`. This is what the road-surface textures use
   (`RDP_AIRPORT_ROADPATCH_A` is 512×512 P8), which is why they looked like
   high-entropy noise until decoded through the palette — **not** a swizzle.
-- **DXT1 / DXT3** (no palette) — inferred from `Size` (DXT3 base `= W·H`, DXT1
-  `= W·H/2`).
+- **DXT1 / DXT3** (no palette) — inferred from `Size` against a per-format
+  **ceil-to-4 block count**: `bx=(w+3)/4, by=(h+3)/4`; DXT1 needs `bx*by*8`
+  bytes, DXT3 needs `bx*by*16` bytes (the record is assumed DXT3 when
+  `Size > w*h*9/10`, else DXT1). **PROVEN fix (M135):** the previous bound used
+  a flat `w*h/2` estimate, which under-validated DXT3 by 2× and let
+  `n2_dxt3` read up to 46 bytes past the end of the data block on a
+  non-multiple-of-4 texture — a latent OOB read, now closed (see
+  `tools/car_material_test.c` fixtures T7/T8/T8b).
 
 Alpha semantics are format-specific and **PROVEN** by A/B renders:
 
@@ -386,6 +401,42 @@ Alpha semantics are format-specific and **PROVEN** by A/B renders:
 - DXT1 is transparent only in the `c0 <= c1` mode and only for selector 3.
 - DXT3 carries an explicit 4-bit alpha value per pixel.
 - An all-255 decoded plane is discarded, preserving the opaque RGB upload path.
+- Authored alpha bytes are never normalized, thresholded or color-keyed by the
+  decoder; the raw palette/DXT alpha value is passed through byte-for-byte.
+  Any dimming/discard decision belongs to the renderer (see "Draw modes"
+  below), not the texture loader.
+
+### Draw modes (M135)
+
+`n2_tex_mode(const N2Tex *t)` derives one of four modes from the header bytes
+above:
+
+| `usage` | `blend` | mode | meaning |
+|---|---|---|---|
+| `1` | — | `N2_DRAW_CUTOUT` | alpha-test discard below 0.5; no blending |
+| `2` | `1` | `N2_DRAW_BLEND` | depth write off, `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` |
+| any | `2` | `N2_DRAW_ADD` | depth write off, `GL_SRC_ALPHA`/`GL_ONE` |
+| else | else | `N2_DRAW_OPAQUE` | depth test+write on, no blending, no discard |
+
+Measured `(order, usage, blend, wz)` signatures from real TPK records:
+opaque `(0,0,0,1)`, cutout `(0,1,0,1)` (`OBJ_RAILING`, `STREAML4RA`), blend
+`(5,2,1,0)`, additive `(5,2,2,0)`. One oddball signature, `(0,2,0,1)`, occurs
+on both a water surface and a parking-wall texture that both render opaque in
+the retail game despite carrying non-opaque alpha — `n2_tex_mode` maps it to
+`N2_DRAW_OPAQUE` (falls through both `usage==1` and `blend` checks), matching
+observed retail behaviour; it is not currently distinguished from ordinary
+opaque textures because no further evidence separates the two real uses.
+
+The mode is per-texture-record, threaded from `world_bind_textures` through a
+parallel `mtexmode`/`modes` array (mirroring the existing `mtex` GL-texture-
+handle array) into `N2Batch.drawmode`, and dispatched at draw time: opaque and
+cutout batches share the ordinary pass (cutout toggles the shader's
+`uAlphaTest` uniform per batch); blend/additive batches are deferred into a
+second pass drawn after all opaque/cutout geometry, with depth test on but
+depth write off (so they don't occlude each other or later translucents, but
+are still correctly hidden behind real opaque geometry). Texture alpha is
+never gated on `uVColor` — per-vertex prelight strength and authored texture
+transparency are independent controls.
 
 Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
 own `STREAM*.BUN` TPK carries its

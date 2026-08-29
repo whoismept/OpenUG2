@@ -2749,7 +2749,8 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
-    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
+    static unsigned char tmapmode[2048];
+    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
@@ -2813,9 +2814,12 @@ int main(int argc, char **argv) {
     /* resolve each mesh's texture once — the per-frame key scan was fine for
        one region, not for a whole city of meshes */
     GLuint *mtex = (GLuint *)calloc(nm, sizeof *mtex);
+    unsigned char *mtexmode = (unsigned char *)calloc((size_t)(nm ? nm : 1), 1);
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
-            if (tmapkey[j] == scene.meshes[i].texkey) { mtex[i] = tmaptex[j]; break; }
+            if (tmapkey[j] == scene.meshes[i].texkey) {
+                mtex[i] = tmaptex[j]; mtexmode[i] = tmapmode[j]; break;
+            }
     if (nansweep) {
         long bad = 0, badobj = 0;
         for (int i = 0; i < nm; i++) {
@@ -4185,8 +4189,8 @@ int main(int argc, char **argv) {
        the ordinary opaque city batches. Print a note if a region genuinely
        has no SKYDOME mesh — the shader just falls back to the flat fog
        clear colour, which is correct but worth knowing about. */
-    N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch);
-    N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch);
+    N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch, NULL);
+    N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch, NULL);
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
@@ -4218,7 +4222,7 @@ int main(int argc, char **argv) {
             N2Scene one = { &world.vista.meshes[i], 1, 1 };
             GLuint t1 = vtex[i];
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part);
+            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part, NULL);
             if (np) {
                 vbatch = (N2Batch *)realloc(vbatch, (size_t)(nvista+np) * sizeof *vbatch);
                 vmesh  = (int *)realloc(vmesh,      (size_t)(nvista+np) * sizeof *vmesh);
@@ -4262,7 +4266,7 @@ int main(int argc, char **argv) {
         for (int c = 0; c <= N2_GLOW; c++) {
             N2Scene rs = { rm, nrm, 4096 };
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&rs, c, rtx, &part);
+            int np = upload_cat_batches(&rs, c, rtx, &part, NULL);
             if (np) {
                 rbatch = (N2Batch *)realloc(rbatch, (size_t)(nrep+np) * sizeof *rbatch);
                 memcpy(rbatch + nrep, part, (size_t)np * sizeof *part);
@@ -4294,10 +4298,12 @@ int main(int argc, char **argv) {
     static int *meshbatch = NULL;
     meshbatch = (int *)malloc((size_t)(nm ? nm : 1) * sizeof *meshbatch);
     int nbatch = upload_world_batches(&scene, (const float (*)[4])world.mbb,
-                                      mtex, texTerr, &wbatch, bmesh, meshbatch);
+                                      mtex, texTerr, &wbatch, bmesh, meshbatch,
+                                      mtexmode);
     /* the local-scene audit reads per-mesh texture resolution every frame, so
        the table has to outlive batching when it is enabled */
     if (!lsaudit) { free(mtex); mtex = NULL; }
+    free(mtexmode); mtexmode = NULL;
     printf("world batched: %d meshes -> %d batches\n", nm, nbatch);
     if (baudit) return 0;   /* --batch-audit: report printed above, nothing to draw */
 
@@ -5559,8 +5565,13 @@ int main(int argc, char **argv) {
         if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
                          memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
+        /* M135: N2_DRAW_BLEND/ADD batches are deferred out of this pass -- they
+           need depth-write off and real blending, neither of which the ordinary
+           opaque/cutout loop below sets up. Collected here, drawn afterward. */
+        static int deferred[4096]; int ndeferred = 0;
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
+        int lastmode = -1;
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
@@ -5578,16 +5589,57 @@ int main(int argc, char **argv) {
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
+            if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
+                if (ndeferred < 4096) deferred[ndeferred++] = k;
+                continue;   /* drawn in the deferred pass below, not here */
+            }
             ndrawn += b->nmesh;
             if (b->tex != lasttex) {
                 if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
                 else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
                 lasttex = b->tex;
             }
+            if (b->drawmode != lastmode) {
+                glUniform1f(rp.uAlphaTest, b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+                lastmode = b->drawmode;
+            }
             draw_batch(b);
             for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
+        }
+        if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
+        /* Deferred pass: authored blended/additive world batches. Depth test
+           stays on (correct occlusion by real opaque geometry) but depth
+           write is off (a translucent/glow surface must not occlude what's
+           behind it), exactly the same shape as the existing car-glass and
+           vista passes elsewhere in this function. Not sorted back-to-front
+           within itself -- there is no proven live defect that needs it, and
+           every batch here is still individually depth-tested against the
+           opaque scene already drawn above. */
+        if (ndeferred) {
+            glEnable(GL_BLEND);
+            glDepthMask(GL_FALSE);
+            GLuint lasttex2 = (GLuint)-1; int lastmode2 = -1;
+            for (int q = 0; q < ndeferred; q++) {
+                N2Batch *b = &wbatch[deferred[q]];
+                if (b->tex != lasttex2) {
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                    lasttex2 = b->tex;
+                }
+                if (b->drawmode != lastmode2) {
+                    glBlendFunc(GL_SRC_ALPHA, b->drawmode == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                    lastmode2 = b->drawmode;
+                }
+                draw_batch(b);
+                for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
+                ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+                if (nviskept < 4096) viskept[nviskept++] = deferred[q];
+            }
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* restore the ordinary default */
         }
         if (nrep) {   /* diagnostic overlay: where the restored geometry is */
             glUniform1f(uUseTex, 0.0f);

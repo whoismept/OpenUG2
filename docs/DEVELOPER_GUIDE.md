@@ -268,6 +268,38 @@ must not alter ordinary same-pose output unless that is the explicit task.
 retain meaningful alpha; an all-255 plane is freed. Do not invent black
 chromakey transparency. DXT1 transparency exists only in its three-colour mode.
 
+### Draw modes (M135)
+
+Authored records carry a draw-mode byte pair (`usage`/`blend`, see
+`docs/FORMATS.md`); `n2_tex_mode` maps them to
+`N2_DRAW_{OPAQUE,CUTOUT,BLEND,ADD}`. The mode is per-texture, resolved once in
+`world_bind_textures` (optional trailing `modes` output array) and threaded
+per-mesh into `upload_world_batches`/`upload_cat_batches` (optional trailing
+`mtexmode` array), landing on `N2Batch.drawmode`. Callers that don't care
+(sky/glow/vista/diagnostic-marker batches) pass `NULL` and get
+`N2_DRAW_OPAQUE`, unchanged from before this field existed.
+
+The main world draw loop in `main.c` dispatches on `drawmode`:
+
+- `OPAQUE`/`CUTOUT` share the ordinary pass (depth test+write on, no
+  blending); `CUTOUT` additionally sets the shader's `uAlphaTest` uniform to
+  1.0 for the duration of its run of batches, enabling a fragment-shader
+  `discard` below 0.5 alpha. Toggled per-batch like the existing `lasttex`
+  bind cache, reset to 0.0 after the loop.
+- `BLEND`/`ADD` batches are collected into a `deferred[]` array instead of
+  being drawn inline, then drawn in one pass right after: depth write off
+  (so they don't occlude what's behind or each other), depth test still on
+  (so real opaque geometry still occludes them correctly), `glBlendFunc`
+  set per-batch (`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` for `BLEND`,
+  `GL_SRC_ALPHA, GL_ONE` for `ADD`). This mirrors the existing car-glass and
+  vista translucent-pass shape elsewhere in the file. Not sorted
+  back-to-front within itself; every batch is still individually depth-
+  tested against the already-drawn opaque scene, and no proven defect
+  requires finer ordering yet.
+
+Texture alpha is never gated on `uVColor`: per-vertex prelight strength and
+authored texture transparency are independent and must not be conflated.
+
 ## 8. Car loading and presentation
 
 The car path is:
