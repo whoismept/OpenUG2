@@ -169,8 +169,8 @@ it from transformed X alone is incorrect.
 | `+0x00` | `f32[3]` | local range bounding-box minimum |
 | `+0x0c` | `u32` | index count |
 | `+0x10` | `f32[3]` | local range bounding-box maximum |
-| `+0x1c` | `u32` | material slot id |
-| `+0x20` | `u32` | render-state flag; semantics still **UNKNOWN** |
+| `+0x1c` | `u32` | `mat`: texture-slot id, positional index into `0x134012` |
+| `+0x20` | `u32` | **PROVEN (M135)**: `matid`, positional index into the object's own `0x134013` material-hash list (see below). Distinct from `mat` at `+0x1c`: on `GOLF_KIT00_BODY_A`, one record has `mat=1, matid=1`; another has `mat=0, matid=4` -- independent selectors into two independent lists. |
 | `+0x24` | 16 B | unknown/reserved |
 | `+0x34` | `u32` | index start |
 
@@ -179,7 +179,48 @@ For the simple production path they must start at zero, form a contiguous chain,
 contain at least one triangle each, stay inside `0x134B03`, and end at the last
 whole triangle. One spare alignment index is allowed; a two-index tail is not.
 `n2_mesh_submeshes` currently accepts exactly one submesh leaf whose body is a
-multiple of 60.
+multiple of 60. Car-only callers additionally run
+`n2_car_submesh_partition_ok`, which re-validates the SAME chain against the
+object's own decoded index-buffer length before a material/texture split is
+ever trusted; any violation keeps the whole-object path.
+
+### `0x134013`: positional material-hash list
+
+**PROVEN (M135).** Same 8-byte-entry shape as `0x134012` (first `u32` kept,
+second unused), parsed by `n2_mesh_matslots`. Values are `n2_str_hash(name)`
+of a material class name (`h = 0xFFFFFFFF; h = h*33 + byte`, applied per
+byte); unlike `0x134012` keys, POSITION within the list is per-object (not
+globally fixed), but the HASH VALUE is globally meaningful -- the same
+material class hashes to the same `u32` everywhere.
+
+Verified against live `GOLF` data, independently re-derived (not copied from
+any external source):
+
+```text
+n2_str_hash("WINDSHIELD") == 0x471a1dca
+n2_str_hash("CARSKIN")    == 0xd6d6080a
+```
+
+`GOLF_BASE_A`'s own `0x134013` list is
+`[0fedee40, 02a05578, 010cb64a, 3ed70c43, 471a1dca]` -- index 4 is
+`WINDSHIELD`, selected by three of its submeshes (one wide front-facing
+pane plus a mirrored left/right pair), none of which resolve a texture key,
+exactly the shape real glass geometry produces. `GOLF_KIT00_BODY_A`'s list
+is `[0fedee40, a7366ae6, d6d6080a, 010cb64a, 02a05578]` -- index 2 is
+`CARSKIN`, selected by its dominant 534-index submesh. Checked across every
+one of `GOLF`'s 608 objects and 2171 `0x134B02` records: every `matid` is
+in-bounds for its own object's `0x134013` list, 2171/2171 (100%).
+
+`n2_mat_class(hash, fallback)` maps a hash to a car category. Only
+`WINDSHIELD -> N2_CAR_GLASS` and `CARSKIN -> N2_CAR_BODY` are classified;
+every other hash -- known-but-unmapped (chrome, aluminium, moldings,
+plastics, tire/rim materials, lens classes all measure the same way but are
+not yet wired) or absent/out-of-range -- returns `fallback`, the
+object-level category from `n2_car_category`, unchanged. A car object
+splits into separate `N2Mesh` slices when EITHER the resolved texture
+differs across `0x134B02` records OR the classified material differs; a
+same-texture body-and-glass object could never split under the old
+texture-only rule.
 
 ### `0x134012`: positional texture slots
 
@@ -204,11 +245,26 @@ available in the region/shared TPK wins; an unavailable key falls back only for
 that range. A malformed object falls back to the legacy one-key whole-object
 path rather than partially dropping geometry.
 
-Cars use the same linkage when multiple records resolve to different textures.
-This matters for small badge/light slices embedded in a large paint panel. If
-all records resolve to the same key, the car remains one draw to avoid a
-pixel-identical draw-call increase. Implementation: `n2_mesh_texslots`,
-`n2_mesh_submeshes`, `n2_walk_meshes`, and `n2_walk_car`.
+Cars use the same linkage when multiple records resolve to different
+textures, OR (M135) when they classify to different material categories via
+`matid -> 0x134013` (see above) even on the SAME texture -- the case a
+same-texture body-and-glass object needs. If neither differs, the car
+remains one draw to avoid a pixel-identical draw-call increase.
+Implementation: `n2_mesh_texslots`, `n2_mesh_matslots`, `n2_mesh_submeshes`,
+`n2_walk_meshes`, and `n2_walk_car`.
+
+**Complete-tier LOD selection (M135).** Splitting by material means two LOD
+tiers of one part need not contain the same slices. `n2_walk_car` tags every
+slice emitted from one `0x80134010` occurrence with the same `tierid`
+(`N2Mesh.tierid`, a plain per-object counter, distinct from `namekey` which
+groups a part ACROSS tiers). `n2_car_dedupe_lod` competes whole tiers, not
+individual meshes: tiers sharing a `namekey` whose union bounding boxes
+overlap score by SUMMED index count (`nidx`, not `nverts` -- `n2_add_pair`
+duplicates the full vertex array per split slice, so scoring by vertex count
+would reward a heavily-split tier for slice count alone) across all their
+slices, and the losing tier's slices are dropped as one unit. This is what
+lets an unmatched glass slice in the winning tier survive instead of being
+compared, and possibly dropped, independently of its own tier's body panel.
 
 ### Object identity, duplicates and vista objects
 

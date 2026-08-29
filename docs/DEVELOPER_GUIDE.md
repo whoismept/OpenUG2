@@ -275,9 +275,11 @@ The car path is:
 ```text
 GEOMETRY.BIN
   -> n2_walk_car
-  -> material-range split when keys differ
+  -> material-range split when a resolved texture key differs, OR a proven
+     material class differs (0x134B02 matid -> 0x134013 hash, e.g.
+     WINDSHIELD -> N2_CAR_GLASS, CARSKIN -> N2_CAR_BODY)
   -> n2_car_apply_config (KIT/STYLE override)
-  -> n2_car_dedupe_lod
+  -> n2_car_dedupe_lod (complete-tier selection, see below)
   -> n2_car_profile (body/tyre measurements)
 
 TEXTURES.BIN
@@ -295,6 +297,51 @@ GLOBALB.BUN
 `KIT00` remains the base car. Higher kit/style records override only matching
 families. Roof, body, badge and light appearance must come from the same
 material rules; never hard-code roof colour by part name.
+
+### Material routing (`0x134B02.matid -> 0x134013`)
+
+A `0x134B02` submesh record carries two positional indices, not one:
+`mat` (`+0x1c`) into the object's `0x134012` texture-slot list (unchanged,
+existing), and `matid` (`+0x20`) into a SEPARATE `0x134013` material-hash
+list (`n2_mesh_matslots`). These answer different questions: `mat` says
+which texture a range binds; `matid` says what CLASS of material it is,
+independent of texture. A car object can (and does) put body paint and
+window glass on the *same* texture slot while giving them different
+`matid` values — `n2_walk_car`'s old texture-only split could never see
+that difference and drew the whole thing as one opaque panel.
+
+`n2_mat_class` maps a material hash to a category. Only two mappings are
+proven and used: `WINDSHIELD -> N2_CAR_GLASS`, `CARSKIN -> N2_CAR_BODY`
+(both hash constants independently re-derived and verified against live
+`GOLF` data — see the `n2_mesh_submeshes` doc comment for the exact
+records). Chrome, aluminium, moldings, plastics, tire/rim materials and
+lens classes are measurable the same way but are deliberately NOT
+classified yet; an unmapped or out-of-range `matid` inherits the
+object-level category from `n2_car_category`, unchanged.
+
+Before trusting a matid-driven (or texture-driven) split at all,
+`n2_car_submesh_partition_ok` requires the `0x134B02` ranges to start at
+index 0, chain contiguously with no gap or overlap, and end exactly at the
+decoded index buffer's own end. Any violation keeps the old whole-object
+path — a malformed partition can shrink coverage but must never grow or
+duplicate it.
+
+### Complete-tier LOD selection
+
+Splitting a car object by material means two LOD tiers of the same part no
+longer necessarily contain the same slices — a lower tier can lack a glass
+slice entirely. `n2_car_dedupe_lod` therefore competes whole TIERS, not
+individual meshes: every slice `n2_walk_car` emits from one `0x80134010`
+occurrence carries the same `tierid` (a plain incrementing counter, reset
+implicitly per car load, distinct from `namekey` which groups a part
+ACROSS tiers). Tiers sharing a `namekey` and whose UNION bounding boxes
+overlap compete as one family; the tier with the larger SUMMED `nidx`
+(triangle index count) across all its slices wins, and every slice of
+every other tier in that group is dropped. Do not score by summed
+`nverts` — `n2_add_pair` duplicates the whole source vertex array per
+split slice, so a heavily-split tier would win merely for having more
+slices, independent of how much triangle detail it contributes. Ties keep
+the earlier-encountered tier, matching the pre-M135 tie-break exactly.
 
 The stock wheel visual is currently partly procedural. Wheel position and ride
 height are separate concerns: axle/track data place contact points, while the

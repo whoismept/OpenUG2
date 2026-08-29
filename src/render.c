@@ -676,7 +676,7 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
     }
-    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0 };
+    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0, 0,0,0,0 };
     GLuint id = upload_tex(&t);
     /* radial, single-sample cap texture (no tiling intended) — clamp so a
        filter footprint near u/v=0 or 1 can't wrap and bleed in colour from

@@ -73,6 +73,11 @@ world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_
 	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
+car-material-test: tools/car_material_test.c src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm
+	./build/car_material_test
+
 world-cli-test: nfsu2
 	@set +e; \
 	./nfsu2 --spawn >/dev/null 2>&1; spawn_missing=$$?; \
@@ -102,4 +107,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test

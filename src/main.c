@@ -3119,7 +3119,7 @@ int main(int argc, char **argv) {
             if (got && bodykey && n2_load_car_tex_by_key(ctdata, ctlen, bodykey, &bt)) {
                 int W = bt.w > vt.w ? bt.w : vt.w, H = bt.h > vt.h ? bt.h : vt.h;
                 N2Tex out = { W, H, (unsigned char *)malloc((long)W*H*3),
-                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0 };
+                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0, 0,0,0,0 };
                 for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
                     long o  = (long)y*W + x;
                     long bo = (long)(y*bt.h/H)*bt.w + x*bt.w/W;   /* nearest */
