@@ -68,6 +68,9 @@ typedef struct {
           uVista,                   /* >0.5: alpha-blended backdrop pass */
           uAlphaTest,               /* >0.5: discard texels below 0.5 alpha
                                        (N2_DRAW_CUTOUT world batches, M135) */
+          uTextureAlpha,            /* >0.5: output alpha = texture alpha *
+                                       uAlpha (N2_DRAW_BLEND/ADD world
+                                       batches only, M135-R) */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in the current object's model space */
           uEnv,     /* environment-reflection amount (cars only) */

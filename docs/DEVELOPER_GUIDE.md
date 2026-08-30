@@ -286,19 +286,51 @@ The main world draw loop in `main.c` dispatches on `drawmode`:
   1.0 for the duration of its run of batches, enabling a fragment-shader
   `discard` below 0.5 alpha. Toggled per-batch like the existing `lasttex`
   bind cache, reset to 0.0 after the loop.
-- `BLEND`/`ADD` batches are collected into a `deferred[]` array instead of
-  being drawn inline, then drawn in one pass right after: depth write off
-  (so they don't occlude what's behind or each other), depth test still on
-  (so real opaque geometry still occludes them correctly), `glBlendFunc`
-  set per-batch (`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` for `BLEND`,
-  `GL_SRC_ALPHA, GL_ONE` for `ADD`). This mirrors the existing car-glass and
-  vista translucent-pass shape elsewhere in the file. Not sorted
-  back-to-front within itself; every batch is still individually depth-
-  tested against the already-drawn opaque scene, and no proven defect
-  requires finer ordering yet.
+- `BLEND`/`ADD` batches are collected into two separate arrays (`defblend`,
+  `defadd`, grown to `nbatch` -- never silently capped) instead of being
+  drawn inline, then drawn in one pass right after: depth write off (so
+  they don't occlude what's behind or each other), depth test still on (so
+  real opaque geometry still occludes them correctly). `defblend` is sorted
+  back-to-front by `n2_sort_back_to_front` (GL-free, unit-tested in
+  `tools/car_material_test.c`) on squared bbox-centre-to-camera distance,
+  with a deterministic smaller-index tie-break; `defadd` draws after, in its
+  original stable texture-sorted order (additive-over-additive order only
+  affects rounding in an associative sum, not correctness, so it needs no
+  per-frame sort). `glBlendFunc` is set per-batch (`GL_SRC_ALPHA,
+  GL_ONE_MINUS_SRC_ALPHA` for `BLEND`, `GL_SRC_ALPHA, GL_ONE` for `ADD`).
+  This mirrors the existing car-glass and vista translucent-pass shape
+  elsewhere in the file.
+- Authored alpha (M135-R): the shader's `uTextureAlpha` uniform, enabled for
+  the whole deferred blend/add bracket, multiplies the sampled texture's own
+  alpha into the fragment's output alpha (`t.a*uAlpha` instead of the flat
+  `uAlpha` every other pass uses) -- otherwise a cutout-shaped blend/additive
+  sheet (e.g. a lit-window texture with transparent gaps between windows)
+  would draw fully opaque/full-strength through those gaps, since `uAlpha`
+  alone carries no per-texel information. Disabled (0.0) everywhere else,
+  including `CUTOUT`, cars, and every HUD/debug `uUnlit` pass.
 
 Texture alpha is never gated on `uVColor`: per-vertex prelight strength and
 authored texture transparency are independent and must not be conflated.
+
+
+### LOC4 fallback and draw modes (M135-R census)
+
+`world_bind_textures` tries a key in three places in order: the region's own
+TPK, then `w->loc4` (`LOC4DYNTEX.BIN`, decoded through
+`n2_load_car_tex_by_key`, the CAR texture-library reader) as a shared
+fallback, then the master TPK. Only `n2_tpk_decode` reads the `order`/
+`usage`/`blend`/`wz` draw-mode bytes; a key resolved through the LOC4
+fallback keeps them at their zero default (`N2_DRAW_OPAQUE`), same as every
+world texture had before the field existed. **Censused** (temporary
+instrumentation, not committed) against both reference scenes this
+milestone verifies against -- `STREAML4RA` (`--world2`/`--instance-audit`
+and legacy `--objdump`) and `STREAML4RB` -- **zero** world texture keys in
+either scene ever fall through to the LOC4 path: every key resolves
+directly from its own region TPK. The LOC4-path draw-mode gap is real but
+currently unreachable from any traffic these two scenes generate, so it is
+left as documented, untested-because-unexercised code rather than guessed
+at; extend it the same way `n2_tpk_decode` was extended if a LOC4-resolved
+world texture is ever found needing a non-opaque mode.
 
 ## 8. Car loading and presentation
 

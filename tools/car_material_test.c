@@ -432,6 +432,45 @@ int texture_record_tests(void) {
     return FAIL;
 }
 
+/* ---------------------------------------------------------------------
+ * n2_sort_back_to_front (M135-R item 2): GL-free, drives the exact function
+ * main.c's deferred blend pass calls, on plain index/distance arrays --
+ * no N2Batch, no GL, no render.h. At least three batches, including an
+ * equal-distance tie, per the review's explicit requirement.
+ * ------------------------------------------------------------------- */
+static int sort_tests(void) {
+    printf("\n  S n2_sort_back_to_front: deterministic back-to-front order\n");
+
+    /* four batches: id 2 farthest (20), id 0 mid (10), ids 1 and 3 TIE at 5.
+       Expected order (farthest first, smaller index wins a tie): 2,0,1,3. */
+    int idx[4] = {0,1,2,3};
+    float dist[4] = {10.0f, 5.0f, 20.0f, 5.0f};   /* indexed by batch id, not position */
+    n2_sort_back_to_front(idx, 4, dist);
+    chk("farthest batch (id 2, dist 20) drawn first", idx[0] == 2);
+    chk("mid batch (id 0, dist 10) drawn second", idx[1] == 0);
+    chk("tied pair (ids 1 and 3, both dist 5): smaller index (1) first",
+        idx[2] == 1 && idx[3] == 3);
+
+    /* re-run with the SAME input to prove determinism -- no dependence on
+       memory layout, uninitialized state, or qsort-style unstable pivoting. */
+    int idx2[4] = {0,1,2,3};
+    n2_sort_back_to_front(idx2, 4, dist);
+    chk("re-run on identical input reproduces the identical order",
+        idx2[0]==idx[0] && idx2[1]==idx[1] && idx2[2]==idx[2] && idx2[3]==idx[3]);
+
+    /* already-sorted and reverse-sorted inputs: edge cases for an insertion
+       sort (best/worst case shift counts), same expected descending result. */
+    int idx3[3] = {0,1,2}; float dist3[3] = {30.0f, 20.0f, 10.0f};   /* already descending */
+    n2_sort_back_to_front(idx3, 3, dist3);
+    chk("already-descending input stays in order", idx3[0]==0 && idx3[1]==1 && idx3[2]==2);
+
+    int idx4[3] = {0,1,2}; float dist4[3] = {10.0f, 20.0f, 30.0f};   /* ascending: fully reversed */
+    n2_sort_back_to_front(idx4, 3, dist4);
+    chk("fully-ascending input is reversed to descending", idx4[0]==2 && idx4[1]==1 && idx4[2]==0);
+
+    return FAIL;
+}
+
 int main(void) {
     printf("MILESTONE 135  car material routing / complete-tier LOD regression\n\n");
 
@@ -674,6 +713,7 @@ int main(void) {
     }
 
     texture_record_tests();
+    sort_tests();
 
     printf("\n  %d passed, %d failed\n", PASS, FAIL);
     return FAIL ? 1 : 0;

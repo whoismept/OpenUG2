@@ -2561,4 +2561,28 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
     return 0;
 }
 
+/* Sorts idx[0..n) back-to-front by dist[idx[i]] descending (farthest first),
+ * for correct alpha-blended draw order (M135-R): a nearer translucent
+ * surface must be drawn AFTER a farther one so it blends over it, not under
+ * it. Deterministic tie-break: the smaller original index wins, so two
+ * batches at equal distance always draw in the same relative order run to
+ * run (no flicker from an unstable sort). GL-free and renderer-agnostic on
+ * purpose -- it only touches plain index/float arrays, not N2Batch or any
+ * GL type, so it can be driven directly from a synthetic test without
+ * pulling in render.h's GL headers (see tools/car_material_test.c).
+ * ponytail: O(n^2) insertion sort -- translucent batch counts per frame are
+ * in the tens to low hundreds, not worth a heap/qsort comparator for; switch
+ * to qsort with an (index,dist) pair struct if this ever profiles hot. */
+static void n2_sort_back_to_front(int *idx, int n, const float *dist) {
+    for (int i = 1; i < n; i++) {
+        int cur = idx[i]; float cd = dist[cur];
+        int j = i - 1;
+        while (j >= 0 && (dist[idx[j]] < cd ||
+               (dist[idx[j]] == cd && idx[j] > cur))) {
+            idx[j+1] = idx[j]; j--;
+        }
+        idx[j+1] = cur;
+    }
+}
+
 #endif /* NFSU2_H */

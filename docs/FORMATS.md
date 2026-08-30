@@ -431,12 +431,38 @@ The mode is per-texture-record, threaded from `world_bind_textures` through a
 parallel `mtexmode`/`modes` array (mirroring the existing `mtex` GL-texture-
 handle array) into `N2Batch.drawmode`, and dispatched at draw time: opaque and
 cutout batches share the ordinary pass (cutout toggles the shader's
-`uAlphaTest` uniform per batch); blend/additive batches are deferred into a
-second pass drawn after all opaque/cutout geometry, with depth test on but
-depth write off (so they don't occlude each other or later translucents, but
-are still correctly hidden behind real opaque geometry). Texture alpha is
-never gated on `uVColor` — per-vertex prelight strength and authored texture
-transparency are independent controls.
+`uAlphaTest` uniform per batch); blend and additive batches are collected into
+separate arrays (grown to the full batch count, never silently capped) and
+drawn in a second pass after all opaque/cutout geometry, with depth test on
+but depth write off (so they don't occlude each other or later translucents,
+but are still correctly hidden behind real opaque geometry). Blend batches
+are sorted back-to-front (`n2_sort_back_to_front`, GL-free, unit-tested) by
+squared bbox-centre-to-camera distance with a deterministic smaller-index
+tie-break; additive batches draw after, in their original stable
+texture-sorted order.
+
+**Authored alpha in blend/additive passes (PROVEN fix, M135-R):** the shader
+multiplies the sampled texture's own alpha into the output alpha
+(`uTextureAlpha`>0.5: `t.a*uAlpha`) for exactly this deferred pass — every
+other pass (opaque, cutout, cars, HUD/debug) keeps the flat `uAlpha`-only
+output unchanged. Before this fix, a `BLEND` texture always drew fully
+opaque and an `ADD` texture always drew at full strength, regardless of its
+own per-texel alpha, since the shared lit fragment path only ever emitted
+the flat `uAlpha` uniform. Texture alpha is never gated on `uVColor` —
+per-vertex prelight strength and authored texture transparency are
+independent controls.
+
+**LOC4 fallback (M135-R census):** `world_bind_textures` falls back to the
+shared `LOC4DYNTEX.BIN` car-texture library (`n2_load_car_tex_by_key`) for a
+key its own region TPK can't resolve; that reader never decodes
+`order`/`usage`/`blend`/`wz`, so a LOC4-resolved key is always
+`N2_DRAW_OPAQUE`. Censused (temporary, uncommitted instrumentation) against
+both reference scenes this milestone verifies against — `STREAML4RA`
+(`--world2`/`--instance-audit` and legacy `--objdump`) and `STREAML4RB` —
+**zero** world texture keys in either scene ever reach the LOC4 fallback;
+every key resolves from its own region TPK. Left undecoded and undocumented
+further per the "don't guess" rule until a real LOC4-resolved non-opaque
+world texture is found.
 
 Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
 own `STREAM*.BUN` TPK carries its

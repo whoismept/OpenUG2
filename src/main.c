@@ -5565,10 +5565,30 @@ int main(int argc, char **argv) {
         if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
                          memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
-        /* M135: N2_DRAW_BLEND/ADD batches are deferred out of this pass -- they
-           need depth-write off and real blending, neither of which the ordinary
-           opaque/cutout loop below sets up. Collected here, drawn afterward. */
-        static int deferred[4096]; int ndeferred = 0;
+        /* M135/M135-R: N2_DRAW_BLEND/ADD batches are deferred out of this pass
+           -- they need depth-write off and real blending, neither of which the
+           ordinary opaque/cutout loop below sets up. Collected separately
+           (blend needs back-to-front distance sort; additive draws after,
+           in stable texture-sorted order) and drawn afterward. Sized to
+           `nbatch` -- every batch could theoretically be translucent -- and
+           grown, never silently capped; a growth failure is reported and the
+           translucent pass is skipped for that frame rather than dropping
+           batches or overrunning a fixed array. */
+        static int *defblend = NULL, *defadd = NULL; static float *defdist = NULL;
+        static int defcap = 0;
+        if (nbatch > defcap) {
+            int *nb2 = (int *)realloc(defblend, (size_t)nbatch * sizeof *defblend);
+            int *na2 = (int *)realloc(defadd,   (size_t)nbatch * sizeof *defadd);
+            float *nd2 = (float *)realloc(defdist, (size_t)nbatch * sizeof *defdist);
+            if (!nb2 || !na2 || !nd2) {
+                fprintf(stderr, "world render: OOM growing deferred blend/add "
+                        "buffers to %d batches -- skipping translucent pass "
+                        "this frame\n", nbatch);
+                free(nb2 ? nb2 : defblend); free(na2 ? na2 : defadd); free(nd2 ? nd2 : defdist);
+                defblend = defadd = NULL; defdist = NULL; defcap = 0;
+            } else { defblend = nb2; defadd = na2; defdist = nd2; defcap = nbatch; }
+        }
+        int ndefblend = 0, ndefadd = 0;
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
         int lastmode = -1;
@@ -5590,7 +5610,23 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
-                if (ndeferred < 4096) deferred[ndeferred++] = k;
+                if (defcap > 0) {
+                    if (b->drawmode == N2_DRAW_BLEND) {
+                        /* bbox-centre distance to camera, squared (only the
+                           ORDER matters, so skip the sqrt): documented choice
+                           for the back-to-front sort below -- true per-vertex
+                           depth would need a second batching pass, which no
+                           observed defect currently justifies. */
+                        float bx = 0.5f*(b->bbox_min[0]+b->bbox_max[0]);
+                        float by = 0.5f*(b->bbox_min[1]+b->bbox_max[1]);
+                        float bz = 0.5f*(b->bbox_min[2]+b->bbox_max[2]);
+                        float ddx = bx-cam[0], ddy = by-cam[1], ddz = bz-cam[2];
+                        defdist[k] = ddx*ddx + ddy*ddy + ddz*ddz;
+                        defblend[ndefblend++] = k;
+                    } else {
+                        defadd[ndefadd++] = k;   /* additive: stable texture-sorted order */
+                    }
+                }
                 continue;   /* drawn in the deferred pass below, not here */
             }
             ndrawn += b->nmesh;
@@ -5613,30 +5649,44 @@ int main(int argc, char **argv) {
            stays on (correct occlusion by real opaque geometry) but depth
            write is off (a translucent/glow surface must not occlude what's
            behind it), exactly the same shape as the existing car-glass and
-           vista passes elsewhere in this function. Not sorted back-to-front
-           within itself -- there is no proven live defect that needs it, and
-           every batch here is still individually depth-tested against the
-           opaque scene already drawn above. */
-        if (ndeferred) {
+           vista passes elsewhere in this function. Blended batches are
+           sorted back-to-front (n2_sort_back_to_front, GL-free and unit-
+           tested) so nearer glass/glow correctly draws over farther glass
+           instead of blend order depending on incidental texture-sort
+           position; additive batches draw after, in their original stable
+           (texture-sorted) order -- order among additive-over-additive only
+           affects rounding in an associative sum, not correctness, so no
+           per-frame sort is needed there. uTextureAlpha is enabled for the
+           whole bracket: every batch reaching this pass is BLEND or ADD, and
+           both must honour their own texture's alpha (M135-R item 1) rather
+           than drawing at flat uAlpha strength. */
+        if (ndefblend || ndefadd) {
+            n2_sort_back_to_front(defblend, ndefblend, defdist);
             glEnable(GL_BLEND);
             glDepthMask(GL_FALSE);
+            glUniform1f(rp.uTextureAlpha, 1.0f);
             GLuint lasttex2 = (GLuint)-1; int lastmode2 = -1;
-            for (int q = 0; q < ndeferred; q++) {
-                N2Batch *b = &wbatch[deferred[q]];
-                if (b->tex != lasttex2) {
-                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
-                    else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
-                    lasttex2 = b->tex;
+            for (int pass = 0; pass < 2; pass++) {
+                int *list = pass == 0 ? defblend : defadd;
+                int cnt   = pass == 0 ? ndefblend : ndefadd;
+                for (int q = 0; q < cnt; q++) {
+                    N2Batch *b = &wbatch[list[q]];
+                    if (b->tex != lasttex2) {
+                        if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                        else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                        lasttex2 = b->tex;
+                    }
+                    if (b->drawmode != lastmode2) {
+                        glBlendFunc(GL_SRC_ALPHA, b->drawmode == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                        lastmode2 = b->drawmode;
+                    }
+                    draw_batch(b);
+                    for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
+                    ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+                    if (nviskept < 4096) viskept[nviskept++] = list[q];
                 }
-                if (b->drawmode != lastmode2) {
-                    glBlendFunc(GL_SRC_ALPHA, b->drawmode == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
-                    lastmode2 = b->drawmode;
-                }
-                draw_batch(b);
-                for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
-                ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
-                if (nviskept < 4096) viskept[nviskept++] = deferred[q];
             }
+            glUniform1f(rp.uTextureAlpha, 0.0f);
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* restore the ordinary default */

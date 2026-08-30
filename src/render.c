@@ -39,6 +39,11 @@ static const char *FS =
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
     "uniform float uAlphaTest;\n" /* >0.5: discard below 0.5 texture alpha */
+    "uniform float uTextureAlpha;\n" /* >0.5: output alpha = texture2D(...).a *
+        uAlpha instead of plain uAlpha (M135-R: N2_DRAW_BLEND/ADD world
+        batches only -- everything else, including CUTOUT, cars, and every
+        HUD/debug uUnlit pass, leaves this at its default 0.0 and keeps its
+        existing uAlpha-only alpha output unchanged) */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -144,8 +149,14 @@ static const char *FS =
     "    lit += env * (uEnv * fres);\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
-       translucent glass keeps its specular highlight */
-    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), uAlpha);\n"
+       translucent glass keeps its specular highlight. M135-R: authored
+       BLEND/ADD world batches instead multiply in the TEXTURE's own alpha
+       (uTextureAlpha>0.5) -- otherwise a cutout-shaped blend/additive
+       texture (e.g. a lit-window sheet with transparent gaps) would draw
+       fully opaque/full-strength through those gaps, since uAlpha alone
+       carries no per-texel information. */
+    "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);\n"
     "}\n";
 
 /* ---- tiny 4x4 matrix (column-major) ---- */
@@ -253,6 +264,7 @@ RProg render_program(void) {
     r.uDecal   = glGetUniformLocation(r.prog, "uDecal");
     r.uVista      = glGetUniformLocation(r.prog, "uVista");
     r.uAlphaTest  = glGetUniformLocation(r.prog, "uAlphaTest");
+    r.uTextureAlpha = glGetUniformLocation(r.prog, "uTextureAlpha");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
@@ -273,6 +285,7 @@ RProg render_program(void) {
     glUniform1f(r.uGloss, 20.0f);
     glUniform1f(r.uFlipN, 0.0f);
     glUniform1f(r.uAlphaTest, 0.0f);
+    glUniform1f(r.uTextureAlpha, 0.0f);
     glUniform3f(r.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
     return r;
 }
