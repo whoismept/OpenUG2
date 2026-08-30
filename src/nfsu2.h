@@ -1380,7 +1380,14 @@ static float n2_bbox_overlap(const float *a, const float *b) {
  * split tier would otherwise win purely for having more slices, independent
  * of how much triangle detail it actually contributes. Tie-break: exactly the
  * old rule, transplanted -- the earlier-encountered tier in the forward scan
- * wins ties (strictly-greater-only replaces the running best). */
+ * wins ties (strictly-greater-only replaces the running best).
+ *
+ * SPATIAL ANCHOR (M135-R hardening). Family membership below is decided
+ * against the group's FIRST tier (`a`), fixed for the whole inner scan --
+ * never against whichever tier currently holds `best`. See the comment at
+ * the loop itself for why a shifting anchor is a real bug, not just a style
+ * preference: it lets a spatially-unrelated third tier get pulled into (and
+ * dropped from) a group purely because the running best changed. */
 #define N2_LOD_OVERLAP 0.4f
 static void n2_car_dedupe_lod(N2Scene *s) {
     int n = s->count;
@@ -1415,11 +1422,22 @@ static void n2_car_dedupe_lod(N2Scene *s) {
     if (!tdrop) { free(bb); free(drop); free(tiers); return; }   /* OOM: keep everything */
     for (int a = 0; a < nt; a++) {
         if (tdrop[a] || !s->meshes[tiers[a].rep].namekey) continue;
-        int best = a;                       /* a stays the spatial anchor */
+        int best = a;
+        /* Family membership (M135-R hardening) is decided against tier `a`'s
+           OWN namekey/bbox, fixed for this whole group -- never against
+           whichever tier currently holds `best`. `best` only tracks the
+           highest-scoring survivor so far; using ITS bbox as the anchor
+           would make membership order/score-dependent: if a<->b overlap and
+           b<->c overlap but a and c do NOT, re-anchoring on b after b beats a
+           would wrongly let c join (and lose to) the group through b, even
+           though the group's actual anchor (a) has nothing to do with c.
+           Proven with a 3-tier A/B/C regression fixture (fixture F) where B
+           has the highest score: A is correctly replaced by B, but C survives
+           untouched because it never overlaps A, regardless of B's bbox. */
         for (int c = a + 1; c < nt; c++) {
             if (tdrop[c]) continue;
-            if (s->meshes[tiers[c].rep].namekey != s->meshes[tiers[best].rep].namekey) continue;
-            if (n2_bbox_overlap(tiers[best].bb, tiers[c].bb) < N2_LOD_OVERLAP) continue;
+            if (s->meshes[tiers[c].rep].namekey != s->meshes[tiers[a].rep].namekey) continue;
+            if (n2_bbox_overlap(tiers[a].bb, tiers[c].bb) < N2_LOD_OVERLAP) continue;
             if (tiers[c].score > tiers[best].score) { tdrop[best] = 1; best = c; }
             else tdrop[c] = 1;
         }
@@ -1689,8 +1707,24 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                 total_idx = (ibytes - ip) / 2;
             }
             int part_ok = nsub > 1 && n2_car_submesh_partition_ok(sub, nsub, total_idx);
+            /* Classification (which class a submesh's matid names) does not
+               need a validated multi-record PARTITION -- it only needs
+               sub[k].matid to be in range, which is already individually
+               bounds-checked below regardless of start/count. Partition
+               validity only matters for trusting per-submesh index RANGES
+               well enough to actually SPLIT the geometry. So classification
+               is trusted whenever nsub==1 (a single record IS the whole
+               object -- trivially "whole," nothing to partition) or when
+               nsub>1 AND part_ok (a validated multi-record partition).
+               A malformed multi-record partition (nsub>1, !part_ok) keeps
+               the conservative cat-based fallback for classification too --
+               a corrupt start/count strongly suggests the whole record is
+               suspect, so its matid is not trusted either (M135-R item 4:
+               "ensure material classification works without requiring
+               nsub > 1", scoped to the case that's actually safe). */
+            int trust_cls = nsub == 1 || part_ok;
             uint32_t subtex[32]; int matcls[32]; int differ = 0, clsdiffer = 0, big = 0;
-            for (int k = 0; k < (part_ok ? nsub : 0); k++) {
+            for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
                 subtex[k] = sub[k].mat < (uint32_t)nslot
                           ? n2_resolve_key(slots[sub[k].mat], keys, nkeys) : 0;
                 uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
@@ -1699,6 +1733,15 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                 if (matcls[k] != matcls[0]) clsdiffer = 1;
                 if (sub[k].count > sub[big].count) big = k;
             }
+            /* Whole-object category when NOT splitting: matcls[0] whenever
+               classification is trusted (it is then, by construction,
+               uniform across every submesh reaching this branch -- if it
+               disagreed AND part_ok held, the split branch below would have
+               been taken instead), else the original name-based cat. This is
+               what lets a single-submesh WINDSHIELD-material object with a
+               non-GLASS name (real on GOLF, see the M135-R census note at
+               n2_mat_class) resolve to GLASS without ever needing to split. */
+            int wholecat = (trust_cls && nsub >= 1) ? matcls[0] : cat;
             /* One 0x80134010 occurrence, split or not, shares one tierid so
                n2_car_dedupe_lod can score and drop/keep its whole slice set
                atomically instead of resolving each split slice on its own. */
@@ -1731,7 +1774,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             } else {
                 for (int k = 0; k < pairs; k++) {   /* car parts have identity transforms */
                     int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 36, 28, 0, tk, NULL, 0, -1);
+                    n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28, 0, tk, NULL, 0, -1);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
                         scene->meshes[before].namekey = nk2;

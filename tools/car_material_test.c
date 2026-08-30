@@ -127,6 +127,27 @@ static int count_by_cat(const N2Scene *s, int cat) {
     return n;
 }
 
+/* Hand-built N2Mesh for n2_car_dedupe_lod fixtures (Fixture G): the function
+ * only reads tierid/namekey/nverts/verts/nidx, so this drives it directly
+ * without going through the chunk parser at all. X varies per call (drives
+ * n2_bbox_overlap), Y/Z fixed 0..1 so only X controls overlap ratio. */
+static N2Mesh mk_lod_mesh(uint32_t tierid, uint32_t namekey, float x0, float x1, int nidx) {
+    N2Mesh m; memset(&m, 0, sizeof m);
+    m.tierid = tierid; m.namekey = namekey; m.nidx = nidx; m.nverts = 2;
+    m.verts = (float *)malloc(2 * 5 * sizeof(float));
+    float v0[5] = {x0, 0, 0, 0, 0}, v1[5] = {x1, 1, 1, 0, 0};
+    memcpy(m.verts, v0, sizeof v0); memcpy(m.verts + 5, v1, sizeof v1);
+    return m;
+}
+static void free_lod_scene(N2Scene *s) {
+    for (int i = 0; i < s->count; i++) { free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol); }
+    free(s->meshes);
+}
+static int has_tierid(const N2Scene *s, uint32_t tierid) {
+    for (int i = 0; i < s->count; i++) if (s->meshes[i].tierid == tierid) return 1;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------
  * Texture-record fixtures (Phase 1.4): explicit format/draw-mode bytes,
  * block-count bounds validation, and authored-alpha preservation, built as
@@ -760,6 +781,103 @@ int main(void) {
             count_by_cat(&sc, N2_CAR_BODY) == 0 && count_by_cat(&sc, N2_CAR_GLASS) == 0);
         for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
         free(sc.meshes);
+    }
+
+    /* -------------------------------------------------------------------
+     * Fixture F (M135-R item 4): a single-submesh object (nsub==1) whose
+     * sole submesh's material hash is WINDSHIELD, but whose OWN NAME matches
+     * the BODY name-heuristic (contains "KIT") rather than GLASS/WINDOW --
+     * exactly the real, fleet-wide shape of every car's door-window pane
+     * (e.g. HUMMER_KIT00_DOOR_LEFT_B; census: 557 real hits across 28 cars,
+     * scratchpad/m135/windshield_census.c -- every one of them previously
+     * resolved to N2_CAR_BODY via the "KIT" substring, since a single-
+     * submesh object never reached material classification at all before
+     * this fix). Splitting never enters into it: nsub==1, nothing to
+     * compare against. The only question is whether the whole object's
+     * category comes from the proven material hash or the name heuristic.
+     * ------------------------------------------------------------------- */
+    printf("  F single-submesh WINDSHIELD-material object with a BODY-heuristic name\n");
+    {
+        Buf f; f.n = 0;
+        float pos[3][3] = {{0,0,0},{1,0,0},{0,1,0}};
+        uint16_t idx[3] = {0,1,2};
+        uint32_t tex[1] = {0xAAAAAAAAu};
+        uint32_t mat[1] = { 0x471a1dcau };   /* N2_MAT_WINDSHIELD */
+        SubSpec sub[1] = { {3, 0, 0, 0} };   /* count=3, mat=0, matid=0, start=0 */
+        object(&f, "TESTCAR_KIT00_DOOR_LEFT_B", tex, 1, mat, 1, sub, 1, pos, 3, idx, 3);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, NULL, 0, NULL);
+        printf("    emitted meshes: %d\n", n);
+        chk("not split (single submesh, nothing to split from)", n == 1);
+        chk("classified GLASS from the proven material hash, not BODY from the name",
+            n == 1 && sc.meshes[0].cat == N2_CAR_GLASS);
+        for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
+        free(sc.meshes);
+    }
+
+    /* -------------------------------------------------------------------
+     * Fixture G (M135-R item 4): n2_car_dedupe_lod spatial-anchor hardening.
+     * Drives n2_car_dedupe_lod directly (hand-built N2Mesh array, no chunk
+     * parsing -- it only reads tierid/namekey/nverts/verts/nidx).
+     *
+     * G1 is the reviewer's literal scenario: three tiers A/B/C, A overlaps
+     * B, B overlaps C, A does NOT overlap C, B has the highest score.
+     * VERIFIED (scratchpad/m135/anchor_probe.c, run against both this
+     * fixed header and the pre-fix 08a5edb header side by side): both
+     * produce the IDENTICAL survivor set {B} for this exact input. That is
+     * expected, not a test bug -- B, having beaten A, always reaches its
+     * OWN outer-loop turn (nothing drops it before then), where it
+     * independently and correctly rediscovers the true B-vs-C overlap
+     * either way; `tiers[best].bb` is never a synthesized/wrong box, only
+     * ever one tier's own real box, so an "early" comparison via a shifted
+     * anchor can never produce a DIFFERENT true/false overlap verdict than
+     * the same tier's own later turn would -- only a different TIMING. The
+     * fixed anchor (tiers[a].bb) is still the right, defensible design
+     * (matches "one stable spatial anchor per candidate family" and removes
+     * a real risk for FUTURE edits, e.g. a non-monotonic drop rule), so it
+     * is kept; this fixture freezes its actual, verified-safe behaviour on
+     * the exact scenario named in review.
+     *
+     * G2 goes further: a 4-tier chain (A, B, D) plus an entirely
+     * unconnected bystander (C, positioned far away) sharing the same
+     * namekey. A overlaps B; B overlaps D; A does NOT overlap D; D has the
+     * highest score, so within A's own scan `best` is reassigned TWICE
+     * (A->B->D) before the scan ends. This is the shape most likely to
+     * expose a real divergence if a future change ever makes the anchor
+     * choice matter (e.g. a non-monotonic drop rule) -- and confirms today
+     * that the always-unrelated bystander C survives untouched regardless,
+     * and the true group champion D is the one kept from {A,B,D}.
+     * ------------------------------------------------------------------- */
+    printf("  G n2_car_dedupe_lod: spatial-anchor hardening (chained tiers)\n");
+    {
+        N2Scene sc; memset(&sc, 0, sizeof sc);
+        sc.count = 3;
+        sc.meshes = (N2Mesh *)malloc(3 * sizeof(N2Mesh));
+        sc.meshes[0] = mk_lod_mesh(101, 0xB0D1u, 0, 10, 30);   /* A: X[0,10]  score 30 */
+        sc.meshes[1] = mk_lod_mesh(102, 0xB0D1u, 5, 15, 60);   /* B: X[5,15]  score 60 (highest) */
+        sc.meshes[2] = mk_lod_mesh(103, 0xB0D1u, 10, 20, 45);  /* C: X[10,20] score 45; touches A at x=10 (no overlap) */
+        n2_car_dedupe_lod(&sc);
+        printf("    G1 (literal reviewer scenario) survivors: %d\n", sc.count);
+        chk("G1 only the highest-scoring, mutually-overlapping tier (B) survives",
+            sc.count == 1 && has_tierid(&sc, 102));
+        free_lod_scene(&sc);
+    }
+    {
+        N2Scene sc; memset(&sc, 0, sizeof sc);
+        sc.count = 4;
+        sc.meshes = (N2Mesh *)malloc(4 * sizeof(N2Mesh));
+        sc.meshes[0] = mk_lod_mesh(201, 0xC4A1u, 0,   10,  20);   /* A: X[0,10]    score 20 */
+        sc.meshes[1] = mk_lod_mesh(202, 0xC4A1u, 5,   15,  50);   /* B: X[5,15]    score 50; overlaps A */
+        sc.meshes[2] = mk_lod_mesh(203, 0xC4A1u, 100, 110, 15);   /* C: X[100,110] score 15; overlaps NOTHING */
+        sc.meshes[3] = mk_lod_mesh(204, 0xC4A1u, 10,  20,  80);   /* D: X[10,20]   score 80 (highest); overlaps B, touches A (no overlap) */
+        n2_car_dedupe_lod(&sc);
+        printf("    G2 (4-tier chain + unrelated bystander) survivors: %d\n", sc.count);
+        chk("G2 exactly two survivors", sc.count == 2);
+        chk("G2 the unrelated bystander (C, tierid 203) is untouched",
+            has_tierid(&sc, 203));
+        chk("G2 the true chain champion (D, tierid 204) wins over A and B",
+            has_tierid(&sc, 204) && !has_tierid(&sc, 201) && !has_tierid(&sc, 202));
+        free_lod_scene(&sc);
     }
 
     texture_record_tests();
