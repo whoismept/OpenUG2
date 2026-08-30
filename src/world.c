@@ -23,8 +23,10 @@ static void nav_build_adj(World *w);
    the ground grid, the physics ground query, and the GPU batches all see one
    clean surface layer with no further plumbing.
 
-   Identity is exact: two meshes that survive share a texkey, an identical
-   bounding box (all three axes) and the same tri+vert counts. An instanced
+   Identity is exact: two meshes are removed only when texkey, material
+   ownership, bounding box, indices, vertices and prelight bytes all match.
+   Counts and bounds are the cheap sort prefix; n2_mesh_content_cmp proves the
+   payload rather than assuming equal dimensions mean equal geometry. An instanced
    prop reused at a DIFFERENT position has a different bbox, so it is NOT a
    duplicate and is kept — only same-place, same-asset copies are removed. */
 static const N2Scene *dd_s;      /* comparator context; load is single-threaded */
@@ -35,17 +37,15 @@ static int dd_cmp(const void *pa, const void *pb) {
     if (ma->texkey != mb->texkey) return ma->texkey < mb->texkey ? -1 : 1;
     for (int k = 0; k < 6; k++)
         if (dd_bb[a][k] != dd_bb[b][k]) return dd_bb[a][k] < dd_bb[b][k] ? -1 : 1;
-    if (ma->nidx   != mb->nidx)   return ma->nidx   < mb->nidx   ? -1 : 1;
-    if (ma->nverts != mb->nverts) return ma->nverts < mb->nverts ? -1 : 1;
+    int content = n2_mesh_content_cmp(ma, mb);
+    if (content) return content;
     return a - b;   /* stable: the earliest original index sorts first, so it
                        is the copy we keep */
 }
 static int dd_same(int a, int b) {
     const N2Mesh *ma = &dd_s->meshes[a], *mb = &dd_s->meshes[b];
-    if (ma->texkey != mb->texkey || ma->nidx != mb->nidx || ma->nverts != mb->nverts)
-        return 0;
     for (int k = 0; k < 6; k++) if (dd_bb[a][k] != dd_bb[b][k]) return 0;
-    return 1;
+    return n2_mesh_same_content(ma, mb);
 }
 
 /* Compact w->scene to unique meshes, fix each region's [mesh0,mesh1) range to

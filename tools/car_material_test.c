@@ -59,6 +59,20 @@ static void leaf_verts(Buf *o, const float (*pos)[3], int n) {
     chunk(o, 0x00134B01u, &p);
 }
 
+/* Track/world vertex buffer, stride 24: pos f32[3]@0, prelight RGBA@12,
+ * uv f32[2]@16. This is the production layout n2_walk_meshes passes to
+ * n2_add_pair; car fixtures above deliberately use their separate 36B layout. */
+static void leaf_world_verts(Buf *o, const float (*pos)[3], int n) {
+    Buf p; p.n = 0;
+    bfill11(&p, 4);
+    for (int i = 0; i < n; i++) {
+        bf32(&p, pos[i][0]); bf32(&p, pos[i][1]); bf32(&p, pos[i][2]);
+        bu32(&p, 0xffffffffu);
+        bf32(&p, 0); bf32(&p, 0);
+    }
+    chunk(o, 0x00134B01u, &p);
+}
+
 /* 0x134B03: u16 triangle index buffer, PAIRED 0x1111 filler prefix. */
 static void leaf_idx(Buf *o, const uint16_t *idx, int n) {
     Buf p; p.n = 0;
@@ -146,6 +160,141 @@ static void free_lod_scene(N2Scene *s) {
 static int has_tierid(const N2Scene *s, uint32_t tierid) {
     for (int i = 0; i < s->count; i++) if (s->meshes[i].tierid == tierid) return 1;
     return 0;
+}
+
+/* Regression for the world-side bug M135 accidentally exposed. A multi-slot
+ * building object has an exact 0x134B02 partition, but the old production
+ * walker only honoured that linkage for ROAD/TERRAIN. OTHER therefore became
+ * one mesh wearing the last slot (often glass/railing), spreading its draw
+ * mode over the opaque walls. These fixtures drive n2_walk_meshes itself. */
+static void world_material_routing_test(void) {
+    printf("\n  W world multi-material routing stays on its exact submesh\n");
+    Buf object_payload; object_payload.n = 0;
+    leaf_name(&object_payload, "XB_TEST_MULTIMATERIAL_1A_00");
+    uint32_t slots[2] = {0x11111101u, 0x22222202u};
+    leaf_slots(&object_payload, 0x00134012u, slots, 2);
+    SubSpec sub[2] = {{3, 0, 0, 0}, {3, 1, 0, 3}};
+    leaf_submeshes(&object_payload, sub, 2);
+    float pos[6][3] = {{0,0,0},{1,0,0},{0,1,0},
+                       {0,0,1},{1,0,1},{0,1,1}};
+    uint16_t idx[6] = {0,1,2, 3,4,5};
+    leaf_world_verts(&object_payload, pos, 6);
+    leaf_idx(&object_payload, idx, 6);
+
+    Buf file; file.n = 0;
+    chunk(&file, 0x80134010u, &object_payload);
+    N2Scene scene; memset(&scene, 0, sizeof scene);
+    n2_walk_meshes(file.b, 0, file.n, &scene, slots, 2);
+
+    chk("OTHER object emits one mesh per verified material range", scene.count == 2);
+    chk("world material partition preserves all six indices", total_nidx(&scene) == 6);
+    chk("first range keeps opaque-wall slot 0",
+        scene.count == 2 && scene.meshes[0].texkey == slots[0] && scene.meshes[0].nidx == 3);
+    chk("second range keeps railing/glass slot 1",
+        scene.count == 2 && scene.meshes[1].texkey == slots[1] && scene.meshes[1].nidx == 3);
+    chk("both verified ranges may consume their authored draw modes",
+        scene.count == 2 && scene.meshes[0].mat_exact && scene.meshes[1].mat_exact &&
+        n2_world_draw_mode(&scene.meshes[0], N2_DRAW_OPAQUE) == N2_DRAW_OPAQUE &&
+        n2_world_draw_mode(&scene.meshes[1], N2_DRAW_CUTOUT) == N2_DRAW_CUTOUT);
+    for (int i = 0; i < scene.count; i++) {
+        free(scene.meshes[i].verts); free(scene.meshes[i].idx); free(scene.meshes[i].vcol);
+    }
+    free(scene.meshes);
+
+    /* A malformed multi-slot partition must keep all geometry but may not
+       spread whichever slot n2_mesh_texkey_cat happened to choose over it. */
+    object_payload.n = 0;
+    leaf_name(&object_payload, "XB_TEST_MALFORMED_1A_00");
+    leaf_slots(&object_payload, 0x00134012u, slots, 2);
+    SubSpec badsub[2] = {{3, 0, 0, 0}, {3, 1, 0, 4}}; /* gap: not contiguous */
+    leaf_submeshes(&object_payload, badsub, 2);
+    leaf_world_verts(&object_payload, pos, 6);
+    leaf_idx(&object_payload, idx, 6);
+    file.n = 0; chunk(&file, 0x80134010u, &object_payload);
+    memset(&scene, 0, sizeof scene);
+    n2_walk_meshes(file.b, 0, file.n, &scene, slots, 2);
+    chk("malformed multi-slot object falls back with full geometry",
+        scene.count == 1 && total_nidx(&scene) == 6);
+    chk("malformed multi-slot fallback is forced opaque",
+        scene.count == 1 && !scene.meshes[0].mat_exact &&
+        n2_world_draw_mode(&scene.meshes[0], N2_DRAW_BLEND) == N2_DRAW_OPAQUE);
+    for (int i = 0; i < scene.count; i++) {
+        free(scene.meshes[i].verts); free(scene.meshes[i].idx); free(scene.meshes[i].vcol);
+    }
+    free(scene.meshes);
+
+    /* Two positional slots are still a multi-slot object when one is empty.
+       The empty entry makes the partition invalid; counting only non-zero
+       values used to mislabel this fallback as exact and leak transparency. */
+    object_payload.n = 0;
+    leaf_name(&object_payload, "XB_TEST_EMPTY_SLOT_1A_00");
+    uint32_t one_and_empty[2] = {slots[1], 0};
+    leaf_slots(&object_payload, 0x00134012u, one_and_empty, 2);
+    SubSpec emptysub[2] = {{3, 0, 0, 0}, {3, 1, 0, 3}};
+    leaf_submeshes(&object_payload, emptysub, 2);
+    leaf_world_verts(&object_payload, pos, 6);
+    leaf_idx(&object_payload, idx, 6);
+    file.n = 0; chunk(&file, 0x80134010u, &object_payload);
+    memset(&scene, 0, sizeof scene);
+    n2_walk_meshes(file.b, 0, file.n, &scene, slots, 2);
+    chk("two positional slots with one empty fall back with full geometry",
+        scene.count == 1 && total_nidx(&scene) == 6);
+    chk("empty-slot multi-material fallback is forced opaque",
+        scene.count == 1 && !scene.meshes[0].mat_exact &&
+        n2_world_draw_mode(&scene.meshes[0], N2_DRAW_CUTOUT) == N2_DRAW_OPAQUE);
+    for (int i = 0; i < scene.count; i++) {
+        free(scene.meshes[i].verts); free(scene.meshes[i].idx); free(scene.meshes[i].vcol);
+    }
+    free(scene.meshes);
+
+    /* A genuinely single-slot object is exact without needing a partition;
+       this preserves authored fence/foliage cutouts rather than disabling
+       world transparency globally. */
+    object_payload.n = 0;
+    leaf_name(&object_payload, "XO_TEST_RAILING_1A_00");
+    leaf_slots(&object_payload, 0x00134012u, slots + 1, 1);
+    leaf_world_verts(&object_payload, pos, 3);
+    leaf_idx(&object_payload, idx, 3);
+    file.n = 0; chunk(&file, 0x80134010u, &object_payload);
+    memset(&scene, 0, sizeof scene);
+    n2_walk_meshes(file.b, 0, file.n, &scene, slots, 2);
+    chk("single-slot world object keeps its exact authored cutout",
+        scene.count == 1 && scene.meshes[0].mat_exact &&
+        n2_world_draw_mode(&scene.meshes[0], N2_DRAW_CUTOUT) == N2_DRAW_CUTOUT);
+    for (int i = 0; i < scene.count; i++) {
+        free(scene.meshes[i].verts); free(scene.meshes[i].idx); free(scene.meshes[i].vcol);
+    }
+    free(scene.meshes);
+}
+
+/* world_dedup used to call meshes identical from only texture+bbox+counts.
+ * Split submeshes share the full source vertex pool, so two different index
+ * ranges can satisfy all of those coarse fields. The production identity
+ * predicate must inspect content, not just dimensions. */
+static void world_mesh_identity_test(void) {
+    printf("\n  H world dedup identity includes mesh content\n");
+    float verts[6 * 5] = {0};
+    uint16_t ia[3] = {0,1,2}, ib[3] = {3,4,5}, ic[3] = {0,1,2};
+    N2Mesh a, b, c; memset(&a, 0, sizeof a); memset(&b, 0, sizeof b); memset(&c, 0, sizeof c);
+    a.verts = b.verts = c.verts = verts;
+    a.idx = ia; b.idx = ib; c.idx = ic;
+    a.nverts = b.nverts = c.nverts = 6;
+    a.nidx = b.nidx = c.nidx = 3;
+    a.texkey = b.texkey = c.texkey = 0xABCD1234u;
+    a.mat_exact = b.mat_exact = c.mat_exact = 1;
+    chk("different index ranges are not duplicate mesh content",
+        !n2_mesh_same_content(&a, &b));
+    chk("byte-identical geometry and material ownership are duplicates",
+        n2_mesh_same_content(&a, &c));
+    c.mat_exact = 0;
+    chk("exact and conservative-fallback material ownership stay separate",
+        !n2_mesh_same_content(&a, &c));
+    chk("exact and fallback opaque material ownership use separate batch groups",
+        n2_world_batch_material_group(&a, N2_DRAW_OPAQUE) !=
+        n2_world_batch_material_group(&c, N2_DRAW_OPAQUE));
+    chk("one exact material's opaque and cutout modes use separate batch groups",
+        n2_world_batch_material_group(&a, N2_DRAW_OPAQUE) !=
+        n2_world_batch_material_group(&a, N2_DRAW_CUTOUT));
 }
 
 /* ---------------------------------------------------------------------
@@ -882,6 +1031,8 @@ int main(void) {
 
     texture_record_tests();
     sort_tests();
+    world_material_routing_test();
+    world_mesh_identity_test();
 
     printf("\n  %d passed, %d failed\n", PASS, FAIL);
     return FAIL ? 1 : 0;

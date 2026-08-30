@@ -2818,7 +2818,10 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
             if (tmapkey[j] == scene.meshes[i].texkey) {
-                mtex[i] = tmaptex[j]; mtexmode[i] = tmapmode[j]; break;
+                mtex[i] = tmaptex[j];
+                mtexmode[i] = (unsigned char)n2_world_draw_mode(
+                    &scene.meshes[i], tmapmode[j]);
+                break;
             }
     if (nansweep) {
         long bad = 0, badobj = 0;

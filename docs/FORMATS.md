@@ -240,10 +240,19 @@ ranges: {start=0,count=48,mat=1}, {start=48,count=9,mat=2}
 result: first 16 triangles use slot 1; final 3 triangles use slot 2
 ```
 
-For world road/terrain, structurally valid records are emitted per range. A key
-available in the region/shared TPK wins; an unavailable key falls back only for
-that range. A malformed object falls back to the legacy one-key whole-object
-path rather than partially dropping geometry.
+For ordinary world objects, structurally valid records are emitted per range.
+This includes buildings, props and other set dressing, not only road/terrain:
+otherwise a multi-material building inherits its last texture slot (for
+example `OBJ_RAILING`) across every opaque wall. A key available in the
+region/shared TPK wins; an unavailable key falls back only for that range. A
+malformed object falls back to the legacy one-key whole-object path rather
+than partially dropping geometry.
+
+`N2Mesh.mat_exact` records whether a range owns its texture structurally. A
+verified range and a true single-slot object set it; an unresolved range or a
+multi-slot whole-object fallback does not. Render draw modes are consumed only
+when this bit is set, so malformed data can keep its geometry and diffuse
+fallback without spreading cutout/blend/additive state across unrelated faces.
 
 Cars use the same linkage when multiple records resolve to different
 textures, OR (M135) when they classify to different material categories via

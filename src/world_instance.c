@@ -240,16 +240,16 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     n2_find_leaves(data, begin, end, 0x00134B03u, idx, &ni, 64);
     int pairs = nv < ni ? nv : ni;
 
-    /* This deliberately mirrors n2_walk_meshes' verified ROAD/TERRAIN
-     * material partition gate. A malformed partition falls through to the
+    /* This deliberately mirrors n2_walk_meshes' verified world-material
+     * partition gate. A malformed partition falls through to the
      * identical whole-object path instead of silently losing geometry. */
     int sub_ok = 0;
     N2Sub sub[64];
     uint32_t slot[64];
-    int nsub = 0, nslot = 0;
-    if ((cat == N2_ROAD || cat == N2_TERRAIN) && pairs == 1) {
+    int nsub = 0;
+    int nslot = n2_mesh_texslots(data, begin, end, slot, 64);
+    if (cat != N2_SKY && cat != N2_GLOW && pairs == 1) {
         nsub = n2_mesh_submeshes(data, begin, end, sub, 64);
-        nslot = n2_mesh_texslots(data, begin, end, slot, 64);
         if (nsub > 0 && nslot > 0) {
             const unsigned char *ib0 = data + idx[0].off;
             int ibytes = (int)idx[0].size, ip = 0;
@@ -271,14 +271,23 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     if (sub_ok) {
         for (int i = 0; i < nsub; i++) {
             uint32_t subkey = n2_resolve_key(slot[sub[i].mat], keys, nkeys);
+            int exact = subkey != 0;
+            int before = local.count;
             n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, cat != N2_SKY,
                         subkey ? subkey : texkey, NULL,
                         (long)sub[i].start, (long)sub[i].count);
+            for (int j = before; j < local.count; j++)
+                local.meshes[j].mat_exact = (unsigned char)exact;
         }
     } else {
-        for (int i = 0; i < pairs; i++)
+        int exact_single_slot = nslot == 1 && slot[0] != 0;
+        for (int i = 0; i < pairs; i++) {
+            int before = local.count;
             n2_add_pair(data, vtx[i], idx[i], cat, &local, 24, 16, cat != N2_SKY,
                         texkey, NULL, 0, -1);
+            for (int j = before; j < local.count; j++)
+                local.meshes[j].mat_exact = (unsigned char)exact_single_slot;
+        }
     }
     for (int i = 0; i < local.count; i++) {
         local.meshes[i].scen = (unsigned char)scen;

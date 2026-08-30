@@ -329,10 +329,11 @@ GpuMesh *upload_scene(N2Scene *s) {
 
 /* ---- static-world batching ---- */
 
-typedef struct { uint64_t key; int idx; } BSortEnt;   /* (cell,tex) -> mesh */
+typedef struct { uint64_t key; int idx; unsigned char group; } BSortEnt;
 static int bsort_cmp(const void *a, const void *b) {
-    uint64_t ka = ((const BSortEnt *)a)->key, kb = ((const BSortEnt *)b)->key;
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+    const BSortEnt *aa = (const BSortEnt *)a, *bb = (const BSortEnt *)b;
+    if (aa->key != bb->key) return aa->key < bb->key ? -1 : 1;
+    return aa->group < bb->group ? -1 : aa->group > bb->group ? 1 : 0;
 }
 static int btex_cmp(const void *a, const void *b) {   /* final texture order */
     GLuint ta = ((const N2Batch *)a)->tex, tb = ((const N2Batch *)b)->tex;
@@ -549,7 +550,11 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
         uint64_t cell = (uint64_t)(uint32_t)((int)((cy-y0)/BATCH_CELL)*4096
                                            + (int)((cx-x0)/BATCH_CELL));
-        ent[m].key = cell << 32 | tex; ent[m].idx = i; m++;
+        ent[m].key = cell << 32 | tex; ent[m].idx = i;
+        int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
+        ent[m].group = (unsigned char)n2_world_batch_material_group(
+            &s->meshes[i], mode);
+        m++;
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     /* walk key runs, splitting a run at the u16 vertex ceiling */
@@ -561,7 +566,8 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
     int *run1 = (int *)malloc((size_t)cap * sizeof *run1);
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
-        int flush = (i == m) || (i > i0 && ent[i].key != ent[i0].key) ||
+        int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
+                                            ent[i].group != ent[i0].group)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat);
@@ -605,13 +611,20 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     BSortEnt *ent = (BSortEnt *)malloc((size_t)(n ? n : 1) * sizeof *ent);
     int m = 0;
     for (int i = 0; i < n; i++)
-        if (s->meshes[i].cat == cat) { ent[m].key = mtex[i]; ent[m].idx = i; m++; }
+        if (s->meshes[i].cat == cat) {
+            ent[m].key = mtex[i]; ent[m].idx = i;
+            int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
+            ent[m].group = (unsigned char)n2_world_batch_material_group(
+                &s->meshes[i], mode);
+            m++;
+        }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     int cap = 8, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
-        int flush = (i == m) || (i > i0 && ent[i].key != ent[i0].key) ||
+        int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
+                                            ent[i].group != ent[i0].group)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }

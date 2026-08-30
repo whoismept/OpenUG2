@@ -26,6 +26,11 @@ typedef struct {
     int      nidx;
     int      cat;     /* N2_ROAD / N2_TERRAIN / N2_OTHER, from material name */
     uint32_t texkey;  /* car meshes: bound TPK diffuse key (0x134012), 0 if none */
+    unsigned char mat_exact; /* world meshes: texkey belongs to this exact
+                                0x134B02 range, or to a true single-slot object.
+                                Zero marks a conservative whole-object fallback:
+                                its texture may draw, but never make unrelated
+                                geometry cutout/blended/additive. */
     int      trim;    /* car BODY meshes only: 1 = plastic bumper/skirt (verified
                           real per-part name tokens, e.g. GOLF_KIT00_FRONT_BUMPER_A),
                           duller/broader specular than the metallic paint panels */
@@ -83,6 +88,32 @@ typedef struct {
     int     count, cap;
 } N2Scene;
 
+/* Total order for exact mesh payload identity. World dedup first groups by
+ * world-space bbox, then uses this to distinguish different material slices
+ * that share one source vertex pool and happen to have equal counts. */
+static int n2_mesh_content_cmp(const N2Mesh *a, const N2Mesh *b) {
+    if (a->texkey != b->texkey) return a->texkey < b->texkey ? -1 : 1;
+    if (a->nidx != b->nidx) return a->nidx < b->nidx ? -1 : 1;
+    if (a->nverts != b->nverts) return a->nverts < b->nverts ? -1 : 1;
+    if (a->mat_exact != b->mat_exact) return a->mat_exact < b->mat_exact ? -1 : 1;
+    if (!!a->idx != !!b->idx) return a->idx ? 1 : -1;
+    if (!!a->verts != !!b->verts) return a->verts ? 1 : -1;
+    if (!!a->vcol != !!b->vcol) return a->vcol ? 1 : -1;
+    int c = 0;
+    if (a->idx && a->nidx > 0)
+        c = memcmp(a->idx, b->idx, (size_t)a->nidx * sizeof *a->idx);
+    if (!c && a->verts && a->nverts > 0)
+        c = memcmp(a->verts, b->verts,
+                   (size_t)a->nverts * 5 * sizeof *a->verts);
+    if (!c && a->vcol && a->nverts > 0)
+        c = memcmp(a->vcol, b->vcol, (size_t)a->nverts * 4);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+
+static int n2_mesh_same_content(const N2Mesh *a, const N2Mesh *b) {
+    return a && b && n2_mesh_content_cmp(a, b) == 0;
+}
+
 /* Decoded RGB texture (3 bytes/pixel, top-left origin).
  *
  * ALPHA. `alpha` is a separate w*h plane, non-NULL only when the source
@@ -131,6 +162,21 @@ static int n2_tex_mode(const N2Tex *t) {
     if (t->usage == 2 && t->blend == 1) return N2_DRAW_BLEND;
     if (t->blend == 2) return N2_DRAW_ADD;
     return N2_DRAW_OPAQUE;
+}
+
+/* Authored transparency is safe only when the mesh-to-material association is
+ * structural. This is separate from n2_tex_mode: that function decodes what a
+ * texture wants; this function decides whether this particular world mesh has
+ * proven ownership of that texture. */
+static int n2_world_draw_mode(const N2Mesh *m, int authored) {
+    return m && m->mat_exact ? authored : N2_DRAW_OPAQUE;
+}
+
+/* Keep conservative whole-object fallbacks out of batches owned by an exact
+ * material range, even when both currently resolve to OPAQUE. Provenance is
+ * part of the batch contract so later material state cannot leak across it. */
+static int n2_world_batch_material_group(const N2Mesh *m, int effective_mode) {
+    return effective_mode * 2 + (m && m->mat_exact ? 1 : 0);
 }
 
 /* ---- file I/O ---- */
@@ -813,8 +859,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                depth-write off) so its absurd span must skip the size-safety
                cull that still guards every other category. */
             int cull = (cat != N2_SKY);
-            /* Per-submesh materials for road/terrain (Milestone 101). A road
-             * object lists SEVERAL 0x134012 slots and its single 0x134B02 leaf
+            /* Per-submesh materials for world objects (Milestone 101/M135-S).
+             * An object lists SEVERAL 0x134012 slots and its single 0x134B02 leaf
              * partitions the index buffer into ranges, each naming its slot by
              * mat_id -- the same linkage the car path already uses. Binding one
              * key per object (the last slot) put a 64x64 intersection tile over
@@ -826,11 +872,11 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
              * straight through to the unchanged single-mesh path below. */
             int sub_ok = 0;
             N2Sub sub[64]; int nsub = 0;
-            uint32_t slot[64]; int nslot = 0;
+            uint32_t slot[64];
+            int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
             int fb_why = -1; long fb_idx = 0, fb_chain = 0;   /* M102 census only */
-            if ((cat == N2_ROAD || cat == N2_TERRAIN) && pairs == 1) {
+            if (cat != N2_SKY && cat != N2_GLOW && pairs == 1) {
                 nsub  = n2_mesh_submeshes(d, ds, ds + size, sub, 64);
-                nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
                 if (nsub > 0 && nslot > 0) {
                     const unsigned char *ib0 = d + idx[0].off;
                     int ibytes = (int)idx[0].size, ip = 0;
@@ -899,25 +945,32 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                        index partition are identical either way -- only the key
                        differs -- so nothing is dropped or duplicated. */
                     uint32_t sk = n2_resolve_key(slot[sub[a].mat], keys, nkeys);
+                    int exact = sk != 0;
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;
                     n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, cull,
                                 sk, objm,
                                 (long)sub[a].start, (long)sub[a].count);
                     for (int m2 = before; m2 < scene->count; m2++) {
+                        scene->meshes[m2].mat_exact = (unsigned char)exact;
                         scene->meshes[m2].scen = (unsigned char)sc;
                         snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
                                  "%.31s", anm);
                     }
                 }
-            } else
-            for (int k = 0; k < pairs; k++) {
-                int before = scene->count;
-                n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull, tk, objm, 0, -1);
-                for (int m2 = before; m2 < scene->count; m2++) {   /* tag the new mesh */
-                    scene->meshes[m2].scen = (unsigned char)sc;
-                    snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
-                             "%.31s", anm);
+            } else {
+                int exact_single_slot = nslot == 1 && slot[0] != 0;
+                for (int k = 0; k < pairs; k++) {
+                    int before = scene->count;
+                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull,
+                                tk, objm, 0, -1);
+                    for (int m2 = before; m2 < scene->count; m2++) {
+                        scene->meshes[m2].mat_exact =
+                            (unsigned char)exact_single_slot;
+                        scene->meshes[m2].scen = (unsigned char)sc;
+                        snprintf(scene->meshes[m2].sname,
+                                 sizeof scene->meshes[m2].sname, "%.31s", anm);
+                    }
                 }
             }
             if (scene != scene0) n2_obj_vista++;          /* routed to the vista scene */

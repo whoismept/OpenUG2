@@ -225,9 +225,13 @@ triangles are bad, reject the mesh and report it.
 
 ### Duplicate and terrain policy
 
-`world_dedup` runs before bounds, the ground grid and GPU upload. Identity is
-exact texture key + XYZ bounds + index count + vertex count. Do not replace it
-with an epsilon merge: nearby distinct authored layers can be meaningful.
+`world_dedup` runs before bounds, the ground grid and GPU upload. Bounds and
+counts are only a cheap grouping prefix; identity also compares material
+ownership plus the complete index, vertex/UV and prelight payload byte-for-byte.
+This matters after material splitting because different ranges share the same
+source vertex pool and can have equal counts without being duplicate faces. Do
+not replace the exact comparison with an epsilon merge: nearby distinct
+authored layers can be meaningful.
 
 Terrain receives a small -0.05 m world-space bias after dedup so coplanar road
 strips win the depth test and ground selector. This is current engine policy,
@@ -238,7 +242,8 @@ not a decoded file-format field.
 ### Batch construction
 
 `upload_world_batches` excludes sky/glow, sorts ordinary meshes by spatial
-cell and resolved GL texture, splits runs before the `u16` vertex ceiling, then
+cell, resolved GL texture and effective draw mode, splits runs before the
+`u16` vertex ceiling, then
 sorts the final batch list by texture. The post-sort batch index is not the
 emission index. Diagnostics must replay the recorded emission run; re-deriving
 membership after the final sort can attribute the wrong object.
@@ -278,6 +283,13 @@ per-mesh into `upload_world_batches`/`upload_cat_batches` (optional trailing
 `mtexmode` array), landing on `N2Batch.drawmode`. Callers that don't care
 (sky/glow/vista/diagnostic-marker batches) pass `NULL` and get
 `N2_DRAW_OPAQUE`, unchanged from before this field existed.
+
+Texture mode is not sufficient evidence that an entire object owns that mode.
+`n2_world_draw_mode` permits authored cutout/blend/additive only for an exact
+`0x134B02 -> 0x134012` range or a true single-slot object. A malformed
+multi-slot fallback is forced opaque, and batch construction keeps that opaque
+fallback separate from exact ranges even when both resolve to the same GL
+texture and effective draw mode.
 
 The main world draw loop in `main.c` dispatches on `drawmode`:
 
