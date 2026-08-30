@@ -71,6 +71,8 @@ typedef struct {
           uTextureAlpha,            /* >0.5: output alpha = texture alpha *
                                        uAlpha (N2_DRAW_BLEND/ADD world
                                        batches only, M135-R) */
+          uEmissiveTex,             /* >0.5: texture-backed unlit RGB/alpha
+                                       (authored sky and point-light sprites) */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in the current object's model space */
           uEnv,     /* environment-reflection amount (cars only) */

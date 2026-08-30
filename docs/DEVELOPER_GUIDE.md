@@ -255,6 +255,21 @@ objects are not smoothed together.
 Sky and glow use `upload_cat_batches` and separate depth/blend behaviour.
 Vista batches exist only for the experimental full tier.
 
+### Authored sky
+
+`SKYDOME` is not a camera-locked flat colour. It is a world-space shell with
+an exact two-range material partition: an opaque dome and a DXT3 alpha cap.
+Their source sunrise keys live in `LOC4DYNTEX.BIN`; `--sky` remaps only those
+keys to the matching shipped `night` (default), `sunrise`, or `sunset` pair
+before the normal texture-binding pass. Invalid profiles exit with status 2.
+
+The sky pass uses the real camera view, a 30 km far plane and depth writes off.
+It enables the narrow `uEmissiveTex` shader gate, draws the dome first and the
+alpha-blended cap second, then restores blending, depth mask, fog density,
+shader gates and the ordinary MVP. Exact `SKYDOME`/`SKY_` classification is an
+invariant: broad substring matching moves buildings and factory skylights into
+this special pass and is forbidden.
+
 ### Visibility tiers
 
 - `baseline`: historical fixed 700 m gate, diagnostic only;
@@ -347,16 +362,13 @@ TPK, then `w->loc4` (`LOC4DYNTEX.BIN`, decoded through
 fallback, then the master TPK. Only `n2_tpk_decode` reads the `order`/
 `usage`/`blend`/`wz` draw-mode bytes; a key resolved through the LOC4
 fallback keeps them at their zero default (`N2_DRAW_OPAQUE`), same as every
-world texture had before the field existed. **Censused** (temporary
-instrumentation, not committed) against both reference scenes this
-milestone verifies against -- `STREAML4RA` (`--world2`/`--instance-audit`
-and legacy `--objdump`) and `STREAML4RB` -- **zero** world texture keys in
-either scene ever fall through to the LOC4 path: every key resolves
-directly from its own region TPK. The LOC4-path draw-mode gap is real but
-currently unreachable from any traffic these two scenes generate, so it is
-left as documented, untested-because-unexercised code rather than guessed
-at; extend it the same way `n2_tpk_decode` was extended if a LOC4-resolved
-world texture is ever found needing a non-opaque mode.
+world texture had before the field existed. Ordinary world-material traffic
+in the two reference scenes resolves directly from its regional TPK. M136
+proved one intentional exception: the `SKYDOME` dome/cap pairs live in LOC4.
+They bypass ordinary draw-mode dispatch and use the dedicated authored-sky
+path, so the cap's decoded alpha is retained without inventing LOC4 header
+metadata. Extend LOC4 draw-mode decoding only if a future ordinary world
+texture is proven to require it.
 
 ## 8. Car loading and presentation
 

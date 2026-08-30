@@ -743,6 +743,38 @@ static void test_private_prototype_paths(void) {
     assert(library.items[0].scene.meshes[0].nidx == 3);
     assert(library.items[0].scene.meshes[0].texkey == 0x1234u);
     winst_library_free(&library);
+
+    /* SKYDOME's two textures live in shared LOC4 and are therefore absent
+       from the region-local key inventory. The instance prototype builder
+       must still retain its exact dome/cap material partition. */
+    {
+        unsigned char sky[1024], sh[128], ss[16], sm[120], sv[72], si[12];
+        memset(sky, 0, sizeof sky); memset(sh, 0, sizeof sh);
+        memset(ss, 0, sizeof ss); memset(sm, 0, sizeof sm);
+        memset(sv, 0, sizeof sv); memset(si, 0, sizeof si);
+        memcpy(sh, "SKYDOME", 7);
+        for (int i = 0; i < 16; i++) put_f32(sh + 0x40 + i * 4,
+                                              i % 5 == 0 ? 1.0f : 0.0f);
+        put_u32(ss + 0, 0x5fb8bcd1u); put_u32(ss + 8, 0x2414a01eu);
+        put_u32(sm + 12, 3); put_u32(sm + 28, 1); put_u32(sm + 52, 0);
+        put_u32(sm + 60 + 12, 3); put_u32(sm + 60 + 28, 0);
+        put_u32(sm + 60 + 52, 3);
+        put_f32(sv + 24, 1.0f); put_f32(sv + 48 + 4, 1.0f);
+        put_u16(si + 0, 0); put_u16(si + 2, 1); put_u16(si + 4, 2);
+        put_u16(si + 6, 0); put_u16(si + 8, 2); put_u16(si + 10, 1);
+        long sn = 0;
+        sn = add_leaf(sky, sn, 0x00134011ul, sh, sizeof sh);
+        sn = add_leaf(sky, sn, 0x00134012ul, ss, sizeof ss);
+        sn = add_leaf(sky, sn, 0x00134b02ul, sm, sizeof sm);
+        sn = add_leaf(sky, sn, 0x00134b01ul, sv, sizeof sv);
+        sn = add_leaf(sky, sn, 0x00134b03ul, si, sizeof si);
+        memset(&library, 0, sizeof library);
+        winst_collect_model(&library, sky, 0, sn, NULL, 0);
+        assert(library.count == 1 && library.items[0].scene.count == 2);
+        assert(library.items[0].scene.meshes[0].texkey == 0x2414a01eu);
+        assert(library.items[0].scene.meshes[1].texkey == 0x5fb8bcd1u);
+        winst_library_free(&library);
+    }
 }
 
 static void test_world2_capture_policy(void) {

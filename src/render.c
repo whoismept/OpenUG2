@@ -44,6 +44,7 @@ static const char *FS =
         batches only -- everything else, including CUTOUT, cars, and every
         HUD/debug uUnlit pass, leaves this at its default 0.0 and keeps its
         existing uAlpha-only alpha output unchanged) */
+    "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -74,6 +75,11 @@ static const char *FS =
     "    if(a < 0.02) discard;\n"
     "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
     "    return;\n"
+    "  }\n"
+    "  if(uEmissiveTex>0.5){\n"
+    "    vec4 t=texture2D(uTex,vUV);\n"
+    "    float a=t.a*uAlpha; if(a<0.02) discard;\n"
+    "    gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog),a); return;\n"
     "  }\n"
     "  if(uUnlit>0.5){ float a=uAlpha;\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
@@ -265,6 +271,7 @@ RProg render_program(void) {
     r.uVista      = glGetUniformLocation(r.prog, "uVista");
     r.uAlphaTest  = glGetUniformLocation(r.prog, "uAlphaTest");
     r.uTextureAlpha = glGetUniformLocation(r.prog, "uTextureAlpha");
+    r.uEmissiveTex = glGetUniformLocation(r.prog, "uEmissiveTex");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
@@ -286,6 +293,7 @@ RProg render_program(void) {
     glUniform1f(r.uFlipN, 0.0f);
     glUniform1f(r.uAlphaTest, 0.0f);
     glUniform1f(r.uTextureAlpha, 0.0f);
+    glUniform1f(r.uEmissiveTex, 0.0f);
     glUniform3f(r.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
     return r;
 }

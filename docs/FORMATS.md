@@ -478,17 +478,36 @@ the flat `uAlpha` uniform. Texture alpha is never gated on `uVColor` —
 per-vertex prelight strength and authored texture transparency are
 independent controls.
 
-**LOC4 fallback (M135-R census):** `world_bind_textures` falls back to the
+**LOC4 fallback (M135-R/M136 census):** `world_bind_textures` falls back to the
 shared `LOC4DYNTEX.BIN` car-texture library (`n2_load_car_tex_by_key`) for a
 key its own region TPK can't resolve; that reader never decodes
 `order`/`usage`/`blend`/`wz`, so a LOC4-resolved key is always
-`N2_DRAW_OPAQUE`. Censused (temporary, uncommitted instrumentation) against
-both reference scenes this milestone verifies against — `STREAML4RA`
-(`--world2`/`--instance-audit` and legacy `--objdump`) and `STREAML4RB` —
-**zero** world texture keys in either scene ever reach the LOC4 fallback;
-every key resolves from its own region TPK. Left undecoded and undocumented
-further per the "don't guess" rule until a real LOC4-resolved non-opaque
-world texture is found.
+`N2_DRAW_OPAQUE`. Ordinary world-material traffic in the two reference scenes
+still resolves from the regional TPK. The authored `SKYDOME` is the measured
+exception: its two `0x134012` slots live only in LOC4 and are rendered by the
+dedicated sky pass, which consumes the cap's decoded DXT3 alpha directly and
+does not use the ordinary-world draw-mode value.
+
+### Authored sky (`SKYDOME`)
+
+The real object has two texture slots and two exact material ranges:
+
+```text
+slot 0  5fb8bcd1  SKY_SUNRISE_A_CAP
+slot 1  2414a01e  SKY_SUNRISE_A
+range 0 start 0   count 288  mat 1   // 96 dome triangles
+range 1 start 288 count 144  mat 0   // 48 cap triangles
+```
+
+Both keys are absent from the regional TPK and present in LOC4. Consequently
+the mesh parser must preserve a structurally valid sky range's authored slot
+even when the region-local key inventory cannot resolve it; texture resolution
+happens later in `world_bind_textures`. The matching LOC4 pairs are sunrise
+`2414a01e/5fb8bcd1`, sunset `27f186b7/3e6947ea`, and night
+`8a9a05cf/b0eb9302` (dome/cap). Only the two proven sunrise source keys are
+profile-remapped. `SKYDOME` exactly and the `SKY_` prefix classify as sky;
+names merely containing those letters, such as `XB_SKYDOMEB_*` and
+`XB_FACTORYSKYLIGHT*`, remain ordinary geometry.
 
 Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
 own `STREAM*.BUN` TPK carries its

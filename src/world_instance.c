@@ -248,7 +248,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     uint32_t slot[64];
     int nsub = 0;
     int nslot = n2_mesh_texslots(data, begin, end, slot, 64);
-    if (cat != N2_SKY && cat != N2_GLOW && pairs == 1) {
+    if (cat != N2_GLOW && pairs == 1) {
         nsub = n2_mesh_submeshes(data, begin, end, sub, 64);
         if (nsub > 0 && nslot > 0) {
             const unsigned char *ib0 = data + idx[0].off;
@@ -270,7 +270,12 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     }
     if (sub_ok) {
         for (int i = 0; i < nsub; i++) {
-            uint32_t subkey = n2_resolve_key(slot[sub[i].mat], keys, nkeys);
+            uint32_t authored = slot[sub[i].mat];
+            /* SKYDOME resolves from shared LOC4 after prototype placement,
+               not from this bundle's regional key inventory. Preserve the
+               verified positional slot exactly, matching n2_walk_meshes. */
+            uint32_t subkey = cat == N2_SKY
+                            ? authored : n2_resolve_key(authored, keys, nkeys);
             int exact = subkey != 0;
             int before = local.count;
             n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, cat != N2_SKY,

@@ -141,6 +141,68 @@ static int count_by_cat(const N2Scene *s, int cat) {
     return n;
 }
 
+static int category_for_name(const char *name) {
+    Buf p; p.n = 0;
+    leaf_name(&p, name);
+    return n2_mesh_category(p.b, 0, p.n);
+}
+
+/* M136 RED/GREEN regression: SKY is a narrow authored family and the shipped
+ * dome is a two-material object (dome + alpha cap), not one last-slot mesh. */
+static void sky_material_routing_test(void) {
+    printf("\n  SKY authored family and two-range material routing\n");
+    chk("exact SKYDOME is sky", category_for_name("SKYDOME") == N2_SKY);
+    chk("SKY_ family is sky", category_for_name("SKY_NIGHT_TEST") == N2_SKY);
+    chk("building containing SKYDOME is ordinary",
+        category_for_name("XB_SKYDOMEB_1A_LL_00") == N2_OTHER);
+    chk("factory skylight is ordinary",
+        category_for_name("XB_FACTORYSKYLIGHTA_1A_00") == N2_OTHER);
+
+    Buf object_payload; object_payload.n = 0;
+    leaf_name(&object_payload, "SKYDOME");
+    const uint32_t slots[2] = {0x5fb8bcd1u, 0x2414a01eu}; /* cap, dome */
+    leaf_slots(&object_payload, 0x00134012u, slots, 2);
+    const SubSpec sub[2] = {
+        {288, 1, 0,   0}, /* 96 dome triangles */
+        {144, 0, 0, 288}, /* 48 cap triangles */
+    };
+    leaf_submeshes(&object_payload, sub, 2);
+    const float pos[3][3] = {{0,0,0},{1,0,0},{0,1,0}};
+    uint16_t idx[432];
+    for (int i = 0; i < 432; i++) idx[i] = (uint16_t)(i % 3);
+    leaf_world_verts(&object_payload, pos, 3);
+    leaf_idx(&object_payload, idx, 432);
+
+    Buf file; file.n = 0;
+    chunk(&file, 0x80134010u, &object_payload);
+    N2Scene scene; memset(&scene, 0, sizeof scene);
+    /* The real SKY keys live in shared LOC4, not the region-local TPK key
+       inventory passed to the mesh walker. Preserve the authored slots now;
+       world_bind_textures resolves them later. */
+    n2_walk_meshes(file.b, 0, file.n, &scene, NULL, 0);
+    chk("SKYDOME emits dome and cap ranges", scene.count == 2);
+    chk("SKYDOME preserves all 432 indices", total_nidx(&scene) == 432);
+    chk("dome range selects shipped dome slot",
+        scene.count == 2 && scene.meshes[0].texkey == 0x2414a01eu &&
+        scene.meshes[0].nidx == 288);
+    chk("cap range selects shipped cap slot",
+        scene.count == 2 && scene.meshes[1].texkey == 0x5fb8bcd1u &&
+        scene.meshes[1].nidx == 144);
+    for (int i = 0; i < scene.count; i++) {
+        free(scene.meshes[i].verts); free(scene.meshes[i].idx); free(scene.meshes[i].vcol);
+    }
+    free(scene.meshes);
+
+    chk("night profile parses", n2_sky_profile_parse("night") == N2_SKY_NIGHT);
+    chk("invalid sky profile is rejected", n2_sky_profile_parse("noon") < 0);
+    chk("night remap selects shipped dome key",
+        n2_sky_remap_key(N2_SKY_NIGHT, 0x2414a01eu) == 0x8a9a05cfu);
+    chk("night remap selects shipped cap key",
+        n2_sky_remap_key(N2_SKY_NIGHT, 0x5fb8bcd1u) == 0xb0eb9302u);
+    chk("unknown sky key is unchanged",
+        n2_sky_remap_key(N2_SKY_NIGHT, 0x12345678u) == 0x12345678u);
+}
+
 /* Hand-built N2Mesh for n2_car_dedupe_lod fixtures (Fixture G): the function
  * only reads tierid/namekey/nverts/verts/nidx, so this drives it directly
  * without going through the chunk parser at all. X varies per call (drives
@@ -1031,6 +1093,7 @@ int main(void) {
 
     texture_record_tests();
     sort_tests();
+    sky_material_routing_test();
     world_material_routing_test();
     world_mesh_identity_test();
 

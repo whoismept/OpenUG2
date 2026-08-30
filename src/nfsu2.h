@@ -16,6 +16,27 @@ enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        /* car mesh classes, from material name */
        N2_CAR_BODY = 10, N2_CAR_GLASS = 11, N2_CAR_LIGHT = 12,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
+
+enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
+
+/* The shipped SKYDOME object is authored with the sunrise pair. Retail also
+ * ships matching sunset/night dome+cap pairs in LOC4; choosing a profile
+ * changes only those two structurally proven source keys. */
+static int n2_sky_profile_parse(const char *name) {
+    if (!name) return -1;
+    if (!strcmp(name, "sunrise")) return N2_SKY_SUNRISE;
+    if (!strcmp(name, "sunset"))  return N2_SKY_SUNSET;
+    if (!strcmp(name, "night"))   return N2_SKY_NIGHT;
+    return -1;
+}
+static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
+    static const uint32_t dome[] = {0x2414a01eu, 0x27f186b7u, 0x8a9a05cfu};
+    static const uint32_t cap[]  = {0x5fb8bcd1u, 0x3e6947eau, 0xb0eb9302u};
+    if (profile < N2_SKY_SUNRISE || profile > N2_SKY_NIGHT) return source_key;
+    if (source_key == dome[N2_SKY_SUNRISE]) return dome[profile];
+    if (source_key == cap[N2_SKY_SUNRISE])  return cap[profile];
+    return source_key;
+}
 typedef struct {
     float   *verts;   /* 5 floats per vertex: pos.xyz, uv */
     unsigned char *vcol; /* 4 bytes/vertex: RGBA prelight from the source stream
@@ -281,7 +302,12 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                 while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
                 if (j - i >= 5) {
                     const unsigned char *n = p + i; long L = j - i;
-                    if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
+                    /* SKY is deliberately narrow. XB_SKYDOMEB and
+                       XB_FACTORYSKYLIGHT are ordinary authored structures;
+                       the former broad substring match moved them into the
+                       camera/depth-write-off sky pass. */
+                    if ((L == 7 && !memcmp(n, "SKYDOME", 7)) ||
+                        (L >= 4 && !memcmp(n, "SKY_", 4))) return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
@@ -875,7 +901,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             uint32_t slot[64];
             int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
             int fb_why = -1; long fb_idx = 0, fb_chain = 0;   /* M102 census only */
-            if (cat != N2_SKY && cat != N2_GLOW && pairs == 1) {
+            if (cat != N2_GLOW && pairs == 1) {
                 nsub  = n2_mesh_submeshes(d, ds, ds + size, sub, 64);
                 if (nsub > 0 && nslot > 0) {
                     const unsigned char *ib0 = d + idx[0].off;
@@ -944,7 +970,14 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                        exactly what the whole object used to get. Geometry and the
                        index partition are identical either way -- only the key
                        differs -- so nothing is dropped or duplicated. */
-                    uint32_t sk = n2_resolve_key(slot[sub[a].mat], keys, nkeys);
+                    uint32_t authored = slot[sub[a].mat];
+                    /* SKYDOME's two proven slots live in shared LOC4, so they
+                       are intentionally absent from the region-local key set.
+                       Preserve those authored keys for world_bind_textures to
+                       resolve later; applying the generic regional fallback
+                       here collapsed dome+cap onto one texture. */
+                    uint32_t sk = cat == N2_SKY
+                                ? authored : n2_resolve_key(authored, keys, nkeys);
                     int exact = sk != 0;
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;

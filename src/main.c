@@ -1188,6 +1188,7 @@ int main(int argc, char **argv) {
          --shot out.png   render one frame and exit
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
          --world2         opt into diagnostic instance-driven world assembly
+         --sky PROFILE    authored sky: night (default), sunrise, or sunset
          --spawn start|X,Y  focus/spawn for --world2 (required)
          --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
          --instance-audit print instance/world/support diagnostics and exit GL-free */
@@ -1198,6 +1199,7 @@ int main(int argc, char **argv) {
     /* M132-R diagnostics. tier: 0 = baseline (old fixed 700 m, no vista),
        1 = ordinary (fog-derived range, no vista), 2 = full (range + vista). */
     int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
+    int sky_profile = N2_SKY_NIGHT;
     const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
                                     start pose and capture four yaws there */
     float posefrac = -1.0f;      /* --pose-frac F: seed the SAME first-safe
@@ -1271,6 +1273,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--batch-audit") && i+2 < argc) { baudit = trackname = argv[++i]; bmesh = argv[++i]; }
         else if (!strcmp(argv[i], "--rendermode") && i+1 < argc) rendermode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--daylight")) daylight = 1;
+        else if (!strcmp(argv[i], "--sky") && i+1 < argc) {
+            const char *s = argv[++i];
+            sky_profile = n2_sky_profile_parse(s);
+            if (sky_profile < 0) {
+                fprintf(stderr, "unknown --sky '%s' -- expected sunrise, sunset, or night\n", s);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--shot-static") && i+1 < argc) sshot = argv[++i];
         else if (!strcmp(argv[i], "--shot-yaw") && i+1 < argc)
             shotyaw = (float)atof(argv[++i]) * 3.14159265f / 180.0f;
@@ -2133,6 +2143,14 @@ int main(int argc, char **argv) {
     }
     if (!nm) { fprintf(stderr, "no track data\n  (pass your NFSU2 data dir: nfsu2 /path/to/data)\n"); return 1; }
     N2Scene scene = world.scene;   /* shares world.scene.meshes */
+    /* The stored SKYDOME references the sunrise dome/cap pair. LOC4 also
+       ships structurally matching sunset/night pairs; remap only those two
+       proven SKY keys before the normal world texture resolver runs. */
+    for (int i = 0; i < scene.count; i++)
+        if (scene.meshes[i].cat == N2_SKY)
+            scene.meshes[i].texkey = n2_sky_remap_key(sky_profile, scene.meshes[i].texkey);
+    const uint32_t sky_dome_key = n2_sky_remap_key(sky_profile, 0x2414a01eu);
+    const uint32_t sky_cap_key  = n2_sky_remap_key(sky_profile, 0x5fb8bcd1u);
     printf("loaded %d submeshes from %d region(s)\n", nm, world.nreg);
     printf("terrain texture TRN_GRASSC: %s\n", world.have_grass ? "ok" : "-");
     int nroad = 0, nterr = 0;
@@ -5384,34 +5402,45 @@ int main(int argc, char **argv) {
            sky and vista draw from the total. */
         g_dbg.drawn = 0;
         int skydraws = 0, vistadraws = 0;
-        /* skybox: drawn first, camera-locked (view built from a zero eye so
-           translation drops out — the classic "at infinity" trick) and with
-           depth-write off so every real batch below still overdraws it via
-           the depth test alone. Falls back to nothing (flat fog clear
-           colour shows through) when the region has no SKYDOME mesh. */
+        /* Authored sky: SKYDOME is a world-space shell split by its proven
+           0x134B02 material ranges into an opaque dome and alpha cap. Draw it
+           first with a deep frustum and no depth writes; the ordinary world
+           then overwrites it normally. Missing textures leave the fog clear
+           colour as the conservative fallback. */
         if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0)) {   /* M78/M79 */
-            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16], Psky[16];
-            mat_lookat(zero, look, Vsky);
-            mat_persp(0.9f, (float)W/H, znear, maxr*30, Psky);  /* deep: dome ~16 km */
-            mat_mul(Psky, Vsky, MVPsky);
+            float MVPsky[16], Psky[16];
+            mat_persp(0.9f, (float)W/H, znear, 30000.0f, Psky);
+            mat_mul(Psky, V, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
-            glUniform1f(uUnlit, 1.0f);
+            glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uEmissiveTex, 1.0f);
+            glUniform1f(uUseTex, 1.0f);
+            glUniform1f(uAlpha, 1.0f);
+            glUniform3f(uColor, 1.0f, 1.0f, 1.0f);
+            glUniform1f(rp.uFogDensity, 0.0f);
             glDepthMask(GL_FALSE);
-            /* The unlit path outputs mix(uFogColor,uColor,fog) and never
-               samples the texture, so every sky batch is flat-shaded to
-               uColor. It MUST be set here: the loop used to set it only for
-               untextured batches, so a textured sky mesh (region D has one)
-               inherited whatever uColor the previous frame last left -- the
-               red brake-light/neon colour -- and, being camera-locked, drew a
-               fixed red block at the top of the frame. Pin it to the fog
-               colour so the dome always dissolves into the horizon. */
-            glUniform1f(uUseTex, 0.0f);
-            glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
+            glDisable(GL_BLEND);
+            /* Dome first. Exact classification means ordinary assets such as
+               XB_SKYDOMEB and XB_FACTORYSKYLIGHT never enter this list. */
             for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].texkey != sky_dome_key || !skybatch[k].tex) continue;
+                glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
                 draw_batch(&skybatch[k]);
                 g_dbg.drawn++; skydraws++;
             }
-            glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+            /* The DXT3 cap carries its own authored gradient alpha. */
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].texkey != sky_cap_key || !skybatch[k].tex) continue;
+                glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
+                draw_batch(&skybatch[k]);
+                g_dbg.drawn++; skydraws++;
+            }
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+            glUniform1f(rp.uEmissiveTex, 0.0f);
+            glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+            glUniform1f(uUseTex, 0.0f);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
         }
 
