@@ -312,6 +312,20 @@ The main world draw loop in `main.c` dispatches on `drawmode`:
 Texture alpha is never gated on `uVColor`: per-vertex prelight strength and
 authored texture transparency are independent and must not be conflated.
 
+### Texture format dispatch (M135-R)
+
+`n2_tpk_decode` selects P8/DXT1/DXT3 from the record's own `+0x3e` format
+tag (`N2_TEXFMT_P8=0x08`, `_DXT1=0x22`, `_DXT3=0x24`), not the old
+`Size`-vs-`w*h` heuristic -- independently verified against 2309 real
+records across three files with zero contradictions (see `docs/FORMATS.md`).
+`PaletteSize` is still cross-checked as a corruption guard (P8 requires a
+real palette; DXT1/DXT3 require none); a tag that doesn't match any proven
+format, or contradicts `PaletteSize`, is rejected outright rather than
+falling back to a guess. `N2_TEXFMT_DXT5`/`_BGRA8` are named for
+completeness (an external reference claims those byte values) but never
+seen on real world data -- those belong to the car `TEXTURES.BIN`
+offset-slot path (`n2_load_car_tex_by_key`), which has its own,
+separately-proven compression byte and is not affected by this change.
 
 ### LOC4 fallback and draw modes (M135-R census)
 

@@ -2487,10 +2487,24 @@ static int n2_tpk_keys(const unsigned char *d, N2Tpk t, uint32_t *keys, int maxk
     return n;
 }
 
+/* Format dispatch (M135-R, PROVEN): +0x3e is an explicit format tag, not a
+ * size guess. Independently verified (scratchpad/m135/tex_format_census.c)
+ * against 2309 real world-texture records across three files
+ * (STREAML4RA.BUN, STREAML4RB.BUN, LOC4DYNTEX.BIN) with ZERO contradictions:
+ * P8=0x08 (36/36), DXT1=0x22 (2033/2033), DXT3=0x24 (240/240). DXT5 (0x26)
+ * and BGRA8 (0x20) are named here for completeness (an external reference
+ * claims those values) but NEVER seen on real world data -- those two belong
+ * to the car TEXTURES.BIN offset-slot path (n2_load_car_tex_by_key), which
+ * has its own, separately-proven compression byte. No world record exists to
+ * prove a DXT5/BGRA8 decoder against here, so a record tagged with either is
+ * rejected rather than guessed at, same as a genuinely unknown tag. */
+enum { N2_TEXFMT_BGRA8 = 0x20, N2_TEXFMT_P8 = 0x08, N2_TEXFMT_DXT1 = 0x22,
+       N2_TEXFMT_DXT3 = 0x24, N2_TEXFMT_DXT5 = 0x26 };
 /* Decode one texture by its record hash, searching all blocks. Fields (Nikki's
  * layout minus a 0x0C name-pad prefix): +0x18 BinKey +0x24 Offset
- * +0x28 PaletteOffset +0x2c Size +0x30 PaletteSize +0x38 W(u16) +0x3a H(u16).
- * P8 when PaletteSize >= 1024 (256-entry RGBA); else DXT1/DXT3 by Size. */
+ * +0x28 PaletteOffset +0x2c Size +0x30 PaletteSize +0x38 W(u16) +0x3a H(u16)
+ * +0x3e format tag. PaletteSize is still cross-checked as a corruption guard
+ * (a record tagged P8 but lacking a real palette is contradictory, not P8). */
 static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t hash, N2Tex *tex) {
     /* every output field defined on BOTH paths, so a failed decode can never
        leave a caller reading a stale alpha/dxt pointer from a reused struct */
@@ -2501,9 +2515,15 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             if (!(d[i] >= 'A' && d[i] <= 'Z')) continue;
             if (n2_u32(d + i + 0x18) != hash) continue;
             uint32_t off = n2_u32(d + i + 0x24), paloff = n2_u32(d + i + 0x28);
-            uint32_t sz = n2_u32(d + i + 0x2c), palsz = n2_u32(d + i + 0x30);
+            uint32_t palsz = n2_u32(d + i + 0x30);   /* Size (+0x2c) no longer read here --
+                                                          format now comes from the +0x3e tag */
             int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
             if (w<=0 || hh<=0 || w>4096 || hh>4096) continue;
+            unsigned char fmt = d[i+0x3e];
+            int is_p8   = fmt == N2_TEXFMT_P8   && palsz >= 1024;
+            int is_dxt1 = fmt == N2_TEXFMT_DXT1 && palsz <  1024;
+            int is_dxt3 = fmt == N2_TEXFMT_DXT3 && palsz <  1024;
+            if (!is_p8 && !is_dxt1 && !is_dxt3) continue;   /* unknown/contradictory tag */
             tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
             tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
             /* order/usage/blend/wz: the last field read is wz at +0x4b, so a
@@ -2523,7 +2543,14 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             unsigned char *alf = (unsigned char *)malloc((long)w*hh);
             tex->alpha = NULL;
             tex->afmt = 0;
-            if (palsz >= 1024 && dbase+paloff+1024 <= len && dbase+off+(long)w*hh <= len) {
+            if (is_p8) {
+                /* Tagged P8 AND has a real palette (checked above); still
+                 * bounds-check the actual palette/index bytes -- a record
+                 * whose declared offsets don't fit the file is corrupt, not
+                 * decodable, regardless of what its tag claims. */
+                if (dbase+paloff+1024 > len || dbase+off+(long)w*hh > len) {
+                    free(tex->rgb); free(alf); continue;
+                }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
@@ -2539,7 +2566,7 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                  * inside n2_dxt3. blocks_x/y use ceil-to-4 so a non-multiple-
                  * of-4 dimension (the source data is not guaranteed aligned)
                  * still gets a correct, slightly-padded block count. */
-                long dxt3 = (long)sz > (long)w*hh*9/10;   /* format choice: unchanged heuristic */
+                long dxt3 = is_dxt3;   /* format choice: from the proven +0x3e tag, not size */
                 long bx = ((long)w + 3) / 4, by = ((long)hh + 3) / 4;
                 long need = bx * by * (dxt3 ? 16 : 8);
                 if (dbase + off + need > len) { free(tex->rgb); free(alf); continue; }

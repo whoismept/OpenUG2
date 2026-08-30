@@ -141,6 +141,8 @@ typedef struct {
     const char *name; uint32_t hash;
     uint32_t paloff, size, palsize; int w, h;
     unsigned char order, usage, blend, wz;
+    unsigned char fmt;                           /* +0x3e format tag (M135-R):
+                                                     0x08 P8, 0x22 DXT1, 0x24 DXT3 */
     const unsigned char *pixels; long pixlen;   /* appended to the pixel block */
     uint32_t off;                                /* filled by build_tpk() */
 } TexRec;
@@ -167,6 +169,7 @@ static N2Tpk build_tpk(Buf *o, TexRec *recs, int n) {
         memcpy(hdr.b + base + 0x3a, &h16, 2);
         hdr.b[base + 0x45] = recs[i].order; hdr.b[base + 0x49] = recs[i].usage;
         hdr.b[base + 0x4a] = recs[i].blend; hdr.b[base + 0x4b] = recs[i].wz;
+        hdr.b[base + 0x3e] = recs[i].fmt;
         pixoff += recs[i].pixlen;
     }
 
@@ -214,7 +217,7 @@ int texture_record_tests(void) {
     {
         Buf px; px.n = 0; dxt1_block(&px, 0xFFFFu, 0x0000u, 0x00000000u);   /* 4x4, one block */
         Buf tpk;
-        TexRec r = { "OPAQUE_TEST", 0x1001u, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, px.b, px.n, 0 };
+        TexRec r = { "OPAQUE_TEST", 0x1001u, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1001u, &tex);
         chk("T1 complete opaque record decodes", ok == 1);
@@ -232,7 +235,7 @@ int texture_record_tests(void) {
         Buf px; px.n = 0;
         dxt1_block(&px, 0x0000u, 0xFFFFu, 0x00000003u);   /* pixel 0 = index 3 (transparent) */
         Buf tpk;
-        TexRec r = { "CUTOUT_TEST", 0x1002u, 0, (uint32_t)px.n, 0, 4, 4, 0,1,0,1, px.b, px.n, 0 };
+        TexRec r = { "CUTOUT_TEST", 0x1002u, 0, (uint32_t)px.n, 0, 4, 4, 0,1,0,1, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1002u, &tex);
         chk("T2 complete cutout record decodes", ok == 1);
@@ -250,7 +253,7 @@ int texture_record_tests(void) {
     {
         Buf px; px.n = 0; dxt1_block(&px, 0x0000u, 0xFFFFu, 0u);
         Buf tpk;
-        TexRec r = { "BLEND_TEST", 0x1003u, 0, (uint32_t)px.n, 0, 4, 4, 5,2,1,0, px.b, px.n, 0 };
+        TexRec r = { "BLEND_TEST", 0x1003u, 0, (uint32_t)px.n, 0, 4, 4, 5,2,1,0, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1003u, &tex);
         chk("T3 complete blended record decodes", ok == 1);
@@ -262,7 +265,7 @@ int texture_record_tests(void) {
     {
         Buf px; px.n = 0; dxt1_block(&px, 0x0000u, 0xFFFFu, 0u);
         Buf tpk;
-        TexRec r = { "ADD_TEST", 0x1004u, 0, (uint32_t)px.n, 0, 4, 4, 5,2,2,0, px.b, px.n, 0 };
+        TexRec r = { "ADD_TEST", 0x1004u, 0, (uint32_t)px.n, 0, 4, 4, 5,2,2,0, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1004u, &tex);
         chk("T4 complete additive record decodes", ok == 1);
@@ -284,6 +287,10 @@ int texture_record_tests(void) {
         memcpy(hdr.b + 0x28, &paloff, 4); memcpy(hdr.b + 0x2c, &size, 4);
         memcpy(hdr.b + 0x30, &palsize, 4);
         uint16_t w16 = 4, h16 = 4; memcpy(hdr.b + 0x38, &w16, 2); memcpy(hdr.b + 0x3a, &h16, 2);
+        hdr.b[0x3e] = 0x22;   /* DXT1 format tag: +0x3e is well before the +0x4c
+                                 truncation point this fixture tests, so it must
+                                 be present the same way real truncated records
+                                 that still resolve W/H would carry it */
         Buf tpk; tpk.n = 0;
         bu32(&tpk, 0xb3310000u); bu32(&tpk, (uint32_t)hdr.n); bbytes(&tpk, hdr.b, hdr.n);
         bu32(&tpk, 0x33320002u); bu32(&tpk, (uint32_t)px.n); bbytes(&tpk, px.b, px.n);
@@ -301,7 +308,7 @@ int texture_record_tests(void) {
     {
         Buf px; px.n = 0; dxt1_block(&px, 0xFFFFu, 0x0000u, 0u);
         Buf tpk;
-        TexRec r = { "BADOFF_TEST", 0x1006u, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, px.b, px.n, 0 };
+        TexRec r = { "BADOFF_TEST", 0x1006u, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         /* patch a huge/invalid offset directly into the already-built record */
         for (long i = 0; i + 0x7c <= t.blk[0].hsize; i++)
@@ -317,19 +324,19 @@ int texture_record_tests(void) {
 
     /* T7: DXT1 dimensions not divisible by 4 (13x13) -- ceil-to-4 block
        count is 4x4 blocks = 128 bytes; must succeed with exactly that much
-       data and fail with less. (5x5 was tried first and rejected as a
-       fixture: at that size the UNCHANGED size heuristic that picks DXT1 vs
-       DXT3 -- sz > w*h*9/10 -- itself selects DXT3 for a correctly-sized
-       32-byte DXT1 buffer, since 32 > 5*5*0.9=22.5. That is a pre-existing
-       property of the untouched heuristic, not a defect this milestone
-       introduces or is trying to prove; 13x13 keeps 128 comfortably under
-       13*13*0.9=152.1, so the heuristic picks DXT1 as intended and this
-       fixture actually exercises the new block-count bounds math.) */
+       data and fail with less. (Originally built at 5x5 and moved to 13x13
+       when the OLD size-heuristic format dispatch -- sz > w*h*9/10 -- picked
+       DXT3 instead of DXT1 for a correctly-sized 32-byte 5x5 DXT1 buffer,
+       since 32 > 5*5*0.9=22.5; that heuristic is GONE now (M135-R: format
+       comes from the record's own +0x3e tag, set explicitly to 0x22 below),
+       so the size-vs-heuristic concern that picked 13x13 no longer applies
+       -- kept at 13x13 anyway since it already exercises the non-multiple-
+       of-4 block-count math this fixture is actually testing.) */
     {
         Buf px; px.n = 0;
         for (int b = 0; b < 16; b++) dxt1_block(&px, 0xFFFFu, 0x0000u, 0u);   /* 4x4 blocks */
         Buf tpk;
-        TexRec r = { "DXT1_13X13", 0x1007u, 0, (uint32_t)px.n, 0, 13, 13, 0,0,0,1, px.b, px.n, 0 };
+        TexRec r = { "DXT1_13X13", 0x1007u, 0, (uint32_t)px.n, 0, 13, 13, 0,0,0,1, 0x22, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1007u, &tex);
         chk("T7 DXT1 13x13 (non-multiple-of-4): decodes with the ceil-to-4 "
@@ -340,7 +347,7 @@ int texture_record_tests(void) {
            OOB. Built from px BEFORE the outer block ends. */
         Buf px2; px2.n = 0; bbytes(&px2, px.b, px.n - 1);
         Buf tpk2;
-        TexRec r2 = { "DXT1_13X13_SHORT", 0x1008u, 0, (uint32_t)px2.n, 0, 13, 13, 0,0,0,1, px2.b, px2.n, 0 };
+        TexRec r2 = { "DXT1_13X13_SHORT", 0x1008u, 0, (uint32_t)px2.n, 0, 13, 13, 0,0,0,1, 0x22, px2.b, px2.n, 0 };
         N2Tpk t2 = build_tpk(&tpk2, &r2, 1);
         N2Tex tex2; int ok2 = n2_tpk_decode(tpk2.b, tpk2.n, t2, 0x1008u, &tex2);
         chk("T7b one byte short of the required DXT1 block length is rejected",
@@ -356,26 +363,26 @@ int texture_record_tests(void) {
         Buf px; px.n = 0;
         for (int b = 0; b < 4; b++) dxt3_block(&px, 0xffffffffffffffffull, 0xFFFFu, 0x0000u, 0u);
         Buf tpk;
-        /* Size chosen large enough to select the DXT3 branch's heuristic
-           (sz > w*h*9/10); w*h=36, so > 32.4 selects DXT3 over DXT1. */
-        TexRec r = { "DXT3_6X6", 0x1009u, 0, (uint32_t)px.n, 0, 6, 6, 0,0,0,1, px.b, px.n, 0 };
+        /* fmt tag (0x24) selects the DXT3 branch directly (M135-R); Size is
+           only used for the byte-length bound below, not format selection. */
+        TexRec r = { "DXT3_6X6", 0x1009u, 0, (uint32_t)px.n, 0, 6, 6, 0,0,0,1, 0x24, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x1009u, &tex);
         chk("T8 DXT3 6x6 (non-multiple-of-4): decodes with the ceil-to-4 "
             "block count (2x2 blocks, 64 bytes -- not w*h/2=18)",
             ok == 1 && tex.w == 6 && tex.h == 6);
         if (ok) { free(tex.rgb); free(tex.alpha); free(tex.dxt); }
-        
-        /* Declared Size (40, > w*h*9/10=32.4) still selects the DXT3 branch
-           via the unchanged heuristic, but only 18 bytes physically follow
-           in the buffer -- far short of the real 64 needed (2x2 blocks x 16).
-           The OLD bounds check used a flat w*h/2=18-byte estimate here, which
-           this exact input would have satisfied, letting n2_dxt3 read 46
-           bytes past the buffer's end. The corrected block-count check must
-           reject it instead. */
+
+        /* Declared Size (40) is irrelevant to format selection now (the fmt
+           tag below picks DXT3 directly), but only 18 bytes physically
+           follow in the buffer -- far short of the real 64 needed (2x2
+           blocks x 16). The OLD bounds check used a flat w*h/2=18-byte
+           estimate here, which this exact input would have satisfied,
+           letting n2_dxt3 read 46 bytes past the buffer's end. The
+           corrected block-count check must reject it instead. */
         Buf px3; px3.n = 0; for (int i = 0; i < 18; i++) px3.b[px3.n++] = 0xAB;
         Buf tpk3;
-        TexRec r3 = { "DXT3_6X6_OLD18", 0x100Au, 0, 40, 0, 6, 6, 0,0,0,1, px3.b, 18, 0 };
+        TexRec r3 = { "DXT3_6X6_OLD18", 0x100Au, 0, 40, 0, 6, 6, 0,0,0,1, 0x24, px3.b, 18, 0 };
         N2Tpk t3 = build_tpk(&tpk3, &r3, 1);
         N2Tex tex3; int ok3 = n2_tpk_decode(tpk3.b, tpk3.n, t3, 0x100Au, &tex3);
         chk("T8b the old w*h/2 estimate (18 B) is correctly rejected for DXT3 "
@@ -392,7 +399,7 @@ int texture_record_tests(void) {
         unsigned char ix[16] = {0,1,0,1, 1,0,1,0, 0,1,0,1, 1,0,1,0};
         bbytes(&px, ix, 16);                               /* then 4x4 index bytes */
         Buf tpk;
-        TexRec r = { "P8_TEST", 0x100Bu, 0, 16, 1024, 4, 4, 0,0,0,1, px.b, px.n, 0 };
+        TexRec r = { "P8_TEST", 0x100Bu, 0, 16, 1024, 4, 4, 0,0,0,1, 0x08, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         /* build_tpk only knows one placement offset per record (the blob's
            own start); P8 needs Offset (index bytes) to land 1024 bytes past
@@ -419,7 +426,7 @@ int texture_record_tests(void) {
         Buf px; px.n = 0; bbytes(&px, pal, 1024);
         unsigned char ix[16]; memset(ix, 0, 16); bbytes(&px, ix, 16);
         Buf tpk;
-        TexRec r = { "P8_OPAQUE", 0x100Cu, 0, 16, 1024, 4, 4, 0,0,0,1, px.b, px.n, 0 };
+        TexRec r = { "P8_OPAQUE", 0x100Cu, 0, 16, 1024, 4, 4, 0,0,0,1, 0x08, px.b, px.n, 0 };
         N2Tpk t = build_tpk(&tpk, &r, 1);
         patch_field(&tpk, t, 0x100Cu, 0x24, 1024);   /* see T9: Offset past the palette */
         N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x100Cu, &tex);
@@ -428,6 +435,49 @@ int texture_record_tests(void) {
                       tex.alpha == NULL);
                  free(tex.rgb); free(tex.alpha); free(tex.dxt); }
             }
+
+    /* T11: unknown format tag (M135-R) -- not one of the three proven values
+       (0x08 P8, 0x22 DXT1, 0x24 DXT3), and not one of the two named-but-
+       unsupported ones (0x20 BGRA8, 0x26 DXT5) either. Must be rejected, not
+       guessed at via the old size heuristic. */
+    {
+        Buf px; px.n = 0; dxt1_block(&px, 0xFFFFu, 0x0000u, 0u);
+        Buf tpk;
+        TexRec r = { "UNKNOWN_FMT", 0x100Du, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, 0x99, px.b, px.n, 0 };
+        N2Tpk t = build_tpk(&tpk, &r, 1);
+        N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x100Du, &tex);
+        chk("T11 unknown format tag (0x99) rejected, not guessed at", ok == 0);
+    }
+
+    /* T12: contradictory tag -- claims DXT1 (0x22) but carries a real 1024-
+       byte palette (PaletteSize >= 1024, the P8 signal). A genuine DXT1
+       record never has a palette; trust neither guess and reject rather
+       than decode either interpretation. */
+    {
+        unsigned char pal[1024]; memset(pal, 0, sizeof pal);
+        Buf px; px.n = 0; bbytes(&px, pal, 1024);
+        unsigned char ix[16]; memset(ix, 0, 16); bbytes(&px, ix, 16);
+        Buf tpk;
+        TexRec r = { "CONTRADICT_FMT", 0x100Eu, 0, 16, 1024, 4, 4, 0,0,0,1, 0x22, px.b, px.n, 0 };
+        N2Tpk t = build_tpk(&tpk, &r, 1);
+        patch_field(&tpk, t, 0x100Eu, 0x24, 1024);
+        N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x100Eu, &tex);
+        chk("T12 DXT1 tag contradicted by a real P8-sized palette: rejected",
+            ok == 0);
+    }
+
+    /* T13: the reverse contradiction -- tagged P8 (0x08) but PaletteSize is
+       0 (no palette at all, the DXT signal). A genuine P8 record always
+       carries a real palette; reject rather than fall through to a DXT
+       interpretation of palette-indexed bytes. */
+    {
+        Buf px; px.n = 0; dxt1_block(&px, 0xFFFFu, 0x0000u, 0u);
+        Buf tpk;
+        TexRec r = { "CONTRADICT_FMT2", 0x100Fu, 0, (uint32_t)px.n, 0, 4, 4, 0,0,0,1, 0x08, px.b, px.n, 0 };
+        N2Tpk t = build_tpk(&tpk, &r, 1);
+        N2Tex tex; int ok = n2_tpk_decode(tpk.b, tpk.n, t, 0x100Fu, &tex);
+        chk("T13 P8 tag contradicted by PaletteSize=0: rejected", ok == 0);
+    }
 
     return FAIL;
 }

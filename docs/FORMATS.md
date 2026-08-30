@@ -365,6 +365,7 @@ library, minus a `0x0C` padding prefix that this in-place variant omits):
 +0x30 PaletteSize (u32)     // 0 = not palettized; 1024 = 256-entry RGBA
 +0x38 Width  (u16)
 +0x3a Height (u16)
++0x3e format (u8)           // PROVEN (M135-R): 0x08 P8, 0x22 DXT1, 0x24 DXT3
 +0x45 order  (u8)           // draw-order hint (unused by OpenUG2)
 +0x49 usage  (u8)           // PROVEN (M135): 0=opaque/normal, 1=cutout (alpha test)
 +0x4a blend  (u8)           // PROVEN (M135): 1=source-alpha blend, 2=additive
@@ -382,17 +383,33 @@ relative to the data start after the `0x11` alignment filler** that prefixes it
 (same quirk as vertex buffers). Three pixel formats occur, distinguished by the
 record, not the (always-0) compression byte:
 
-- **P8** (`PaletteSize >= 1024`) — a 256-entry RGBA palette at `PaletteOffset`
-  then 8-bit indices at `Offset`. This is what the road-surface textures use
-  (`RDP_AIRPORT_ROADPATCH_A` is 512×512 P8), which is why they looked like
-  high-entropy noise until decoded through the palette — **not** a swizzle.
-- **DXT1 / DXT3** (no palette) — inferred from `Size` against a per-format
-  **ceil-to-4 block count**: `bx=(w+3)/4, by=(h+3)/4`; DXT1 needs `bx*by*8`
-  bytes, DXT3 needs `bx*by*16` bytes (the record is assumed DXT3 when
-  `Size > w*h*9/10`, else DXT1). **PROVEN fix (M135):** the previous bound used
-  a flat `w*h/2` estimate, which under-validated DXT3 by 2× and let
-  `n2_dxt3` read up to 46 bytes past the end of the data block on a
-  non-multiple-of-4 texture — a latent OOB read, now closed (see
+- **P8** (`format == 0x08`, palette present) — a 256-entry RGBA palette at
+  `PaletteOffset` then 8-bit indices at `Offset`. This is what the
+  road-surface textures use (`RDP_AIRPORT_ROADPATCH_A` is 512×512 P8), which
+  is why they looked like high-entropy noise until decoded through the
+  palette — **not** a swizzle.
+- **DXT1 / DXT3** (`format == 0x22` / `0x24`, no palette) — dispatched
+  directly from the `+0x3e` tag (**PROVEN, M135-R**: independently verified
+  against 2309 real records across three files —
+  `tools/tex_format_census.c` in scratch —  with **zero contradictions**:
+  P8=0x08 36/36, DXT1=0x22 2033/2033, DXT3=0x24 240/240; superseded the old
+  `Size > w*h*9/10` heuristic, which is no longer consulted for format
+  selection at all). `PaletteSize` is still cross-checked as a corruption
+  guard (P8 requires a real palette; DXT1/DXT3 require none); a tag that
+  matches neither a proven format nor its expected `PaletteSize` is
+  **rejected**, not guessed at (`tools/car_material_test.c` T11–T13).
+  `DXT5` (`0x26`) and `BGRA8` (`0x20`) are recognised by name (an external
+  reference claims those values) but never observed on real world data —
+  those belong to the car `TEXTURES.BIN` offset-slot path
+  (`n2_load_car_tex_by_key`), which has its own, separately-proven
+  compression byte.
+
+  Once the format is known, the byte-length **bound** still uses a
+  per-format **ceil-to-4 block count**: `bx=(w+3)/4, by=(h+3)/4`; DXT1 needs
+  `bx*by*8` bytes, DXT3 needs `bx*by*16` bytes. **PROVEN fix (M135):** the
+  previous bound used a flat `w*h/2` estimate, which under-validated DXT3 by
+  2× and let `n2_dxt3` read up to 46 bytes past the end of the data block on
+  a non-multiple-of-4 texture — a latent OOB read, now closed (see
   `tools/car_material_test.c` fixtures T7/T8/T8b).
 
 Alpha semantics are format-specific and **PROVEN** by A/B renders:
