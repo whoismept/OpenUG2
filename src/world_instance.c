@@ -13,6 +13,7 @@ typedef struct {
     N2Scene scene;
     float matrix[16];
     uint32_t name_hash;
+    uint32_t model_key;  /* authored 0x134011+0x10; display names may truncate */
     char name[28];
     unsigned char has_matrix;
     unsigned char is_vista;
@@ -199,6 +200,39 @@ static const WInstProto *winst_library_find(const WInstLibrary *library,
     return NULL;
 }
 
+/* U2 type records name up to three model keys (0x34102 +0x20/+0x24/+0x28).
+ * Prefer the first available authored model; later keys are explicit LOD
+ * alternatives, not names synthesized from A/B/Z suffixes. This is availability
+ * fallback, not retail's still-undecoded distance/region LOD selection rule.
+ * Name lookup is reserved for records without ANY authored key. */
+static const WInstProto *winst_library_resolve(const WInstLibrary *library,
+                                              const WInstPlacement *placement,
+                                              const char *name,
+                                              WInstStats *stats) {
+    int keyed = 0;
+    for (int lod = 0; lod < 3; lod++) {
+        uint32_t key = placement->model_keys[lod];
+        if (!key) continue;
+        keyed = 1;
+        if (library) for (int i = 0; i < library->count; i++) {
+            const WInstProto *proto = &library->items[i];
+            if (proto->model_key != key) continue;
+            if (stats) {
+                stats->keyed_models++;
+                stats->lod_fallbacks += lod != 0;
+            }
+            return proto;
+        }
+    }
+    if (keyed) {
+        if (stats) stats->missing_models++;
+        return NULL;
+    }
+    const WInstProto *proto = winst_library_find(library, name, stats);
+    if (proto && stats) stats->unkeyed_models++;
+    return proto;
+}
+
 /* An object's authored matrix belongs to the prototype, never a final mesh.
  * It is only a later fallback candidate when this is the unique ROAD/TERRAIN
  * prototype for a requested asset. */
@@ -216,6 +250,37 @@ static int winst_proto_has_own_matrix(const WInstLibrary *library,
     return 1;
 }
 
+/* The U2 object header's stored name starts at +0xa4 after filler. Searching
+ * binary matrix/bounds bytes for an ASCII-looking run can manufacture a name
+ * before reaching it (e.g. the recovered tree models). Keep the legacy reader
+ * for short/unknown layouts; model identity never depends on this display name. */
+static uint32_t winst_model_identity(const unsigned char *data, long begin,
+                                     long end, char *name, int cap) {
+    n2_mesh_name(data, begin, end, name, cap);
+    N2Leaf info[1]; int ninfo = 0;
+    n2_find_leaves(data, begin, end, 0x00134011u, info, &ninfo, 1);
+    if (!ninfo) return 0;
+    const unsigned char *header = data + info[0].off;
+    long pad = n2_skip_filler(header, (int)info[0].size);
+    long length = info[0].size - pad;
+    header += pad;
+    uint32_t key = length >= 0x14 ? n2_u32(header + 0x10) : 0;
+    if (cap <= 0 || length <= 0xa4) return key;
+    long n = 0;
+    while (0xa4 + n < length) {
+        unsigned char c = header[0xa4 + n];
+        if (!c) break;
+        if (!(c == '_' || (c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return key;
+        n++;
+    }
+    if (!n || 0xa4 + n == length) return key;
+    if (n >= cap) n = cap - 1;
+    memcpy(name, header + 0xa4, (size_t)n);
+    name[n] = 0;
+    return key;
+}
+
 static void winst_collect_model(WInstLibrary *library, const unsigned char *data,
                                 long begin, long end,
                                 const uint32_t *keys, int nkeys) {
@@ -223,7 +288,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     memset(&local, 0, sizeof local);
     int cat = n2_mesh_category(data, begin, end);
     char name[40];
-    n2_mesh_name(data, begin, end, name, sizeof name);
+    uint32_t model_key = winst_model_identity(data, begin, end, name, sizeof name);
     int scen = n2_scen_class(name);
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
@@ -299,7 +364,10 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         snprintf(local.meshes[i].sname, sizeof local.meshes[i].sname, "%.31s", name);
     }
     if (local.count && winst_library_add(library, &local, name, matrix,
-                                         has_matrix, is_vista)) return;
+                                         has_matrix, is_vista)) {
+        library->items[library->count - 1].model_key = model_key;
+        return;
+    }
     winst_free_scene(&local);
 }
 
@@ -627,8 +695,11 @@ static int winst_visit_section(const WInstSection *section,
             continue;
         }
         char type_name[33];
-        memcpy(type_name, section->types + (long)placement.type_index * 68, 32);
+        const unsigned char *type = section->types + (long)placement.type_index * 68;
+        memcpy(type_name, type, 32);
         type_name[32] = 0;
+        for (int lod = 0; lod < 3; lod++)
+            placement.model_keys[lod] = n2_u32(type + 0x20 + lod * 4);
         if (visit && !visit(&placement, type_name, userdata)) return 0;
     }
     return 1;
@@ -702,8 +773,8 @@ typedef struct {
 static int winst_build_visit(const WInstPlacement *placement,
                              const char *type_name, void *userdata) {
     WInstBuildVisit *build = (WInstBuildVisit *)userdata;
-    const WInstProto *proto = winst_library_find(build->library, type_name,
-                                                 build->stats);
+    const WInstProto *proto = winst_library_resolve(build->library, placement,
+                                                    type_name, build->stats);
     if (!proto) return 1;
     N2Scene *dst = proto->is_vista ? build->vista : build->scene;
     for (int i = 0; i < proto->scene.count; i++) {

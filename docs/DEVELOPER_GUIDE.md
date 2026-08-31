@@ -118,6 +118,15 @@ has the home section. It builds a local prototype library from that bundle,
 places in-range non-ground instances with their instance matrices, and emits
 the one-time ROAD/TERRAIN fallback prototypes before the normal world pipeline:
 
+Instance model identity is the authored key, not the display name. The section
+walker carries the three keys from each type record into `WInstPlacement`;
+`winst_library_resolve` tries the primary then the explicit available alternatives.
+Keyed records never fall back to a similarly named object. The bounded object
+name is used for diagnostics and scenery classification. Name-only compatibility
+is restricted to records with no keys. Multiple resident copies of the SAME
+key still use the first copy; district-specific copy selection and live streaming
+are separate, unimplemented work. This does not enable `--world2` by default.
+
 ```text
 --world2 focus
   -> companion polygon selection
@@ -139,7 +148,8 @@ Use the GL-free audit for deterministic assembly evidence:
 
 It reports selected bundle/home district, region and instance totals, placed
 meshes, missing-model and rejected-placement counts, triangle and scene-class
-totals, finite-coordinate failures, and the ROAD/TERRAIN support result; it
+totals, keyed/explicit-LOD/name-only resolution counts, finite-coordinate failures,
+and the ROAD/TERRAIN support result; it
 exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
 normalizing only machine-specific absolute paths or elapsed time if present.
 For a fixed render check, retain the same arguments, replace the audit switch
@@ -158,7 +168,14 @@ region buffers must stay alive through `world_bind_textures`. That function
 decodes/uploads each distinct key and only then frees `WRegion.data`.
 
 `LOC4DYNTEX.BIN` is the shared lookup after the region-local TPK. Some
-single-region bundles also consult a measured master-neighbour TPK. A missing
+single-region bundles also consult a measured master-neighbour TPK. The last
+fallback is `GLOBAL/InGameCommon.bun`, resolved relative to the TRACKS directory.
+All original per-region binding attempts finish before this last fallback;
+a common copy cannot preempt a later region's successful lookup, nor cause
+ordinary meshes to borrow from unrelated regions in diagnostic multi-region mode.
+The common library supplies textures only; its keys are not added to prototype
+or submesh material selection. All STREAM buffers survive binding; the common
+bytes and TPK index are freed/reset at its end. A missing
 record and a decoded-but-noise-rejected texture are different failures; keep
 those counters separate.
 
@@ -384,19 +401,32 @@ separately-proven compression byte and is not affected by this change.
 
 ### LOC4 fallback and draw modes (M135-R census)
 
-`world_bind_textures` tries a key in three places in order: the region's own
+`world_bind_textures` first tries the region's own
 TPK, then `w->loc4` (`LOC4DYNTEX.BIN`, decoded through
 `n2_load_car_tex_by_key`, the CAR texture-library reader) as a shared
-fallback, then the master TPK. Only `n2_tpk_decode` reads the `order`/
+fallback, then the master TPK. M138 retries still-unbound requests against
+`GLOBAL/InGameCommon.bun` only after every original region attempt. Only
+`n2_tpk_decode` reads the `order`/
 `usage`/`blend`/`wz` draw-mode bytes; a key resolved through the LOC4
 fallback keeps them at their zero default (`N2_DRAW_OPAQUE`), same as every
-world texture had before the field existed. Ordinary world-material traffic
-in the two reference scenes resolves directly from its regional TPK. M136
+world texture had before the field existed. The original M135-R census resolved
+ordinary world-material traffic directly from its regional TPK; this is not a
+guarantee for objects restored later. M138's restored `421X_STARTFINGRAPHIC`
+needs common `STARTLINE` (`96d35495`), a 64x64 DXT3 BLEND record whose decoded
+alpha ranges from 153 to 204. M136
 proved one intentional exception: the `SKYDOME` dome/cap pairs live in LOC4.
 They bypass ordinary draw-mode dispatch and use the dedicated authored-sky
 path, so the cap's decoded alpha is retained without inventing LOC4 header
 metadata. Extend LOC4 draw-mode decoding only if a future ordinary world
 texture is proven to require it.
+
+`make world-texture-test` runs synthetic files through the real world loader,
+decoder and hidden OpenGL upload. It checks common fallback for meshes, vistas
+and lights, RGBA/mode preservation, duplicate requests, region/master precedence,
+later-region precedence, unavailable keys and common-buffer cleanup. No retail
+assets are required. `--tex-audit` reports `TEXSOURCE` for common-library hits.
+Texture resolution is not event visibility: a restored start/finish graphic's
+presence in free roam still needs an independently proven activation rule.
 
 ## 8. Car loading and presentation
 
@@ -633,6 +663,31 @@ Output: result / evidence / files / remaining limitation
 Avoid role-play, praise, milestone-history dumps and broad “fix the map” prompts.
 A capable coding model is most effective when the planner has already localized
 the owning boundary and supplied a falsifiable acceptance test.
+
+### Scenery group audit (M139)
+
+Build `make world-group-test world-group-audit`, then run:
+
+```sh
+./build/world_group_audit /path/to/NFSU2/TRACKS L4RA
+./build/world_group_audit /path/to/NFSU2/TRACKS L4RA BARRIERS_4144
+```
+
+The first command validates all companion group tables and their STREAM
+section/placement targets. The second also prints members of that exact
+authored group. No GL context or game launch is required. Exit 0 means the
+structural checks passed, 1 means missing/corrupt/inconsistent data, and 2
+means invalid arguments or a requested group with no members.
+
+The reader validates the enclosing chunks before visiting payloads, then checks
+group hashes, reference bounds/counts, placement row bounds and the copied
+flags. It never treats placement `+0x1c` as a global override index. Input
+buffers remain alive until the borrowed table view is no longer used.
+
+This tool does **not** enable or disable groups in the engine. Event membership
+is proven; activation timing, race direction and career-stage state are not.
+Some venue graphics (six in RB) have no override membership. Do not convert
+this audit into a blanket name-prefix filter or section-level suppression.
 
 ## 14. Common failure patterns
 

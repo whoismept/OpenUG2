@@ -15,6 +15,8 @@ typedef struct {
 typedef struct {
     uint16_t type_index;
     uint16_t flags;
+    /* Populated by the section walker from 0x34102, not from 0x34103. */
+    uint32_t model_keys[3];
     float bounds_min[3], bounds_max[3];
     float matrix[16];
 } WInstPlacement;
@@ -26,6 +28,9 @@ typedef struct {
     long missing_models;
     long own_matrix_meshes;
     long rejected_meshes;
+    long keyed_models;
+    long lod_fallbacks;
+    long unkeyed_models;
     int regions_total;
     int regions_selected;
     int home_region;

@@ -237,6 +237,15 @@ Format reverse-engineering builds on prior community work, used as references
 - **[Nikki](https://github.com/SpeedReflect/Nikki)** — TPK / texture header reference.
 - **[OpenNFSTools](https://github.com/MWisBest/OpenNFSTools)** — JDLZ algorithm reference.
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — Gnsu20 / EA-XAS v0 format reference.
+- **[noclip.website](https://github.com/magcius/noclip.website)** — Jasper St.
+  Pierre (magcius) and contributors, especially the
+  [Need for Speed: Most Wanted viewer](https://github.com/magcius/noclip.website/tree/main/src/NeedForSpeedMostWanted).
+  Its separation of model identity, instance placement and region loading
+  informed our Underground 2 placement investigation. Thank you for making
+  this work publicly available. Used as a research/architecture reference,
+  not copied code: U2 layouts and the implementation are independently checked
+  against U2 data. Reference revision and scope are recorded in
+  [`docs/FORMATS.md`](docs/FORMATS.md#instance-driven-world-districts-0x341xx).
 
 See [`docs/FORMATS.md`](docs/FORMATS.md) for details.
 

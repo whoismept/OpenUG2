@@ -2092,6 +2092,8 @@ int main(int argc, char **argv) {
                st->instances_seen, st->instances_in_range, st->meshes_placed,
                st->missing_models, st->own_matrix_meshes, st->rejected_meshes,
                triangles, world.vista.count);
+        printf("INSTANCE model-links keyed=%ld lod-fallback=%ld unkeyed-name=%ld\n",
+               st->keyed_models, st->lod_fallbacks, st->unkeyed_models);
         printf("INSTANCE scene classes none=%d terrain=%d building=%d prop=%d "
                "tree=%d wall=%d struct=%d other=%d\n",
                classes[0], classes[1], classes[2], classes[3],
@@ -2665,7 +2667,8 @@ int main(int argc, char **argv) {
         int nfound = 0, firstw = 0, firsth = 0, firstdone = 0;
         char firstsrc[128] = "-"; uint32_t f_off=0, f_pal=0, f_psz=0;
         long f_dbase = 0; const unsigned char *f_d = NULL; long f_len = 0;
-        for (int pass = 0; pass < 3; pass++) {
+        N2Tpk firsttpk = {0};
+        for (int pass = 0; pass < 4; pass++) {
             const unsigned char *d = NULL; long dl = 0; N2Tpk tp; char label[128];
             if (pass == 0) {
                 int r = -1;
@@ -2677,10 +2680,14 @@ int main(int argc, char **argv) {
                 if (!world.loc4) { printf("[LOC4 fallback: not present]\n"); continue; }
                 d = world.loc4; dl = world.loc4len; tp = n2_tpk_open(d, dl);
                 snprintf(label, sizeof label, "TRACKS/LOC4DYNTEX.BIN");
-            } else {
+            } else if (pass == 2) {
                 if (!world.master) { printf("[master fallback: not present]\n"); continue; }
                 d = world.master; dl = world.masterlen; tp = world.mastertpk;
                 snprintf(label, sizeof label, "master TPK");
+            } else {
+                if (!world.common) { printf("[common fallback: not present]\n"); continue; }
+                d = world.common; dl = world.commonlen; tp = world.commontpk;
+                snprintf(label, sizeof label, "GLOBAL/InGameCommon.bun");
             }
             for (int b = 0; b < tp.nblk; b++) {
                 long hbeg = tp.blk[b].hbeg, hend = hbeg + tp.blk[b].hsize;
@@ -2720,7 +2727,7 @@ int main(int argc, char **argv) {
                         firstdone = 1; firstw = w; firsth = hh;
                         snprintf(firstsrc, sizeof firstsrc, "%s block %d", label, b);
                         f_off=off; f_pal=paloff; f_psz=palsz;
-                        f_dbase=dbase; f_d=d; f_len=dl;
+                        f_dbase=dbase; f_d=d; f_len=dl; firsttpk=tp;
                     }
                     nfound++;
                     i += 0x7b;
@@ -2732,10 +2739,7 @@ int main(int argc, char **argv) {
             printf("world_bind_textures resolves FIRST: %s  ->  raw W/H %d x %d\n",
                    firstsrc, firstw, firsth);
             N2Tex chk = {0};
-            int r0 = -1;
-            for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) { r0 = q; break; }
-            int ok = r0 >= 0 && n2_tpk_decode(world.rgn[r0].data, world.rgn[r0].len,
-                                              world.rgn[r0].tpk, tpkkey, &chk);
+            int ok = n2_tpk_decode(f_d, f_len, firsttpk, tpkkey, &chk);
             printf("n2_tpk_decode returns:            %s  %d x %d   -> raw==decoded: %s\n",
                    ok ? "ok" : "FAILED", chk.w, chk.h,
                    (ok && chk.w == firstw && chk.h == firsth) ? "YES" : "NO");

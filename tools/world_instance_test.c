@@ -542,6 +542,114 @@ static int write_fixture_file(const char *path,
     return written == (size_t)len && closed == 0;
 }
 
+/* Synthetic bytes only. Catch selecting a display-name collision instead of
+ * the type record's explicit key, or inventing an unlisted LOD/name fallback. */
+static long add_keyed_model(unsigned char *buf, long pos, const char *name,
+                            uint32_t key, float width) {
+    unsigned char header[8 + 192], verts[72], idx[6], slot[8];
+    memset(header, 0, sizeof header); memset(header, 0x11, 8);
+    memset(verts, 0, sizeof verts); memset(slot, 0, sizeof slot);
+    put_u32(header + 8 + 0x10, key);
+    for (int i = 0; i < 16; i++)
+        put_f32(header + 8 + 0x40 + i * 4, i % 5 == 0 ? 1.0f : 0.0f);
+    snprintf((char *)header + 8 + 0xa4, 28, "%s", name);
+    if (!strncmp(name, "XT_", 3)) memcpy(header + 8 + 0x24, "mmRBl", 5);
+    put_f32(verts + 24, width); put_f32(verts + 48 + 4, 1.0f);
+    put_f32(verts + 24 + 16, 0.75f);
+    put_u16(idx, 0); put_u16(idx + 2, 1); put_u16(idx + 4, 2);
+    put_u32(slot, 0x1234);
+    long start = pos; pos += 8;
+    pos = add_leaf(buf, pos, 0x134011, header, sizeof header);
+    pos = add_leaf(buf, pos, 0x134012, slot, sizeof slot);
+    pos = add_leaf(buf, pos, 0x134b01, verts, sizeof verts);
+    pos = add_leaf(buf, pos, 0x134b03, idx, sizeof idx);
+    put_u32(buf + start, 0x80134010);
+    put_u32(buf + start + 4, (unsigned long)(pos - start - 8));
+    return pos;
+}
+
+static void test_builder_authored_model_keys(void) {
+    const char *root = "build/world_instance_key_fixture";
+    const char *companion_path = "build/world_instance_key_fixture/L4RA.BUN";
+    const char *stream_path = "build/world_instance_key_fixture/STREAML4RA.BUN";
+    assert(mkdir(root, 0777) == 0 || errno == EEXIST);
+    unsigned char companion[256], stream[4096], placement[64];
+    long clen = make_regions(companion, sizeof companion);
+    assert(write_fixture_file(companion_path, companion, clen));
+    const struct { uint32_t keys[3]; int count; float width; } cases[] = {
+        {{0x20202020, 0x10101010, 0x30303030}, 1, 2.0f}, /* primary beats name */
+        {{0x40404040, 0x20202020, 0x30303030}, 1, 2.0f}, /* B before Z */
+        {{0x40404040, 0x50505050, 0x30303030}, 1, 3.0f}, /* explicit Z key */
+        {{0, 0, 0x30303030}, 1, 3.0f},                /* skip empty slots */
+        {{0x40404040, 0, 0}, 0, 0.0f},                /* no name substitution */
+        {{0, 0, 0}, 1, 1.0f},                        /* old unkeyed format */
+    };
+    for (int c = 0; c < (int)(sizeof cases / sizeof cases[0]); c++) {
+        memset(stream, 0, sizeof stream);
+        long len = add_keyed_model(stream, 0, "XO_REUSED", 0x10101010, 1.0f);
+        len = add_keyed_model(stream, len, "XO_REUSED", 0x20202020, 2.0f);
+        len = add_keyed_model(stream, len, "XT_FOLIAGE_A", 0x30303030, 3.0f);
+        make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+        long section = len;
+        len = add_section(stream, len, 17, "XO_REUSED", placement, 1);
+        N2Leaf types[1]; int nt = 0;
+        n2_find_leaves(stream, section + 8, len, 0x34102, types, &nt, 1);
+        assert(nt == 1);
+        for (int k = 0; k < 3; k++)
+            put_u32(stream + types[0].off + 0x20 + k * 4, cases[c].keys[k]);
+        assert(write_fixture_file(stream_path, stream, len));
+        const char *requested[] = { "STREAML4RA" };
+        N2Scene scene = {0}, vista = {0}; WInstStats stats = {0};
+        assert(world_instance_build(&scene, &vista, root, requested, 1,
+                                    0, 0, 5, NULL, 0, &stats) == 1);
+        assert(scene.count == cases[c].count && vista.count == 0);
+        assert(stats.missing_models == (cases[c].count == 0));
+        assert(stats.keyed_models == (c < 4));
+        assert(stats.lod_fallbacks == (c >= 1 && c <= 3));
+        assert(stats.unkeyed_models == (c == 5));
+        if (scene.count) {
+            assert(near(scene.meshes[0].verts[5], cases[c].width));
+            assert(scene.meshes[0].nidx == 3 && scene.meshes[0].idx[2] == 2);
+            assert(near(scene.meshes[0].verts[8], 0.75f));
+            assert(scene.meshes[0].texkey == 0x1234);
+            if (cases[c].width == 3.0f) {
+                assert(scene.meshes[0].scen == N2_SC_TREE);
+                assert(strcmp(scene.meshes[0].sname, "XT_FOLIAGE_A") == 0);
+            }
+        }
+        free_scene(&scene); free_scene(&vista);
+    }
+    remove(companion_path); remove(stream_path); rmdir(root);
+}
+
+static void test_positioned_model_name_boundaries(void) {
+    unsigned char data[512], header[192]; char name[8];
+    memset(header, 0, sizeof header);
+    memcpy(header, "XO_OLD", 7);
+    put_u32(header + 0x10, 0x10203040);
+    /* An unterminated positioned field must not escape its leaf into the
+       next chunk. Invalid/absent fields must retain the legacy result. */
+    const struct { int length, mode; const char *want; } cases[] = {
+        {128, 0, "XO_OLD"}, {192, 1, "XO_OLD"},
+        {192, 2, "XO_OLD"}, {192, 3, "XT_LONG"},
+        {192, 4, "XT_END"}, {192, 0, "XO_OLD"},
+    };
+    for (int c = 0; c < (int)(sizeof cases / sizeof cases[0]); c++) {
+        memset(header + 0xa4, 0, sizeof header - 0xa4);
+        if (cases[c].mode == 1) memcpy(header + 0xa4, "XT_BAD!", 8);
+        if (cases[c].mode == 2) memset(header + 0xa4, 'A', sizeof header - 0xa4);
+        if (cases[c].mode == 3) memcpy(header + 0xa4, "XT_LONG_NAME", 13);
+        if (cases[c].mode == 4) memcpy(header + 0xa4, "XT_END", 7);
+        int len = cases[c].mode == 4 ? 0xa4 + 7 : cases[c].length;
+        long used = add_leaf(data, 0, 0x134011, header, len);
+        assert(winst_model_identity(data, 0, used, name, sizeof name) == 0x10203040);
+        assert(strcmp(name, cases[c].want) == 0);
+    }
+    memset(name, 0xcc, sizeof name);
+    assert(winst_model_identity(data, 0, 0, name, sizeof name) == 0);
+    assert(name[0] == 0);
+}
+
 static void test_builder_uses_bounds_across_unmapped_sections(void) {
     const char *root = "build/world_instance_cross_section_fixture";
     assert(mkdir(root, 0777) == 0 || errno == EEXIST);
@@ -805,6 +913,8 @@ static void test_world2_capture_policy(void) {
 }
 
 int main(void) {
+    test_builder_authored_model_keys();
+    test_positioned_model_name_boundaries();
     test_regions();
     test_placement();
     test_decoded_asymmetric_placement();

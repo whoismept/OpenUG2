@@ -276,6 +276,56 @@ slices, and the losing tier's slices are dropped as one unit. This is what
 lets an unmatched glass slice in the winning tier survive instead of being
 compared, and possibly dropped, independently of its own tier's body panel.
 
+### Scenery group membership (`0x34107` / `0x34108`, M139)
+
+**PROVEN structure; activation UNDECODED.** Each surveyed companion `L4R*.BUN`
+contains an override table and a variable-length group list. This is not the
+polygon directory: event graphics and ordinary scenery share spatial sections.
+
+`0x34107` is an exact array of 8-byte records, without a filler prefix:
+
+| offset | type | measured meaning |
+|---:|---|---|
+| `+0` | `u16` | STREAM `0x34101` section id |
+| `+2` | `u16` | zero-based placement row in that section's `0x34103` |
+| `+4` | `u16` | copy of that placement's `+0x1a` flags |
+| `+6` | `u16` | number of references from the group list |
+
+`0x34108` consists of records of length `align4(52 + 2 * count)`:
+
+| offset | type | measured meaning |
+|---:|---|---|
+| `+0/+4` | `u32[2]` | unconsumed fields (both 11 in sampled named groups) |
+| `+8` | `char[32]` | bounded, terminated group name |
+| `+40` | `u32` | group-name hash (`h=0xffffffff; h=h*33+c`) |
+| `+44` | `u32` | unconsumed field; not assigned activation semantics |
+| `+48` | `u32` | reference count |
+| `+52` | `u16[count]` | indices into `0x34107`, followed by alignment bytes |
+
+Across RA/RB/RC/RD/RF/RG/RH/RR, all 21,342 override rows resolve to an existing
+section/placement with identical flags. All group hashes, index bounds and
+stored reference counts agree. RA's 166 start/finish graphics each resolve
+through this chain to their own `BARRIERS_<event>` group. For example,
+`BARRIERS_4144` includes overrides 4968/4969, which point to section 1718,
+placement rows 98/99. No spatial transform is changed by this interpretation.
+Other real groups include `PLAYER_BARRIERS_*`, `FREE_ROAM`, stage-qualified
+free-roam groups and `SMOKEABLE`. Do not treat every group as race-only.
+
+The six RB start/finish graphics are **not** in this override table and carry
+zero placement flags. Thus group membership alone cannot hide every venue's
+race graphic. Neither direction-specific flag bits, runtime state changes,
+nor career-stage activation is proven here. The placement's `+0x1c` is **not**
+a global override index (6,430/6,431 RA reverse-link attempts fail); join by
+the override's section and placement fields instead.
+
+The checked, read-only reader is currently tool-only:
+`tools/world_group_reader.h`, consumed by `tools/world_group_audit.c`.
+`make world-group-test world-group-audit` builds asset-free corruption tests
+and an audit that verifies the complete companion table before visiting members.
+It rejects malformed chunk boundaries, duplicate tables, excessive nesting,
+unterminated names, hash/refcount mismatches and out-of-range references. The
+runtime loader does not yet apply these groups as a visibility/collision policy.
+
 ### Object identity, duplicates and vista objects
 
 The STREAM bundles are overlapping route/event working sets, not adjacent
@@ -317,8 +367,51 @@ record stride.
 | child | layout used by OpenUG2 |
 |---|---|
 | `0x00034101` | at least 16 bytes; `u32` district id at `+0x0c` |
-| `0x00034102` | 68-byte type records; bounded NUL-terminated model name in the first 32 bytes, remainder not consumed |
+| `0x00034102` | 68-byte type records; display name in the first 32 bytes; three authored model keys at `+0x20/+0x24/+0x28` |
 | `0x00034103` | 64-byte placement records |
+
+**Model identity (M137 implementation).** The type record's three `u32` keys
+reference the `u32` at `0x134011 +0x10` after that leaf's filler. They describe
+the primary model and explicit alternative detail models. The instance reader
+tries them in stored order, skipping zero or unavailable keys. This is an
+availability fallback, **not** a reconstruction of retail's distance-based LOD
+or district dependency selection. It never invents an A/B/Z name substitution.
+If at least one key is present but none resolves, the placement remains missing;
+it must not silently select an unrelated same-name model. The old name lookup
+is retained only when all three keys are zero.
+Multiple resident copies with the same stored key still select the first copy;
+section-specific copy selection remains unimplemented. A matching key solves
+the measured name ambiguity, not the whole region/dependency problem.
+
+The stored object name starts at `0x134011 +0xa4` after filler in the surveyed
+U2 world records. `winst_model_identity` validates a bounded, terminated name
+there, falling back to the old scan for short/unknown layouts. The keyed lookup
+does not recompute identity from this name: names can be truncated while the
+stored key still identifies the complete name. Scanning earlier numeric header
+bytes for text also misnamed actual tree models, breaking their lookup and
+semantic classification. Correcting the instance-reader name restores the
+source scenery class without a name-based visibility exception. The legacy
+non-instance name reader is unchanged.
+
+Measured evidence: the L4RB type names `XT_TreewallA_1a_00` and `_2a_00`
+reference primary model keys `809d61db` and `80af7a5c`. Their primary models
+exist but the old scan called both `mmRBl`. The types also explicitly reference
+`80ab1754` / `80bd2fd5`, the corresponding Z-detail models, in slot 2. Two
+start/finish graphic variants can share the same shortened display name yet
+have distinct stored keys; selecting by key resolves the measured 2.326/4.610 m
+bounds discrepancies without changing any placement transform.
+
+Research credit: [noclip.website](https://github.com/magcius/noclip.website),
+Jasper St. Pierre and contributors, particularly its Most Wanted
+[model/instance reader](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/src/NeedForSpeedMostWanted/region.ts)
+and [region management](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/src/NeedForSpeedMostWanted/map.ts),
+at revision `6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6`. These were architecture
+and research references; no source code was copied or ported. The project is
+[MIT-licensed](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/LICENSE)
+and its license notice explains its reverse-engineering provenance. U2's
+68-byte type records and model-index offset differ from MW's 72-byte records
+and must be verified separately. Any future code reuse must preserve the
+applicable copyright/license notices and be reviewed for project policy.
 
 A placement record has `f32[3]` AABB minimum at `+0x00`, AABB maximum at
 `+0x0c`, `u16 type_index` at `+0x18`, `u16 flags` at `+0x1a`, translation
@@ -349,7 +442,7 @@ fails without replacing the destination scenes.
 Models in the selected bundle are collected as local prototypes: their object
 matrix is retained as prototype metadata, not baked into the local vertices.
 An in-range non-ground placement applies its own decoded matrix directly to
-the matching named prototype. ROAD/TERRAIN prototypes are instead emitted once:
+the prototype selected by its type's authored model keys. ROAD/TERRAIN prototypes are instead emitted once:
 a unique prototype with an authored object matrix uses that matrix; otherwise
 it uses identity and remains in its local/world coordinates. Unreferenced
 non-ground variants are not emitted. Existing vista classification still routes
@@ -551,6 +644,19 @@ A STREAM file can contain many header/data pairs. `n2_tpk_open` records every
 then search those blocks without rescanning the file. World texture resolution
 is region-local first, then shared packs. The region file buffers remain owned
 by `World` until `world_bind_textures` finishes decoding and GPU upload.
+
+**Common gameplay textures (M138).** The same uncompressed-table decoder also
+reads `GLOBAL/InGameCommon.bun`. `STARTLINE`, key `96d35495`, is absent from the
+regional/shared TRACKS sources surveyed but present there as a 64x64 DXT3
+record: `(order, usage, blend, wz) = (5,2,1,0)`, decoded alpha 153..204.
+The keyed, placed `421X_STARTFINGRAPHIC` mesh references it directly. Without
+this source it drew a flat grey fallback rectangle; resolving the record gives
+the authored checkered road marking at the unchanged transform and UVs.
+This library is the last texture fallback, in a second pass after all original
+own-region/LOC4/master binding attempts; it never contributes geometry or changes
+material slot selection. Missing common files remain optional. Buffer and TPK
+index lifetime ends after binding. This proves the texture dependency, not the
+event activation rule; do not infer free-roam visibility from a texture match.
 
 **Car TPK (`CARS/*/TEXTURES.BIN`, compressed).** Same outer container
 (`0xb3300000` → `0xb3310000` header + `0xb3320000` pixels). The header block

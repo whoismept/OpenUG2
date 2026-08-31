@@ -329,6 +329,15 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
                w->dist[i].tok, w->dist[i].n, w->dist[i].cx, w->dist[i].cy,
                w->dist[i].medz, w->dist[i].bb[0], w->dist[i].bb[1],
                w->dist[i].bb[2], w->dist[i].bb[3]);
+    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Do not
+       add their keys to geometry/material selection: this is only the last
+       texture-resolution source, with existing regional precedence intact. */
+    char commonp[1024];
+    int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
+    if (plen >= 0 && (size_t)plen < sizeof commonp) {
+        w->common = n2_read_file(commonp, &w->commonlen);
+        if (w->common) w->commontpk = n2_tpk_open(w->common, w->commonlen);
+    }
     return nm;
 }
 
@@ -337,9 +346,31 @@ int world_load(World *w, const char *troot, const char *trackname) {
 }
 
 int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
+/* One source order for ordinary meshes, vistas and authored light textures.
+   The shared fallback cannot replace a successful existing resolution. */
+static int world_texture_decode(const World *w, const WRegion *g,
+                                uint32_t key, N2Tex *tex, int common_only) {
+    if (common_only) {
+        int ok = n2_tpk_decode(w->common, w->commonlen, w->commontpk, key, tex);
+        if (ok && g_world_texaudit)
+            printf("TEXSOURCE key %08x  GLOBAL/InGameCommon.bun\n", key);
+        return ok;
+    }
+    int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
+    if (!ok && w->loc4)
+        ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, key, tex);
+    if (!ok && w->master)
+        ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, key, tex);
+    return ok;
+}
+
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                         unsigned char *modes, int cap) {
     int n = 0;
+    /* Finish the original binding order across ALL regions first. Only then
+       retry still-unbound requests against common; never borrow from an
+       unrelated region or preempt a later region's successful old lookup. */
+    for (int pass = 0; pass < (w->common ? 2 : 1); pass++)
     for (int r = 0; r < w->nreg; r++) {
         WRegion *g = &w->rgn[r];
         if (!g->data) continue;
@@ -348,11 +379,7 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
-            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
-            if (!ok && w->loc4)
-                ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
-            if (!ok && w->master)
-                ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+            int ok = world_texture_decode(w, g, tk, &tt, pass);
             if (ok && !n2_tex_noise(&tt)) {
                 keys[n] = tk; texs[n] = upload_tex(&tt);
                 /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
@@ -364,12 +391,13 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                 if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
                 n++;
             }
-            else if (g_world_texaudit) {
+            else if (g_world_texaudit && (ok || pass || !w->common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
+                       pass ? "not in common TPK" : "not in region/LOC4/master",
                        w->scene.meshes[i].sname, w->scene.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
@@ -384,11 +412,7 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
             for (int j = 0; j < n; j++) if (keys[j] == tk) { seen = 1; break; }
             if (!seen) {
                 N2Tex tt = {0};
-                int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
-                if (!ok && w->loc4)
-                    ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
-                if (!ok && w->master)
-                    ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+                int ok = world_texture_decode(w, g, tk, &tt, pass);
                 if (ok && !n2_tex_noise(&tt)) {
                     keys[n] = tk; texs[n] = upload_tex(&tt);
                     if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
@@ -406,9 +430,7 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};
-            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
-            if (!ok && w->loc4) ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
-            if (!ok && w->master) ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+            int ok = world_texture_decode(w, g, tk, &tt, pass);
             if (ok && !n2_tex_noise(&tt)) {
                 keys[n] = tk; texs[n] = upload_tex(&tt);
                 /* vista batches don't consult drawmode (the tier has its own
@@ -417,7 +439,7 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                 if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
                 n++;
             }
-            else if (g_world_texaudit) {
+            else if (g_world_texaudit && (ok || pass || !w->common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. M133-R: `i` here
@@ -425,14 +447,20 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                    mesh that actually owns this key, not whatever scene mesh
                    happens to share the same index. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
+                       pass ? "not in common TPK" : "not in region/LOC4/master",
                        w->vista.meshes[i].sname, w->vista.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
         }
-        free(g->data); g->data = NULL;   /* meshes + textures live on the GPU now */
     }
+    /* Keep every region alive until the last shared-fallback decision. */
+    for (int r = 0; r < w->nreg; r++) {
+        free(w->rgn[r].data); w->rgn[r].data = NULL;
+    }
+    free(w->commontpk.blk); memset(&w->commontpk, 0, sizeof w->commontpk);
+    free(w->common); w->common = NULL; w->commonlen = 0;
     return n;
 }
 
