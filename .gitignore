@@ -22,6 +22,7 @@ SafeMode.bat
 # --- Build output ---
 nfsu2
 build/
+scratchpad/
 *.o
 *.obj
 *.exe
@@ -30,6 +31,7 @@ build/
 *.png
 mesh_out.*
 src/generated_world_debug_shaders.h
+*.log
 
 # --- Reverse-engineering scratch (Ghidra projects, clones) ---
 ghidra/
