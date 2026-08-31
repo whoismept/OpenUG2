@@ -12,6 +12,23 @@
 static void grid_build(World *w);
 static void nav_build_adj(World *w);
 
+static void world_append_lights(World *w, const N2LightSrc *src, int count) {
+    for (int i = 0; i < count; i++) {
+        int duplicate = 0;
+        for (int j = 0; j < w->nlights; j++)
+            if (n2_light_same(w->lights + j, src + i)) { duplicate = 1; break; }
+        if (duplicate) continue;
+        if (w->nlights == w->lightcap) {
+            int next = w->lightcap ? w->lightcap * 2 : 256;
+            N2LightSrc *grown = (N2LightSrc *)realloc(
+                w->lights, (size_t)next * sizeof *grown);
+            if (!grown) return;
+            w->lights = grown; w->lightcap = next;
+        }
+        w->lights[w->nlights++] = src[i];
+    }
+}
+
 /* ---- load-time duplicate stripper (Phase 48) ----
    The 8 STREAM*.BUN bundles are overlapping per-race supersets, not adjacent
    tiles, so stitching them (and even a single bundle on its own) stacks exact
@@ -23,8 +40,10 @@ static void nav_build_adj(World *w);
    the ground grid, the physics ground query, and the GPU batches all see one
    clean surface layer with no further plumbing.
 
-   Identity is exact: two meshes that survive share a texkey, an identical
-   bounding box (all three axes) and the same tri+vert counts. An instanced
+   Identity is exact: two meshes are removed only when texkey, material
+   ownership, bounding box, indices, vertices and prelight bytes all match.
+   Counts and bounds are the cheap sort prefix; n2_mesh_content_cmp proves the
+   payload rather than assuming equal dimensions mean equal geometry. An instanced
    prop reused at a DIFFERENT position has a different bbox, so it is NOT a
    duplicate and is kept — only same-place, same-asset copies are removed. */
 static const N2Scene *dd_s;      /* comparator context; load is single-threaded */
@@ -35,17 +54,15 @@ static int dd_cmp(const void *pa, const void *pb) {
     if (ma->texkey != mb->texkey) return ma->texkey < mb->texkey ? -1 : 1;
     for (int k = 0; k < 6; k++)
         if (dd_bb[a][k] != dd_bb[b][k]) return dd_bb[a][k] < dd_bb[b][k] ? -1 : 1;
-    if (ma->nidx   != mb->nidx)   return ma->nidx   < mb->nidx   ? -1 : 1;
-    if (ma->nverts != mb->nverts) return ma->nverts < mb->nverts ? -1 : 1;
+    int content = n2_mesh_content_cmp(ma, mb);
+    if (content) return content;
     return a - b;   /* stable: the earliest original index sorts first, so it
                        is the copy we keep */
 }
 static int dd_same(int a, int b) {
     const N2Mesh *ma = &dd_s->meshes[a], *mb = &dd_s->meshes[b];
-    if (ma->texkey != mb->texkey || ma->nidx != mb->nidx || ma->nverts != mb->nverts)
-        return 0;
     for (int k = 0; k < 6; k++) if (dd_bb[a][k] != dd_bb[b][k]) return 0;
-    return 1;
+    return n2_mesh_same_content(ma, mb);
 }
 
 /* Compact w->scene to unique meshes, fix each region's [mesh0,mesh1) range to
@@ -154,8 +171,15 @@ static int world_dedup(World *w) {
  * physics ground query, and the GPU batches all see one clean surface
  * layer. It keeps the first copy of each (texkey, xyz-bbox, tri, vert)
  * and drops the rest. */
-int world_load(World *w, const char *troot, const char *trackname) {
+int world_load_ex(World *w, const char *troot, const char *trackname,
+                  const WLoadOptions *options) {
     memset(w, 0, sizeof *w);
+    const int instance_world = options && options->enabled;
+    if (instance_world && !strcmp(trackname, "ALL")) {
+        fprintf(stderr, "instance world requires one explicit STREAM bundle; "
+                        "--track ALL is not a production composition\n");
+        return 0;
+    }
 
     /* Region set. ALL is a diagnostic union, not the retail open world:
        STREAM bundles overlap as route/event supersets and can author
@@ -183,6 +207,17 @@ int world_load(World *w, const char *troot, const char *trackname) {
         g->data = n2_read_file(trackp, &g->len);
         g->mesh0 = g->mesh1 = w->scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
+        {
+            const int light_cap = 8192;
+            N2LightSrc *lights = (N2LightSrc *)malloc(
+                (size_t)light_cap * sizeof *lights);
+            if (lights) {
+                int nlight = n2_load_light_sources(g->data, g->len,
+                                                    lights, light_cap);
+                world_append_lights(w, lights, nlight);
+                free(lights);
+            }
+        }
         g->tpk = n2_tpk_open(g->data, g->len);
         int ntk = n2_tpk_keys(g->data, g->tpk, tkeys, 16384);
         if (w->loc4 && ntk < 16384)
@@ -198,20 +233,49 @@ int world_load(World *w, const char *troot, const char *trackname) {
                     ntk += n2_tpk_keys(w->master, w->mastertpk, tkeys + ntk, 16384 - ntk);
             }
         }
-        n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
-        n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
-        n2_vista_out = NULL;
+        if (!instance_world) {
+            n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
+            n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+            n2_vista_out = NULL;
+        }
         g->mesh1 = w->scene.count;
         if (!w->have_grass)
             w->have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->grass);
-        printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
-               regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
-        printf("objects: %ld seen = %ld emitted + %ld routed to vista + %ld emitted "
-               "nothing (%ld of them had no 0x134B01/B03 leaf pair)  %s\n",
-               n2_obj_seen, n2_obj_emit, n2_obj_vista, n2_obj_nomesh, n2_obj_nopair,
-               n2_obj_seen == n2_obj_emit + n2_obj_vista + n2_obj_nomesh
-                   ? "(closed)" : "(LEAK)");
+        if (!instance_world) {
+            printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
+                   regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
+            printf("objects: %ld seen = %ld emitted + %ld routed to vista + %ld emitted "
+                   "nothing (%ld of them had no 0x134B01/B03 leaf pair)  %s\n",
+                   n2_obj_seen, n2_obj_emit, n2_obj_vista, n2_obj_nomesh, n2_obj_nopair,
+                   n2_obj_seen == n2_obj_emit + n2_obj_vista + n2_obj_nomesh
+                       ? "(closed)" : "(LEAK)");
+        }
     }
+
+    if (instance_world) {
+        const char *bundle_names[WORLD_MAXREG];
+        for (int r = 0; r < nreg; r++) bundle_names[r] = regs[r];
+        if (!world_instance_build(&w->scene, &w->vista, troot,
+                                  bundle_names, nreg,
+                                  options->focus_x, options->focus_y,
+                                  options->view_radius,
+                                  w->loc4, w->loc4len, &w->inst_stats)) {
+            fprintf(stderr, "instance world: no complete home district at "
+                            "(%.1f, %.1f)\n",
+                    options->focus_x, options->focus_y);
+            return 0;
+        }
+        for (int r = 0; r < nreg; r++) {
+            w->rgn[r].mesh0 = 0;
+            w->rgn[r].mesh1 = !strcmp(w->rgn[r].name, w->inst_stats.bundle)
+                            ? w->scene.count : 0;
+            printf("region %-12s: %3ld MB, %5d instance meshes\n",
+                   w->rgn[r].name, w->rgn[r].len >> 20,
+                   w->rgn[r].mesh1 - w->rgn[r].mesh0);
+        }
+    }
+
+    printf("authored local light sources: %d\n", w->nlights);
 
     /* strip coplanar duplicates before anything downstream sees the scene.
        This handles the overlapping-superset bundles under --track ALL: the 8
@@ -265,12 +329,48 @@ int world_load(World *w, const char *troot, const char *trackname) {
                w->dist[i].tok, w->dist[i].n, w->dist[i].cx, w->dist[i].cy,
                w->dist[i].medz, w->dist[i].bb[0], w->dist[i].bb[1],
                w->dist[i].bb[2], w->dist[i].bb[3]);
+    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Do not
+       add their keys to geometry/material selection: this is only the last
+       texture-resolution source, with existing regional precedence intact. */
+    char commonp[1024];
+    int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
+    if (plen >= 0 && (size_t)plen < sizeof commonp) {
+        w->common = n2_read_file(commonp, &w->commonlen);
+        if (w->common) w->commontpk = n2_tpk_open(w->common, w->commonlen);
+    }
     return nm;
 }
 
+int world_load(World *w, const char *troot, const char *trackname) {
+    return world_load_ex(w, troot, trackname, NULL);
+}
+
 int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
+/* One source order for ordinary meshes, vistas and authored light textures.
+   The shared fallback cannot replace a successful existing resolution. */
+static int world_texture_decode(const World *w, const WRegion *g,
+                                uint32_t key, N2Tex *tex, int common_only) {
+    if (common_only) {
+        int ok = n2_tpk_decode(w->common, w->commonlen, w->commontpk, key, tex);
+        if (ok && g_world_texaudit)
+            printf("TEXSOURCE key %08x  GLOBAL/InGameCommon.bun\n", key);
+        return ok;
+    }
+    int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
+    if (!ok && w->loc4)
+        ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, key, tex);
+    if (!ok && w->master)
+        ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, key, tex);
+    return ok;
+}
+
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *modes, int cap) {
     int n = 0;
+    /* Finish the original binding order across ALL regions first. Only then
+       retry still-unbound requests against common; never borrow from an
+       unrelated region or preempt a later region's successful old lookup. */
+    for (int pass = 0; pass < (w->common ? 2 : 1); pass++)
     for (int r = 0; r < w->nreg; r++) {
         WRegion *g = &w->rgn[r];
         if (!g->data) continue;
@@ -279,22 +379,47 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
-            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
-            if (!ok && w->loc4)
-                ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
-            if (!ok && w->master)
-                ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
-            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
-            else if (g_world_texaudit) {
+            int ok = world_texture_decode(w, g, tk, &tt, pass);
+            if (ok && !n2_tex_noise(&tt)) {
+                keys[n] = tk; texs[n] = upload_tex(&tt);
+                /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
+                   itself; a key that resolved via n2_load_car_tex_by_key (the
+                   shared LOC4 car-texture library) keeps them at their zero
+                   default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
+                   world texture had before this field existed, not a new
+                   misclassification. */
+                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                n++;
+            }
+            else if (g_world_texaudit && (ok || pass || !w->common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
+                       pass ? "not in common TPK" : "not in region/LOC4/master",
                        w->scene.meshes[i].sname, w->scene.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+        }
+        /* District light records have no mesh-owned texture slot. Request
+           their shipped flare through this same regional/shared resolver
+           while the STREAM bytes are still alive. */
+        if (w->nlights > 0 && n < cap) {
+            uint32_t tk = N2_TEX_SFX_FLARE_GLOWA;
+            int seen = 0;
+            for (int j = 0; j < n; j++) if (keys[j] == tk) { seen = 1; break; }
+            if (!seen) {
+                N2Tex tt = {0};
+                int ok = world_texture_decode(w, g, tk, &tt, pass);
+                if (ok && !n2_tex_noise(&tt)) {
+                    keys[n] = tk; texs[n] = upload_tex(&tt);
+                    if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                    n++;
+                }
+                if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+            }
         }
         /* M132: vista impostors carry their own authored texture keys and are
            decoded from the same TPK, in the same pass, before the region bytes
@@ -305,11 +430,16 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};
-            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
-            if (!ok && w->loc4) ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
-            if (!ok && w->master) ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
-            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
-            else if (g_world_texaudit) {
+            int ok = world_texture_decode(w, g, tk, &tt, pass);
+            if (ok && !n2_tex_noise(&tt)) {
+                keys[n] = tk; texs[n] = upload_tex(&tt);
+                /* vista batches don't consult drawmode (the tier has its own
+                   uVista alpha-blend path), but fill it anyway so the slot
+                   never carries stale/uninitialised data. */
+                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                n++;
+            }
+            else if (g_world_texaudit && (ok || pass || !w->common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. M133-R: `i` here
@@ -317,14 +447,20 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
                    mesh that actually owns this key, not whatever scene mesh
                    happens to share the same index. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
+                       pass ? "not in common TPK" : "not in region/LOC4/master",
                        w->vista.meshes[i].sname, w->vista.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
         }
-        free(g->data); g->data = NULL;   /* meshes + textures live on the GPU now */
     }
+    /* Keep every region alive until the last shared-fallback decision. */
+    for (int r = 0; r < w->nreg; r++) {
+        free(w->rgn[r].data); w->rgn[r].data = NULL;
+    }
+    free(w->commontpk.blk); memset(&w->commontpk, 0, sizeof w->commontpk);
+    free(w->common); w->common = NULL; w->commonlen = 0;
     return n;
 }
 

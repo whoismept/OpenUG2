@@ -14,6 +14,82 @@
 #  define GLSL_HEADER "#version 120\n#define lowp\n#define mediump\n#define highp\n"
 #endif
 
+int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
+                           const N2LightSrc *lights, int nlights,
+                           const float cam[3], const float look[3],
+                           const float MVP[16], float viewdist) {
+    RProg rp = *r;
+    int draws = 0;
+    const GLint scalar_loc[] = {rp.uUnlit, rp.uEmissiveTex, rp.uUseTex,
+                                rp.uSoft, rp.uAlpha};
+    float scalars[5], color[3], fog_color[3], saved_mvp[16];
+    for (int i=0; i<5; i++) glGetUniformfv(rp.prog,scalar_loc[i],scalars+i);
+    glGetUniformfv(rp.prog,rp.uColor,color);
+    glGetUniformfv(rp.prog,rp.uFogColor,fog_color);
+    glGetUniformfv(rp.prog,rp.uMVP,saved_mvp);
+    GLint texture_before, blend_src_rgb, blend_dst_rgb, blend_src_a, blend_dst_a;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture_before);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB,&blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&blend_src_a);
+    glGetIntegerv(GL_BLEND_DST_ALPHA,&blend_dst_a);
+    GLboolean blend_before=glIsEnabled(GL_BLEND), depth_before=glIsEnabled(GL_DEPTH_TEST);
+    GLboolean depth_mask; glGetBooleanv(GL_DEPTH_WRITEMASK,&depth_mask);
+    float ll = sqrtf(look[0]*look[0] + look[1]*look[1] + look[2]*look[2]);
+    if (ll < 1e-4f) ll = 1.0f;
+    float ld[3] = {look[0]/ll, look[1]/ll, look[2]/ll};
+    float rt[3] = {ld[1], -ld[0], 0};
+    float rl = sqrtf(rt[0]*rt[0] + rt[1]*rt[1]);
+    if (rl < 1e-4f) rl = 1.0f;
+    rt[0] /= rl; rt[1] /= rl;
+    float up[3] = {rt[1]*ld[2], -rt[0]*ld[2],
+                   rt[0]*ld[1] - rt[1]*ld[0]};
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+    glUniform1f(rp.uUnlit, 0.0f); glUniform1f(rp.uEmissiveTex, 1.0f);
+    glUniform1f(rp.uUseTex, 1.0f); glUniform1f(rp.uSoft, 0.0f);
+    /* Additive emission fades toward zero, not fog RGB: black sprite edges
+       must add nothing even at long distance. The sky path is unaffected. */
+    glUniform3f(rp.uFogColor,0.0f,0.0f,0.0f);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    float maxd2 = viewdist * viewdist;
+    for (int i = 0; i < nlights; i++) {
+        const N2LightSrc *light = &lights[i];
+        float dx = light->pos[0]-cam[0], dy = light->pos[1]-cam[1],
+              dz = light->pos[2]-cam[2];
+        if (dx*dx + dy*dy + dz*dz > maxd2) continue;
+        float s = light->r_in > 1.0f ? light->r_in : 1.0f;
+        float M[16] = {
+            rt[0]*s,rt[1]*s,rt[2]*s,0,
+            up[0]*s,up[1]*s,up[2]*s,0,
+            0,0,1,0,
+            light->pos[0]-(rt[0]+up[0])*s*0.5f,
+            light->pos[1]-(rt[1]+up[1])*s*0.5f,
+            light->pos[2]-(rt[2]+up[2])*s*0.5f,1
+        };
+        float LMVP[16]; mat_mul(MVP, M, LMVP);
+        glUniformMatrix4fv(rp.uMVP, 1, GL_FALSE, LMVP);
+        glUniform3f(rp.uColor,
+            (float)( light->rgba        & 0xffu) / 255.0f,
+            (float)((light->rgba >> 8)  & 0xffu) / 255.0f,
+            (float)((light->rgba >> 16) & 0xffu) / 255.0f);
+        glUniform1f(rp.uAlpha, (float)((light->rgba >> 24) & 0xffu) / 255.0f);
+        draw_gpumesh(quad); draws++;
+    }
+    for (int i=0; i<5; i++) glUniform1f(scalar_loc[i],scalars[i]);
+    glUniform3fv(rp.uColor,1,color);
+    glUniform3fv(rp.uFogColor,1,fog_color);
+    glUniformMatrix4fv(rp.uMVP,1,GL_FALSE,saved_mvp);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)texture_before);
+    glBlendFuncSeparate((GLenum)blend_src_rgb,(GLenum)blend_dst_rgb,
+                        (GLenum)blend_src_a,(GLenum)blend_dst_a);
+    if (blend_before) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (depth_before) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthMask(depth_mask);
+    return draws;
+}
+
 static const char *VS =
     GLSL_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
@@ -38,6 +114,13 @@ static const char *FS =
     "uniform float uGloss; uniform float uFlipN;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
+    "uniform float uAlphaTest;\n" /* >0.5: discard below 0.5 texture alpha */
+    "uniform float uTextureAlpha;\n" /* >0.5: output alpha = texture2D(...).a *
+        uAlpha instead of plain uAlpha (M135-R: N2_DRAW_BLEND/ADD world
+        batches only -- everything else, including CUTOUT, cars, and every
+        HUD/debug uUnlit pass, leaves this at its default 0.0 and keeps its
+        existing uAlpha-only alpha output unchanged) */
+    "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -69,6 +152,11 @@ static const char *FS =
     "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
     "    return;\n"
     "  }\n"
+    "  if(uEmissiveTex>0.5){\n"
+    "    vec4 t=texture2D(uTex,vUV);\n"
+    "    float a=t.a*uAlpha; if(a<0.02) discard;\n"
+    "    gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog),a); return;\n"
+    "  }\n"
     "  if(uUnlit>0.5){ float a=uAlpha;\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
     "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
@@ -90,6 +178,11 @@ static const char *FS =
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
+    /* N2_DRAW_CUTOUT world batches only (M135): uAlphaTest is 0.0 for every
+       other draw call, so this changes nothing anywhere else. Threshold 0.5
+       matches the authored railing/fence texture's own 1-bit DXT1 alpha
+       (fully 0 or 255, no partial value to tune against). */
+    "  if(uAlphaTest>0.5 && t.a<0.5) discard;\n"
     "  vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;\n"
     /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
        Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
@@ -138,8 +231,14 @@ static const char *FS =
     "    lit += env * (uEnv * fres);\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
-       translucent glass keeps its specular highlight */
-    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), uAlpha);\n"
+       translucent glass keeps its specular highlight. M135-R: authored
+       BLEND/ADD world batches instead multiply in the TEXTURE's own alpha
+       (uTextureAlpha>0.5) -- otherwise a cutout-shaped blend/additive
+       texture (e.g. a lit-window sheet with transparent gaps) would draw
+       fully opaque/full-strength through those gaps, since uAlpha alone
+       carries no per-texel information. */
+    "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);\n"
     "}\n";
 
 /* ---- tiny 4x4 matrix (column-major) ---- */
@@ -246,6 +345,9 @@ RProg render_program(void) {
     r.uSpec    = glGetUniformLocation(r.prog, "uSpec");
     r.uDecal   = glGetUniformLocation(r.prog, "uDecal");
     r.uVista      = glGetUniformLocation(r.prog, "uVista");
+    r.uAlphaTest  = glGetUniformLocation(r.prog, "uAlphaTest");
+    r.uTextureAlpha = glGetUniformLocation(r.prog, "uTextureAlpha");
+    r.uEmissiveTex = glGetUniformLocation(r.prog, "uEmissiveTex");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
@@ -265,6 +367,9 @@ RProg render_program(void) {
     glUniform1f(r.uUVCheck, 0.0f);
     glUniform1f(r.uGloss, 20.0f);
     glUniform1f(r.uFlipN, 0.0f);
+    glUniform1f(r.uAlphaTest, 0.0f);
+    glUniform1f(r.uTextureAlpha, 0.0f);
+    glUniform1f(r.uEmissiveTex, 0.0f);
     glUniform3f(r.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
     return r;
 }
@@ -308,10 +413,11 @@ GpuMesh *upload_scene(N2Scene *s) {
 
 /* ---- static-world batching ---- */
 
-typedef struct { uint64_t key; int idx; } BSortEnt;   /* (cell,tex) -> mesh */
+typedef struct { uint64_t key; int idx; unsigned char group; } BSortEnt;
 static int bsort_cmp(const void *a, const void *b) {
-    uint64_t ka = ((const BSortEnt *)a)->key, kb = ((const BSortEnt *)b)->key;
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+    const BSortEnt *aa = (const BSortEnt *)a, *bb = (const BSortEnt *)b;
+    if (aa->key != bb->key) return aa->key < bb->key ? -1 : 1;
+    return aa->group < bb->group ? -1 : aa->group > bb->group ? 1 : 0;
 }
 static int btex_cmp(const void *a, const void *b) {   /* final texture order */
     GLuint ta = ((const N2Batch *)a)->tex, tb = ((const N2Batch *)b)->tex;
@@ -454,7 +560,8 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
 
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
 static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
-                       GLuint tex, N2Batch *b, int bidx, const char *audit) {
+                       GLuint tex, N2Batch *b, int bidx, const char *audit,
+                       const unsigned char *mtexmode) {
     int nv = 0, ni = 0;
     for (int k = i0; k < i1; k++) {
         nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx;
@@ -492,6 +599,7 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
+    b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
     for (int k = i0; k < i1; k++) {
         int sc = s->meshes[ent[k].idx].scen;
         if (sc >= 0 && sc < 8) b->scen_count[sc]++;
@@ -502,7 +610,8 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
 
 int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                          const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                         const char *audit, int *meshbatch) {
+                         const char *audit, int *meshbatch,
+                         const unsigned char *mtexmode) {
     int n = s->count;
     if (meshbatch) for (int i = 0; i < n; i++) meshbatch[i] = -1;
     /* world extent -> grid coords */
@@ -525,7 +634,11 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
         uint64_t cell = (uint64_t)(uint32_t)((int)((cy-y0)/BATCH_CELL)*4096
                                            + (int)((cx-x0)/BATCH_CELL));
-        ent[m].key = cell << 32 | tex; ent[m].idx = i; m++;
+        ent[m].key = cell << 32 | tex; ent[m].idx = i;
+        int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
+        ent[m].group = (unsigned char)n2_world_batch_material_group(
+            &s->meshes[i], mode);
+        m++;
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     /* walk key runs, splitting a run at the u16 vertex ceiling */
@@ -537,13 +650,14 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
     int *run1 = (int *)malloc((size_t)cap * sizeof *run1);
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
-        int flush = (i == m) || (i > i0 && ent[i].key != ent[i0].key) ||
+        int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
+                                            ent[i].group != ent[i0].group)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat);
                 run0 = (int *)realloc(run0, (size_t)cap * sizeof *run0);
                 run1 = (int *)realloc(run1, (size_t)cap * sizeof *run1); }
-            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit);
+            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit, mtexmode);
             run0[nb] = i0; run1[nb] = i; nb++;
             i0 = i; verts = 0;
         }
@@ -575,22 +689,30 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
 /* Same merge as above but for exactly one category, grouped by texture only
  * (no spatial grid — a city has a handful of skybox/neon meshes, not tens of
  * thousands, so there's nothing for a cell split to buy here). */
-int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out) {
+int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
+                       const unsigned char *mtexmode) {
     int n = s->count;
     BSortEnt *ent = (BSortEnt *)malloc((size_t)(n ? n : 1) * sizeof *ent);
     int m = 0;
     for (int i = 0; i < n; i++)
-        if (s->meshes[i].cat == cat) { ent[m].key = mtex[i]; ent[m].idx = i; m++; }
+        if (s->meshes[i].cat == cat) {
+            ent[m].key = mtex[i]; ent[m].idx = i;
+            int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
+            ent[m].group = (unsigned char)n2_world_batch_material_group(
+                &s->meshes[i], mode);
+            m++;
+        }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     int cap = 8, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
-        int flush = (i == m) || (i > i0 && ent[i].key != ent[i0].key) ||
+        int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
+                                            ent[i].group != ent[i0].group)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }
-            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL);
+            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL, mtexmode);
             nb++;
             i0 = i; verts = 0;
         }
@@ -676,7 +798,7 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
     }
-    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0 };
+    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0, 0,0,0,0 };
     GLuint id = upload_tex(&t);
     /* radial, single-sample cap texture (no tiling intended) — clamp so a
        filter footprint near u/v=0 or 1 can't wrap and bleed in colour from

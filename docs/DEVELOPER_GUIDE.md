@@ -86,6 +86,7 @@ data root
   │    res_list_tracks / res_list_cars / res_list_circuits
   ├─ world_load
   │    ├─ map STREAM region bytes
+  │    ├─ decode authored 0x135003 light sources into World.lights
   │    ├─ open regional/shared TPK indices
   │    ├─ n2_walk_meshes
   │    │    chunk object -> transform -> material ranges -> N2Mesh
@@ -102,6 +103,63 @@ data root
        -> race state -> camera -> render passes -> optional diagnostics
 ```
 
+### Opt-in instance-driven district flow
+
+The legacy STREAM object walk remains the default. `--world2` is a diagnostic
+instance-world path and must be paired with one explicit `--track STREAM...`
+and `--spawn start` or `--spawn X,Y`; it refuses `--track ALL`. The named
+`start` pose is only a repeatable L4RA reference focus, not a new freeroam
+spawn policy.
+
+For this path, `main` resolves the requested XY before `world_load_ex`.
+`world_instance_build` reads companion district polygons, selects the smallest
+containing home district and nearby district ids, then chooses one bundle that
+has the home section. It builds a local prototype library from that bundle,
+places in-range non-ground instances with their instance matrices, and emits
+the one-time ROAD/TERRAIN fallback prototypes before the normal world pipeline:
+
+Instance model identity is the authored key, not the display name. The section
+walker carries the three keys from each type record into `WInstPlacement`;
+`winst_library_resolve` tries the primary then the explicit available alternatives.
+Keyed records never fall back to a similarly named object. The bounded object
+name is used for diagnostics and scenery classification. Name-only compatibility
+is restricted to records with no keys. Multiple resident copies of the SAME
+key still use the first copy; district-specific copy selection and live streaming
+are separate, unimplemented work. This does not enable `--world2` by default.
+
+```text
+--world2 focus
+  -> companion polygon selection
+  -> one home-section STREAM bundle
+  -> local prototype library + instance placements
+  -> world_dedup -> terrain bias -> bounds/ground grid -> nav -> textures/batches
+```
+
+After the completed ground grid exists, the diagnostic spawn Z is resolved
+against the nearest authored ROAD/TERRAIN layer. This establishes load-time
+support evidence only; it does not establish vertical contact, collision,
+physics, alpha/glass, lighting, or vista behavior.
+
+Use the GL-free audit for deterministic assembly evidence:
+
+```sh
+./nfsu2 DATA_ROOT --track STREAML4RA --world2 --spawn start --heading -101 --instance-audit
+```
+
+It reports selected bundle/home district, region and instance totals, placed
+meshes, missing-model and rejected-placement counts, triangle and scene-class
+totals, keyed/explicit-LOD/name-only resolution counts, finite-coordinate failures,
+and the ROAD/TERRAIN support result; it
+exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
+normalizing only machine-specific absolute paths or elapsed time if present.
+For a fixed render check, retain the same arguments, replace the audit switch
+with `--shot OUTPUT.png`, and change only `--heading` (for example `-101`,
+`-11`, `79`, or `169`). In this explicit `--world2 --shot` mode, `--heading`
+is the fixed camera direction (and seeds the parked car yaw); the requested
+supported spawn is preserved, with no legacy showcase selection, race-grid
+placement, or capture autopilot. `--instance-audit` remains GL-free and has no
+camera output. Keep generated logs and captures outside Git.
+
 ### Region bytes and texture lifetime
 
 `WRegion.data` owns each loaded STREAM buffer. Mesh parsing stores copied CPU
@@ -110,7 +168,14 @@ region buffers must stay alive through `world_bind_textures`. That function
 decodes/uploads each distinct key and only then frees `WRegion.data`.
 
 `LOC4DYNTEX.BIN` is the shared lookup after the region-local TPK. Some
-single-region bundles also consult a measured master-neighbour TPK. A missing
+single-region bundles also consult a measured master-neighbour TPK. The last
+fallback is `GLOBAL/InGameCommon.bun`, resolved relative to the TRACKS directory.
+All original per-region binding attempts finish before this last fallback;
+a common copy cannot preempt a later region's successful lookup, nor cause
+ordinary meshes to borrow from unrelated regions in diagnostic multi-region mode.
+The common library supplies textures only; its keys are not added to prototype
+or submesh material selection. All STREAM buffers survive binding; the common
+bytes and TPK index are freed/reset at its end. A missing
 record and a decoded-but-noise-rejected texture are different failures; keep
 those counters separate.
 
@@ -178,9 +243,13 @@ triangles are bad, reject the mesh and report it.
 
 ### Duplicate and terrain policy
 
-`world_dedup` runs before bounds, the ground grid and GPU upload. Identity is
-exact texture key + XYZ bounds + index count + vertex count. Do not replace it
-with an epsilon merge: nearby distinct authored layers can be meaningful.
+`world_dedup` runs before bounds, the ground grid and GPU upload. Bounds and
+counts are only a cheap grouping prefix; identity also compares material
+ownership plus the complete index, vertex/UV and prelight payload byte-for-byte.
+This matters after material splitting because different ranges share the same
+source vertex pool and can have equal counts without being duplicate faces. Do
+not replace the exact comparison with an epsilon merge: nearby distinct
+authored layers can be meaningful.
 
 Terrain receives a small -0.05 m world-space bias after dedup so coplanar road
 strips win the depth test and ground selector. This is current engine policy,
@@ -191,7 +260,8 @@ not a decoded file-format field.
 ### Batch construction
 
 `upload_world_batches` excludes sky/glow, sorts ordinary meshes by spatial
-cell and resolved GL texture, splits runs before the `u16` vertex ceiling, then
+cell, resolved GL texture and effective draw mode, splits runs before the
+`u16` vertex ceiling, then
 sorts the final batch list by texture. The post-sort batch index is not the
 emission index. Diagnostics must replay the recorded emission run; re-deriving
 membership after the final sort can attribute the wrong object.
@@ -202,6 +272,48 @@ objects are not smoothed together.
 
 Sky and glow use `upload_cat_batches` and separate depth/blend behaviour.
 Vista batches exist only for the experimental full tier.
+
+### Authored sky
+
+`SKYDOME` is not a camera-locked flat colour. It is a world-space shell with
+an exact two-range material partition: an opaque dome and a DXT3 alpha cap.
+Their source sunrise keys live in `LOC4DYNTEX.BIN`; `--sky` remaps only those
+keys to the matching shipped `night` (default), `sunrise`, or `sunset` pair
+before the normal texture-binding pass. Invalid profiles exit with status 2.
+
+The sky pass uses the real camera view, a 30 km far plane and depth writes off.
+It enables the narrow `uEmissiveTex` shader gate, draws the dome first and the
+alpha-blended cap second, then restores blending, depth mask, fog density,
+shader gates and the ordinary MVP. Exact `SKYDOME`/`SKY_` classification is an
+invariant: broad substring matching moves buildings and factory skylights into
+this special pass and is forbidden.
+
+### Authored district lights
+
+`world_load_ex` extracts enabled `0x135003` light records while each
+`WRegion.data` buffer is still owned by the world. It appends exact-unique
+records to dynamic `World.lights` storage before texture upload releases the
+STREAM bytes. `main` frees that array at shutdown; scene meshes and texture
+objects do not own it.
+
+Light records have no mesh texture slot, so `world_bind_textures` explicitly
+requests the shipped `SFX_FLARE_GLOWA` key through the same regional/LOC4/master
+resolver as world materials. Do not add a second texture decoder or keep
+region bytes alive after binding merely for lights.
+
+At night, sources inside the ordinary fog-derived view distance draw as
+camera-facing quads in `render_district_lights`. This late additive pass enables
+depth testing, turns depth writes off, consumes texture alpha through
+`uEmissiveTex`, and restores the incoming uniforms, texture, blend factors and
+blend/depth enable/write state. Like other mesh draws, it sets vertex attributes
+and buffers; the caller binds the main program on texture unit zero. Additive
+emission fades toward zero, not fog RGB, so distant black sprite edges do not
+add colored rectangles. `make light-state-test` verifies this on a real SDL/GL
+context with synthetic textures, including an occluded light and deliberately
+different incoming state; it requires no retail assets. Daylight
+draws zero authored light quads. Fixed M136 reference poses draw 197 of 2,228
+L4RA sources and 64 of 193 L4RB sources; these numbers prove distance culling,
+not a universal visibility count for every camera.
 
 ### Visibility tiers
 
@@ -221,6 +333,101 @@ must not alter ordinary same-pose output unless that is the explicit task.
 retain meaningful alpha; an all-255 plane is freed. Do not invent black
 chromakey transparency. DXT1 transparency exists only in its three-colour mode.
 
+### Draw modes (M135)
+
+Authored records carry a draw-mode byte pair (`usage`/`blend`, see
+`docs/FORMATS.md`); `n2_tex_mode` maps them to
+`N2_DRAW_{OPAQUE,CUTOUT,BLEND,ADD}`. The mode is per-texture, resolved once in
+`world_bind_textures` (optional trailing `modes` output array) and threaded
+per-mesh into `upload_world_batches`/`upload_cat_batches` (optional trailing
+`mtexmode` array), landing on `N2Batch.drawmode`. Callers that don't care
+(sky/glow/vista/diagnostic-marker batches) pass `NULL` and get
+`N2_DRAW_OPAQUE`, unchanged from before this field existed.
+
+Texture mode is not sufficient evidence that an entire object owns that mode.
+`n2_world_draw_mode` permits authored cutout/blend/additive only for an exact
+`0x134B02 -> 0x134012` range or a true single-slot object. A malformed
+multi-slot fallback is forced opaque, and batch construction keeps that opaque
+fallback separate from exact ranges even when both resolve to the same GL
+texture and effective draw mode.
+
+The main world draw loop in `main.c` dispatches on `drawmode`:
+
+- `OPAQUE`/`CUTOUT` share the ordinary pass (depth test+write on, no
+  blending); `CUTOUT` additionally sets the shader's `uAlphaTest` uniform to
+  1.0 for the duration of its run of batches, enabling a fragment-shader
+  `discard` below 0.5 alpha. Toggled per-batch like the existing `lasttex`
+  bind cache, reset to 0.0 after the loop.
+- `BLEND`/`ADD` batches are collected into two separate arrays (`defblend`,
+  `defadd`, grown to `nbatch` -- never silently capped) instead of being
+  drawn inline, then drawn in one pass right after: depth write off (so
+  they don't occlude what's behind or each other), depth test still on (so
+  real opaque geometry still occludes them correctly). `defblend` is sorted
+  back-to-front by `n2_sort_back_to_front` (GL-free, unit-tested in
+  `tools/car_material_test.c`) on squared bbox-centre-to-camera distance,
+  with a deterministic smaller-index tie-break; `defadd` draws after, in its
+  original stable texture-sorted order (additive-over-additive order only
+  affects rounding in an associative sum, not correctness, so it needs no
+  per-frame sort). `glBlendFunc` is set per-batch (`GL_SRC_ALPHA,
+  GL_ONE_MINUS_SRC_ALPHA` for `BLEND`, `GL_SRC_ALPHA, GL_ONE` for `ADD`).
+  This mirrors the existing car-glass and vista translucent-pass shape
+  elsewhere in the file.
+- Authored alpha (M135-R): the shader's `uTextureAlpha` uniform, enabled for
+  the whole deferred blend/add bracket, multiplies the sampled texture's own
+  alpha into the fragment's output alpha (`t.a*uAlpha` instead of the flat
+  `uAlpha` every other pass uses) -- otherwise a cutout-shaped blend/additive
+  sheet (e.g. a lit-window texture with transparent gaps between windows)
+  would draw fully opaque/full-strength through those gaps, since `uAlpha`
+  alone carries no per-texel information. Disabled (0.0) everywhere else,
+  including `CUTOUT`, cars, and every HUD/debug `uUnlit` pass.
+
+Texture alpha is never gated on `uVColor`: per-vertex prelight strength and
+authored texture transparency are independent and must not be conflated.
+
+### Texture format dispatch (M135-R)
+
+`n2_tpk_decode` selects P8/DXT1/DXT3 from the record's own `+0x3e` format
+tag (`N2_TEXFMT_P8=0x08`, `_DXT1=0x22`, `_DXT3=0x24`), not the old
+`Size`-vs-`w*h` heuristic -- independently verified against 2309 real
+records across three files with zero contradictions (see `docs/FORMATS.md`).
+`PaletteSize` is still cross-checked as a corruption guard (P8 requires a
+real palette; DXT1/DXT3 require none); a tag that doesn't match any proven
+format, or contradicts `PaletteSize`, is rejected outright rather than
+falling back to a guess. `N2_TEXFMT_DXT5`/`_BGRA8` are named for
+completeness (an external reference claims those byte values) but never
+seen on real world data -- those belong to the car `TEXTURES.BIN`
+offset-slot path (`n2_load_car_tex_by_key`), which has its own,
+separately-proven compression byte and is not affected by this change.
+
+### LOC4 fallback and draw modes (M135-R census)
+
+`world_bind_textures` first tries the region's own
+TPK, then `w->loc4` (`LOC4DYNTEX.BIN`, decoded through
+`n2_load_car_tex_by_key`, the CAR texture-library reader) as a shared
+fallback, then the master TPK. M138 retries still-unbound requests against
+`GLOBAL/InGameCommon.bun` only after every original region attempt. Only
+`n2_tpk_decode` reads the `order`/
+`usage`/`blend`/`wz` draw-mode bytes; a key resolved through the LOC4
+fallback keeps them at their zero default (`N2_DRAW_OPAQUE`), same as every
+world texture had before the field existed. The original M135-R census resolved
+ordinary world-material traffic directly from its regional TPK; this is not a
+guarantee for objects restored later. M138's restored `421X_STARTFINGRAPHIC`
+needs common `STARTLINE` (`96d35495`), a 64x64 DXT3 BLEND record whose decoded
+alpha ranges from 153 to 204. M136
+proved one intentional exception: the `SKYDOME` dome/cap pairs live in LOC4.
+They bypass ordinary draw-mode dispatch and use the dedicated authored-sky
+path, so the cap's decoded alpha is retained without inventing LOC4 header
+metadata. Extend LOC4 draw-mode decoding only if a future ordinary world
+texture is proven to require it.
+
+`make world-texture-test` runs synthetic files through the real world loader,
+decoder and hidden OpenGL upload. It checks common fallback for meshes, vistas
+and lights, RGBA/mode preservation, duplicate requests, region/master precedence,
+later-region precedence, unavailable keys and common-buffer cleanup. No retail
+assets are required. `--tex-audit` reports `TEXSOURCE` for common-library hits.
+Texture resolution is not event visibility: a restored start/finish graphic's
+presence in free roam still needs an independently proven activation rule.
+
 ## 8. Car loading and presentation
 
 The car path is:
@@ -228,9 +435,11 @@ The car path is:
 ```text
 GEOMETRY.BIN
   -> n2_walk_car
-  -> material-range split when keys differ
+  -> material-range split when a resolved texture key differs, OR a proven
+     material class differs (0x134B02 matid -> 0x134013 hash, e.g.
+     WINDSHIELD -> N2_CAR_GLASS, CARSKIN -> N2_CAR_BODY)
   -> n2_car_apply_config (KIT/STYLE override)
-  -> n2_car_dedupe_lod
+  -> n2_car_dedupe_lod (complete-tier selection, see below)
   -> n2_car_profile (body/tyre measurements)
 
 TEXTURES.BIN
@@ -248,6 +457,51 @@ GLOBALB.BUN
 `KIT00` remains the base car. Higher kit/style records override only matching
 families. Roof, body, badge and light appearance must come from the same
 material rules; never hard-code roof colour by part name.
+
+### Material routing (`0x134B02.matid -> 0x134013`)
+
+A `0x134B02` submesh record carries two positional indices, not one:
+`mat` (`+0x1c`) into the object's `0x134012` texture-slot list (unchanged,
+existing), and `matid` (`+0x20`) into a SEPARATE `0x134013` material-hash
+list (`n2_mesh_matslots`). These answer different questions: `mat` says
+which texture a range binds; `matid` says what CLASS of material it is,
+independent of texture. A car object can (and does) put body paint and
+window glass on the *same* texture slot while giving them different
+`matid` values — `n2_walk_car`'s old texture-only split could never see
+that difference and drew the whole thing as one opaque panel.
+
+`n2_mat_class` maps a material hash to a category. Only two mappings are
+proven and used: `WINDSHIELD -> N2_CAR_GLASS`, `CARSKIN -> N2_CAR_BODY`
+(both hash constants independently re-derived and verified against live
+`GOLF` data — see the `n2_mesh_submeshes` doc comment for the exact
+records). Chrome, aluminium, moldings, plastics, tire/rim materials and
+lens classes are measurable the same way but are deliberately NOT
+classified yet; an unmapped or out-of-range `matid` inherits the
+object-level category from `n2_car_category`, unchanged.
+
+Before trusting a matid-driven (or texture-driven) split at all,
+`n2_car_submesh_partition_ok` requires the `0x134B02` ranges to start at
+index 0, chain contiguously with no gap or overlap, and end exactly at the
+decoded index buffer's own end. Any violation keeps the old whole-object
+path — a malformed partition can shrink coverage but must never grow or
+duplicate it.
+
+### Complete-tier LOD selection
+
+Splitting a car object by material means two LOD tiers of the same part no
+longer necessarily contain the same slices — a lower tier can lack a glass
+slice entirely. `n2_car_dedupe_lod` therefore competes whole TIERS, not
+individual meshes: every slice `n2_walk_car` emits from one `0x80134010`
+occurrence carries the same `tierid` (a plain incrementing counter, reset
+implicitly per car load, distinct from `namekey` which groups a part
+ACROSS tiers). Tiers sharing a `namekey` and whose UNION bounding boxes
+overlap compete as one family; the tier with the larger SUMMED `nidx`
+(triangle index count) across all its slices wins, and every slice of
+every other tier in that group is dropped. Do not score by summed
+`nverts` — `n2_add_pair` duplicates the whole source vertex array per
+split slice, so a heavily-split tier would win merely for having more
+slices, independent of how much triangle detail it contributes. Ties keep
+the earlier-encountered tier, matching the pre-M135 tie-break exactly.
 
 The stock wheel visual is currently partly procedural. Wheel position and ride
 height are separate concerns: axle/track data place contact points, while the
@@ -409,6 +663,31 @@ Output: result / evidence / files / remaining limitation
 Avoid role-play, praise, milestone-history dumps and broad “fix the map” prompts.
 A capable coding model is most effective when the planner has already localized
 the owning boundary and supplied a falsifiable acceptance test.
+
+### Scenery group audit (M139)
+
+Build `make world-group-test world-group-audit`, then run:
+
+```sh
+./build/world_group_audit /path/to/NFSU2/TRACKS L4RA
+./build/world_group_audit /path/to/NFSU2/TRACKS L4RA BARRIERS_4144
+```
+
+The first command validates all companion group tables and their STREAM
+section/placement targets. The second also prints members of that exact
+authored group. No GL context or game launch is required. Exit 0 means the
+structural checks passed, 1 means missing/corrupt/inconsistent data, and 2
+means invalid arguments or a requested group with no members.
+
+The reader validates the enclosing chunks before visiting payloads, then checks
+group hashes, reference bounds/counts, placement row bounds and the copied
+flags. It never treats placement `+0x1c` as a global override index. Input
+buffers remain alive until the borrowed table view is no longer used.
+
+This tool does **not** enable or disable groups in the engine. Event membership
+is proven; activation timing, race direction and career-stage state are not.
+Some venue graphics (six in RB) have no override membership. Do not convert
+this audit into a blanket name-prefix filter or section-level suppression.
 
 ## 14. Common failure patterns
 

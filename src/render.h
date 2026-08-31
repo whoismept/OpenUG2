@@ -50,6 +50,12 @@ typedef struct {
                                  index is NOT the index batch_emit saw (M79) */
     float bbox_min[3];        /* culling bounds */
     float bbox_max[3];
+    unsigned char drawmode;   /* N2_DRAW_* (M135): authored from the first
+                                 member mesh's resolved texture record, via
+                                 n2_tex_mode. N2_DRAW_OPAQUE (0) when no
+                                 per-mesh mode table was supplied -- sky/glow/
+                                 vista/diagnostic batches keep their own,
+                                 separate, unrelated render treatment. */
 } N2Batch;
 
 /* the one shader program + its uniform handles */
@@ -60,6 +66,13 @@ typedef struct {
           uVColor,  /* 0..1 strength of per-vertex prelight (world geometry only) */
           uDecal,   /* 1 = texture is an alpha-masked decal over uColor paint */
           uVista,                   /* >0.5: alpha-blended backdrop pass */
+          uAlphaTest,               /* >0.5: discard texels below 0.5 alpha
+                                       (N2_DRAW_CUTOUT world batches, M135) */
+          uTextureAlpha,            /* >0.5: output alpha = texture alpha *
+                                       uAlpha (N2_DRAW_BLEND/ADD world
+                                       batches only, M135-R) */
+          uEmissiveTex,             /* >0.5: texture-backed unlit RGB/alpha
+                                       (authored sky and point-light sprites) */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in the current object's model space */
           uEnv,     /* environment-reflection amount (cars only) */
@@ -94,6 +107,13 @@ GLuint   make_wheel_blur_tex(void);     /* same rim, angular-averaged (spinning)
 GpuMesh  make_quad(void);               /* unit quad for HUD / billboards */
 void     draw_gpumesh(GpuMesh *g);
 
+/* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
+ * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */
+int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
+                           const N2LightSrc *lights, int nlights,
+                           const float cam[3], const float look[3],
+                           const float mvp[16], float viewdist);
+
 /* Merge the static world into per-(cell,texture) batches and upload them.
  * mtex = per-mesh resolved GL texture, texTerr = grass fallback for terrain
  * meshes without one. Sorted by texture so binds are rare. The CPU-side scene
@@ -106,13 +126,22 @@ void     draw_gpumesh(GpuMesh *g);
  * FINAL batch index each source mesh ended in, or -1 if it never entered the
  * world partition (sky/glow go to their own passes). Written after the texture
  * re-sort, so the indices are the ones the renderer uses (M133). */
+/* mtexmode (optional, NULL to skip): per-mesh N2_DRAW_* (M135), mirroring
+ * mtex -- the authored draw mode of the mesh's own resolved texture record.
+ * Every mesh a batch merges shares one texture, hence one mode; batch_emit
+ * takes it from the first member. NULL leaves every batch N2_DRAW_OPAQUE,
+ * unchanged from before this field existed. */
 int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                           const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                          const char *audit, int *meshbatch);
+                          const char *audit, int *meshbatch,
+                          const unsigned char *mtexmode);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
- * since there are only ever a handful of skybox/neon meshes per city. */
-int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out);
+ * since there are only ever a handful of skybox/neon meshes per city. Sky,
+ * glow, vista and diagnostic-marker batches keep their own dedicated render
+ * treatment, so their callers pass mtexmode = NULL (-> N2_DRAW_OPAQUE). */
+int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
+                        const unsigned char *mtexmode);
 void draw_batch(const N2Batch *b);
 GLuint   upload_tex(const N2Tex *t);
 /* Upload a decoded TPK texture, preferring a direct glCompressedTexImage2D of

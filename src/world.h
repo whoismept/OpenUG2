@@ -8,6 +8,7 @@
 #include "nfsu2.h"
 #include "render.h"
 #include "debug.h"   /* ScriptedDef, for world_scripted_defs */
+#include "world_instance.h"
 
 #define WORLD_MAXREG 16
 #define WORLD_MAXDIST 24
@@ -52,7 +53,11 @@ typedef struct {
     WRegion rgn[WORLD_MAXREG]; int nreg;
     unsigned char *loc4; long loc4len;                       /* shared tex library */
     unsigned char *master; long masterlen; N2Tpk mastertpk;  /* single-region mode */
+    /* Texture-only shared fallback; never enters model/placement assembly.
+       Released, including its TPK index, after world_bind_textures. */
+    unsigned char *common; long commonlen; N2Tpk commontpk;
     N2Tex grass; int have_grass;                             /* terrain fallback */
+    N2LightSrc *lights; int nlights, lightcap;                /* authored 0x135003 */
     float (*mbb)[4];   /* per-mesh XY bbox (x0,y0,x1,y1) for culling + ground grid */
     WDistrict dist[WORLD_MAXDIST]; int ndist;  /* connected road components */
     int *navcomp;                             /* district index per nav node, -1 = none */
@@ -79,7 +84,14 @@ typedef struct {
      * deliberately invisible to ground selection, wheel support, collision,
      * navigation and spawn -- every one of those queries w->scene. */
     N2Scene vista;
+    WInstStats inst_stats;  /* populated only by explicit instance-world loads */
 } World;
+
+typedef struct {
+    int enabled;
+    float focus_x, focus_y;
+    float view_radius;
+} WLoadOptions;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/
  * Paths*.bin. Each file's 0x34148 leaf is an array of 24-byte records:
@@ -171,11 +183,19 @@ int world_barrier_push(const World *w, float *pos, float r);
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the
  * mesh count (0 = nothing readable). */
 int world_load(World *w, const char *troot, const char *trackname);
+int world_load_ex(World *w, const char *troot, const char *trackname,
+                  const WLoadOptions *options);
 
-/* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master),
- * writing the key->GL map, then free the region buffers. Needs a GL context.
- * Returns the number of textures bound. */
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
+/* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master).
+ * After all original region attempts, retry unbound requests against
+ * GLOBAL/InGameCommon.bun. Write the key->GL map, then free region buffers
+ * and the common bytes/index. Needs a GL context.
+ * Returns the number of textures bound.
+ * modes (optional, NULL to skip): parallel array receiving each resolved
+ * key's authored N2_DRAW_* mode (n2_tex_mode on the same decoded record),
+ * M135. */
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *modes, int cap);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */

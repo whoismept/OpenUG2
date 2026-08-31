@@ -35,6 +35,7 @@ guard that makes the assumption safe.
 |---|---|---|
 | generic chunks, track/car meshes, TPK, codecs | `src/nfsu2.h` | `N2Scene`, `N2Tex`, `N2Path` |
 | region loading, events, nav, ground/contact | `src/world.c` | `World` |
+| authored district lights (`0x135003`) | `n2_load_light_sources` in `src/nfsu2.h` | `World.lights` |
 | file mapping and content discovery | `src/resource.c` | caller |
 | car axle/track anchors in `GLOBALB.BUN` | `n2_global_wheel_attr` in `src/nfsu2.h` | `N2WheelAttr` |
 | generic `0x00135200` attribute records | `src/attrib.h` | diagnostic `N2Attrib` view |
@@ -169,8 +170,8 @@ it from transformed X alone is incorrect.
 | `+0x00` | `f32[3]` | local range bounding-box minimum |
 | `+0x0c` | `u32` | index count |
 | `+0x10` | `f32[3]` | local range bounding-box maximum |
-| `+0x1c` | `u32` | material slot id |
-| `+0x20` | `u32` | render-state flag; semantics still **UNKNOWN** |
+| `+0x1c` | `u32` | `mat`: texture-slot id, positional index into `0x134012` |
+| `+0x20` | `u32` | **PROVEN (M135)**: `matid`, positional index into the object's own `0x134013` material-hash list (see below). Distinct from `mat` at `+0x1c`: on `GOLF_KIT00_BODY_A`, one record has `mat=1, matid=1`; another has `mat=0, matid=4` -- independent selectors into two independent lists. |
 | `+0x24` | 16 B | unknown/reserved |
 | `+0x34` | `u32` | index start |
 
@@ -179,7 +180,48 @@ For the simple production path they must start at zero, form a contiguous chain,
 contain at least one triangle each, stay inside `0x134B03`, and end at the last
 whole triangle. One spare alignment index is allowed; a two-index tail is not.
 `n2_mesh_submeshes` currently accepts exactly one submesh leaf whose body is a
-multiple of 60.
+multiple of 60. Car-only callers additionally run
+`n2_car_submesh_partition_ok`, which re-validates the SAME chain against the
+object's own decoded index-buffer length before a material/texture split is
+ever trusted; any violation keeps the whole-object path.
+
+### `0x134013`: positional material-hash list
+
+**PROVEN (M135).** Same 8-byte-entry shape as `0x134012` (first `u32` kept,
+second unused), parsed by `n2_mesh_matslots`. Values are `n2_str_hash(name)`
+of a material class name (`h = 0xFFFFFFFF; h = h*33 + byte`, applied per
+byte); unlike `0x134012` keys, POSITION within the list is per-object (not
+globally fixed), but the HASH VALUE is globally meaningful -- the same
+material class hashes to the same `u32` everywhere.
+
+Verified against live `GOLF` data, independently re-derived (not copied from
+any external source):
+
+```text
+n2_str_hash("WINDSHIELD") == 0x471a1dca
+n2_str_hash("CARSKIN")    == 0xd6d6080a
+```
+
+`GOLF_BASE_A`'s own `0x134013` list is
+`[0fedee40, 02a05578, 010cb64a, 3ed70c43, 471a1dca]` -- index 4 is
+`WINDSHIELD`, selected by three of its submeshes (one wide front-facing
+pane plus a mirrored left/right pair), none of which resolve a texture key,
+exactly the shape real glass geometry produces. `GOLF_KIT00_BODY_A`'s list
+is `[0fedee40, a7366ae6, d6d6080a, 010cb64a, 02a05578]` -- index 2 is
+`CARSKIN`, selected by its dominant 534-index submesh. Checked across every
+one of `GOLF`'s 608 objects and 2171 `0x134B02` records: every `matid` is
+in-bounds for its own object's `0x134013` list, 2171/2171 (100%).
+
+`n2_mat_class(hash, fallback)` maps a hash to a car category. Only
+`WINDSHIELD -> N2_CAR_GLASS` and `CARSKIN -> N2_CAR_BODY` are classified;
+every other hash -- known-but-unmapped (chrome, aluminium, moldings,
+plastics, tire/rim materials, lens classes all measure the same way but are
+not yet wired) or absent/out-of-range -- returns `fallback`, the
+object-level category from `n2_car_category`, unchanged. A car object
+splits into separate `N2Mesh` slices when EITHER the resolved texture
+differs across `0x134B02` records OR the classified material differs; a
+same-texture body-and-glass object could never split under the old
+texture-only rule.
 
 ### `0x134012`: positional texture slots
 
@@ -199,16 +241,90 @@ ranges: {start=0,count=48,mat=1}, {start=48,count=9,mat=2}
 result: first 16 triangles use slot 1; final 3 triangles use slot 2
 ```
 
-For world road/terrain, structurally valid records are emitted per range. A key
-available in the region/shared TPK wins; an unavailable key falls back only for
-that range. A malformed object falls back to the legacy one-key whole-object
-path rather than partially dropping geometry.
+For ordinary world objects, structurally valid records are emitted per range.
+This includes buildings, props and other set dressing, not only road/terrain:
+otherwise a multi-material building inherits its last texture slot (for
+example `OBJ_RAILING`) across every opaque wall. A key available in the
+region/shared TPK wins; an unavailable key falls back only for that range. A
+malformed object falls back to the legacy one-key whole-object path rather
+than partially dropping geometry.
 
-Cars use the same linkage when multiple records resolve to different textures.
-This matters for small badge/light slices embedded in a large paint panel. If
-all records resolve to the same key, the car remains one draw to avoid a
-pixel-identical draw-call increase. Implementation: `n2_mesh_texslots`,
-`n2_mesh_submeshes`, `n2_walk_meshes`, and `n2_walk_car`.
+`N2Mesh.mat_exact` records whether a range owns its texture structurally. A
+verified range and a true single-slot object set it; an unresolved range or a
+multi-slot whole-object fallback does not. Render draw modes are consumed only
+when this bit is set, so malformed data can keep its geometry and diffuse
+fallback without spreading cutout/blend/additive state across unrelated faces.
+
+Cars use the same linkage when multiple records resolve to different
+textures, OR (M135) when they classify to different material categories via
+`matid -> 0x134013` (see above) even on the SAME texture -- the case a
+same-texture body-and-glass object needs. If neither differs, the car
+remains one draw to avoid a pixel-identical draw-call increase.
+Implementation: `n2_mesh_texslots`, `n2_mesh_matslots`, `n2_mesh_submeshes`,
+`n2_walk_meshes`, and `n2_walk_car`.
+
+**Complete-tier LOD selection (M135).** Splitting by material means two LOD
+tiers of one part need not contain the same slices. `n2_walk_car` tags every
+slice emitted from one `0x80134010` occurrence with the same `tierid`
+(`N2Mesh.tierid`, a plain per-object counter, distinct from `namekey` which
+groups a part ACROSS tiers). `n2_car_dedupe_lod` competes whole tiers, not
+individual meshes: tiers sharing a `namekey` whose union bounding boxes
+overlap score by SUMMED index count (`nidx`, not `nverts` -- `n2_add_pair`
+duplicates the full vertex array per split slice, so scoring by vertex count
+would reward a heavily-split tier for slice count alone) across all their
+slices, and the losing tier's slices are dropped as one unit. This is what
+lets an unmatched glass slice in the winning tier survive instead of being
+compared, and possibly dropped, independently of its own tier's body panel.
+
+### Scenery group membership (`0x34107` / `0x34108`, M139)
+
+**PROVEN structure; activation UNDECODED.** Each surveyed companion `L4R*.BUN`
+contains an override table and a variable-length group list. This is not the
+polygon directory: event graphics and ordinary scenery share spatial sections.
+
+`0x34107` is an exact array of 8-byte records, without a filler prefix:
+
+| offset | type | measured meaning |
+|---:|---|---|
+| `+0` | `u16` | STREAM `0x34101` section id |
+| `+2` | `u16` | zero-based placement row in that section's `0x34103` |
+| `+4` | `u16` | copy of that placement's `+0x1a` flags |
+| `+6` | `u16` | number of references from the group list |
+
+`0x34108` consists of records of length `align4(52 + 2 * count)`:
+
+| offset | type | measured meaning |
+|---:|---|---|
+| `+0/+4` | `u32[2]` | unconsumed fields (both 11 in sampled named groups) |
+| `+8` | `char[32]` | bounded, terminated group name |
+| `+40` | `u32` | group-name hash (`h=0xffffffff; h=h*33+c`) |
+| `+44` | `u32` | unconsumed field; not assigned activation semantics |
+| `+48` | `u32` | reference count |
+| `+52` | `u16[count]` | indices into `0x34107`, followed by alignment bytes |
+
+Across RA/RB/RC/RD/RF/RG/RH/RR, all 21,342 override rows resolve to an existing
+section/placement with identical flags. All group hashes, index bounds and
+stored reference counts agree. RA's 166 start/finish graphics each resolve
+through this chain to their own `BARRIERS_<event>` group. For example,
+`BARRIERS_4144` includes overrides 4968/4969, which point to section 1718,
+placement rows 98/99. No spatial transform is changed by this interpretation.
+Other real groups include `PLAYER_BARRIERS_*`, `FREE_ROAM`, stage-qualified
+free-roam groups and `SMOKEABLE`. Do not treat every group as race-only.
+
+The six RB start/finish graphics are **not** in this override table and carry
+zero placement flags. Thus group membership alone cannot hide every venue's
+race graphic. Neither direction-specific flag bits, runtime state changes,
+nor career-stage activation is proven here. The placement's `+0x1c` is **not**
+a global override index (6,430/6,431 RA reverse-link attempts fail); join by
+the override's section and placement fields instead.
+
+The checked, read-only reader is currently tool-only:
+`tools/world_group_reader.h`, consumed by `tools/world_group_audit.c`.
+`make world-group-test world-group-audit` builds asset-free corruption tests
+and an audit that verifies the complete companion table before visiting members.
+It rejects malformed chunk boundaries, duplicate tables, excessive nesting,
+unterminated names, hash/refcount mismatches and out-of-range references. The
+runtime loader does not yet apply these groups as a visibility/collision policy.
 
 ### Object identity, duplicates and vista objects
 
@@ -224,6 +340,114 @@ ordinary collision/ground scene. Production `--tier ordinary` does not batch
 or draw them; the common texture-binding pass may still resolve a vista key
 before the tier gate. `--tier full` is experimental because some shipped
 sheets are fully opaque and still form hard horizon bands.
+
+### Instance-driven world districts (`0x341xx`)
+
+**PROVEN.** A companion regional bundle supplies polygonal districts through
+`0x80034150` → `0x00034152`. Its payload starts with a run of `0x11` filler;
+the following records are variable-length:
+
+| offset | type | meaning |
+|---:|---|---|
+| `+0x08` | `u16` | district id |
+| `+0x0a` | `u16` | polygon vertex count, 1–64 |
+| `+0x0c` | `f32[4]` | XY bounding rectangle `{min_x,min_y,max_x,max_y}` |
+| `+0x1c` | 8 B | not consumed by the current reader |
+| `+0x24` | `f32[vertex_count][2]` | polygon XY vertices |
+
+The complete record length is `0x24 + vertex_count * 8`; a run of `0x11`
+bytes may separate adjacent records. The loader validates both the enclosing
+chunk boundaries and this computed length before copying a polygon.
+
+The STREAM bundle contains one or more `0x80034100` sections. Each usable
+section has all three children below; their payloads may start with `0x11`
+filler, which is skipped only when that makes the remaining length an exact
+record stride.
+
+| child | layout used by OpenUG2 |
+|---|---|
+| `0x00034101` | at least 16 bytes; `u32` district id at `+0x0c` |
+| `0x00034102` | 68-byte type records; display name in the first 32 bytes; three authored model keys at `+0x20/+0x24/+0x28` |
+| `0x00034103` | 64-byte placement records |
+
+**Model identity (M137 implementation).** The type record's three `u32` keys
+reference the `u32` at `0x134011 +0x10` after that leaf's filler. They describe
+the primary model and explicit alternative detail models. The instance reader
+tries them in stored order, skipping zero or unavailable keys. This is an
+availability fallback, **not** a reconstruction of retail's distance-based LOD
+or district dependency selection. It never invents an A/B/Z name substitution.
+If at least one key is present but none resolves, the placement remains missing;
+it must not silently select an unrelated same-name model. The old name lookup
+is retained only when all three keys are zero.
+Multiple resident copies with the same stored key still select the first copy;
+section-specific copy selection remains unimplemented. A matching key solves
+the measured name ambiguity, not the whole region/dependency problem.
+
+The stored object name starts at `0x134011 +0xa4` after filler in the surveyed
+U2 world records. `winst_model_identity` validates a bounded, terminated name
+there, falling back to the old scan for short/unknown layouts. The keyed lookup
+does not recompute identity from this name: names can be truncated while the
+stored key still identifies the complete name. Scanning earlier numeric header
+bytes for text also misnamed actual tree models, breaking their lookup and
+semantic classification. Correcting the instance-reader name restores the
+source scenery class without a name-based visibility exception. The legacy
+non-instance name reader is unchanged.
+
+Measured evidence: the L4RB type names `XT_TreewallA_1a_00` and `_2a_00`
+reference primary model keys `809d61db` and `80af7a5c`. Their primary models
+exist but the old scan called both `mmRBl`. The types also explicitly reference
+`80ab1754` / `80bd2fd5`, the corresponding Z-detail models, in slot 2. Two
+start/finish graphic variants can share the same shortened display name yet
+have distinct stored keys; selecting by key resolves the measured 2.326/4.610 m
+bounds discrepancies without changing any placement transform.
+
+Research credit: [noclip.website](https://github.com/magcius/noclip.website),
+Jasper St. Pierre and contributors, particularly its Most Wanted
+[model/instance reader](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/src/NeedForSpeedMostWanted/region.ts)
+and [region management](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/src/NeedForSpeedMostWanted/map.ts),
+at revision `6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6`. These were architecture
+and research references; no source code was copied or ported. The project is
+[MIT-licensed](https://github.com/magcius/noclip.website/blob/6b16cfda00ef5af3ee2a66d8b928bb0bf700e5b6/LICENSE)
+and its license notice explains its reverse-engineering provenance. U2's
+68-byte type records and model-index offset differ from MW's 72-byte records
+and must be verified separately. Any future code reuse must preserve the
+applicable copyright/license notices and be reviewed for project policy.
+
+A placement record has `f32[3]` AABB minimum at `+0x00`, AABB maximum at
+`+0x0c`, `u16 type_index` at `+0x18`, `u16 flags` at `+0x1a`, translation
+`f32[3]` at `+0x20`, and a 3×3 signed-`i16` row-major rotation/scale block at
+`+0x2c`. Each rotation/scale cell is divided by 8192.0; negative values stay
+negative. The runtime keeps that binary row-major 3×3 ordering in the matching
+`WInstPlacement.matrix` slots; it does not transpose the block. Translation is
+kept at matrix elements 12–14, with identity for the last row/column. This
+record convention is required for the decoded placement to match authored
+instance bounds when the engine's direct placement multiplication is applied.
+Malformed or truncated chunk/section data makes the corresponding parser/walk
+fail according to its API. Records are skipped and never placed when
+`type_index >= type_count`, any placement AABB coordinate is non-finite, an
+AABB minimum exceeds its maximum, or the bbox lies outside the requested focus
+radius. Once an eligible selected placement reaches `winst_place_mesh`, an
+allocation/copy failure, a non-finite transformed coordinate, an absolute-limit
+failure, or a scene-append failure aborts the entire staged build atomically;
+destination scenes remain untouched rather than receiving a partial placement
+set.
+
+Districts may overlap. For an explicit focus point, OpenUG2 chooses the
+smallest containing polygon as the home district and marks every district
+whose XY bounding rectangle is within the configured radius. It then selects
+one STREAM bundle that actually contains a section for that home id; it does
+not compose every overlapping bundle. If no such section exists, assembly
+fails without replacing the destination scenes.
+
+Models in the selected bundle are collected as local prototypes: their object
+matrix is retained as prototype metadata, not baked into the local vertices.
+An in-range non-ground placement applies its own decoded matrix directly to
+the prototype selected by its type's authored model keys. ROAD/TERRAIN prototypes are instead emitted once:
+a unique prototype with an authored object matrix uses that matrix; otherwise
+it uses identity and remains in its local/world coordinates. Unreferenced
+non-ground variants are not emitted. Existing vista classification still routes
+those prototypes to `World.vista`, and existing deduplication, terrain bias,
+ground-grid, collision, batching, and texture ownership rules run afterward.
 
 ## Textures
 
@@ -244,7 +468,17 @@ library, minus a `0x0C` padding prefix that this in-place variant omits):
 +0x30 PaletteSize (u32)     // 0 = not palettized; 1024 = 256-entry RGBA
 +0x38 Width  (u16)
 +0x3a Height (u16)
++0x3e format (u8)           // PROVEN (M135-R): 0x08 P8, 0x22 DXT1, 0x24 DXT3
++0x45 order  (u8)           // draw-order hint (unused by OpenUG2)
++0x49 usage  (u8)           // PROVEN (M135): 0=opaque/normal, 1=cutout (alpha test)
++0x4a blend  (u8)           // PROVEN (M135): 1=source-alpha blend, 2=additive
++0x4b wz     (u8)           // depth-write hint (unused by OpenUG2)
 ```
+
+`order`/`usage`/`blend`/`wz` are only read when a **complete** `0x4c`-byte
+record is present (`i + 0x4c <= hend`); a truncated header leaves all four at
+their zero-initialized default, which maps to opaque — matching every other
+"missing data degrades to the safe/legacy behaviour" rule in this codebase.
 
 Pixels are in block `0xb3320000`, under its **`0x33320002`** sub-chunk payload
 (a `0x33320001` info sub-chunk comes first), and **`Offset`/`PaletteOffset` are
@@ -252,12 +486,34 @@ relative to the data start after the `0x11` alignment filler** that prefixes it
 (same quirk as vertex buffers). Three pixel formats occur, distinguished by the
 record, not the (always-0) compression byte:
 
-- **P8** (`PaletteSize >= 1024`) — a 256-entry RGBA palette at `PaletteOffset`
-  then 8-bit indices at `Offset`. This is what the road-surface textures use
-  (`RDP_AIRPORT_ROADPATCH_A` is 512×512 P8), which is why they looked like
-  high-entropy noise until decoded through the palette — **not** a swizzle.
-- **DXT1 / DXT3** (no palette) — inferred from `Size` (DXT3 base `= W·H`, DXT1
-  `= W·H/2`).
+- **P8** (`format == 0x08`, palette present) — a 256-entry RGBA palette at
+  `PaletteOffset` then 8-bit indices at `Offset`. This is what the
+  road-surface textures use (`RDP_AIRPORT_ROADPATCH_A` is 512×512 P8), which
+  is why they looked like high-entropy noise until decoded through the
+  palette — **not** a swizzle.
+- **DXT1 / DXT3** (`format == 0x22` / `0x24`, no palette) — dispatched
+  directly from the `+0x3e` tag (**PROVEN, M135-R**: independently verified
+  against 2309 real records across three files —
+  `tools/tex_format_census.c` in scratch —  with **zero contradictions**:
+  P8=0x08 36/36, DXT1=0x22 2033/2033, DXT3=0x24 240/240; superseded the old
+  `Size > w*h*9/10` heuristic, which is no longer consulted for format
+  selection at all). `PaletteSize` is still cross-checked as a corruption
+  guard (P8 requires a real palette; DXT1/DXT3 require none); a tag that
+  matches neither a proven format nor its expected `PaletteSize` is
+  **rejected**, not guessed at (`tools/car_material_test.c` T11–T13).
+  `DXT5` (`0x26`) and `BGRA8` (`0x20`) are recognised by name (an external
+  reference claims those values) but never observed on real world data —
+  those belong to the car `TEXTURES.BIN` offset-slot path
+  (`n2_load_car_tex_by_key`), which has its own, separately-proven
+  compression byte.
+
+  Once the format is known, the byte-length **bound** still uses a
+  per-format **ceil-to-4 block count**: `bx=(w+3)/4, by=(h+3)/4`; DXT1 needs
+  `bx*by*8` bytes, DXT3 needs `bx*by*16` bytes. **PROVEN fix (M135):** the
+  previous bound used a flat `w*h/2` estimate, which under-validated DXT3 by
+  2× and let `n2_dxt3` read up to 46 bytes past the end of the data block on
+  a non-multiple-of-4 texture — a latent OOB read, now closed (see
+  `tools/car_material_test.c` fixtures T7/T8/T8b).
 
 Alpha semantics are format-specific and **PROVEN** by A/B renders:
 
@@ -265,6 +521,116 @@ Alpha semantics are format-specific and **PROVEN** by A/B renders:
 - DXT1 is transparent only in the `c0 <= c1` mode and only for selector 3.
 - DXT3 carries an explicit 4-bit alpha value per pixel.
 - An all-255 decoded plane is discarded, preserving the opaque RGB upload path.
+- Authored alpha bytes are never normalized, thresholded or color-keyed by the
+  decoder; the raw palette/DXT alpha value is passed through byte-for-byte.
+  Any dimming/discard decision belongs to the renderer (see "Draw modes"
+  below), not the texture loader.
+
+### Draw modes (M135)
+
+`n2_tex_mode(const N2Tex *t)` derives one of four modes from the header bytes
+above:
+
+| `usage` | `blend` | mode | meaning |
+|---|---|---|---|
+| `1` | — | `N2_DRAW_CUTOUT` | alpha-test discard below 0.5; no blending |
+| `2` | `1` | `N2_DRAW_BLEND` | depth write off, `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` |
+| any | `2` | `N2_DRAW_ADD` | depth write off, `GL_SRC_ALPHA`/`GL_ONE` |
+| else | else | `N2_DRAW_OPAQUE` | depth test+write on, no blending, no discard |
+
+Measured `(order, usage, blend, wz)` signatures from real TPK records:
+opaque `(0,0,0,1)`, cutout `(0,1,0,1)` (`OBJ_RAILING`, `STREAML4RA`), blend
+`(5,2,1,0)`, additive `(5,2,2,0)`. One oddball signature, `(0,2,0,1)`, occurs
+on both a water surface and a parking-wall texture that both render opaque in
+the retail game despite carrying non-opaque alpha — `n2_tex_mode` maps it to
+`N2_DRAW_OPAQUE` (falls through both `usage==1` and `blend` checks), matching
+observed retail behaviour; it is not currently distinguished from ordinary
+opaque textures because no further evidence separates the two real uses.
+
+The mode is per-texture-record, threaded from `world_bind_textures` through a
+parallel `mtexmode`/`modes` array (mirroring the existing `mtex` GL-texture-
+handle array) into `N2Batch.drawmode`, and dispatched at draw time: opaque and
+cutout batches share the ordinary pass (cutout toggles the shader's
+`uAlphaTest` uniform per batch); blend and additive batches are collected into
+separate arrays (grown to the full batch count, never silently capped) and
+drawn in a second pass after all opaque/cutout geometry, with depth test on
+but depth write off (so they don't occlude each other or later translucents,
+but are still correctly hidden behind real opaque geometry). Blend batches
+are sorted back-to-front (`n2_sort_back_to_front`, GL-free, unit-tested) by
+squared bbox-centre-to-camera distance with a deterministic smaller-index
+tie-break; additive batches draw after, in their original stable
+texture-sorted order.
+
+**Authored alpha in blend/additive passes (PROVEN fix, M135-R):** the shader
+multiplies the sampled texture's own alpha into the output alpha
+(`uTextureAlpha`>0.5: `t.a*uAlpha`) for exactly this deferred pass — every
+other pass (opaque, cutout, cars, HUD/debug) keeps the flat `uAlpha`-only
+output unchanged. Before this fix, a `BLEND` texture always drew fully
+opaque and an `ADD` texture always drew at full strength, regardless of its
+own per-texel alpha, since the shared lit fragment path only ever emitted
+the flat `uAlpha` uniform. Texture alpha is never gated on `uVColor` —
+per-vertex prelight strength and authored texture transparency are
+independent controls.
+
+**LOC4 fallback (M135-R/M136 census):** `world_bind_textures` falls back to the
+shared `LOC4DYNTEX.BIN` car-texture library (`n2_load_car_tex_by_key`) for a
+key its own region TPK can't resolve; that reader never decodes
+`order`/`usage`/`blend`/`wz`, so a LOC4-resolved key is always
+`N2_DRAW_OPAQUE`. Ordinary world-material traffic in the two reference scenes
+still resolves from the regional TPK. The authored `SKYDOME` is the measured
+exception: its two `0x134012` slots live only in LOC4 and are rendered by the
+dedicated sky pass, which consumes the cap's decoded DXT3 alpha directly and
+does not use the ordinary-world draw-mode value.
+
+### Authored sky (`SKYDOME`)
+
+The real object has two texture slots and two exact material ranges:
+
+```text
+slot 0  5fb8bcd1  SKY_SUNRISE_A_CAP
+slot 1  2414a01e  SKY_SUNRISE_A
+range 0 start 0   count 288  mat 1   // 96 dome triangles
+range 1 start 288 count 144  mat 0   // 48 cap triangles
+```
+
+Both keys are absent from the regional TPK and present in LOC4. Consequently
+the mesh parser must preserve a structurally valid sky range's authored slot
+even when the region-local key inventory cannot resolve it; texture resolution
+happens later in `world_bind_textures`. The matching LOC4 pairs are sunrise
+`2414a01e/5fb8bcd1`, sunset `27f186b7/3e6947ea`, and night
+`8a9a05cf/b0eb9302` (dome/cap). Only the two proven sunrise source keys are
+profile-remapped. `SKYDOME` exactly and the `SKY_` prefix classify as sky;
+names merely containing those letters, such as `XB_SKYDOMEB_*` and
+`XB_FACTORYSKYLIGHT*`, remain ordinary geometry.
+
+### Authored district light sources (`0x135003`)
+
+**PROVEN.** STREAM bundles contain nested `0x00135003` leaves whose payload,
+after the leading `0x11` filler run, is a sequence of 96-byte records. The
+production parser uses the bounded recursive chunk walk; it does not search
+texture or geometry bytes for the leaf id.
+
+| record offset | type | current meaning / validation |
+|---|---|---|
+| `+0x07` | `u8` | enabled when exactly `1` |
+| `+0x0c` | `u32` | packed little-endian RGBA |
+| `+0x10` | `f32[3]` | world-space position |
+| `+0x1c` | `f32` | outer radius; require `0 < value <= 5000` |
+| `+0x30` | `f32` | inner radius; require `0 <= value <= outer` |
+
+The parser rejects a malformed leaf as a unit when its post-filler size is not
+divisible by 96, ignores disabled/non-finite/out-of-range records, and
+deduplicates exact accepted records. A map-wide 9999 m record is excluded by
+the measured 5 km safety ceiling rather than by an asset-name exception. Real
+single-region censuses produce 2,228 accepted unique sources in L4RA and 193
+in L4RB.
+
+These records do not own a texture slot. Rendering explicitly resolves the
+shipped `SFX_FLARE_GLOWA` key `0x17e5ebd2` through the normal regional -> LOC4
+-> master texture resolver, then draws camera-facing additive quads at night.
+The current renderer sizes the visual quad from the inner radius and retains
+the outer radius as validated source metadata; neither value participates in
+collision, ground, navigation or physics.
 
 Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
 own `STREAM*.BUN` TPK carries its
@@ -278,6 +644,19 @@ A STREAM file can contain many header/data pairs. `n2_tpk_open` records every
 then search those blocks without rescanning the file. World texture resolution
 is region-local first, then shared packs. The region file buffers remain owned
 by `World` until `world_bind_textures` finishes decoding and GPU upload.
+
+**Common gameplay textures (M138).** The same uncompressed-table decoder also
+reads `GLOBAL/InGameCommon.bun`. `STARTLINE`, key `96d35495`, is absent from the
+regional/shared TRACKS sources surveyed but present there as a 64x64 DXT3
+record: `(order, usage, blend, wz) = (5,2,1,0)`, decoded alpha 153..204.
+The keyed, placed `421X_STARTFINGRAPHIC` mesh references it directly. Without
+this source it drew a flat grey fallback rectangle; resolving the record gives
+the authored checkered road marking at the unchanged transform and UVs.
+This library is the last texture fallback, in a second pass after all original
+own-region/LOC4/master binding attempts; it never contributes geometry or changes
+material slot selection. Missing common files remain optional. Buffer and TPK
+index lifetime ends after binding. This proves the texture dependency, not the
+event activation rule; do not infer free-roam visibility from a texture match.
 
 **Car TPK (`CARS/*/TEXTURES.BIN`, compressed).** Same outer container
 (`0xb3300000` → `0xb3310000` header + `0xb3320000` pixels). The header block

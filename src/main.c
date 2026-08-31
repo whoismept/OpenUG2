@@ -32,6 +32,7 @@
 #include "resource.h"
 #include "world.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
+#include "world_capture_policy.h"
 #include "debug.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
@@ -1185,7 +1186,12 @@ int main(int argc, char **argv) {
                           not a supported playable open-world composition.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit
-         --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free) */
+         --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
+         --world2         opt into diagnostic instance-driven world assembly
+         --sky PROFILE    authored sky: night (default), sunrise, or sunset
+         --spawn start|X,Y  focus/spawn for --world2 (required)
+         --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
+         --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     const char *xaudit = NULL;   /* --transform-audit REGION: GL-free placement forensics */
@@ -1193,6 +1199,7 @@ int main(int argc, char **argv) {
     /* M132-R diagnostics. tier: 0 = baseline (old fixed 700 m, no vista),
        1 = ordinary (fog-derived range, no vista), 2 = full (range + vista). */
     int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
+    int sky_profile = N2_SKY_NIGHT;
     const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
                                     start pose and capture four yaws there */
     float posefrac = -1.0f;      /* --pose-frac F: seed the SAME first-safe
@@ -1244,6 +1251,9 @@ int main(int argc, char **argv) {
     int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
+    int world2 = 0, instance_audit = 0;
+    int world2_spawn_set = 0, world2_heading_set = 0;
+    float world2_spawn_xy[2] = {0, 0}, world2_heading_deg = 0.0f;
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
@@ -1263,6 +1273,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--batch-audit") && i+2 < argc) { baudit = trackname = argv[++i]; bmesh = argv[++i]; }
         else if (!strcmp(argv[i], "--rendermode") && i+1 < argc) rendermode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--daylight")) daylight = 1;
+        else if (!strcmp(argv[i], "--sky") && i+1 < argc) {
+            const char *s = argv[++i];
+            sky_profile = n2_sky_profile_parse(s);
+            if (sky_profile < 0) {
+                fprintf(stderr, "unknown --sky '%s' -- expected sunrise, sunset, or night\n", s);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--shot-static") && i+1 < argc) sshot = argv[++i];
         else if (!strcmp(argv[i], "--shot-yaw") && i+1 < argc)
             shotyaw = (float)atof(argv[++i]) * 3.14159265f / 180.0f;
@@ -1356,7 +1374,56 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vista-census")) { vcensus = 1;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
+        else if (!strcmp(argv[i], "--world2")) world2 = 1;
+        else if (!strcmp(argv[i], "--instance-audit")) instance_audit = 1;
+        else if (!strcmp(argv[i], "--spawn")) {
+            if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
+                fprintf(stderr, "missing operand for --spawn (expected start or X,Y)\n");
+                return 2;
+            }
+            const char *value = argv[++i];
+            if (!strcmp(value, "start")) {
+                world2_spawn_xy[0] = 1695.2f;
+                world2_spawn_xy[1] = -883.6f;
+                world2_spawn_set = 1;
+            } else {
+                char tail = 0;
+                if (sscanf(value, "%f,%f%c", &world2_spawn_xy[0],
+                           &world2_spawn_xy[1], &tail) != 2 ||
+                    !isfinite(world2_spawn_xy[0]) || !isfinite(world2_spawn_xy[1])) {
+                    fprintf(stderr, "invalid --spawn '%s' (expected start or X,Y)\n", value);
+                    return 2;
+                }
+                world2_spawn_set = 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--heading")) {
+            if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
+                fprintf(stderr, "missing operand for --heading (expected degrees)\n");
+                return 2;
+            }
+            char *end = NULL;
+            world2_heading_deg = strtof(argv[++i], &end);
+            if (!end || *end || !isfinite(world2_heading_deg)) {
+                fprintf(stderr, "invalid --heading '%s'\n", argv[i]);
+                return 2;
+            }
+            world2_heading_set = 1;
+        }
         else dataroot = argv[i];
+    }
+    if (instance_audit && !world2) {
+        fprintf(stderr, "--instance-audit requires explicit --world2\n");
+        return 2;
+    }
+    if (world2 && !world2_spawn_set) {
+        fprintf(stderr, "--world2 requires --spawn start or --spawn X,Y\n");
+        return 2;
+    }
+    if (world2 && !strcmp(trackname, "ALL")) {
+        fprintf(stderr, "--world2 requires one explicit --track STREAM... bundle; "
+                        "ALL is only a legacy diagnostic union\n");
+        return 2;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
        capture tail, but every dynamic subsystem below is gated off it — no
@@ -1372,6 +1439,10 @@ int main(int argc, char **argv) {
         shot = dashot; shotframes = 2220;
     }
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
+    const WorldCapturePolicy capture_policy = world_capture_policy(
+        world2, shot != NULL, sstatic, world2_heading_set);
+    if (capture_policy.fixed_camera)
+        shotyaw = world2_heading_deg * 3.14159265f / 180.0f;
     if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
     if (vcmpA) {   /* M121: same fixed input trace, two cars, flat ROAD. GL-free. */
         const char *nmv[2] = { vcmpA, vcmpB };
@@ -1960,7 +2031,87 @@ int main(int argc, char **argv) {
     }
 
     static World world;
-    int nm = world_load(&world, troot, trackname);
+    WLoadOptions world_options = { world2, world2_spawn_xy[0], world2_spawn_xy[1], 700.0f };
+    int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
+                    : world_load(&world, troot, trackname);
+    if (world2 && nm <= 0) {
+        fprintf(stderr, "--world2 load failed for %s at requested focus "
+                        "(%.3f, %.3f); exiting before SDL/GL initialization\n",
+                trackname, world2_spawn_xy[0], world2_spawn_xy[1]);
+        return 1;
+    }
+    float world2_spawn_z = 0.0f, world2_support_ref = 0.0f;
+    int world2_support_cat = WSURF_NONE;
+    if (world2 && nm > 0) {
+        float bestd = 1e30f;
+        int have_reference = 0;
+        for (int i = 0; i < world.scene.count; i++) {
+            const N2Mesh *mesh = &world.scene.meshes[i];
+            if (mesh->cat != N2_ROAD && mesh->cat != N2_TERRAIN) continue;
+            for (int v = 0; v < mesh->nverts; v++) {
+                const float *p = mesh->verts + v * 5;
+                float dx = p[0] - world2_spawn_xy[0];
+                float dy = p[1] - world2_spawn_xy[1];
+                float d2 = dx * dx + dy * dy;
+                if (d2 < bestd) {
+                    bestd = d2;
+                    world2_support_ref = p[2];
+                    have_reference = 1;
+                }
+            }
+        }
+        if (have_reference) {
+            WGroundHit support;
+            world2_support_cat = world_ground_hit(&world.scene,
+                                                   world2_spawn_xy[0],
+                                                   world2_spawn_xy[1],
+                                                   world2_support_ref, &support);
+            if (world2_support_cat != WSURF_NONE) world2_spawn_z = support.z;
+        }
+    }
+
+    if (instance_audit) {
+        const WInstStats *st = &world.inst_stats;
+        long triangles = 0, finite_failures = 0;
+        int classes[8] = {0};
+        for (int i = 0; i < world.scene.count; i++) {
+            const N2Mesh *mesh = &world.scene.meshes[i];
+            triangles += mesh->nidx / 3;
+            if (mesh->scen < 8) classes[mesh->scen]++;
+            for (int v = 0; v < mesh->nverts; v++)
+                for (int c = 0; c < 3; c++) {
+                    float q = mesh->verts[v * 5 + c];
+                    if (!isfinite(q) || fabsf(q) > 1e8f) finite_failures++;
+                }
+        }
+        printf("INSTANCE AUDIT bundle=%s home=%d regions=%d/%d radius=%.1f\n",
+               st->bundle[0] ? st->bundle : "-", st->home_region,
+               st->regions_selected, st->regions_total, world_options.view_radius);
+        printf("INSTANCE counts seen=%ld in-range=%ld meshes=%ld missing=%ld "
+               "own-matrix=%ld rejected=%ld triangles=%ld vista=%d\n",
+               st->instances_seen, st->instances_in_range, st->meshes_placed,
+               st->missing_models, st->own_matrix_meshes, st->rejected_meshes,
+               triangles, world.vista.count);
+        printf("INSTANCE model-links keyed=%ld lod-fallback=%ld unkeyed-name=%ld\n",
+               st->keyed_models, st->lod_fallbacks, st->unkeyed_models);
+        printf("INSTANCE scene classes none=%d terrain=%d building=%d prop=%d "
+               "tree=%d wall=%d struct=%d other=%d\n",
+               classes[0], classes[1], classes[2], classes[3],
+               classes[4], classes[5], classes[6], classes[7]);
+        printf("INSTANCE finite-coordinate-failures=%ld\n", finite_failures);
+        printf("INSTANCE support spawn=(%.3f,%.3f,%.3f) reference=%.3f category=%s\n",
+               world2_spawn_xy[0], world2_spawn_xy[1], world2_spawn_z,
+               world2_support_ref,
+               world2_support_cat == WSURF_ROAD ? "ROAD" :
+               world2_support_cat == WSURF_TERRAIN ? "TERRAIN" : "NONE");
+        return nm > 0 && !finite_failures && world2_support_cat != WSURF_NONE ? 0 : 1;
+    }
+    if (world2 && nm > 0 && world2_support_cat == WSURF_NONE) {
+        fprintf(stderr, "--world2 spawn (%.3f, %.3f) has no ROAD/TERRAIN support "
+                        "near the authored layer reference %.3f\n",
+                world2_spawn_xy[0], world2_spawn_xy[1], world2_support_ref);
+        return 1;
+    }
 
     /* --objdump: write the exact post-dedup, world-space scene the GPU batches
        are built from to a .obj, then exit. Independent parser-vs-renderer check:
@@ -1994,6 +2145,14 @@ int main(int argc, char **argv) {
     }
     if (!nm) { fprintf(stderr, "no track data\n  (pass your NFSU2 data dir: nfsu2 /path/to/data)\n"); return 1; }
     N2Scene scene = world.scene;   /* shares world.scene.meshes */
+    /* The stored SKYDOME references the sunrise dome/cap pair. LOC4 also
+       ships structurally matching sunset/night pairs; remap only those two
+       proven SKY keys before the normal world texture resolver runs. */
+    for (int i = 0; i < scene.count; i++)
+        if (scene.meshes[i].cat == N2_SKY)
+            scene.meshes[i].texkey = n2_sky_remap_key(sky_profile, scene.meshes[i].texkey);
+    const uint32_t sky_dome_key = n2_sky_remap_key(sky_profile, 0x2414a01eu);
+    const uint32_t sky_cap_key  = n2_sky_remap_key(sky_profile, 0x5fb8bcd1u);
     printf("loaded %d submeshes from %d region(s)\n", nm, world.nreg);
     printf("terrain texture TRN_GRASSC: %s\n", world.have_grass ? "ok" : "-");
     int nroad = 0, nterr = 0;
@@ -2508,7 +2667,8 @@ int main(int argc, char **argv) {
         int nfound = 0, firstw = 0, firsth = 0, firstdone = 0;
         char firstsrc[128] = "-"; uint32_t f_off=0, f_pal=0, f_psz=0;
         long f_dbase = 0; const unsigned char *f_d = NULL; long f_len = 0;
-        for (int pass = 0; pass < 3; pass++) {
+        N2Tpk firsttpk = {0};
+        for (int pass = 0; pass < 4; pass++) {
             const unsigned char *d = NULL; long dl = 0; N2Tpk tp; char label[128];
             if (pass == 0) {
                 int r = -1;
@@ -2520,10 +2680,14 @@ int main(int argc, char **argv) {
                 if (!world.loc4) { printf("[LOC4 fallback: not present]\n"); continue; }
                 d = world.loc4; dl = world.loc4len; tp = n2_tpk_open(d, dl);
                 snprintf(label, sizeof label, "TRACKS/LOC4DYNTEX.BIN");
-            } else {
+            } else if (pass == 2) {
                 if (!world.master) { printf("[master fallback: not present]\n"); continue; }
                 d = world.master; dl = world.masterlen; tp = world.mastertpk;
                 snprintf(label, sizeof label, "master TPK");
+            } else {
+                if (!world.common) { printf("[common fallback: not present]\n"); continue; }
+                d = world.common; dl = world.commonlen; tp = world.commontpk;
+                snprintf(label, sizeof label, "GLOBAL/InGameCommon.bun");
             }
             for (int b = 0; b < tp.nblk; b++) {
                 long hbeg = tp.blk[b].hbeg, hend = hbeg + tp.blk[b].hsize;
@@ -2563,7 +2727,7 @@ int main(int argc, char **argv) {
                         firstdone = 1; firstw = w; firsth = hh;
                         snprintf(firstsrc, sizeof firstsrc, "%s block %d", label, b);
                         f_off=off; f_pal=paloff; f_psz=palsz;
-                        f_dbase=dbase; f_d=d; f_len=dl;
+                        f_dbase=dbase; f_d=d; f_len=dl; firsttpk=tp;
                     }
                     nfound++;
                     i += 0x7b;
@@ -2575,10 +2739,7 @@ int main(int argc, char **argv) {
             printf("world_bind_textures resolves FIRST: %s  ->  raw W/H %d x %d\n",
                    firstsrc, firstw, firsth);
             N2Tex chk = {0};
-            int r0 = -1;
-            for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) { r0 = q; break; }
-            int ok = r0 >= 0 && n2_tpk_decode(world.rgn[r0].data, world.rgn[r0].len,
-                                              world.rgn[r0].tpk, tpkkey, &chk);
+            int ok = n2_tpk_decode(f_d, f_len, firsttpk, tpkkey, &chk);
             printf("n2_tpk_decode returns:            %s  %d x %d   -> raw==decoded: %s\n",
                    ok ? "ok" : "FAILED", chk.w, chk.h,
                    (ok && chk.w == firstw && chk.h == firsth) ? "YES" : "NO");
@@ -2610,8 +2771,16 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
-    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
+    static unsigned char tmapmode[2048];
+    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+    GLuint district_light_tex = 0;
+    for (int j = 0; j < ntmap; j++)
+        if (tmapkey[j] == N2_TEX_SFX_FLARE_GLOWA) {
+            district_light_tex = tmaptex[j]; break;
+        }
+    printf("authored light texture: %s\n",
+           world.nlights == 0 ? "not needed" : district_light_tex ? "resolved" : "missing");
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
         printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
@@ -2674,9 +2843,15 @@ int main(int argc, char **argv) {
     /* resolve each mesh's texture once — the per-frame key scan was fine for
        one region, not for a whole city of meshes */
     GLuint *mtex = (GLuint *)calloc(nm, sizeof *mtex);
+    unsigned char *mtexmode = (unsigned char *)calloc((size_t)(nm ? nm : 1), 1);
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
-            if (tmapkey[j] == scene.meshes[i].texkey) { mtex[i] = tmaptex[j]; break; }
+            if (tmapkey[j] == scene.meshes[i].texkey) {
+                mtex[i] = tmaptex[j];
+                mtexmode[i] = (unsigned char)n2_world_draw_mode(
+                    &scene.meshes[i], tmapmode[j]);
+                break;
+            }
     if (nansweep) {
         long bad = 0, badobj = 0;
         for (int i = 0; i < nm; i++) {
@@ -2801,7 +2976,13 @@ int main(int argc, char **argv) {
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
-    float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
+    float spawn[3] = {
+        world2 ? world2_spawn_xy[0] : cx,
+        world2 ? world2_spawn_xy[1] : cy,
+        world2 ? world2_spawn_z : cz
+    };
+    float heading0 = world2 && world2_heading_set
+                   ? world2_heading_deg * 3.14159265f / 180.0f : 0.0f;
     if (cdata) {
         ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
         /* Wheels are modelled once at the origin (the SolidObject transform is
@@ -2974,7 +3155,7 @@ int main(int argc, char **argv) {
             if (got && bodykey && n2_load_car_tex_by_key(ctdata, ctlen, bodykey, &bt)) {
                 int W = bt.w > vt.w ? bt.w : vt.w, H = bt.h > vt.h ? bt.h : vt.h;
                 N2Tex out = { W, H, (unsigned char *)malloc((long)W*H*3),
-                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0 };
+                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0, 0,0,0,0 };
                 for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
                     long o  = (long)y*W + x;
                     long bo = (long)(y*bt.h/H)*bt.w + x*bt.w/W;   /* nearest */
@@ -3006,14 +3187,16 @@ int main(int argc, char **argv) {
         }
         /* spawn on the road mesh nearest the track centre; aim inward so a
            straight run stays on the populated track (user steers in play). */
-        float bestd = 1e30f;
-        for (int i = 0; i < nm; i++) if (scene.meshes[i].cat == N2_ROAD) {
-            float vx = scene.meshes[i].verts[0], vy = scene.meshes[i].verts[1];
-            float d = (vx-cx)*(vx-cx) + (vy-cy)*(vy-cy);
-            if (d < bestd) { bestd = d;
-                spawn[0]=vx; spawn[1]=vy; spawn[2]=scene.meshes[i].verts[2]; }
+        if (!world2) {
+            float bestd = 1e30f;
+            for (int i = 0; i < nm; i++) if (scene.meshes[i].cat == N2_ROAD) {
+                float vx = scene.meshes[i].verts[0], vy = scene.meshes[i].verts[1];
+                float d = (vx-cx)*(vx-cx) + (vy-cy)*(vy-cy);
+                if (d < bestd) { bestd = d;
+                    spawn[0]=vx; spawn[1]=vy; spawn[2]=scene.meshes[i].verts[2]; }
+            }
+            heading0 = atan2f(cy - spawn[1], cx - spawn[0]);
         }
-        heading0 = atan2f(cy - spawn[1], cx - spawn[0]);
         printf("car: %d meshes, spawn (%.1f,%.1f) heading %.2f\n",
                ncar, spawn[0], spawn[1], heading0);
     }
@@ -3304,7 +3487,7 @@ int main(int argc, char **argv) {
     AiCar ais[N_AI]; int start_idx = 0;
     /* load_circuit also REWRITES spawn/heading0 to the circuit start; a static
        capture must keep the region's own showcase spawn, so skip it entirely. */
-    int nai = (ncirc && !sstatic) ? load_circuit(dataroot, circlist[selcirc], &scene, &aipath,
+    int nai = (ncirc && !sstatic && !world2) ? load_circuit(dataroot, circlist[selcirc], &scene, &aipath,
                                    ais, spawn, &heading0, &start_idx, densx, densy) : 0;
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
@@ -3574,7 +3757,7 @@ int main(int argc, char **argv) {
        away. Menu/showcase only: the Enter branch, sl_first_safe, the race route
        start and the --shot-static selector are all downstream and untouched, and
        if nothing passes, the shipped pose is left exactly as it was. */
-    if (!sstatic && !sspawn && !sstack &&
+    if (!capture_policy.preserve_explicit_pose && !sstatic && !sspawn && !sstack &&
         (citypose || !strcmp(trackname, "STREAML4RA"))) {
         const float (*wmbb)[4] = (const float (*)[4])world.mbb;
         float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
@@ -4038,8 +4221,8 @@ int main(int argc, char **argv) {
        the ordinary opaque city batches. Print a note if a region genuinely
        has no SKYDOME mesh — the shader just falls back to the flat fog
        clear colour, which is correct but worth knowing about. */
-    N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch);
-    N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch);
+    N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch, NULL);
+    N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch, NULL);
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
@@ -4071,7 +4254,7 @@ int main(int argc, char **argv) {
             N2Scene one = { &world.vista.meshes[i], 1, 1 };
             GLuint t1 = vtex[i];
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part);
+            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part, NULL);
             if (np) {
                 vbatch = (N2Batch *)realloc(vbatch, (size_t)(nvista+np) * sizeof *vbatch);
                 vmesh  = (int *)realloc(vmesh,      (size_t)(nvista+np) * sizeof *vmesh);
@@ -4115,7 +4298,7 @@ int main(int argc, char **argv) {
         for (int c = 0; c <= N2_GLOW; c++) {
             N2Scene rs = { rm, nrm, 4096 };
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&rs, c, rtx, &part);
+            int np = upload_cat_batches(&rs, c, rtx, &part, NULL);
             if (np) {
                 rbatch = (N2Batch *)realloc(rbatch, (size_t)(nrep+np) * sizeof *rbatch);
                 memcpy(rbatch + nrep, part, (size_t)np * sizeof *part);
@@ -4147,10 +4330,12 @@ int main(int argc, char **argv) {
     static int *meshbatch = NULL;
     meshbatch = (int *)malloc((size_t)(nm ? nm : 1) * sizeof *meshbatch);
     int nbatch = upload_world_batches(&scene, (const float (*)[4])world.mbb,
-                                      mtex, texTerr, &wbatch, bmesh, meshbatch);
+                                      mtex, texTerr, &wbatch, bmesh, meshbatch,
+                                      mtexmode);
     /* the local-scene audit reads per-mesh texture resolution every frame, so
        the table has to outlive batching when it is enabled */
     if (!lsaudit) { free(mtex); mtex = NULL; }
+    free(mtexmode); mtexmode = NULL;
     printf("world batched: %d meshes -> %d batches\n", nm, nbatch);
     if (baudit) return 0;   /* --batch-audit: report printed above, nothing to draw */
 
@@ -4180,7 +4365,7 @@ int main(int argc, char **argv) {
     float paint[3] = { 0.70f, 0.70f, 0.75f };
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && !daudit && aipath.n > 0) {
+    if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -4190,7 +4375,8 @@ int main(int argc, char **argv) {
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
     /* an armed race wins: start on its own grid, facing through the start line */
-    if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
+    if (!sstatic && !capture_policy.freeze_motion)
+        race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
@@ -4458,7 +4644,7 @@ int main(int argc, char **argv) {
            sideways component so hard cornering at speed slides/drifts). */
         float throttle = 0.0f;
         if (!g_dbg.freecam && race_state == 1) {
-            if      (ks[SDL_SCANCODE_W] || (shot && !sstatic)) throttle =  1.0f;
+            if      (ks[SDL_SCANCODE_W] || (shot && !sstatic && !capture_policy.freeze_motion)) throttle =  1.0f;
             else if (ks[SDL_SCANCODE_S])         throttle = -1.0f;
         }
         float steer = g_dbg.freecam ? 0.f
@@ -4531,7 +4717,8 @@ int main(int argc, char **argv) {
            snap lands the car inside geometry, so collide_walls holds it at
            0 km/h; pre-existing, not the race system). */
         static int rpath[8192]; static int rpn = 0, rp_gate = -1, rp_at = 0;
-        int race_auto = shot && !sstatic && world.race.active && !world.race.finished;
+        int race_auto = shot && !sstatic && !capture_policy.freeze_motion &&
+                        world.race.active && !world.race.finished;
         if (race_auto) {
             if (rp_gate != world.race.next) {
                 int s = world_nav_nearest(&world, carpos[0], carpos[1]);
@@ -4602,7 +4789,7 @@ int main(int argc, char **argv) {
               carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
-        else if (shot && !sstatic && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        else if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -4619,7 +4806,7 @@ int main(int argc, char **argv) {
             if (da> 0.06f) da= 0.06f; if (da<-0.06f) da=-0.06f;
             heading += da;
         }
-        float dmag = sstatic ? 0.0f
+        float dmag = (sstatic || capture_policy.freeze_motion) ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
                                    throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
@@ -4646,7 +4833,7 @@ int main(int argc, char **argv) {
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
         PhysWallContact wc[8]; int nwc = 0;
         float vpre[2] = { vel[0], vel[1] };
-        if (raudit && race_state == 1 && !race_auto && !sstatic) {
+        if (raudit && race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
             /* read-only: the same rects collide_walls is about to test, before it
                moves anything. Nothing here writes carpos or vel. */
             for (int o = 0; o < nobst; o++) {
@@ -4663,7 +4850,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (race_state == 1 && !race_auto && !sstatic &&
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion &&
             (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
@@ -4682,7 +4869,7 @@ int main(int argc, char **argv) {
             } }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
-          int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
+          int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) &&
                         world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
@@ -4692,11 +4879,12 @@ int main(int argc, char **argv) {
           }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
-        if (race_state == 1 && !race_auto && !sstatic && world_barrier_push(&world, carpos, 1.3f)) {
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion && world_barrier_push(&world, carpos, 1.3f)) {
             vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
         /* checkpoint / lap tracking, after the pushes so it sees the final XY */
-        if (race_state == 1 && !race_auto && !sstatic) world_race_update(&world, carpos[0], carpos[1]);
+        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion)
+            world_race_update(&world, carpos[0], carpos[1]);
         /* Stable contact pose: select ONE triangle using the same reference-Z
            rule for height, surface class and normal. The previous four-wheel
            experiment could combine four different stacked layers, making the
@@ -4720,7 +4908,7 @@ int main(int argc, char **argv) {
            climb toward it at 0.5 m per frame. */
         static WGroundHit ride_hit[4], ride_cand[4]; static int ride_reason[4];
         int ride_nsup = 0;
-        if (!sstatic && !race_auto) {
+        if (!sstatic && !capture_policy.freeze_motion && !race_auto) {
             ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
@@ -5010,7 +5198,7 @@ int main(int argc, char **argv) {
            to cover the centre this frame. This is rigid-body road alignment,
            not the later per-wheel suspension system. */
         int chassis_patch_ok=0;
-        if (!sstatic && !race_auto && g_ride_ready) {
+        if (!sstatic && !capture_policy.freeze_motion && !race_auto && g_ride_ready) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
             float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
@@ -5224,35 +5412,46 @@ int main(int argc, char **argv) {
            sat between the vista and world passes and silently discarded every
            sky and vista draw from the total. */
         g_dbg.drawn = 0;
-        int skydraws = 0, vistadraws = 0;
-        /* skybox: drawn first, camera-locked (view built from a zero eye so
-           translation drops out — the classic "at infinity" trick) and with
-           depth-write off so every real batch below still overdraws it via
-           the depth test alone. Falls back to nothing (flat fog clear
-           colour shows through) when the region has no SKYDOME mesh. */
+        int skydraws = 0, vistadraws = 0, districtdraws = 0;
+        /* Authored sky: SKYDOME is a world-space shell split by its proven
+           0x134B02 material ranges into an opaque dome and alpha cap. Draw it
+           first with a deep frustum and no depth writes; the ordinary world
+           then overwrites it normally. Missing textures leave the fog clear
+           colour as the conservative fallback. */
         if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0)) {   /* M78/M79 */
-            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16], Psky[16];
-            mat_lookat(zero, look, Vsky);
-            mat_persp(0.9f, (float)W/H, znear, maxr*30, Psky);  /* deep: dome ~16 km */
-            mat_mul(Psky, Vsky, MVPsky);
+            float MVPsky[16], Psky[16];
+            mat_persp(0.9f, (float)W/H, znear, 30000.0f, Psky);
+            mat_mul(Psky, V, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
-            glUniform1f(uUnlit, 1.0f);
+            glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uEmissiveTex, 1.0f);
+            glUniform1f(uUseTex, 1.0f);
+            glUniform1f(uAlpha, 1.0f);
+            glUniform3f(uColor, 1.0f, 1.0f, 1.0f);
+            glUniform1f(rp.uFogDensity, 0.0f);
             glDepthMask(GL_FALSE);
-            /* The unlit path outputs mix(uFogColor,uColor,fog) and never
-               samples the texture, so every sky batch is flat-shaded to
-               uColor. It MUST be set here: the loop used to set it only for
-               untextured batches, so a textured sky mesh (region D has one)
-               inherited whatever uColor the previous frame last left -- the
-               red brake-light/neon colour -- and, being camera-locked, drew a
-               fixed red block at the top of the frame. Pin it to the fog
-               colour so the dome always dissolves into the horizon. */
-            glUniform1f(uUseTex, 0.0f);
-            glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
+            glDisable(GL_BLEND);
+            /* Dome first. Exact classification means ordinary assets such as
+               XB_SKYDOMEB and XB_FACTORYSKYLIGHT never enter this list. */
             for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].texkey != sky_dome_key || !skybatch[k].tex) continue;
+                glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
                 draw_batch(&skybatch[k]);
                 g_dbg.drawn++; skydraws++;
             }
-            glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+            /* The DXT3 cap carries its own authored gradient alpha. */
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].texkey != sky_cap_key || !skybatch[k].tex) continue;
+                glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
+                draw_batch(&skybatch[k]);
+                g_dbg.drawn++; skydraws++;
+            }
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+            glUniform1f(rp.uEmissiveTex, 0.0f);
+            glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+            glUniform1f(uUseTex, 0.0f);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
         }
 
@@ -5409,8 +5608,33 @@ int main(int argc, char **argv) {
         if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
                          memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
+        /* M135/M135-R: N2_DRAW_BLEND/ADD batches are deferred out of this pass
+           -- they need depth-write off and real blending, neither of which the
+           ordinary opaque/cutout loop below sets up. Collected separately
+           (blend needs back-to-front distance sort; additive draws after,
+           in stable texture-sorted order) and drawn afterward. Sized to
+           `nbatch` -- every batch could theoretically be translucent -- and
+           grown, never silently capped; a growth failure is reported and the
+           translucent pass is skipped for that frame rather than dropping
+           batches or overrunning a fixed array. */
+        static int *defblend = NULL, *defadd = NULL; static float *defdist = NULL;
+        static int defcap = 0;
+        if (nbatch > defcap) {
+            int *nb2 = (int *)realloc(defblend, (size_t)nbatch * sizeof *defblend);
+            int *na2 = (int *)realloc(defadd,   (size_t)nbatch * sizeof *defadd);
+            float *nd2 = (float *)realloc(defdist, (size_t)nbatch * sizeof *defdist);
+            if (!nb2 || !na2 || !nd2) {
+                fprintf(stderr, "world render: OOM growing deferred blend/add "
+                        "buffers to %d batches -- skipping translucent pass "
+                        "this frame\n", nbatch);
+                free(nb2 ? nb2 : defblend); free(na2 ? na2 : defadd); free(nd2 ? nd2 : defdist);
+                defblend = defadd = NULL; defdist = NULL; defcap = 0;
+            } else { defblend = nb2; defadd = na2; defdist = nd2; defcap = nbatch; }
+        }
+        int ndefblend = 0, ndefadd = 0;
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
+        int lastmode = -1;
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
@@ -5428,16 +5652,87 @@ int main(int argc, char **argv) {
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
+            if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
+                if (defcap > 0) {
+                    if (b->drawmode == N2_DRAW_BLEND) {
+                        /* bbox-centre distance to camera, squared (only the
+                           ORDER matters, so skip the sqrt): documented choice
+                           for the back-to-front sort below -- true per-vertex
+                           depth would need a second batching pass, which no
+                           observed defect currently justifies. */
+                        float bx = 0.5f*(b->bbox_min[0]+b->bbox_max[0]);
+                        float by = 0.5f*(b->bbox_min[1]+b->bbox_max[1]);
+                        float bz = 0.5f*(b->bbox_min[2]+b->bbox_max[2]);
+                        float ddx = bx-cam[0], ddy = by-cam[1], ddz = bz-cam[2];
+                        defdist[k] = ddx*ddx + ddy*ddy + ddz*ddz;
+                        defblend[ndefblend++] = k;
+                    } else {
+                        defadd[ndefadd++] = k;   /* additive: stable texture-sorted order */
+                    }
+                }
+                continue;   /* drawn in the deferred pass below, not here */
+            }
             ndrawn += b->nmesh;
             if (b->tex != lasttex) {
                 if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
                 else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
                 lasttex = b->tex;
             }
+            if (b->drawmode != lastmode) {
+                glUniform1f(rp.uAlphaTest, b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+                lastmode = b->drawmode;
+            }
             draw_batch(b);
             for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
+        }
+        if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
+        /* Deferred pass: authored blended/additive world batches. Depth test
+           stays on (correct occlusion by real opaque geometry) but depth
+           write is off (a translucent/glow surface must not occlude what's
+           behind it), exactly the same shape as the existing car-glass and
+           vista passes elsewhere in this function. Blended batches are
+           sorted back-to-front (n2_sort_back_to_front, GL-free and unit-
+           tested) so nearer glass/glow correctly draws over farther glass
+           instead of blend order depending on incidental texture-sort
+           position; additive batches draw after, in their original stable
+           (texture-sorted) order -- order among additive-over-additive only
+           affects rounding in an associative sum, not correctness, so no
+           per-frame sort is needed there. uTextureAlpha is enabled for the
+           whole bracket: every batch reaching this pass is BLEND or ADD, and
+           both must honour their own texture's alpha (M135-R item 1) rather
+           than drawing at flat uAlpha strength. */
+        if (ndefblend || ndefadd) {
+            n2_sort_back_to_front(defblend, ndefblend, defdist);
+            glEnable(GL_BLEND);
+            glDepthMask(GL_FALSE);
+            glUniform1f(rp.uTextureAlpha, 1.0f);
+            GLuint lasttex2 = (GLuint)-1; int lastmode2 = -1;
+            for (int pass = 0; pass < 2; pass++) {
+                int *list = pass == 0 ? defblend : defadd;
+                int cnt   = pass == 0 ? ndefblend : ndefadd;
+                for (int q = 0; q < cnt; q++) {
+                    N2Batch *b = &wbatch[list[q]];
+                    if (b->tex != lasttex2) {
+                        if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                        else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                        lasttex2 = b->tex;
+                    }
+                    if (b->drawmode != lastmode2) {
+                        glBlendFunc(GL_SRC_ALPHA, b->drawmode == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                        lastmode2 = b->drawmode;
+                    }
+                    draw_batch(b);
+                    for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
+                    ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+                    if (nviskept < 4096) viskept[nviskept++] = list[q];
+                }
+            }
+            glUniform1f(rp.uTextureAlpha, 0.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* restore the ordinary default */
         }
         if (nrep) {   /* diagnostic overlay: where the restored geometry is */
             glUniform1f(uUseTex, 0.0f);
@@ -5672,7 +5967,7 @@ int main(int argc, char **argv) {
                      grounded wheel stays on its contact while the sprung body
                      heaves, pitches and rolls above it. A single shared height
                      would float or sink tyres on every bump. */
-                  float wzk = wz + (g_ride_ready && !sstatic ? g_ride.compression[k] : 0.0f);
+                  float wzk = wz + (g_ride_ready && !sstatic && !capture_policy.freeze_motion ? g_ride.compression[k] : 0.0f);
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
                                wp[k][0],wp[k][1],wzk,1};
@@ -6049,6 +6344,14 @@ int main(int argc, char **argv) {
                 g_dbg.drawn++;
             }
             glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+        }
+
+        /* Authored point lights are render-only; gameplay owns no part of this pass. */
+        if (world.nlights && district_light_tex && g_dbg.show_track &&
+            g_dbg.night_mode && (passmode == 0 || passmode == 2)) {
+            districtdraws = render_district_lights(&rp, &quad, district_light_tex,
+                world.lights, world.nlights, cam, look, MVP, VIEW_DIST);
+            g_dbg.drawn += districtdraws;
         }
 
         /* neon signs / bulbs / lens flares: additive pass at the very end of
@@ -6549,6 +6852,8 @@ int main(int argc, char **argv) {
                                        "full (fog-derived + vista) EXPERIMENTAL",
                                (double)VIEW_DIST, zfar);
                         printf("COUNT sky      draws %4d\n", skydraws);
+                        printf("COUNT lights   sources %4d  draws %4d\n",
+                               world.nlights, districtdraws);
                         printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                                "(skipped %d meshes in %d batches)\n",
                                vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
@@ -6564,7 +6869,8 @@ int main(int argc, char **argv) {
                         printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
                                ndrawn, nm, wbdrawn, nbatch, wbdrawn);
                         printf("COUNT car/glow/HUD draws %4d\n",
-                               g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+                               g_dbg.drawn - skydraws - vistadraws -
+                               districtdraws - wbdrawn);
                         /* render cost since the pose was pinned -- the old
                            figure divided total elapsed (including the scene
                            upload) by every frame and read ~17 ms for a scene
@@ -6757,6 +7063,8 @@ int main(int argc, char **argv) {
                            "full (fog-derived + vista) EXPERIMENTAL",
                    (double)VIEW_DIST, zfar);
             printf("COUNT sky      draws %4d\n", skydraws);
+            printf("COUNT lights   sources %4d  draws %4d\n",
+                   world.nlights, districtdraws);
             printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                    "(skipped %d meshes in %d batches)\n",
                    vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
@@ -6768,7 +7076,7 @@ int main(int argc, char **argv) {
             printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
                    ndrawn, nm, wbdrawn, nbatch, wbdrawn);
             printf("COUNT car/glow/HUD draws %4d\n",
-                   g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+                   g_dbg.drawn - skydraws - vistadraws - districtdraws - wbdrawn);
             printf("COUNT total    draws %4d\n", g_dbg.drawn);
             printf("visible scenery:");
             for (int sc=1; sc<=N2_SC_OTHER; sc++)
@@ -6877,6 +7185,7 @@ int main(int argc, char **argv) {
     dbgui_shutdown();
 #endif
     n2_free_scene(&scene);   /* region buffers already freed after texture upload */
+    free(world.lights);
     free(wmbatch);           /* wraps wbatch's GL handles; frees the array only */
     if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);

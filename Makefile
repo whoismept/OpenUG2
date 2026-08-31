@@ -25,8 +25,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_mesh.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_mesh.h src/world_capture_policy.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -68,6 +68,57 @@ build/%.dbg.o: src/%.c $(HDRS) $(GEN)
 debug: $(DBG_OBJ) $(IMGUI_OBJ)
 	$(CXX) -O2 $(DBG_OBJ) $(IMGUI_OBJ) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
 
+world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_instance.h src/world_capture_policy.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c -o build/world_instance_test -lm
+	./build/world_instance_test
+
+car-material-test: tools/car_material_test.c src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm
+	./build/car_material_test
+
+world-render-test: tools/world_render_test.c src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/world_render_test.c -o build/world_render_test -lm
+	./build/world_render_test
+
+world-group-test: tools/world_group_test.c tools/world_group_reader.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) tools/world_group_test.c -o build/world_group_test
+	./build/world_group_test
+
+world-group-audit: tools/world_group_audit.c tools/world_group_reader.h src/world_instance.c src/world_instance.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) tools/world_group_audit.c -o build/world_group_audit -lm
+
+light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/light_state_test.c src/render.c -o build/light_state_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/light_state_test
+
+world-texture-test: tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/render.c $(HDRS) src/world.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/render.c -o build/world_texture_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/world_texture_test
+
+world-cli-test: nfsu2
+	@set +e; \
+	./nfsu2 --spawn >/dev/null 2>&1; spawn_missing=$$?; \
+	./nfsu2 --heading >/dev/null 2>&1; heading_missing=$$?; \
+	./nfsu2 --spawn malformed >/dev/null 2>&1; spawn_bad=$$?; \
+	./nfsu2 --heading malformed >/dev/null 2>&1; heading_bad=$$?; \
+	./nfsu2 build/no-such-data-root --track STREAML4RA --world2 --spawn start \
+	  --objdump /dev/null >/dev/null 2>&1; world2_load_fail=$$?; \
+	if test $$spawn_missing -eq 2 && test $$heading_missing -eq 2 && \
+	   test $$spawn_bad -eq 2 && test $$heading_bad -eq 2 && \
+	   test $$world2_load_fail -eq 1; then \
+	  echo "world_cli_test: PASS"; \
+	else \
+	  echo "world_cli_test: FAIL missing-spawn=$$spawn_missing missing-heading=$$heading_missing bad-spawn=$$spawn_bad bad-heading=$$heading_bad world2-load=$$world2_load_fail"; \
+	  exit 1; \
+	fi
+
 # OpenGL ES 2.0 (embedded/mobile). Cross-compile e.g.:
 #   CC=aarch64-linux-gnu-gcc make gles
 gles: $(SRC) $(HDRS) $(GEN)
@@ -80,4 +131,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test light-state-test world-texture-test world-group-test world-group-audit

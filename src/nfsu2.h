@@ -16,6 +16,28 @@ enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        /* car mesh classes, from material name */
        N2_CAR_BODY = 10, N2_CAR_GLASS = 11, N2_CAR_LIGHT = 12,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
+
+enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
+#define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
+
+/* The shipped SKYDOME object is authored with the sunrise pair. Retail also
+ * ships matching sunset/night dome+cap pairs in LOC4; choosing a profile
+ * changes only those two structurally proven source keys. */
+static int n2_sky_profile_parse(const char *name) {
+    if (!name) return -1;
+    if (!strcmp(name, "sunrise")) return N2_SKY_SUNRISE;
+    if (!strcmp(name, "sunset"))  return N2_SKY_SUNSET;
+    if (!strcmp(name, "night"))   return N2_SKY_NIGHT;
+    return -1;
+}
+static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
+    static const uint32_t dome[] = {0x2414a01eu, 0x27f186b7u, 0x8a9a05cfu};
+    static const uint32_t cap[]  = {0x5fb8bcd1u, 0x3e6947eau, 0xb0eb9302u};
+    if (profile < N2_SKY_SUNRISE || profile > N2_SKY_NIGHT) return source_key;
+    if (source_key == dome[N2_SKY_SUNRISE]) return dome[profile];
+    if (source_key == cap[N2_SKY_SUNRISE])  return cap[profile];
+    return source_key;
+}
 typedef struct {
     float   *verts;   /* 5 floats per vertex: pos.xyz, uv */
     unsigned char *vcol; /* 4 bytes/vertex: RGBA prelight from the source stream
@@ -26,6 +48,11 @@ typedef struct {
     int      nidx;
     int      cat;     /* N2_ROAD / N2_TERRAIN / N2_OTHER, from material name */
     uint32_t texkey;  /* car meshes: bound TPK diffuse key (0x134012), 0 if none */
+    unsigned char mat_exact; /* world meshes: texkey belongs to this exact
+                                0x134B02 range, or to a true single-slot object.
+                                Zero marks a conservative whole-object fallback:
+                                its texture may draw, but never make unrelated
+                                geometry cutout/blended/additive. */
     int      trim;    /* car BODY meshes only: 1 = plastic bumper/skirt (verified
                           real per-part name tokens, e.g. GOLF_KIT00_FRONT_BUMPER_A),
                           duller/broader specular than the metallic paint panels */
@@ -43,6 +70,16 @@ typedef struct {
     char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
     unsigned char vrepair; /* 1 = this mesh kept its good geometry after corrupt
                               source vertices were excluded (M133) */
+    char aname[28];        /* instance asset name (27 chars + terminator) */
+    unsigned char inst;    /* mesh was placed from an instance matrix */
+    /* car meshes only (M135): a stable id shared by every GPU slice emitted
+       from ONE 0x80134010 object occurrence, whether or not that object was
+       split into several meshes by n2_walk_car. Distinct from namekey, which
+       groups the SAME part across LOD tiers/instances (so different tierid,
+       matching namekey) -- tierid is what lets n2_car_dedupe_lod score and
+       keep/drop one whole tier's slice set atomically instead of resolving
+       each split slice independently. 0 = not a car mesh / not tier-tracked. */
+    uint32_t tierid;
 } N2Mesh;
 
 /* Active customization profile.
@@ -73,6 +110,32 @@ typedef struct {
     int     count, cap;
 } N2Scene;
 
+/* Total order for exact mesh payload identity. World dedup first groups by
+ * world-space bbox, then uses this to distinguish different material slices
+ * that share one source vertex pool and happen to have equal counts. */
+static int n2_mesh_content_cmp(const N2Mesh *a, const N2Mesh *b) {
+    if (a->texkey != b->texkey) return a->texkey < b->texkey ? -1 : 1;
+    if (a->nidx != b->nidx) return a->nidx < b->nidx ? -1 : 1;
+    if (a->nverts != b->nverts) return a->nverts < b->nverts ? -1 : 1;
+    if (a->mat_exact != b->mat_exact) return a->mat_exact < b->mat_exact ? -1 : 1;
+    if (!!a->idx != !!b->idx) return a->idx ? 1 : -1;
+    if (!!a->verts != !!b->verts) return a->verts ? 1 : -1;
+    if (!!a->vcol != !!b->vcol) return a->vcol ? 1 : -1;
+    int c = 0;
+    if (a->idx && a->nidx > 0)
+        c = memcmp(a->idx, b->idx, (size_t)a->nidx * sizeof *a->idx);
+    if (!c && a->verts && a->nverts > 0)
+        c = memcmp(a->verts, b->verts,
+                   (size_t)a->nverts * 5 * sizeof *a->verts);
+    if (!c && a->vcol && a->nverts > 0)
+        c = memcmp(a->vcol, b->vcol, (size_t)a->nverts * 4);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+
+static int n2_mesh_same_content(const N2Mesh *a, const N2Mesh *b) {
+    return a && b && n2_mesh_content_cmp(a, b) == 0;
+}
+
 /* Decoded RGB texture (3 bytes/pixel, top-left origin).
  *
  * ALPHA. `alpha` is a separate w*h plane, non-NULL only when the source
@@ -93,7 +156,50 @@ typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
        fallback. Set only by n2_load_car_tex_by_key for straight DXT1/DXT3
        slots. dxtfmt: 0 = none (use rgb), 1 = DXT1, 3 = DXT3. */
     unsigned char *dxt; int dxtlen, dxtfmt;
-    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */ } N2Tex;
+    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */
+    /* AUTHORED DRAW METADATA (M135), read directly from the TPK record when a
+     * full 0x4c-byte record prefix is present; 0 otherwise (n2_tex_mode then
+     * reports N2_DRAW_OPAQUE, the existing de-facto behaviour). Offsets and
+     * the four measured byte combinations were INDEPENDENTLY re-derived and
+     * verified against this repo's own STREAML4RA.BUN, not copied from any
+     * external reference:
+     *   OBJ_RAILING     (order,usage,blend,wz)=(0,1,0,1) -> cutout (matches
+     *     its own decoded pixels: a chain-link cutout with a mostly-black
+     *     background and a 1-bit-alpha metal frame)
+     *   ARC_WAREHOUSE_WALL06_RA, ARC_SUBWAY_FLOOR_01, ARK_DETAIL01,
+     *     ARK_WALLCORRIN (four unrelated opaque wall/floor textures)
+     *                     (0,0,0,1) -> opaque
+     * order: draw order (0 opaque layer, 5..7 transparent -- not itself
+     *   consulted by n2_tex_mode; usage/blend already determine the mode).
+     * usage: 0 none, 1 cutout (alpha test), 2 blending.
+     * blend: 0 none, 1 ordinary src/1-src, 2 additive.
+     * wz:    1 write depth (opaque/cutout), 0 do not (blended/additive). */
+    unsigned char order, usage, blend, wz; } N2Tex;
+
+/* Derived draw-mode classification -- NOT a raw stored field, computed from
+ * usage/blend exactly as measured (see the N2Tex comment above). */
+enum { N2_DRAW_OPAQUE = 0, N2_DRAW_CUTOUT = 1, N2_DRAW_BLEND = 2, N2_DRAW_ADD = 3 };
+static int n2_tex_mode(const N2Tex *t) {
+    if (t->usage == 1) return N2_DRAW_CUTOUT;
+    if (t->usage == 2 && t->blend == 1) return N2_DRAW_BLEND;
+    if (t->blend == 2) return N2_DRAW_ADD;
+    return N2_DRAW_OPAQUE;
+}
+
+/* Authored transparency is safe only when the mesh-to-material association is
+ * structural. This is separate from n2_tex_mode: that function decodes what a
+ * texture wants; this function decides whether this particular world mesh has
+ * proven ownership of that texture. */
+static int n2_world_draw_mode(const N2Mesh *m, int authored) {
+    return m && m->mat_exact ? authored : N2_DRAW_OPAQUE;
+}
+
+/* Keep conservative whole-object fallbacks out of batches owned by an exact
+ * material range, even when both currently resolve to OPAQUE. Provenance is
+ * part of the batch contract so later material state cannot leak across it. */
+static int n2_world_batch_material_group(const N2Mesh *m, int effective_mode) {
+    return effective_mode * 2 + (m && m->mat_exact ? 1 : 0);
+}
 
 /* ---- file I/O ---- */
 static unsigned char *n2_read_file(const char *path, long *out_len) {
@@ -115,6 +221,78 @@ static uint32_t n2_u32(const unsigned char *p) {
 /* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
 static int n2_skip_filler(const unsigned char *p, int n) {
     int i = 0; while (i < n && p[i] == 0x11) i++; return i;
+}
+
+/* Shipped district point-light source (0x135003, 96-byte records). This is
+ * render metadata only: it never enters collision, ground or navigation. */
+typedef struct {
+    float pos[3], r_in, r_out;
+    uint32_t rgba;
+} N2LightSrc;
+
+static int n2_light_same(const N2LightSrc *a, const N2LightSrc *b) {
+    return a->rgba == b->rgba && a->pos[0] == b->pos[0] &&
+           a->pos[1] == b->pos[1] && a->pos[2] == b->pos[2] &&
+           a->r_in == b->r_in && a->r_out == b->r_out;
+}
+
+static int n2_light_walk(const unsigned char *d, long beg, long end,
+                         N2LightSrc *out, int cap, int *count) {
+    for (long o = beg; o < end;) {
+        if (end - o < 8) return 0;
+        uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
+        long payload = o + 8;
+        if ((uint64_t)size > (uint64_t)(end - payload)) return 0;
+        long next = payload + (long)size;
+        if (magic == 0x00135003u) {
+            const unsigned char *p = d + payload;
+            int skip = n2_skip_filler(p, (int)size);
+            long body = (long)size - skip;
+            /* One malformed leaf must not erase valid light leaves elsewhere
+               in the same STREAM bundle. Reject this leaf as a unit. */
+            if (body % 96 != 0) { o = next; continue; }
+            for (long r = 0; r < body; r += 96) {
+                const unsigned char *q = p + skip + r;
+                if (q[7] != 1) continue;
+                N2LightSrc light;
+                memcpy(&light.rgba, q + 0x0c, 4);
+                memcpy(&light.pos[0], q + 0x10, 4);
+                memcpy(&light.pos[1], q + 0x14, 4);
+                memcpy(&light.pos[2], q + 0x18, 4);
+                memcpy(&light.r_out, q + 0x1c, 4);
+                memcpy(&light.r_in, q + 0x30, 4);
+                if (!isfinite(light.pos[0]) || !isfinite(light.pos[1]) ||
+                    !isfinite(light.pos[2]) || !isfinite(light.r_out) ||
+                    !isfinite(light.r_in) || fabsf(light.pos[0]) > 60000.0f ||
+                    fabsf(light.pos[1]) > 60000.0f ||
+                    fabsf(light.pos[2]) > 60000.0f || light.r_out <= 0.0f ||
+                    light.r_out > 5000.0f || light.r_in < 0.0f ||
+                    light.r_in > light.r_out) continue;
+                int duplicate = 0;
+                for (int i = 0; i < *count; i++)
+                    if (n2_light_same(out + i, &light)) { duplicate = 1; break; }
+                if (duplicate) continue;
+                if (*count >= cap) return 0;
+                out[(*count)++] = light;
+            }
+        } else if (magic && (magic >> 28) == 8) {
+            if (!n2_light_walk(d, payload, next, out, cap, count)) return 0;
+        }
+        o = next;
+    }
+    return 1;
+}
+
+static int n2_load_light_sources(const unsigned char *d, long len,
+                                 N2LightSrc *out, int cap) {
+    if (!d || len < 0 || !out || cap <= 0) return 0;
+    N2LightSrc *tmp = (N2LightSrc *)malloc((size_t)cap * sizeof *tmp);
+    if (!tmp) return 0;
+    int count = 0;
+    int ok = n2_light_walk(d, 0, len, tmp, cap, &count);
+    if (ok && count) memcpy(out, tmp, (size_t)count * sizeof *out);
+    free(tmp);
+    return ok ? count : 0;
 }
 
 /* ---- mesh extraction ---- */
@@ -197,7 +375,12 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                 while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
                 if (j - i >= 5) {
                     const unsigned char *n = p + i; long L = j - i;
-                    if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
+                    /* SKY is deliberately narrow. XB_SKYDOMEB and
+                       XB_FACTORYSKYLIGHT are ordinary authored structures;
+                       the former broad substring match moved them into the
+                       camera/depth-write-off sky pass. */
+                    if ((L == 7 && !memcmp(n, "SKYDOME", 7)) ||
+                        (L >= 4 && !memcmp(n, "SKY_", 4))) return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
@@ -679,7 +862,7 @@ static void n2_m102_note(int why, const char *anm, int cat, int nslot, int nsub,
 
 /* Declared here because n2_walk_meshes' per-submesh road path (M101) needs
  * them; the definitions stay with the car material code further down. */
-typedef struct { uint32_t start, count, mat; } N2Sub;
+typedef struct { uint32_t start, count, mat, matid; } N2Sub;
 static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
                              N2Sub *out, int cap);
 static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
@@ -775,8 +958,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                depth-write off) so its absurd span must skip the size-safety
                cull that still guards every other category. */
             int cull = (cat != N2_SKY);
-            /* Per-submesh materials for road/terrain (Milestone 101). A road
-             * object lists SEVERAL 0x134012 slots and its single 0x134B02 leaf
+            /* Per-submesh materials for world objects (Milestone 101/M135-S).
+             * An object lists SEVERAL 0x134012 slots and its single 0x134B02 leaf
              * partitions the index buffer into ranges, each naming its slot by
              * mat_id -- the same linkage the car path already uses. Binding one
              * key per object (the last slot) put a 64x64 intersection tile over
@@ -788,11 +971,11 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
              * straight through to the unchanged single-mesh path below. */
             int sub_ok = 0;
             N2Sub sub[64]; int nsub = 0;
-            uint32_t slot[64]; int nslot = 0;
+            uint32_t slot[64];
+            int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
             int fb_why = -1; long fb_idx = 0, fb_chain = 0;   /* M102 census only */
-            if ((cat == N2_ROAD || cat == N2_TERRAIN) && pairs == 1) {
+            if (cat != N2_GLOW && pairs == 1) {
                 nsub  = n2_mesh_submeshes(d, ds, ds + size, sub, 64);
-                nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
                 if (nsub > 0 && nslot > 0) {
                     const unsigned char *ib0 = d + idx[0].off;
                     int ibytes = (int)idx[0].size, ip = 0;
@@ -860,26 +1043,40 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                        exactly what the whole object used to get. Geometry and the
                        index partition are identical either way -- only the key
                        differs -- so nothing is dropped or duplicated. */
-                    uint32_t sk = n2_resolve_key(slot[sub[a].mat], keys, nkeys);
+                    uint32_t authored = slot[sub[a].mat];
+                    /* SKYDOME's two proven slots live in shared LOC4, so they
+                       are intentionally absent from the region-local key set.
+                       Preserve those authored keys for world_bind_textures to
+                       resolve later; applying the generic regional fallback
+                       here collapsed dome+cap onto one texture. */
+                    uint32_t sk = cat == N2_SKY
+                                ? authored : n2_resolve_key(authored, keys, nkeys);
+                    int exact = sk != 0;
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;
                     n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, cull,
                                 sk, objm,
                                 (long)sub[a].start, (long)sub[a].count);
                     for (int m2 = before; m2 < scene->count; m2++) {
+                        scene->meshes[m2].mat_exact = (unsigned char)exact;
                         scene->meshes[m2].scen = (unsigned char)sc;
                         snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
                                  "%.31s", anm);
                     }
                 }
-            } else
-            for (int k = 0; k < pairs; k++) {
-                int before = scene->count;
-                n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull, tk, objm, 0, -1);
-                for (int m2 = before; m2 < scene->count; m2++) {   /* tag the new mesh */
-                    scene->meshes[m2].scen = (unsigned char)sc;
-                    snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
-                             "%.31s", anm);
+            } else {
+                int exact_single_slot = nslot == 1 && slot[0] != 0;
+                for (int k = 0; k < pairs; k++) {
+                    int before = scene->count;
+                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull,
+                                tk, objm, 0, -1);
+                    for (int m2 = before; m2 < scene->count; m2++) {
+                        scene->meshes[m2].mat_exact =
+                            (unsigned char)exact_single_slot;
+                        scene->meshes[m2].scen = (unsigned char)sc;
+                        snprintf(scene->meshes[m2].sname,
+                                 sizeof scene->meshes[m2].sname, "%.31s", anm);
+                    }
                 }
             }
             if (scene != scene0) n2_obj_vista++;          /* routed to the vista scene */
@@ -1323,7 +1520,33 @@ static float n2_bbox_overlap(const float *a, const float *b) {
  *     the tiers are NOT always stored best-first. Seven parts across the fleet
  *     (GOLF/PEUGOT/RSX roofs, CIVIC/RX8 brakelights, SUPRA/FOCUS skirts) store
  *     a later tier with MORE vertices than the one named _A.
- * Hence: group spatially, then keep max vertex count. */
+ * Hence: group spatially, then keep max vertex count.
+ *
+ * COMPLETE-TIER SELECTION (M135). The unit of the decision above this line was
+ * always "the part," but it used to be scored and dropped per emitted MESH,
+ * not per source object. Since n2_walk_car (M135) now splits a car object by
+ * material class as well as by texture, two tiers of the same part need not
+ * split into the same slices -- a lower tier can lack a glass slice entirely.
+ * Comparing meshes independently either orphans the winning tier's unmatched
+ * slice (its derived namekey almost never collides with anything, so it is
+ * simply never compared against anything and is dropped or kept in isolation)
+ * or, worse, lets a LOSING tier's unmatched slice survive untouched next to
+ * the winner, producing a visible duplicate. So the comparison unit here is
+ * the TIER (every slice sharing one n2_walk_car-assigned tierid): one union
+ * bounding box, one score, kept or dropped as a whole. Scored by SUMMED
+ * INDEX COUNT across a tier's slices, not summed vertex count -- n2_add_pair
+ * duplicates the entire source vertex array per split slice, so a heavily
+ * split tier would otherwise win purely for having more slices, independent
+ * of how much triangle detail it actually contributes. Tie-break: exactly the
+ * old rule, transplanted -- the earlier-encountered tier in the forward scan
+ * wins ties (strictly-greater-only replaces the running best).
+ *
+ * SPATIAL ANCHOR (M135-R hardening). Family membership below is decided
+ * against the group's FIRST tier (`a`), fixed for the whole inner scan --
+ * never against whichever tier currently holds `best`. See the comment at
+ * the loop itself for why a shifting anchor is a real bug, not just a style
+ * preference: it lets a spatially-unrelated third tier get pulled into (and
+ * dropped from) a group purely because the running best changed. */
 #define N2_LOD_OVERLAP 0.4f
 static void n2_car_dedupe_lod(N2Scene *s) {
     int n = s->count;
@@ -1332,16 +1555,59 @@ static void n2_car_dedupe_lod(N2Scene *s) {
     char *drop = (char *)calloc((size_t)n, 1);
     if (!bb || !drop) { free(bb); free(drop); return; }   /* OOM: keep everything */
     for (int i = 0; i < n; i++) n2_mesh_bbox(&s->meshes[i], bb[i]);
+
+    typedef struct { uint32_t tierid; int rep; float bb[6]; long score; } N2CarTier;
+    N2CarTier *tiers = (N2CarTier *)malloc((size_t)n * sizeof *tiers);
+    if (!tiers) { free(bb); free(drop); return; }        /* OOM: keep everything */
+    int nt = 0;
     for (int i = 0; i < n; i++) {
-        if (drop[i] || !s->meshes[i].namekey) continue;
-        int best = i;                       /* i stays the spatial anchor */
-        for (int j = i + 1; j < n; j++) {
-            if (drop[j] || s->meshes[j].namekey != s->meshes[i].namekey) continue;
-            if (n2_bbox_overlap(bb[i], bb[j]) < N2_LOD_OVERLAP) continue;
-            if (s->meshes[j].nverts > s->meshes[best].nverts) { drop[best] = 1; best = j; }
-            else drop[j] = 1;
+        uint32_t tid = s->meshes[i].tierid;
+        int t = -1;
+        for (int q = 0; q < nt; q++) if (tiers[q].tierid == tid) { t = q; break; }
+        if (t < 0) {
+            t = nt++;
+            tiers[t].tierid = tid; tiers[t].rep = i; tiers[t].score = 0;
+            for (int c = 0; c < 6; c++) tiers[t].bb[c] = bb[i][c];
+        } else {
+            if (s->meshes[i].nidx > s->meshes[tiers[t].rep].nidx) tiers[t].rep = i;
+            for (int c = 0; c < 3; c++) {
+                if (bb[i][2*c]   < tiers[t].bb[2*c])   tiers[t].bb[2*c]   = bb[i][2*c];
+                if (bb[i][2*c+1] > tiers[t].bb[2*c+1]) tiers[t].bb[2*c+1] = bb[i][2*c+1];
+            }
+        }
+        tiers[t].score += s->meshes[i].nidx;
+    }
+    char *tdrop = (char *)calloc((size_t)nt, 1);
+    if (!tdrop) { free(bb); free(drop); free(tiers); return; }   /* OOM: keep everything */
+    for (int a = 0; a < nt; a++) {
+        if (tdrop[a] || !s->meshes[tiers[a].rep].namekey) continue;
+        int best = a;
+        /* Family membership (M135-R hardening) is decided against tier `a`'s
+           OWN namekey/bbox, fixed for this whole group -- never against
+           whichever tier currently holds `best`. `best` only tracks the
+           highest-scoring survivor so far; using ITS bbox as the anchor
+           would make membership order/score-dependent: if a<->b overlap and
+           b<->c overlap but a and c do NOT, re-anchoring on b after b beats a
+           would wrongly let c join (and lose to) the group through b, even
+           though the group's actual anchor (a) has nothing to do with c.
+           Proven with a 3-tier A/B/C regression fixture (fixture F) where B
+           has the highest score: A is correctly replaced by B, but C survives
+           untouched because it never overlaps A, regardless of B's bbox. */
+        for (int c = a + 1; c < nt; c++) {
+            if (tdrop[c]) continue;
+            if (s->meshes[tiers[c].rep].namekey != s->meshes[tiers[a].rep].namekey) continue;
+            if (n2_bbox_overlap(tiers[a].bb, tiers[c].bb) < N2_LOD_OVERLAP) continue;
+            if (tiers[c].score > tiers[best].score) { tdrop[best] = 1; best = c; }
+            else tdrop[c] = 1;
         }
     }
+    for (int i = 0; i < n; i++) {
+        uint32_t tid = s->meshes[i].tierid;
+        for (int t = 0; t < nt; t++)
+            if (tiers[t].tierid == tid) { if (tdrop[t]) drop[i] = 1; break; }
+    }
+    free(tiers); free(tdrop);
+
     int w = 0;
     for (int i = 0; i < n; i++) {
         if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
@@ -1421,11 +1687,23 @@ static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys) {
  *   +0  bbox min xyz (3 floats)      +12 index count
  *   +16 bbox max xyz (3 floats)      +28 mat_id  = index into the 0x134012
  *                                                  slot list above
- *   +32 render-state flag            +52 index start
+ *   +32 matid: positional index into   +52 index start
+ *       the object's own 0x134013
+ *       material-hash list (M135; see n2_mesh_matslots / n2_mat_class)
  * The starts/counts chain exactly across the buffer (0->39->1065->1083 =
  * 1143 = the whole index list), which is what confirms the field roles.
- * mat_id is NOT the same field as the flag at +32: BODY_A's last record has
- * mat_id 1 but flag 2, and BODY_A only HAS two slots. */
+ * matid is NOT the same field as mat_id at +28: BODY_A's last record has
+ * mat_id 1 but matid 2, and BODY_A only HAS two texture slots (its 0x134013
+ * list, separately, has more entries -- verified: GOLF_KIT00_BODY_A's own
+ * 0x134013 is [0fedee40, a7366ae6, d6d6080a, 010cb64a, 02a05578], and its
+ * dominant 534-index submesh selects matid=2 -> 0xd6d6080a, which is
+ * n2_str_hash("CARSKIN") bit for bit. GOLF_BASE_A's 0x134013 list separately
+ * contains 0x471a1dca == n2_str_hash("WINDSHIELD") at index 4, selected by
+ * three of its submeshes -- one wide front-facing pane plus a mirrored L/R
+ * pair, none of which resolve a texture key (glass has none to resolve),
+ * exactly the shape real automotive glass would produce. Checked across
+ * every one of GOLF's 608 objects / 2171 submesh records: every matid is
+ * in-bounds for its own object's 0x134013 list (2171/2171, 100%). */
 static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
                              N2Sub *out, int cap) {
     N2Leaf sm[4]; int nsm = 0;
@@ -1448,9 +1726,72 @@ static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
         const unsigned char *q = p + pad + i*60;
         out[i].count = n2_u32(q + 12);
         out[i].mat   = n2_u32(q + 28);
+        out[i].matid = n2_u32(q + 32);
         out[i].start = n2_u32(q + 52);
     }
     return n;
+}
+
+/* Car-only structural validation of a submesh partition (M135), independent
+ * of n2_mesh_submeshes so world/road callers of that function are completely
+ * unaffected. Requires: the first range starts at index 0; every later range
+ * starts exactly where the previous one ended (no gap, no overlap); every
+ * range holds at least one whole triangle; the last range ends exactly at
+ * the (post-filler) end of the decoded index buffer. Any violation means the
+ * caller must fall back to the whole-object path rather than trust a
+ * partial/garbled split. */
+static int n2_car_submesh_partition_ok(const N2Sub *sub, int nsub, long total_idx) {
+    if (nsub <= 0 || total_idx <= 0) return 0;
+    long want = 0;
+    for (int k = 0; k < nsub; k++) {
+        if (sub[k].count < 3 || sub[k].count % 3) return 0;
+        if ((long)sub[k].start != want) return 0;
+        long end = (long)sub[k].start + (long)sub[k].count;
+        if (end > total_idx) return 0;
+        want = end;
+    }
+    return want == total_idx;
+}
+
+/* Every key in a car object's own 0x134013 list, BY POSITION (8-byte entries:
+ * hash + 0, second word unused) -- the list a 0x134B02 record's matid indexes.
+ * Values are meaningful across DIFFERENT objects (the same material always
+ * hashes the same), but POSITION within the list is per-object, exactly like
+ * 0x134012's texture slots, so gaps/order must be kept exactly as stored. */
+static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
+                            uint32_t *out, int cap) {
+    N2Leaf t13[4]; int n13 = 0, n = 0;
+    n2_find_leaves(d, beg, end, 0x00134013u, t13, &n13, 4);
+    for (int a = 0; a < n13; a++) {
+        const unsigned char *p = d + t13[a].off; long ls = t13[a].size;
+        for (long b = 0; b + 8 <= ls && n < cap; b += 8) out[n++] = n2_u32(p + b);
+    }
+    return n;
+}
+
+/* Two material hashes this milestone proves and uses; both independently
+ * recomputed against live GOLF data (see n2_mesh_submeshes' comment above),
+ * not copied from any external source. n2_str_hash is documented here rather
+ * than implemented as a general runtime function: only these two literal,
+ * pre-verified constants are consulted, deliberately narrower than a full
+ * name-hash chain (chrome/aluminium/moldings/plastics/lights are measurable
+ * the same way but are NOT classified here -- a separate, evidenced change).
+ *   h = 0xFFFFFFFF; for each byte c: h = h*33 + c;
+ *   n2_str_hash("WINDSHIELD") == 0x471a1dca
+ *   n2_str_hash("CARSKIN")    == 0xd6d6080a  */
+#define N2_MAT_WINDSHIELD 0x471a1dcau
+#define N2_MAT_CARSKIN    0xd6d6080au
+
+/* Classify one submesh's material hash. `fallback` is the object-level
+ * category from n2_car_category, used whenever the hash is 0 (absent/out of
+ * bounds -- n2_mesh_submeshes and the matid bounds check both fail safe to
+ * this), or is not one of the two proven mappings below. This is the ONLY
+ * thing that lets a same-texture BODY+WINDSHIELD object split correctly: the
+ * pre-existing texture-key split cannot see this distinction at all. */
+static int n2_mat_class(uint32_t hash, int fallback) {
+    if (hash == N2_MAT_WINDSHIELD) return N2_CAR_GLASS;
+    if (hash == N2_MAT_CARSKIN)    return N2_CAR_BODY;
+    return fallback;
 }
 
 /* Parse a car GEOMETRY.BIN (36-byte verts w/ normals), tagging each mesh with
@@ -1510,44 +1851,96 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                the records actually resolve to different textures, emit one
                mesh per record instead. */
             uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
+            uint32_t mslots[32]; int nmslot = n2_mesh_matslots(d, ds, ds + s, mslots, 32);
             N2Sub sub[32]; int nsub = pairs == 1 ? n2_mesh_submeshes(d, ds, ds + s, sub, 32) : 0;
-            uint32_t subtex[32]; int differ = 0, big = 0;
-            for (int k = 0; k < nsub; k++) {
+            /* Validate the partition structurally before trusting a split at
+               all (M135): first range at 0, contiguous, in-bounds, ending at
+               the decoded index buffer's own end. Mirrors n2_add_pair's own
+               paired-0x1111 filler convention for the index leaf so this
+               checks the SAME triangle count n2_add_pair will actually see. */
+            long total_idx = 0;
+            if (nsub > 1) {
+                const unsigned char *ib0 = d + idx[0].off;
+                int ibytes = (int)idx[0].size, ip = 0;
+                while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+                total_idx = (ibytes - ip) / 2;
+            }
+            int part_ok = nsub > 1 && n2_car_submesh_partition_ok(sub, nsub, total_idx);
+            /* Classification (which class a submesh's matid names) does not
+               need a validated multi-record PARTITION -- it only needs
+               sub[k].matid to be in range, which is already individually
+               bounds-checked below regardless of start/count. Partition
+               validity only matters for trusting per-submesh index RANGES
+               well enough to actually SPLIT the geometry. So classification
+               is trusted whenever nsub==1 (a single record IS the whole
+               object -- trivially "whole," nothing to partition) or when
+               nsub>1 AND part_ok (a validated multi-record partition).
+               A malformed multi-record partition (nsub>1, !part_ok) keeps
+               the conservative cat-based fallback for classification too --
+               a corrupt start/count strongly suggests the whole record is
+               suspect, so its matid is not trusted either (M135-R item 4:
+               "ensure material classification works without requiring
+               nsub > 1", scoped to the case that's actually safe). */
+            int trust_cls = nsub == 1 || part_ok;
+            uint32_t subtex[32]; int matcls[32]; int differ = 0, clsdiffer = 0, big = 0;
+            for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
                 subtex[k] = sub[k].mat < (uint32_t)nslot
                           ? n2_resolve_key(slots[sub[k].mat], keys, nkeys) : 0;
+                uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
+                matcls[k] = n2_mat_class(mh, cat);
                 if (subtex[k] != subtex[0]) differ = 1;
+                if (matcls[k] != matcls[0]) clsdiffer = 1;
                 if (sub[k].count > sub[big].count) big = k;
             }
-            if (nsub > 1 && differ) {
+            /* Whole-object category when NOT splitting: matcls[0] whenever
+               classification is trusted (it is then, by construction,
+               uniform across every submesh reaching this branch -- if it
+               disagreed AND part_ok held, the split branch below would have
+               been taken instead), else the original name-based cat. This is
+               what lets a single-submesh WINDSHIELD-material object with a
+               non-GLASS name (real on GOLF, see the M135-R census note at
+               n2_mat_class) resolve to GLASS without ever needing to split. */
+            int wholecat = (trust_cls && nsub >= 1) ? matcls[0] : cat;
+            /* One 0x80134010 occurrence, split or not, shares one tierid so
+               n2_car_dedupe_lod can score and drop/keep its whole slice set
+               atomically instead of resolving each split slice on its own. */
+            static uint32_t g_car_tierid_next = 1;
+            uint32_t tierid = g_car_tierid_next++;
+            if (part_ok && nsub > 1 && (differ || clsdiffer)) {
                 for (int k = 0; k < nsub; k++) {
                     int before = scene->count;
-                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 36, 28, 0,
+                    n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28, 0,
                                 subtex[k], NULL, sub[k].start, sub[k].count);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
-                                                /* The dominant slice keeps the plain family key so it
+                        /* The dominant slice keeps the plain family key so it
                            still dedupes against LOD tiers that never split
                            (a lower tier can lack the badge slot entirely, so
                            it stays whole); the small extra slices get their
                            own keys and only ever match the same slice of
-                           another tier. */
+                           another tier. Complete-tier selection (tierid,
+                           scored by total index count) is what actually
+                           protects an unmatched slice now; namekey is only
+                           the cross-tier family grouping. */
                         scene->meshes[before].namekey =
                             k == big ? nk2 : nk2 ^ (0x9e3779b9u * (sub[k].mat + 1));
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
+                        scene->meshes[before].tierid = tierid;
                     }
                 }
             } else {
                 for (int k = 0; k < pairs; k++) {   /* car parts have identity transforms */
                     int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 36, 28, 0, tk, NULL, 0, -1);
+                    n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28, 0, tk, NULL, 0, -1);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
-                                                scene->meshes[before].namekey = nk2;
+                        scene->meshes[before].namekey = nk2;
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
+                        scene->meshes[before].tierid = tierid;
                     }
                 }
             }
@@ -2296,10 +2689,24 @@ static int n2_tpk_keys(const unsigned char *d, N2Tpk t, uint32_t *keys, int maxk
     return n;
 }
 
+/* Format dispatch (M135-R, PROVEN): +0x3e is an explicit format tag, not a
+ * size guess. Independently verified (scratchpad/m135/tex_format_census.c)
+ * against 2309 real world-texture records across three files
+ * (STREAML4RA.BUN, STREAML4RB.BUN, LOC4DYNTEX.BIN) with ZERO contradictions:
+ * P8=0x08 (36/36), DXT1=0x22 (2033/2033), DXT3=0x24 (240/240). DXT5 (0x26)
+ * and BGRA8 (0x20) are named here for completeness (an external reference
+ * claims those values) but NEVER seen on real world data -- those two belong
+ * to the car TEXTURES.BIN offset-slot path (n2_load_car_tex_by_key), which
+ * has its own, separately-proven compression byte. No world record exists to
+ * prove a DXT5/BGRA8 decoder against here, so a record tagged with either is
+ * rejected rather than guessed at, same as a genuinely unknown tag. */
+enum { N2_TEXFMT_BGRA8 = 0x20, N2_TEXFMT_P8 = 0x08, N2_TEXFMT_DXT1 = 0x22,
+       N2_TEXFMT_DXT3 = 0x24, N2_TEXFMT_DXT5 = 0x26 };
 /* Decode one texture by its record hash, searching all blocks. Fields (Nikki's
  * layout minus a 0x0C name-pad prefix): +0x18 BinKey +0x24 Offset
- * +0x28 PaletteOffset +0x2c Size +0x30 PaletteSize +0x38 W(u16) +0x3a H(u16).
- * P8 when PaletteSize >= 1024 (256-entry RGBA); else DXT1/DXT3 by Size. */
+ * +0x28 PaletteOffset +0x2c Size +0x30 PaletteSize +0x38 W(u16) +0x3a H(u16)
+ * +0x3e format tag. PaletteSize is still cross-checked as a corruption guard
+ * (a record tagged P8 but lacking a real palette is contradictory, not P8). */
 static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t hash, N2Tex *tex) {
     /* every output field defined on BOTH paths, so a failed decode can never
        leave a caller reading a stale alpha/dxt pointer from a reused struct */
@@ -2310,11 +2717,25 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             if (!(d[i] >= 'A' && d[i] <= 'Z')) continue;
             if (n2_u32(d + i + 0x18) != hash) continue;
             uint32_t off = n2_u32(d + i + 0x24), paloff = n2_u32(d + i + 0x28);
-            uint32_t sz = n2_u32(d + i + 0x2c), palsz = n2_u32(d + i + 0x30);
+            uint32_t palsz = n2_u32(d + i + 0x30);   /* Size (+0x2c) no longer read here --
+                                                          format now comes from the +0x3e tag */
             int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
             if (w<=0 || hh<=0 || w>4096 || hh>4096) continue;
+            unsigned char fmt = d[i+0x3e];
+            int is_p8   = fmt == N2_TEXFMT_P8   && palsz >= 1024;
+            int is_dxt1 = fmt == N2_TEXFMT_DXT1 && palsz <  1024;
+            int is_dxt3 = fmt == N2_TEXFMT_DXT3 && palsz <  1024;
+            if (!is_p8 && !is_dxt1 && !is_dxt3) continue;   /* unknown/contradictory tag */
             tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
             tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
+            /* order/usage/blend/wz: the last field read is wz at +0x4b, so a
+             * full 0x4c-byte record prefix must be present before touching any
+             * of them. Left at their memset-0 default (-> N2_DRAW_OPAQUE, the
+             * only behaviour this format ever had before M135) otherwise. */
+            if (i + 0x4c <= hend) {
+                tex->order = d[i+0x45]; tex->usage = d[i+0x49];
+                tex->blend = d[i+0x4a]; tex->wz    = d[i+0x4b];
+            }
             /* M132-R2: alpha is DECODED, not discarded. The palettes are RGBA
                and the DXT blocks carry real alpha; throwing it away was why a
                panorama sheet rendered as an opaque black-edged slab. It is only
@@ -2324,7 +2745,14 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             unsigned char *alf = (unsigned char *)malloc((long)w*hh);
             tex->alpha = NULL;
             tex->afmt = 0;
-            if (palsz >= 1024 && dbase+paloff+1024 <= len && dbase+off+(long)w*hh <= len) {
+            if (is_p8) {
+                /* Tagged P8 AND has a real palette (checked above); still
+                 * bounds-check the actual palette/index bytes -- a record
+                 * whose declared offsets don't fit the file is corrupt, not
+                 * decodable, regardless of what its tag claims. */
+                if (dbase+paloff+1024 > len || dbase+off+(long)w*hh > len) {
+                    free(tex->rgb); free(alf); continue;
+                }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
@@ -2332,11 +2760,21 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                     if (alf) alf[p] = c[3];
                 }
                 tex->afmt = 8;                      /* P8 */
-            } else if (dbase + off + (long)w*hh/2 <= len) {
-                int dxt3 = (long)sz > (long)w*hh*9/10;
+            } else {
+                /* Block-count-based length, not a flat w*h/2 guess: DXT1 is
+                 * 8 bytes/block, DXT3 is 16 -- half the previous check's
+                 * assumed size, so a truncated DXT3 buffer between w*h/2 and
+                 * w*h bytes used to pass this test and then read past the end
+                 * inside n2_dxt3. blocks_x/y use ceil-to-4 so a non-multiple-
+                 * of-4 dimension (the source data is not guaranteed aligned)
+                 * still gets a correct, slightly-padded block count. */
+                long dxt3 = is_dxt3;   /* format choice: from the proven +0x3e tag, not size */
+                long bx = ((long)w + 3) / 4, by = ((long)hh + 3) / 4;
+                long need = bx * by * (dxt3 ? 16 : 8);
+                if (dbase + off + need > len) { free(tex->rgb); free(alf); continue; }
                 if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
                 else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
-            } else { free(tex->rgb); free(alf); continue; }
+            }
             if (alf) {
 #ifdef N2_NO_WORLD_ALPHA
                 free(alf);        /* A/B control build: pre-M132-R2 behaviour */
@@ -2350,6 +2788,30 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
         }
     }
     return 0;
+}
+
+/* Sorts idx[0..n) back-to-front by dist[idx[i]] descending (farthest first),
+ * for correct alpha-blended draw order (M135-R): a nearer translucent
+ * surface must be drawn AFTER a farther one so it blends over it, not under
+ * it. Deterministic tie-break: the smaller original index wins, so two
+ * batches at equal distance always draw in the same relative order run to
+ * run (no flicker from an unstable sort). GL-free and renderer-agnostic on
+ * purpose -- it only touches plain index/float arrays, not N2Batch or any
+ * GL type, so it can be driven directly from a synthetic test without
+ * pulling in render.h's GL headers (see tools/car_material_test.c).
+ * ponytail: O(n^2) insertion sort -- translucent batch counts per frame are
+ * in the tens to low hundreds, not worth a heap/qsort comparator for; switch
+ * to qsort with an (index,dist) pair struct if this ever profiles hot. */
+static void n2_sort_back_to_front(int *idx, int n, const float *dist) {
+    for (int i = 1; i < n; i++) {
+        int cur = idx[i]; float cd = dist[cur];
+        int j = i - 1;
+        while (j >= 0 && (dist[idx[j]] < cd ||
+               (dist[idx[j]] == cd && idx[j] > cur))) {
+            idx[j+1] = idx[j]; j--;
+        }
+        idx[j+1] = cur;
+    }
 }
 
 #endif /* NFSU2_H */
