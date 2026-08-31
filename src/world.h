@@ -54,6 +54,7 @@ typedef struct {
     unsigned char *loc4; long loc4len;                       /* shared tex library */
     unsigned char *master; long masterlen; N2Tpk mastertpk;  /* single-region mode */
     N2Tex grass; int have_grass;                             /* terrain fallback */
+    N2LightSrc *lights; int nlights, lightcap;                /* authored 0x135003 */
     float (*mbb)[4];   /* per-mesh XY bbox (x0,y0,x1,y1) for culling + ground grid */
     WDistrict dist[WORLD_MAXDIST]; int ndist;  /* connected road components */
     int *navcomp;                             /* district index per nav node, -1 = none */

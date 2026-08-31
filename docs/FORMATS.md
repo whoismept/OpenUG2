@@ -35,6 +35,7 @@ guard that makes the assumption safe.
 |---|---|---|
 | generic chunks, track/car meshes, TPK, codecs | `src/nfsu2.h` | `N2Scene`, `N2Tex`, `N2Path` |
 | region loading, events, nav, ground/contact | `src/world.c` | `World` |
+| authored district lights (`0x135003`) | `n2_load_light_sources` in `src/nfsu2.h` | `World.lights` |
 | file mapping and content discovery | `src/resource.c` | caller |
 | car axle/track anchors in `GLOBALB.BUN` | `n2_global_wheel_attr` in `src/nfsu2.h` | `N2WheelAttr` |
 | generic `0x00135200` attribute records | `src/attrib.h` | diagnostic `N2Attrib` view |
@@ -508,6 +509,35 @@ happens later in `world_bind_textures`. The matching LOC4 pairs are sunrise
 profile-remapped. `SKYDOME` exactly and the `SKY_` prefix classify as sky;
 names merely containing those letters, such as `XB_SKYDOMEB_*` and
 `XB_FACTORYSKYLIGHT*`, remain ordinary geometry.
+
+### Authored district light sources (`0x135003`)
+
+**PROVEN.** STREAM bundles contain nested `0x00135003` leaves whose payload,
+after the leading `0x11` filler run, is a sequence of 96-byte records. The
+production parser uses the bounded recursive chunk walk; it does not search
+texture or geometry bytes for the leaf id.
+
+| record offset | type | current meaning / validation |
+|---|---|---|
+| `+0x07` | `u8` | enabled when exactly `1` |
+| `+0x0c` | `u32` | packed little-endian RGBA |
+| `+0x10` | `f32[3]` | world-space position |
+| `+0x1c` | `f32` | outer radius; require `0 < value <= 5000` |
+| `+0x30` | `f32` | inner radius; require `0 <= value <= outer` |
+
+The parser rejects a malformed leaf as a unit when its post-filler size is not
+divisible by 96, ignores disabled/non-finite/out-of-range records, and
+deduplicates exact accepted records. A map-wide 9999 m record is excluded by
+the measured 5 km safety ceiling rather than by an asset-name exception. Real
+single-region censuses produce 2,228 accepted unique sources in L4RA and 193
+in L4RB.
+
+These records do not own a texture slot. Rendering explicitly resolves the
+shipped `SFX_FLARE_GLOWA` key `0x17e5ebd2` through the normal regional -> LOC4
+-> master texture resolver, then draws camera-facing additive quads at night.
+The current renderer sizes the visual quad from the inner radius and retains
+the outer radius as validated source metadata; neither value participates in
+collision, ground, navigation or physics.
 
 Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
 own `STREAM*.BUN` TPK carries its

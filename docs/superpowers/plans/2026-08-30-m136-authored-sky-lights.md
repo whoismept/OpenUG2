@@ -97,7 +97,9 @@ Commit only Task 1 files with message `render: draw authored two-range sky`.
 - Modify: `src/world.h`
 - Modify: `src/world.c`
 - Modify: `src/main.c`
+- Modify: `src/render.c` / `src/render.h` (isolated light pass and state restoration)
 - Create: `tools/world_render_test.c`
+- Create: `tools/light_state_test.c` (asset-free real GL regression)
 - Modify: `Makefile`
 - Modify: `docs/FORMATS.md`
 - Modify: `docs/DEVELOPER_GUIDE.md`
@@ -106,7 +108,7 @@ Commit only Task 1 files with message `render: draw authored two-range sky`.
 - Consumes: bounded chunk walk, region buffers before `world_bind_textures`, `SFX_FLARE_GLOWA` key `0x17e5ebd2`, `RProg.uEmissiveTex`, shared quad.
 - Produces: `N2LightSrc`, `n2_load_light_sources`, `World.lights`/`World.nlights`, additive camera-facing light pass.
 
-- [ ] **Step 1: Write failing 0x135003 tests**
+- [x] **Step 1: Write failing 0x135003 tests**
 
 Create synthetic nested chunks containing exact 96-byte records and assert:
 
@@ -123,26 +125,32 @@ assert(n2_load_light_sources(truncated, truncated_len, out, 8) == 0);
 
 Add an exact duplicate fixture and require one output.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run `make world-render-test`. Expected: compile failure because `N2LightSrc` and `n2_load_light_sources` do not exist.
 
-- [ ] **Step 3: Implement the bounded parser**
+- [x] **Step 3: Implement the bounded parser**
 
 Walk only valid nested chunks. For `0x00135003`, skip the `0x11` prefix and reject the entire leaf unless the remaining body is a multiple of 96. Accept records only when byte `+0x07 == 1`; position `f32[3] @+0x10`; `r_out @+0x1c`; `r_in @+0x30`; packed RGBA `u32 @+0x0c`. Require finite coordinates inside ±60 km, `0 < r_out <= 5000`, and `0 <= r_in <= r_out`. Deduplicate exact accepted records. Read floats with `memcpy`.
 
-- [ ] **Step 4: Collect sources while World owns region bytes**
+- [x] **Step 4: Collect sources while World owns region bytes**
 
 Append/deduplicate every loaded region's sources before texture upload frees the buffers. Store them in dynamic `World.lights`; free them on shutdown. Expected retail census: L4RA 2,228 exact-unique local sources after rejecting the map-wide 9999 m source and malformed leaf; L4RB 193.
 
-- [ ] **Step 5: Render shipped additive halos**
+- [x] **Step 5: Render shipped additive halos**
 
 Resolve `SFX_FLARE_GLOWA` (`0x17e5ebd2`) from the normal regional texture map. At frame end, camera-distance cull lights using the ordinary view distance; construct a camera-facing quad from the shared quad mesh; size from `r_in` with a 1 m minimum; set authored RGB from packed color; use `uEmissiveTex`, depth test on, depth write off, `SRC_ALPHA, ONE`; restore MVP, alpha, blend, depth mask, texture and shader state.
 
-- [ ] **Step 6: Verify and capture**
+- [x] **Step 6: Verify and capture**
 
 Run `make world-render-test`, all existing parser/world tests, release/debug builds, `git diff --check`, and fixed night captures at the L4RA airport/city and L4RB airport. Confirm source counts, distance culling, no daytime hard-coded light, no solid billboard rectangles, and unchanged supported spawn/geometry counts.
 
-- [ ] **Step 7: Commit Task 2**
+Review follow-up: `make light-state-test` reproduced the leaked shader color
+before the fix. It now verifies exact pass-state restoration, depth occlusion
+even when depth testing was disabled at entry, distance culling, and black
+sprite edges adding zero under fog. The additive-fog assertion also failed
+before its isolated fix. These checks use synthetic GL input, not game assets.
+
+- [x] **Step 7: Commit Task 2**
 
 Commit only Task 2 files with message `render: draw authored district light sources`.

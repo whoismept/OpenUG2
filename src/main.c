@@ -2770,6 +2770,13 @@ int main(int argc, char **argv) {
     static unsigned char tmapmode[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+    GLuint district_light_tex = 0;
+    for (int j = 0; j < ntmap; j++)
+        if (tmapkey[j] == N2_TEX_SFX_FLARE_GLOWA) {
+            district_light_tex = tmaptex[j]; break;
+        }
+    printf("authored light texture: %s\n",
+           world.nlights == 0 ? "not needed" : district_light_tex ? "resolved" : "missing");
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
         printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
@@ -5401,7 +5408,7 @@ int main(int argc, char **argv) {
            sat between the vista and world passes and silently discarded every
            sky and vista draw from the total. */
         g_dbg.drawn = 0;
-        int skydraws = 0, vistadraws = 0;
+        int skydraws = 0, vistadraws = 0, districtdraws = 0;
         /* Authored sky: SKYDOME is a world-space shell split by its proven
            0x134B02 material ranges into an opaque dome and alpha cap. Draw it
            first with a deep frustum and no depth writes; the ordinary world
@@ -6335,6 +6342,14 @@ int main(int argc, char **argv) {
             glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
+        /* Authored point lights are render-only; gameplay owns no part of this pass. */
+        if (world.nlights && district_light_tex && g_dbg.show_track &&
+            g_dbg.night_mode && (passmode == 0 || passmode == 2)) {
+            districtdraws = render_district_lights(&rp, &quad, district_light_tex,
+                world.lights, world.nlights, cam, look, MVP, VIEW_DIST);
+            g_dbg.drawn += districtdraws;
+        }
+
         /* neon signs / bulbs / lens flares: additive pass at the very end of
            the 3D frame, using each mesh's own texture as its emissive colour
            (these never receive diffuse lighting in-game — they ARE the
@@ -6833,6 +6848,8 @@ int main(int argc, char **argv) {
                                        "full (fog-derived + vista) EXPERIMENTAL",
                                (double)VIEW_DIST, zfar);
                         printf("COUNT sky      draws %4d\n", skydraws);
+                        printf("COUNT lights   sources %4d  draws %4d\n",
+                               world.nlights, districtdraws);
                         printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                                "(skipped %d meshes in %d batches)\n",
                                vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
@@ -6848,7 +6865,8 @@ int main(int argc, char **argv) {
                         printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
                                ndrawn, nm, wbdrawn, nbatch, wbdrawn);
                         printf("COUNT car/glow/HUD draws %4d\n",
-                               g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+                               g_dbg.drawn - skydraws - vistadraws -
+                               districtdraws - wbdrawn);
                         /* render cost since the pose was pinned -- the old
                            figure divided total elapsed (including the scene
                            upload) by every frame and read ~17 ms for a scene
@@ -7041,6 +7059,8 @@ int main(int argc, char **argv) {
                            "full (fog-derived + vista) EXPERIMENTAL",
                    (double)VIEW_DIST, zfar);
             printf("COUNT sky      draws %4d\n", skydraws);
+            printf("COUNT lights   sources %4d  draws %4d\n",
+                   world.nlights, districtdraws);
             printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                    "(skipped %d meshes in %d batches)\n",
                    vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
@@ -7052,7 +7072,7 @@ int main(int argc, char **argv) {
             printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
                    ndrawn, nm, wbdrawn, nbatch, wbdrawn);
             printf("COUNT car/glow/HUD draws %4d\n",
-                   g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+                   g_dbg.drawn - skydraws - vistadraws - districtdraws - wbdrawn);
             printf("COUNT total    draws %4d\n", g_dbg.drawn);
             printf("visible scenery:");
             for (int sc=1; sc<=N2_SC_OTHER; sc++)
@@ -7161,6 +7181,7 @@ int main(int argc, char **argv) {
     dbgui_shutdown();
 #endif
     n2_free_scene(&scene);   /* region buffers already freed after texture upload */
+    free(world.lights);
     free(wmbatch);           /* wraps wbatch's GL handles; frees the array only */
     if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);

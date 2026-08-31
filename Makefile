@@ -78,6 +78,16 @@ car-material-test: tools/car_material_test.c src/nfsu2.h
 	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm
 	./build/car_material_test
 
+world-render-test: tools/world_render_test.c src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/world_render_test.c -o build/world_render_test -lm
+	./build/world_render_test
+
+light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/light_state_test.c src/render.c -o build/light_state_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/light_state_test
+
 world-cli-test: nfsu2
 	@set +e; \
 	./nfsu2 --spawn >/dev/null 2>&1; spawn_missing=$$?; \
@@ -107,4 +117,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test light-state-test

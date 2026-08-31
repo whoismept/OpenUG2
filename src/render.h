@@ -107,6 +107,13 @@ GLuint   make_wheel_blur_tex(void);     /* same rim, angular-averaged (spinning)
 GpuMesh  make_quad(void);               /* unit quad for HUD / billboards */
 void     draw_gpumesh(GpuMesh *g);
 
+/* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
+ * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */
+int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
+                           const N2LightSrc *lights, int nlights,
+                           const float cam[3], const float look[3],
+                           const float mvp[16], float viewdist);
+
 /* Merge the static world into per-(cell,texture) batches and upload them.
  * mtex = per-mesh resolved GL texture, texTerr = grass fallback for terrain
  * meshes without one. Sorted by texture so binds are rare. The CPU-side scene

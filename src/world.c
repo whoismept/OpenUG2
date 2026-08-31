@@ -12,6 +12,23 @@
 static void grid_build(World *w);
 static void nav_build_adj(World *w);
 
+static void world_append_lights(World *w, const N2LightSrc *src, int count) {
+    for (int i = 0; i < count; i++) {
+        int duplicate = 0;
+        for (int j = 0; j < w->nlights; j++)
+            if (n2_light_same(w->lights + j, src + i)) { duplicate = 1; break; }
+        if (duplicate) continue;
+        if (w->nlights == w->lightcap) {
+            int next = w->lightcap ? w->lightcap * 2 : 256;
+            N2LightSrc *grown = (N2LightSrc *)realloc(
+                w->lights, (size_t)next * sizeof *grown);
+            if (!grown) return;
+            w->lights = grown; w->lightcap = next;
+        }
+        w->lights[w->nlights++] = src[i];
+    }
+}
+
 /* ---- load-time duplicate stripper (Phase 48) ----
    The 8 STREAM*.BUN bundles are overlapping per-race supersets, not adjacent
    tiles, so stitching them (and even a single bundle on its own) stacks exact
@@ -190,6 +207,17 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
         g->data = n2_read_file(trackp, &g->len);
         g->mesh0 = g->mesh1 = w->scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
+        {
+            const int light_cap = 8192;
+            N2LightSrc *lights = (N2LightSrc *)malloc(
+                (size_t)light_cap * sizeof *lights);
+            if (lights) {
+                int nlight = n2_load_light_sources(g->data, g->len,
+                                                    lights, light_cap);
+                world_append_lights(w, lights, nlight);
+                free(lights);
+            }
+        }
         g->tpk = n2_tpk_open(g->data, g->len);
         int ntk = n2_tpk_keys(g->data, g->tpk, tkeys, 16384);
         if (w->loc4 && ntk < 16384)
@@ -246,6 +274,8 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
                    w->rgn[r].mesh1 - w->rgn[r].mesh0);
         }
     }
+
+    printf("authored local light sources: %d\n", w->nlights);
 
     /* strip coplanar duplicates before anything downstream sees the scene.
        This handles the overlapping-superset bundles under --track ALL: the 8
@@ -344,6 +374,28 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+        }
+        /* District light records have no mesh-owned texture slot. Request
+           their shipped flare through this same regional/shared resolver
+           while the STREAM bytes are still alive. */
+        if (w->nlights > 0 && n < cap) {
+            uint32_t tk = N2_TEX_SFX_FLARE_GLOWA;
+            int seen = 0;
+            for (int j = 0; j < n; j++) if (keys[j] == tk) { seen = 1; break; }
+            if (!seen) {
+                N2Tex tt = {0};
+                int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
+                if (!ok && w->loc4)
+                    ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
+                if (!ok && w->master)
+                    ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+                if (ok && !n2_tex_noise(&tt)) {
+                    keys[n] = tk; texs[n] = upload_tex(&tt);
+                    if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
+                    n++;
+                }
+                if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+            }
         }
         /* M132: vista impostors carry their own authored texture keys and are
            decoded from the same TPK, in the same pass, before the region bytes

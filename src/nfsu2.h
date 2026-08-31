@@ -18,6 +18,7 @@ enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
 
 enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
+#define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
 
 /* The shipped SKYDOME object is authored with the sunrise pair. Retail also
  * ships matching sunset/night dome+cap pairs in LOC4; choosing a profile
@@ -220,6 +221,78 @@ static uint32_t n2_u32(const unsigned char *p) {
 /* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
 static int n2_skip_filler(const unsigned char *p, int n) {
     int i = 0; while (i < n && p[i] == 0x11) i++; return i;
+}
+
+/* Shipped district point-light source (0x135003, 96-byte records). This is
+ * render metadata only: it never enters collision, ground or navigation. */
+typedef struct {
+    float pos[3], r_in, r_out;
+    uint32_t rgba;
+} N2LightSrc;
+
+static int n2_light_same(const N2LightSrc *a, const N2LightSrc *b) {
+    return a->rgba == b->rgba && a->pos[0] == b->pos[0] &&
+           a->pos[1] == b->pos[1] && a->pos[2] == b->pos[2] &&
+           a->r_in == b->r_in && a->r_out == b->r_out;
+}
+
+static int n2_light_walk(const unsigned char *d, long beg, long end,
+                         N2LightSrc *out, int cap, int *count) {
+    for (long o = beg; o < end;) {
+        if (end - o < 8) return 0;
+        uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
+        long payload = o + 8;
+        if ((uint64_t)size > (uint64_t)(end - payload)) return 0;
+        long next = payload + (long)size;
+        if (magic == 0x00135003u) {
+            const unsigned char *p = d + payload;
+            int skip = n2_skip_filler(p, (int)size);
+            long body = (long)size - skip;
+            /* One malformed leaf must not erase valid light leaves elsewhere
+               in the same STREAM bundle. Reject this leaf as a unit. */
+            if (body % 96 != 0) { o = next; continue; }
+            for (long r = 0; r < body; r += 96) {
+                const unsigned char *q = p + skip + r;
+                if (q[7] != 1) continue;
+                N2LightSrc light;
+                memcpy(&light.rgba, q + 0x0c, 4);
+                memcpy(&light.pos[0], q + 0x10, 4);
+                memcpy(&light.pos[1], q + 0x14, 4);
+                memcpy(&light.pos[2], q + 0x18, 4);
+                memcpy(&light.r_out, q + 0x1c, 4);
+                memcpy(&light.r_in, q + 0x30, 4);
+                if (!isfinite(light.pos[0]) || !isfinite(light.pos[1]) ||
+                    !isfinite(light.pos[2]) || !isfinite(light.r_out) ||
+                    !isfinite(light.r_in) || fabsf(light.pos[0]) > 60000.0f ||
+                    fabsf(light.pos[1]) > 60000.0f ||
+                    fabsf(light.pos[2]) > 60000.0f || light.r_out <= 0.0f ||
+                    light.r_out > 5000.0f || light.r_in < 0.0f ||
+                    light.r_in > light.r_out) continue;
+                int duplicate = 0;
+                for (int i = 0; i < *count; i++)
+                    if (n2_light_same(out + i, &light)) { duplicate = 1; break; }
+                if (duplicate) continue;
+                if (*count >= cap) return 0;
+                out[(*count)++] = light;
+            }
+        } else if (magic && (magic >> 28) == 8) {
+            if (!n2_light_walk(d, payload, next, out, cap, count)) return 0;
+        }
+        o = next;
+    }
+    return 1;
+}
+
+static int n2_load_light_sources(const unsigned char *d, long len,
+                                 N2LightSrc *out, int cap) {
+    if (!d || len < 0 || !out || cap <= 0) return 0;
+    N2LightSrc *tmp = (N2LightSrc *)malloc((size_t)cap * sizeof *tmp);
+    if (!tmp) return 0;
+    int count = 0;
+    int ok = n2_light_walk(d, 0, len, tmp, cap, &count);
+    if (ok && count) memcpy(out, tmp, (size_t)count * sizeof *out);
+    free(tmp);
+    return ok ? count : 0;
 }
 
 /* ---- mesh extraction ---- */

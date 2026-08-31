@@ -86,6 +86,7 @@ data root
   │    res_list_tracks / res_list_cars / res_list_circuits
   ├─ world_load
   │    ├─ map STREAM region bytes
+  │    ├─ decode authored 0x135003 light sources into World.lights
   │    ├─ open regional/shared TPK indices
   │    ├─ n2_walk_meshes
   │    │    chunk object -> transform -> material ranges -> N2Mesh
@@ -269,6 +270,33 @@ alpha-blended cap second, then restores blending, depth mask, fog density,
 shader gates and the ordinary MVP. Exact `SKYDOME`/`SKY_` classification is an
 invariant: broad substring matching moves buildings and factory skylights into
 this special pass and is forbidden.
+
+### Authored district lights
+
+`world_load_ex` extracts enabled `0x135003` light records while each
+`WRegion.data` buffer is still owned by the world. It appends exact-unique
+records to dynamic `World.lights` storage before texture upload releases the
+STREAM bytes. `main` frees that array at shutdown; scene meshes and texture
+objects do not own it.
+
+Light records have no mesh texture slot, so `world_bind_textures` explicitly
+requests the shipped `SFX_FLARE_GLOWA` key through the same regional/LOC4/master
+resolver as world materials. Do not add a second texture decoder or keep
+region bytes alive after binding merely for lights.
+
+At night, sources inside the ordinary fog-derived view distance draw as
+camera-facing quads in `render_district_lights`. This late additive pass enables
+depth testing, turns depth writes off, consumes texture alpha through
+`uEmissiveTex`, and restores the incoming uniforms, texture, blend factors and
+blend/depth enable/write state. Like other mesh draws, it sets vertex attributes
+and buffers; the caller binds the main program on texture unit zero. Additive
+emission fades toward zero, not fog RGB, so distant black sprite edges do not
+add colored rectangles. `make light-state-test` verifies this on a real SDL/GL
+context with synthetic textures, including an occluded light and deliberately
+different incoming state; it requires no retail assets. Daylight
+draws zero authored light quads. Fixed M136 reference poses draw 197 of 2,228
+L4RA sources and 64 of 193 L4RB sources; these numbers prove distance culling,
+not a universal visibility count for every camera.
 
 ### Visibility tiers
 

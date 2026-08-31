@@ -14,6 +14,82 @@
 #  define GLSL_HEADER "#version 120\n#define lowp\n#define mediump\n#define highp\n"
 #endif
 
+int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
+                           const N2LightSrc *lights, int nlights,
+                           const float cam[3], const float look[3],
+                           const float MVP[16], float viewdist) {
+    RProg rp = *r;
+    int draws = 0;
+    const GLint scalar_loc[] = {rp.uUnlit, rp.uEmissiveTex, rp.uUseTex,
+                                rp.uSoft, rp.uAlpha};
+    float scalars[5], color[3], fog_color[3], saved_mvp[16];
+    for (int i=0; i<5; i++) glGetUniformfv(rp.prog,scalar_loc[i],scalars+i);
+    glGetUniformfv(rp.prog,rp.uColor,color);
+    glGetUniformfv(rp.prog,rp.uFogColor,fog_color);
+    glGetUniformfv(rp.prog,rp.uMVP,saved_mvp);
+    GLint texture_before, blend_src_rgb, blend_dst_rgb, blend_src_a, blend_dst_a;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture_before);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB,&blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&blend_src_a);
+    glGetIntegerv(GL_BLEND_DST_ALPHA,&blend_dst_a);
+    GLboolean blend_before=glIsEnabled(GL_BLEND), depth_before=glIsEnabled(GL_DEPTH_TEST);
+    GLboolean depth_mask; glGetBooleanv(GL_DEPTH_WRITEMASK,&depth_mask);
+    float ll = sqrtf(look[0]*look[0] + look[1]*look[1] + look[2]*look[2]);
+    if (ll < 1e-4f) ll = 1.0f;
+    float ld[3] = {look[0]/ll, look[1]/ll, look[2]/ll};
+    float rt[3] = {ld[1], -ld[0], 0};
+    float rl = sqrtf(rt[0]*rt[0] + rt[1]*rt[1]);
+    if (rl < 1e-4f) rl = 1.0f;
+    rt[0] /= rl; rt[1] /= rl;
+    float up[3] = {rt[1]*ld[2], -rt[0]*ld[2],
+                   rt[0]*ld[1] - rt[1]*ld[0]};
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+    glUniform1f(rp.uUnlit, 0.0f); glUniform1f(rp.uEmissiveTex, 1.0f);
+    glUniform1f(rp.uUseTex, 1.0f); glUniform1f(rp.uSoft, 0.0f);
+    /* Additive emission fades toward zero, not fog RGB: black sprite edges
+       must add nothing even at long distance. The sky path is unaffected. */
+    glUniform3f(rp.uFogColor,0.0f,0.0f,0.0f);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    float maxd2 = viewdist * viewdist;
+    for (int i = 0; i < nlights; i++) {
+        const N2LightSrc *light = &lights[i];
+        float dx = light->pos[0]-cam[0], dy = light->pos[1]-cam[1],
+              dz = light->pos[2]-cam[2];
+        if (dx*dx + dy*dy + dz*dz > maxd2) continue;
+        float s = light->r_in > 1.0f ? light->r_in : 1.0f;
+        float M[16] = {
+            rt[0]*s,rt[1]*s,rt[2]*s,0,
+            up[0]*s,up[1]*s,up[2]*s,0,
+            0,0,1,0,
+            light->pos[0]-(rt[0]+up[0])*s*0.5f,
+            light->pos[1]-(rt[1]+up[1])*s*0.5f,
+            light->pos[2]-(rt[2]+up[2])*s*0.5f,1
+        };
+        float LMVP[16]; mat_mul(MVP, M, LMVP);
+        glUniformMatrix4fv(rp.uMVP, 1, GL_FALSE, LMVP);
+        glUniform3f(rp.uColor,
+            (float)( light->rgba        & 0xffu) / 255.0f,
+            (float)((light->rgba >> 8)  & 0xffu) / 255.0f,
+            (float)((light->rgba >> 16) & 0xffu) / 255.0f);
+        glUniform1f(rp.uAlpha, (float)((light->rgba >> 24) & 0xffu) / 255.0f);
+        draw_gpumesh(quad); draws++;
+    }
+    for (int i=0; i<5; i++) glUniform1f(scalar_loc[i],scalars[i]);
+    glUniform3fv(rp.uColor,1,color);
+    glUniform3fv(rp.uFogColor,1,fog_color);
+    glUniformMatrix4fv(rp.uMVP,1,GL_FALSE,saved_mvp);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)texture_before);
+    glBlendFuncSeparate((GLenum)blend_src_rgb,(GLenum)blend_dst_rgb,
+                        (GLenum)blend_src_a,(GLenum)blend_dst_a);
+    if (blend_before) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (depth_before) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthMask(depth_mask);
+    return draws;
+}
+
 static const char *VS =
     GLSL_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
