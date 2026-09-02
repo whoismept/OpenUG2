@@ -28,6 +28,22 @@ OpenUG2 is an **early clean-room engine prototype**, not yet a finished or
 drop-in replacement for the original game. The asset → render → drive → race
 pipeline works, but only selected content has been verified end to end.
 
+### Current development screenshots
+
+These are unedited captures from the current single-region `--world2` path,
+rendered from user-supplied retail data. They show the engine's present state,
+not a finished release or a claim of pixel-perfect retail fidelity.
+
+| L4RA city scene | L4RB suspension bridge |
+| --- | --- |
+| ![OpenUG2 rendering an L4RA city scene](docs/images/openug2-l4ra-city.png) | ![OpenUG2 rendering the L4RB suspension bridge](docs/images/openug2-l4rb-bridge.png) |
+
+![OpenUG2 rendering an L4RA tunnel and roadway](docs/images/openug2-l4ra-tunnel.png)
+
+Known defects are tracked alongside the progress. For example,
+[#6](https://github.com/whoismept/OpenUG2/issues/6) documents a reproducible
+world-surface artifact with its own capture and acceptance criteria.
+
 ### Working today
 
 - **Track assets** — parses `STREAM*.BUN` scenery and object transforms, emits
