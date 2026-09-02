@@ -34,11 +34,13 @@ These are unedited captures from the current single-region `--world2` path,
 rendered from user-supplied retail data. They show the engine's present state,
 not a finished release or a claim of pixel-perfect retail fidelity.
 
-| L4RA city scene | L4RB suspension bridge |
+| Golf — L4RA city road | Miata — L4RA hillside |
 | --- | --- |
-| ![OpenUG2 rendering an L4RA city scene](docs/images/openug2-l4ra-city.png) | ![OpenUG2 rendering the L4RB suspension bridge](docs/images/openug2-l4rb-bridge.png) |
+| ![OpenUG2 Golf on an L4RA city road](docs/images/openug2-golf-city-road.png) | ![OpenUG2 Miata on an L4RA hillside road](docs/images/openug2-miata-hillside.png) |
 
-![OpenUG2 rendering an L4RA tunnel and roadway](docs/images/openug2-l4ra-tunnel.png)
+| 350Z — L4RB suspension bridge | Eclipse — L4RB wooded road |
+| --- | --- |
+| ![OpenUG2 350Z on the L4RB suspension bridge](docs/images/openug2-350z-suspension-bridge.png) | ![OpenUG2 Eclipse on a wooded L4RB road](docs/images/openug2-eclipse-wooded-road.png) |
 
 Known defects are tracked alongside the progress. For example,
 [#6](https://github.com/whoismept/OpenUG2/issues/6) documents a reproducible
