@@ -118,6 +118,13 @@ has the home section. It builds a local prototype library from that bundle,
 places in-range non-ground instances with their instance matrices, and emits
 the one-time ROAD/TERRAIN fallback prototypes before the normal world pipeline:
 
+The fixed-neighborhood diagnostic uses a 1000 m placement radius. At the
+airport reference it emits 13,797 post-dedup meshes (2,149 eligible
+placements), versus 12,017 at the former 700 m radius. Loading the whole bundle
+at 7000 m emits 96,841 post-dedup meshes, confirming that the complete STREAM
+superset cannot be one resident scene. Production `--world2` free-roam now uses
+the M144 moving-resident policy documented below.
+
 Instance model identity is the authored key, not the display name. The section
 walker carries the three keys from each type record into `WInstPlacement`;
 `winst_library_resolve` tries the primary then the explicit available alternatives.
@@ -177,7 +184,11 @@ The common library supplies textures only; its keys are not added to prototype
 or submesh material selection. All STREAM buffers survive binding; the common
 bytes and TPK index are freed/reset at its end. A missing
 record and a decoded-but-noise-rejected texture are different failures; keep
-those counters separate.
+those counters separate. A measured example is common key `2e95ce7d`,
+`SFX_LIGHT_BEAMB` (32x256, tagged DXT3): the positional hanging-light material
+references it, but the current decode is high-frequency colour noise and is
+rejected. Do not force that key into instance material selection until its data
+layout/offset is decoded correctly; the existing regional fallback is safer.
 
 ### Scene ownership
 
@@ -688,6 +699,116 @@ This tool does **not** enable or disable groups in the engine. Event membership
 is proven; activation timing, race direction and career-stage state are not.
 Some venue graphics (six in RB) have no override membership. Do not convert
 this audit into a blanket name-prefix filter or section-level suppression.
+
+### Scenery preview (M140, opt-in; not live activation)
+
+The checked reader is shared from `src/world_group_reader.h`. The separate
+selection policy in `src/world_scenery.h` hides only exclusively numeric-event
+memberships; ordinary/shared/unknown placements remain. Both rendering and
+collision are built from that same filtered scene. Default loading is unchanged.
+
+For a bounded city comparison, run these as three independent loads:
+
+```sh
+./nfsu2 /path/to/NFSU2 --world2 --track STREAML4RA \
+  --spawn 1837.844,-791.08 --heading 90 --car GOLF \
+  --scenery-preview free --shot free.png --frames 1
+./nfsu2 /path/to/NFSU2 --world2 --track STREAML4RA \
+  --spawn 1837.844,-791.08 --heading 90 --car GOLF \
+  --scenery-preview 4144 --shot event4144.png --frames 1
+# Repeat the first command with a different output name, then compare hashes.
+```
+
+`--instance-audit` can replace the capture flags for a GL-free assembly check.
+The preview cannot be used interactively, with `--event`, race/drive audits,
+or alternate-spawn captures/audits. Event selection here does not arm a race.
+An unrecognized numeric event or inconsistent group data fails loading; it
+does not silently fall back to an unfiltered scene.
+
+At this RA pose with the current 1000 m chunk, free suppresses 258 placements;
+event 4144 suppresses 226, restoring 32 placements / 92 emitted meshes / 604
+triangles. The fixed-camera start/finish strip returns without moving the road
+or neighboring scenery.
+The standard RB slot-16 neighborhood has no affected exclusive memberships;
+its unchanged preview is a negative control, not evidence of missing filtering.
+
+Run `make world-instance-test world-group-test world-cli-test` for synthetic
+off/event/off coverage. The instance fixture uses identical model names for
+five placements with different memberships; it checks emitted meshes and real
+wall-contact responses, shared memberships, unknown events and corrupt targets.
+Runtime direction/career selection is still unimplemented. Do not present this
+preview as retail free-roam fidelity or automatic Enter/finish activation.
+
+### Moving world neighborhood (M144, `--world2` free-roam)
+
+The instance-driven world keeps one replaceable `WorldResident`. Persistent
+navigation, districts, events and race state stay in `WorldCity`; geometry,
+ground grid, regional texture sources, lights and bounds live in
+`WorldNeighborhood`. `WorldResidentResources` owns the matching GL textures,
+ordinary/sky/glow/vista batches, per-mesh material maps and solid-collision
+arrays. Do not cache a scene mesh or batch index outside that package.
+
+Resident replacement is transactional and synchronous:
+
+1. `world_resident_target` snaps the player to a deterministic 400 m cell.
+2. `world_neighborhood_load` builds a candidate without activating its grid.
+3. CPU validation checks finite geometry/index/bounds, zero rejected instances
+   and ROAD/TERRAIN support under the current player layer.
+4. `world_resident_resources_build` resolves textures and uploads every pass,
+   then builds collision from that same candidate scene.
+5. At a frame boundary `world_resident_activate` swaps the complete owner and
+   activates its ground grid; only then is the former resident destroyed.
+
+Build failure leaves the old resident active and the failed snapped cell is not
+retried until the player targets another cell. Player position, velocity,
+heading, sprung ride/contact state, camera and input are deliberately outside
+the resident and must remain byte-identical across activation. This path is
+free-roam-only, requires one explicit STREAM bundle and never uses `--track ALL`.
+
+`WorldNeighborhood.master` records whether the master resource came from
+`mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only
+for heap data; treating both as heap allocations caused a real L4RB shutdown
+crash and is covered by `world-resident-test`.
+
+The measured production policy is `{resident=1400, draw=933, safety=67,
+cell=400}` metres. Its invariant is `resident >= draw + cell + safety`; 1200 m
+is therefore invalid even if one test camera appears complete. Measurements at
+the supported L4RA start / L4RB sprint-grid pose:
+
+| radius | L4RA meshes / batches / textures / GPU ms | L4RB meshes / batches / textures / GPU ms |
+|---:|---:|---:|
+| 1000 | 15880 / 3214 / 424 / 511 | 3179 / 642 / 128 / 45 |
+| 1200 | 19076 / 3780 / 570 / 701 | 3730 / 879 / 240 / 93 |
+| **1400** | **23768 / 4528 / 694 / 1077** | **4142 / 1059 / 277 / 101** |
+| 1600 | 31557 / 5397 / 777 / 1546 | 6916 / 1449 / 371 / 135 |
+
+Use `--resident-audit RADIUS X Y` with `--world2`, one explicit `--track` and
+`--spawn` to measure the real loader/uploader. The audit is rejected for legacy,
+`ALL` and `--event` modes. Times are synchronous development measurements, not
+frame-budget promises; asynchronous/background loading is intentionally not in
+M144.
+
+Use `--resident-route-audit PREFIX` with the same mode guards to exercise the
+production transaction across two supported navigation points. The audit takes
+`PREFIX_before.png`, `PREFIX_swap1.png`, `PREFIX_after1.png`,
+`PREFIX_swap2.png` and `PREFIX_after2.png`, and fails if support, mesh-to-batch
+or obstacle-source ownership is invalid. It freezes vehicle physics only; route
+points come from the persistent navigation graph and must resolve to ROAD or
+TERRAIN in the active resident.
+
+The final deterministic routes were:
+
+| region | resident centers | final mesh / batch / texture / obstacle counts |
+|---|---|---:|
+| L4RA | `(1600,-400)` -> `(1200,-400)` | 37728 / 6159 / 873 / 17745 |
+| L4RB | `(800,400)` -> `(400,400)` | 4103 / 1020 / 253 / 1878 |
+
+Two independent runs per region produced identical hashes for every
+corresponding capture and repeated the same centers and counts. L4RB remained
+visually coherent from road to suspension bridge. A persistent black
+panel/strip family near the L4RA `(1200,-400)` resident appears in both swap and
+post-swap captures; it is therefore a separate map/material defect, not a
+one-frame residency tear.
 
 ## 14. Common failure patterns
 

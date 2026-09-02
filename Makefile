@@ -25,8 +25,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_mesh.h src/world_capture_policy.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -68,9 +68,9 @@ build/%.dbg.o: src/%.c $(HDRS) $(GEN)
 debug: $(DBG_OBJ) $(IMGUI_OBJ)
 	$(CXX) -O2 $(DBG_OBJ) $(IMGUI_OBJ) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
 
-world-instance-test: tools/world_instance_test.c src/world_instance.c src/world_instance.h src/world_capture_policy.h src/nfsu2.h
+world-instance-test: tools/world_instance_test.c src/world_instance.c src/physics.c src/physics.h src/world_instance.h src/world_capture_policy.h src/nfsu2.h src/world_group_reader.h src/world_scenery.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c -o build/world_instance_test -lm
+	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c src/physics.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
 car-material-test: tools/car_material_test.c src/nfsu2.h
@@ -83,12 +83,17 @@ world-render-test: tools/world_render_test.c src/nfsu2.h
 	$(CC) $(CFLAGS) -Isrc tools/world_render_test.c -o build/world_render_test -lm
 	./build/world_render_test
 
-world-group-test: tools/world_group_test.c tools/world_group_reader.h
+world-resident-test: tools/world_resident_test.c src/world_resident.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DWORLD_RESIDENT_TESTING -Isrc tools/world_resident_test.c src/world_resident.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/world_resident_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/world_resident_test
+
+world-group-test: tools/world_group_test.c src/world_group_reader.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_test.c -o build/world_group_test
 	./build/world_group_test
 
-world-group-audit: tools/world_group_audit.c tools/world_group_reader.h src/world_instance.c src/world_instance.h src/nfsu2.h
+world-group-audit: tools/world_group_audit.c src/world_group_reader.h src/world_scenery.h src/world_instance.c src/world_instance.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_audit.c -o build/world_group_audit -lm
 
@@ -97,9 +102,9 @@ light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/light_state_test.c src/render.c -o build/light_state_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/light_state_test
 
-world-texture-test: tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/render.c $(HDRS) src/world.h
+world-texture-test: tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/world_resident.c src/render.c src/physics.c $(HDRS) src/world.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/render.c -o build/world_texture_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/world_texture_test.c src/world.c src/resource.c src/world_instance.c src/world_resident.c src/render.c src/physics.c -o build/world_texture_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/world_texture_test
 
 world-cli-test: nfsu2
@@ -108,14 +113,41 @@ world-cli-test: nfsu2
 	./nfsu2 --heading >/dev/null 2>&1; heading_missing=$$?; \
 	./nfsu2 --spawn malformed >/dev/null 2>&1; spawn_bad=$$?; \
 	./nfsu2 --heading malformed >/dev/null 2>&1; heading_bad=$$?; \
+	./nfsu2 --scenery-preview >/dev/null 2>&1; scenery_missing=$$?; \
+	./nfsu2 --scenery-preview banana >/dev/null 2>&1; scenery_bad=$$?; \
+	./nfsu2 --scenery-preview free --instance-audit >/dev/null 2>&1; scenery_legacy=$$?; \
+	./nfsu2 --world2 --spawn start --track STREAML4RA --scenery-preview free >/dev/null 2>&1; scenery_live=$$?; \
+	./nfsu2 /nonexistent/openug-test-data --world2 --spawn start --track STREAML4RA --scenery-preview free --shot /dev/null --static-spawn-audit STREAML4RA >/dev/null 2>&1; scenery_spawn=$$?; \
+	./nfsu2 /nonexistent/openug-test-data --world2 --spawn start --track STREAML4RA --scenery-preview free --shot /dev/null --surface-stack STREAML4RA 0 0 >/dev/null 2>&1; scenery_stack=$$?; \
 	./nfsu2 build/no-such-data-root --track STREAML4RA --world2 --spawn start \
 	  --objdump /dev/null >/dev/null 2>&1; world2_load_fail=$$?; \
+	./nfsu2 --resident-audit 1400 0 0 --spawn start --track STREAML4RA \
+	  >/dev/null 2>&1; resident_legacy=$$?; \
+	./nfsu2 --world2 --resident-audit 1400 0 0 --spawn start --track ALL \
+	  >/dev/null 2>&1; resident_all=$$?; \
+	./nfsu2 --world2 --resident-audit 1400 0 0 --spawn start --track STREAML4RA \
+	  --event 4001 >/dev/null 2>&1; resident_race=$$?; \
+	./nfsu2 build/no-such-data-root --world2 --resident-audit 1400 0 0 \
+	  --spawn start --track STREAML4RA >/dev/null 2>&1; resident_valid=$$?; \
+	./nfsu2 --resident-route-audit /tmp/openug-rra --spawn start \
+	  --track STREAML4RA >/dev/null 2>&1; resident_route_legacy=$$?; \
+	./nfsu2 --world2 --resident-route-audit /tmp/openug-rra --spawn start \
+	  --track STREAML4RA --event 4001 >/dev/null 2>&1; resident_route_race=$$?; \
+	./nfsu2 build/no-such-data-root --world2 \
+	  --resident-route-audit /tmp/openug-rra --spawn start \
+	  --track STREAML4RA >/dev/null 2>&1; resident_route_valid=$$?; \
 	if test $$spawn_missing -eq 2 && test $$heading_missing -eq 2 && \
 	   test $$spawn_bad -eq 2 && test $$heading_bad -eq 2 && \
-	   test $$world2_load_fail -eq 1; then \
+	   test $$scenery_missing -eq 2 && test $$scenery_bad -eq 2 && \
+	   test $$scenery_legacy -eq 2 && test $$scenery_live -eq 2 && \
+	   test $$scenery_spawn -eq 2 && test $$scenery_stack -eq 2 && \
+	   test $$world2_load_fail -eq 1 && test $$resident_legacy -eq 2 && \
+	   test $$resident_all -eq 2 && test $$resident_race -eq 2 && \
+	   test $$resident_valid -eq 1 && test $$resident_route_legacy -eq 2 && \
+	   test $$resident_route_race -eq 2 && test $$resident_route_valid -eq 1; then \
 	  echo "world_cli_test: PASS"; \
 	else \
-	  echo "world_cli_test: FAIL missing-spawn=$$spawn_missing missing-heading=$$heading_missing bad-spawn=$$spawn_bad bad-heading=$$heading_bad world2-load=$$world2_load_fail"; \
+	  echo "world_cli_test: FAIL missing-spawn=$$spawn_missing missing-heading=$$heading_missing bad-spawn=$$spawn_bad bad-heading=$$heading_bad world2-load=$$world2_load_fail scenery-missing=$$scenery_missing scenery-bad=$$scenery_bad scenery-legacy=$$scenery_legacy scenery-live=$$scenery_live scenery-spawn=$$scenery_spawn scenery-stack=$$scenery_stack resident-legacy=$$resident_legacy resident-all=$$resident_all resident-race=$$resident_race resident-valid=$$resident_valid resident-route-legacy=$$resident_route_legacy resident-route-race=$$resident_route_race resident-route-valid=$$resident_route_valid"; \
 	  exit 1; \
 	fi
 
@@ -131,4 +163,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test light-state-test world-texture-test world-group-test world-group-audit
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test light-state-test world-texture-test world-group-test world-group-audit

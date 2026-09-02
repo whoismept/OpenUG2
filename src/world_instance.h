@@ -31,6 +31,7 @@ typedef struct {
     long keyed_models;
     long lod_fallbacks;
     long unkeyed_models;
+    long scenery_hidden; /* explicit event preview only; before scene emission */
     int regions_total;
     int regions_selected;
     int home_region;
@@ -55,6 +56,14 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
                          float focus_x, float focus_y, float view_radius,
                          const unsigned char *shared, long shared_len,
                          WInstStats *stats);
+/* Explicit load-time scenery preview: 0 = unchanged, -1 = free roam,
+ * positive = authored event group id. Not a live race/career state machine. */
+int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
+                         const char *track_root,
+                         const char *const *bundles, int bundle_count,
+                         float focus_x, float focus_y, float view_radius,
+                         const unsigned char *shared, long shared_len,
+                         WInstStats *stats, int scenery_event);
 
 #ifdef WORLD_INSTANCE_TESTING
 typedef int (*WInstVisitFn)(const WInstPlacement *placement,

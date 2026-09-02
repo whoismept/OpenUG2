@@ -10,6 +10,7 @@
  * 100MB shared "master" region costs just the bytes actually read (TPK header
  * + the few textures we decode), not a full load. NULL on failure. */
 unsigned char *res_map_file(const char *path, long *len);
+void res_unmap_file(unsigned char *data, long len);
 
 /* Enumerate selectable tracks: STREAM*.BUN files under troot. Writes up to
  * max names (extension stripped) and sets *sel to the entry matching cur.

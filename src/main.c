@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <assert.h>
+#include <time.h>
 #include <unistd.h>   /* execvp: menu track-switch re-launches the process */
 #include <SDL.h>
 
@@ -31,6 +32,7 @@
 #include "audio.h"
 #include "resource.h"
 #include "world.h"
+#include "world_resident.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "world_capture_policy.h"
 #include "debug.h"
@@ -64,6 +66,25 @@ DbgState g_dbg = {
        would ever clear it -- main.c would relaunch the process every frame. */
     .want_car = -1, .want_track = -1,
 };
+
+static int capture_frame_png(const char *path, int width, int height) {
+    if (!path || width <= 0 || height <= 0) return 0;
+    size_t bytes = (size_t)width * (size_t)height * 3;
+    unsigned char *pixels = (unsigned char *)malloc(bytes);
+    unsigned char *flipped = (unsigned char *)malloc(bytes);
+    if (!pixels || !flipped) {
+        free(pixels); free(flipped);
+        return 0;
+    }
+    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+    for (int y = 0; y < height; y++)
+        memcpy(flipped + (size_t)y * (size_t)width * 3,
+               pixels + (size_t)(height - 1 - y) * (size_t)width * 3,
+               (size_t)width * 3);
+    write_png(path, width, height, flipped);
+    free(pixels); free(flipped);
+    return 1;
+}
 
 /* ---- Per-car wheel stance ------------------------------------------------
  * Primary source is the GLOBALB per-car table (n2_global_wheel_attr): the
@@ -719,7 +740,7 @@ static float seg_d2_m112(float px,float py,float ax,float ay,float bx,float by,
  * Returns 1 when a race is armed and a grid exists. */
 static int race_place_on_grid(const World *w, const N2Scene *sc,
                               float carpos[3], float *heading0) {
-    if (!w->race.active || w->race.ngrid <= 0 || w->race.ngate <= 0) return 0;
+    if (!w->city.race.active || w->city.race.ngrid <= 0 || w->city.race.ngate <= 0) return 0;
     /* Stand the car on a SHIPPED grid slot rather than rebuilding a position
        around gate 0. Event 4201 ships two 10-slot grids -- one per race
        direction, as the Phase 72 note recorded -- and the old rule kept only the
@@ -730,36 +751,36 @@ static int race_place_on_grid(const World *w, const N2Scene *sc,
        other cluster's Z sits 6.6 m above its ground), and among those the one
        nearest gate 0 wins -- that is the cluster belonging to this direction of
        travel (260 m from gate 0 versus 1953 m for the far-end grid). */
-    const WGate *g0 = &w->race.gate[0];
+    const WGate *g0 = &w->city.race.gate[0];
     int best = -1; float bestd = 1e30f, bestz = 0;
     for (int pass = 0; pass < 2 && best < 0; pass++)
-        for (int i = 0; i < w->race.ngrid; i++) {
-            float gz = w->race.grid[i][2];
-            int cat = world_ground_at(sc, w->race.grid[i][0], w->race.grid[i][1],
-                                      w->race.grid[i][2], &gz);
+        for (int i = 0; i < w->city.race.ngrid; i++) {
+            float gz = w->city.race.grid[i][2];
+            int cat = world_ground_at(sc, w->city.race.grid[i][0], w->city.race.grid[i][1],
+                                      w->city.race.grid[i][2], &gz);
             if (cat == WSURF_NONE) continue;
             if (pass == 0) {   /* first pass: the slot must sit on its own layer */
-                float dz = gz - w->race.grid[i][2]; if (dz < 0) dz = -dz;
+                float dz = gz - w->city.race.grid[i][2]; if (dz < 0) dz = -dz;
                 if (cat != WSURF_ROAD || dz > 1.0f) continue;
             }
-            float dx = w->race.grid[i][0] - g0->x, dy = w->race.grid[i][1] - g0->y;
+            float dx = w->city.race.grid[i][0] - g0->x, dy = w->city.race.grid[i][1] - g0->y;
             float d2 = dx*dx + dy*dy;
             if (d2 < bestd) { bestd = d2; best = i; bestz = gz; }
         }
     if (best < 0) return 0;
-    carpos[0] = w->race.grid[best][0];
-    carpos[1] = w->race.grid[best][1];
+    carpos[0] = w->city.race.grid[best][0];
+    carpos[1] = w->city.race.grid[best][1];
     carpos[2] = bestz;                       /* the layer under the slot */
         g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
     /* the records carry no orientation (their direction fields are all zero),
        so face along the event's own route: gate 0 towards the next gate. */
-    if (w->race.ngate > 1) {
-        const WGate *g1 = &w->race.gate[1];
+    if (w->city.race.ngate > 1) {
+        const WGate *g1 = &w->city.race.gate[1];
         *heading0 = atan2f(g1->y - g0->y, g1->x - g0->x);
     } else *heading0 = atan2f(g0->dy, g0->dx);
     printf("race start: grid slot %d of %d at (%.3f, %.3f, %.3f) on its own %s "
            "layer, %.1f m from gate 0, heading %+.4f\n",
-           best, w->race.ngrid, carpos[0], carpos[1], carpos[2], "ROAD",
+           best, w->city.race.ngrid, carpos[0], carpos[1], carpos[2], "ROAD",
            sqrtf(bestd), *heading0);
     return 1;
 }
@@ -1188,6 +1209,7 @@ int main(int argc, char **argv) {
          --shot out.png   render one frame and exit
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
          --world2         opt into diagnostic instance-driven world assembly
+         --scenery-preview free|EVENT  load-time event-only scenery test (world2 capture/audit only)
          --sky PROFILE    authored sky: night (default), sunrise, or sunset
          --spawn start|X,Y  focus/spawn for --world2 (required)
          --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
@@ -1252,6 +1274,10 @@ int main(int argc, char **argv) {
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
     int world2 = 0, instance_audit = 0;
+    int resident_audit = 0;
+    const char *resident_route_audit = NULL;
+    float resident_audit_radius = 0.0f, resident_audit_xy[2] = {0.0f, 0.0f};
+    int scenery_event = 0;
     int world2_spawn_set = 0, world2_heading_set = 0;
     float world2_spawn_xy[2] = {0, 0}, world2_heading_deg = 0.0f;
     const char *carname = "HUMMER", *trackname = "ALL";
@@ -1375,6 +1401,49 @@ int main(int argc, char **argv) {
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
         else if (!strcmp(argv[i], "--world2")) world2 = 1;
+        else if (!strcmp(argv[i], "--resident-audit")) {
+            if (i+3 >= argc) {
+                fprintf(stderr, "--resident-audit requires RADIUS X Y\n");
+                return 2;
+            }
+            char *end = NULL;
+            resident_audit_radius = strtof(argv[++i], &end);
+            if (!end || *end || !isfinite(resident_audit_radius) ||
+                resident_audit_radius <= 0.0f) {
+                fprintf(stderr, "invalid --resident-audit radius '%s'\n", argv[i]);
+                return 2;
+            }
+            for (int axis = 0; axis < 2; axis++) {
+                end = NULL;
+                resident_audit_xy[axis] = strtof(argv[++i], &end);
+                if (!end || *end || !isfinite(resident_audit_xy[axis])) {
+                    fprintf(stderr, "invalid --resident-audit coordinate '%s'\n", argv[i]);
+                    return 2;
+                }
+            }
+            resident_audit = 1;
+        }
+        else if (!strcmp(argv[i], "--resident-route-audit") && i+1 < argc)
+            resident_route_audit = argv[++i];
+        else if (!strcmp(argv[i], "--scenery-preview")) {
+            if (i+1 >= argc) {
+                fprintf(stderr,"--scenery-preview requires free or a positive event id\n");return 2;
+            }
+            const char *p=argv[++i];
+            if (!strcmp(p,"free")) scenery_event=-1;
+            else {
+                unsigned value=0;
+                if (!*p) {fprintf(stderr,"empty scenery event\n");return 2;}
+                for (;*p;p++) {
+                    if (*p<'0'||*p>'9'||value>6553) {
+                        fprintf(stderr,"invalid scenery event (expected free or 1..65535)\n");return 2;
+                    }
+                    value=value*10+(unsigned)(*p-'0');
+                }
+                if (!value||value>65535) {fprintf(stderr,"invalid scenery event\n");return 2;}
+                scenery_event=(int)value;
+            }
+        }
         else if (!strcmp(argv[i], "--instance-audit")) instance_audit = 1;
         else if (!strcmp(argv[i], "--spawn")) {
             if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
@@ -1412,6 +1481,12 @@ int main(int argc, char **argv) {
         }
         else dataroot = argv[i];
     }
+    if (scenery_event && (!world2 || (!instance_audit && !shot) || sshot || sspawn || sstack ||
+                         want_event_id || daudit || raudit || poseshot || shaudit)) {
+        fprintf(stderr,"--scenery-preview needs --world2 with --instance-audit or --shot; "
+                       "not interactive/race/alternate-spawn modes\n");
+        return 2;
+    }
     if (instance_audit && !world2) {
         fprintf(stderr, "--instance-audit requires explicit --world2\n");
         return 2;
@@ -1423,6 +1498,22 @@ int main(int argc, char **argv) {
     if (world2 && !strcmp(trackname, "ALL")) {
         fprintf(stderr, "--world2 requires one explicit --track STREAM... bundle; "
                         "ALL is only a legacy diagnostic union\n");
+        return 2;
+    }
+    if (resident_audit && !world2) {
+        fprintf(stderr, "--resident-audit requires --world2\n");
+        return 2;
+    }
+    if (resident_audit && want_event_id) {
+        fprintf(stderr, "--resident-audit is free-roam only; --event is not supported\n");
+        return 2;
+    }
+    if (resident_route_audit && !world2) {
+        fprintf(stderr, "--resident-route-audit requires --world2\n");
+        return 2;
+    }
+    if (resident_route_audit && want_event_id) {
+        fprintf(stderr, "--resident-route-audit is free-roam only; --event is not supported\n");
         return 2;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
@@ -1439,8 +1530,13 @@ int main(int argc, char **argv) {
         shot = dashot; shotframes = 2220;
     }
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
-    const WorldCapturePolicy capture_policy = world_capture_policy(
+    WorldCapturePolicy capture_policy = world_capture_policy(
         world2, shot != NULL, sstatic, world2_heading_set);
+    if (resident_route_audit) {
+        capture_policy.preserve_explicit_pose = 1;
+        capture_policy.freeze_motion = 1;
+        shotyaw = 0.0f;
+    }
     if (capture_policy.fixed_camera)
         shotyaw = world2_heading_deg * 3.14159265f / 180.0f;
     if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
@@ -1851,9 +1947,10 @@ int main(int argc, char **argv) {
         int nr = res_list_tracks(troot, regs, WORLD_MAXREG, "", &dummy);
         static World ew;
         static ERRegion er[WORLD_MAXREG];
-        ew.nreg = nr;
+        ew.neighborhood.nreg = nr;
         for (int r = 0; r < nr; r++)
-            snprintf(ew.rgn[r].name, sizeof ew.rgn[r].name, "%s", regs[r]);
+            snprintf(ew.neighborhood.rgn[r].name,
+                     sizeof ew.neighborhood.rgn[r].name, "%s", regs[r]);
 
         printf("MILESTONE: 87\n\n");
         printf("PARSER PATH:\n");
@@ -1935,7 +2032,7 @@ int main(int argc, char **argv) {
         int idlo[WORLD_MAXREG], idhi[WORLD_MAXREG];
         for (int k = 0; k < WORLD_MAXREG; k++) { idlo[k] = 1 << 30; idhi[k] = -1; }
         for (int i = 0; i < nev; i++) {
-            const WEvent *e = &ew.ev[i];
+            const WEvent *e = &ew.city.ev[i];
             int r = -1;
             for (int k = 0; k < nr; k++) if (!strcmp(er[k].stem, e->reg)) { r = k; break; }
             unsigned b4 = 0, b6 = 0;
@@ -2031,9 +2128,23 @@ int main(int argc, char **argv) {
     }
 
     static World world;
-    WLoadOptions world_options = { world2, world2_spawn_xy[0], world2_spawn_xy[1], 700.0f };
+    WorldResident *active_resident = NULL, *candidate_resident = NULL;
+    const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
+    /* First open-world chunk: wide enough to include the neighboring airport/
+       city set dressing without attempting the measured 97k-mesh whole bundle.
+       A later atomic neighbor swap can reuse the same explicit radius. */
+    WLoadOptions world_options = {
+        world2,
+        resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0],
+        resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1],
+        resident_audit ? resident_audit_radius : resident_policy.resident_radius,
+        scenery_event
+    };
+    clock_t resident_cpu_begin = clock();
     int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
                     : world_load(&world, troot, trackname);
+    double resident_cpu_ms = 1000.0 * (double)(clock() - resident_cpu_begin) /
+                             (double)CLOCKS_PER_SEC;
     if (world2 && nm <= 0) {
         fprintf(stderr, "--world2 load failed for %s at requested focus "
                         "(%.3f, %.3f); exiting before SDL/GL initialization\n",
@@ -2043,15 +2154,17 @@ int main(int argc, char **argv) {
     float world2_spawn_z = 0.0f, world2_support_ref = 0.0f;
     int world2_support_cat = WSURF_NONE;
     if (world2 && nm > 0) {
+        float support_x = resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0];
+        float support_y = resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1];
         float bestd = 1e30f;
         int have_reference = 0;
-        for (int i = 0; i < world.scene.count; i++) {
-            const N2Mesh *mesh = &world.scene.meshes[i];
+        for (int i = 0; i < world.neighborhood.scene.count; i++) {
+            const N2Mesh *mesh = &world.neighborhood.scene.meshes[i];
             if (mesh->cat != N2_ROAD && mesh->cat != N2_TERRAIN) continue;
             for (int v = 0; v < mesh->nverts; v++) {
                 const float *p = mesh->verts + v * 5;
-                float dx = p[0] - world2_spawn_xy[0];
-                float dy = p[1] - world2_spawn_xy[1];
+                float dx = p[0] - support_x;
+                float dy = p[1] - support_y;
                 float d2 = dx * dx + dy * dy;
                 if (d2 < bestd) {
                     bestd = d2;
@@ -2062,20 +2175,19 @@ int main(int argc, char **argv) {
         }
         if (have_reference) {
             WGroundHit support;
-            world2_support_cat = world_ground_hit(&world.scene,
-                                                   world2_spawn_xy[0],
-                                                   world2_spawn_xy[1],
+            world2_support_cat = world_ground_hit(&world.neighborhood.scene,
+                                                   support_x, support_y,
                                                    world2_support_ref, &support);
             if (world2_support_cat != WSURF_NONE) world2_spawn_z = support.z;
         }
     }
 
     if (instance_audit) {
-        const WInstStats *st = &world.inst_stats;
+        const WInstStats *st = &world.neighborhood.inst_stats;
         long triangles = 0, finite_failures = 0;
         int classes[8] = {0};
-        for (int i = 0; i < world.scene.count; i++) {
-            const N2Mesh *mesh = &world.scene.meshes[i];
+        for (int i = 0; i < world.neighborhood.scene.count; i++) {
+            const N2Mesh *mesh = &world.neighborhood.scene.meshes[i];
             triangles += mesh->nidx / 3;
             if (mesh->scen < 8) classes[mesh->scen]++;
             for (int v = 0; v < mesh->nverts; v++)
@@ -2091,7 +2203,7 @@ int main(int argc, char **argv) {
                "own-matrix=%ld rejected=%ld triangles=%ld vista=%d\n",
                st->instances_seen, st->instances_in_range, st->meshes_placed,
                st->missing_models, st->own_matrix_meshes, st->rejected_meshes,
-               triangles, world.vista.count);
+               triangles, world.neighborhood.vista.count);
         printf("INSTANCE model-links keyed=%ld lod-fallback=%ld unkeyed-name=%ld\n",
                st->keyed_models, st->lod_fallbacks, st->unkeyed_models);
         printf("INSTANCE scene classes none=%d terrain=%d building=%d prop=%d "
@@ -2109,7 +2221,9 @@ int main(int argc, char **argv) {
     if (world2 && nm > 0 && world2_support_cat == WSURF_NONE) {
         fprintf(stderr, "--world2 spawn (%.3f, %.3f) has no ROAD/TERRAIN support "
                         "near the authored layer reference %.3f\n",
-                world2_spawn_xy[0], world2_spawn_xy[1], world2_support_ref);
+                resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0],
+                resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1],
+                world2_support_ref);
         return 1;
     }
 
@@ -2120,12 +2234,12 @@ int main(int argc, char **argv) {
     if (objdump) {
         FILE *of = fopen(objdump, "w");
         if (!of) { fprintf(stderr, "objdump: cannot write %s\n", objdump); return 1; }
-        const N2Scene *s = &world.scene;
+        const N2Scene *s = &world.neighborhood.scene;
         fprintf(of, "# OpenUG2 scene export  track=%s  meshes=%d (post-dedup, world space)\n",
                 trackname, s->count);
         long base = 1, tv = 0, tf = 0;   /* OBJ is 1-indexed */
         for (int mi = 0; mi < s->count; mi++) {
-            const N2Mesh *m = &world.scene.meshes[mi];
+            const N2Mesh *m = &world.neighborhood.scene.meshes[mi];
             fprintf(of, "o m%d_%.31s\n", mi, m->sname[0] ? m->sname : "mesh");
             for (int v = 0; v < m->nverts; v++) {
                 const float *p = m->verts + v*5;
@@ -2144,7 +2258,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!nm) { fprintf(stderr, "no track data\n  (pass your NFSU2 data dir: nfsu2 /path/to/data)\n"); return 1; }
-    N2Scene scene = world.scene;   /* shares world.scene.meshes */
+    N2Scene scene = world.neighborhood.scene;   /* shares world.neighborhood.scene.meshes */
     /* The stored SKYDOME references the sunrise dome/cap pair. LOC4 also
        ships structurally matching sunset/night pairs; remap only those two
        proven SKY keys before the normal world texture resolver runs. */
@@ -2153,8 +2267,8 @@ int main(int argc, char **argv) {
             scene.meshes[i].texkey = n2_sky_remap_key(sky_profile, scene.meshes[i].texkey);
     const uint32_t sky_dome_key = n2_sky_remap_key(sky_profile, 0x2414a01eu);
     const uint32_t sky_cap_key  = n2_sky_remap_key(sky_profile, 0x5fb8bcd1u);
-    printf("loaded %d submeshes from %d region(s)\n", nm, world.nreg);
-    printf("terrain texture TRN_GRASSC: %s\n", world.have_grass ? "ok" : "-");
+    printf("loaded %d submeshes from %d region(s)\n", nm, world.neighborhood.nreg);
+    printf("terrain texture TRN_GRASSC: %s\n", world.neighborhood.have_grass ? "ok" : "-");
     int nroad = 0, nterr = 0;
     for (int i = 0; i < nm; i++) {
         if (scene.meshes[i].cat == N2_ROAD) nroad++;
@@ -2214,9 +2328,12 @@ int main(int argc, char **argv) {
 
     /* building collision footprints — the car is kept out of these */
     #define MAXOBST 32768   /* whole city worth of building footprints */
-    static float obst[MAXOBST][4];
-    static int obstsrc[MAXOBST];   /* source mesh per rect, same collection pass */
-    static float obstz[MAXOBST][2];/* its Z span, measured in that same pass */
+    static float obst_store[MAXOBST][4];
+    static int obstsrc_store[MAXOBST];
+    static float obstz_store[MAXOBST][2];
+    float (*obst)[4] = obst_store;
+    int *obstsrc = obstsrc_store;   /* source mesh per rect, same collection pass */
+    float (*obstz)[2] = obstz_store;/* its Z span, measured in that same pass */
     int nobst = phys_collect_walls(&scene, obst, obstsrc, obstz, MAXOBST);
     printf("collision obstacles: %d buildings\n", nobst);
     if (facecensus) {
@@ -2320,16 +2437,16 @@ int main(int argc, char **argv) {
         printf("\nMILESTONE: 98  target texture %08x\n", smkey);
         /* re-decode the same key through the same lookup to report its source form */
         N2Tex tt = {0}; int ok = 0; const char *via = "-";
-        for (int r = 0; r < world.nreg && !ok; r++) {
-            WRegion *g = &world.rgn[r];
+        for (int r = 0; r < world.neighborhood.nreg && !ok; r++) {
+            WRegion *g = &world.neighborhood.rgn[r];
             if (!g->data) continue;
             ok = n2_tpk_decode(g->data, g->len, g->tpk, smkey, &tt);
             if (ok) via = "region STREAM TPK (n2_tpk_decode)";
         }
-        if (!ok && world.loc4) { ok = n2_load_car_tex_by_key(world.loc4, world.loc4len, smkey, &tt);
+        if (!ok && world.neighborhood.loc4) { ok = n2_load_car_tex_by_key(world.neighborhood.loc4, world.neighborhood.loc4len, smkey, &tt);
                                  if (ok) via = "LOC4DYNTEX (n2_load_car_tex_by_key)"; }
-        if (!ok && world.master) { ok = n2_tpk_decode(world.master, world.masterlen,
-                                                      world.mastertpk, smkey, &tt);
+        if (!ok && world.neighborhood.master) { ok = n2_tpk_decode(world.neighborhood.master, world.neighborhood.masterlen,
+                                                      world.neighborhood.mastertpk, smkey, &tt);
                                    if (ok) via = "master TPK (n2_tpk_decode)"; }
         if (!ok) printf("  DECODE FAILED (region buffers already freed after bind)\n");
         else {
@@ -2363,14 +2480,14 @@ int main(int argc, char **argv) {
            assembles: region TPK + LOC4 + master. Throwaway scene; the world the
            engine renders is the one world.c already built and is untouched. */
         static uint32_t ck[16384]; int nck = 0;
-        for (int r = 0; r < world.nreg; r++) {
-            WRegion *g = &world.rgn[r];
+        for (int r = 0; r < world.neighborhood.nreg; r++) {
+            WRegion *g = &world.neighborhood.rgn[r];
             if (!g->data) continue;
             nck = n2_tpk_keys(g->data, g->tpk, ck, 16384);
-            if (world.loc4 && nck < 16384)
-                nck += n2_car_tex_keys(world.loc4, world.loc4len, ck + nck, 16384 - nck);
-            if (world.master && nck < 16384)
-                nck += n2_tpk_keys(world.master, world.mastertpk, ck + nck, 16384 - nck);
+            if (world.neighborhood.loc4 && nck < 16384)
+                nck += n2_car_tex_keys(world.neighborhood.loc4, world.neighborhood.loc4len, ck + nck, 16384 - nck);
+            if (world.neighborhood.master && nck < 16384)
+                nck += n2_tpk_keys(world.neighborhood.master, world.neighborhood.mastertpk, ck + nck, 16384 - nck);
             N2Scene tmp = {0};
             n2_walk_meshes(g->data, 0, g->len, &tmp, ck, nck);
             for (int i = 0; i < tmp.count; i++) {
@@ -2381,7 +2498,7 @@ int main(int argc, char **argv) {
         }
         if (b02probe) {
             const unsigned char *rd = NULL;
-            for (int r = 0; r < world.nreg; r++) if (world.rgn[r].data) { rd = world.rgn[r].data; break; }
+            for (int r = 0; r < world.neighborhood.nreg; r++) if (world.neighborhood.rgn[r].data) { rd = world.neighborhood.rgn[r].data; break; }
             printf("\nMILESTONE: 104  0x134B02 stride/field probe  track=%s\n", trackname);
             printf("Method: for each B02 body, try every 4-aligned stride that divides it\n"
                    "exactly; at each stride try every 4-aligned (start,count) u32 field pair\n"
@@ -2547,9 +2664,9 @@ int main(int argc, char **argv) {
        asset change, and nothing is inferred from a texture name. */
     if (matdump) {
         const unsigned char *rd = NULL; long rl = 0; N2Tpk rtpk; const char *rn = "";
-        for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) {
-            rd = world.rgn[q].data; rl = world.rgn[q].len; rtpk = world.rgn[q].tpk;
-            rn = world.rgn[q].name; break; }
+        for (int q = 0; q < world.neighborhood.nreg; q++) if (world.neighborhood.rgn[q].data) {
+            rd = world.neighborhood.rgn[q].data; rl = world.neighborhood.rgn[q].len; rtpk = world.neighborhood.rgn[q].tpk;
+            rn = world.neighborhood.rgn[q].name; break; }
         if (rd) {
             printf("MILESTONE: 100  object material dump  %s in %s\n\n", matmesh, rn);
             long ds = 0; uint32_t sz = 0;
@@ -2672,21 +2789,21 @@ int main(int argc, char **argv) {
             const unsigned char *d = NULL; long dl = 0; N2Tpk tp; char label[128];
             if (pass == 0) {
                 int r = -1;
-                for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) { r = q; break; }
+                for (int q = 0; q < world.neighborhood.nreg; q++) if (world.neighborhood.rgn[q].data) { r = q; break; }
                 if (r < 0) continue;
-                d = world.rgn[r].data; dl = world.rgn[r].len; tp = world.rgn[r].tpk;
-                snprintf(label, sizeof label, "STREAM%s.BUN local TPK", world.rgn[r].name + 6);
+                d = world.neighborhood.rgn[r].data; dl = world.neighborhood.rgn[r].len; tp = world.neighborhood.rgn[r].tpk;
+                snprintf(label, sizeof label, "STREAM%s.BUN local TPK", world.neighborhood.rgn[r].name + 6);
             } else if (pass == 1) {
-                if (!world.loc4) { printf("[LOC4 fallback: not present]\n"); continue; }
-                d = world.loc4; dl = world.loc4len; tp = n2_tpk_open(d, dl);
+                if (!world.neighborhood.loc4) { printf("[LOC4 fallback: not present]\n"); continue; }
+                d = world.neighborhood.loc4; dl = world.neighborhood.loc4len; tp = n2_tpk_open(d, dl);
                 snprintf(label, sizeof label, "TRACKS/LOC4DYNTEX.BIN");
             } else if (pass == 2) {
-                if (!world.master) { printf("[master fallback: not present]\n"); continue; }
-                d = world.master; dl = world.masterlen; tp = world.mastertpk;
+                if (!world.neighborhood.master) { printf("[master fallback: not present]\n"); continue; }
+                d = world.neighborhood.master; dl = world.neighborhood.masterlen; tp = world.neighborhood.mastertpk;
                 snprintf(label, sizeof label, "master TPK");
             } else {
-                if (!world.common) { printf("[common fallback: not present]\n"); continue; }
-                d = world.common; dl = world.commonlen; tp = world.commontpk;
+                if (!world.neighborhood.common) { printf("[common fallback: not present]\n"); continue; }
+                d = world.neighborhood.common; dl = world.neighborhood.commonlen; tp = world.neighborhood.commontpk;
                 snprintf(label, sizeof label, "GLOBAL/InGameCommon.bun");
             }
             for (int b = 0; b < tp.nblk; b++) {
@@ -2770,9 +2887,72 @@ int main(int argc, char **argv) {
         }
         printf("\n");
     }
-    static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
-    static unsigned char tmapmode[2048];
-    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
+    static uint32_t legacy_tmapkey[2048]; static GLuint legacy_tmaptex[2048];
+    static unsigned char legacy_tmapmode[2048];
+    uint32_t *tmapkey = legacy_tmapkey;
+    GLuint *tmaptex = legacy_tmaptex;
+    unsigned char *tmapmode = legacy_tmapmode;
+    int ntmap = 0;
+    if (world2) {
+        uint32_t resident_gpu_begin = SDL_GetTicks();
+        float validate_x = resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0];
+        float validate_y = resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1];
+        active_resident = (WorldResident *)calloc(1, sizeof *active_resident);
+        if (!active_resident) {
+            fprintf(stderr, "world resident: out of memory\n");
+            return 1;
+        }
+        active_resident->world = world.neighborhood;
+        active_resident->center[0] = active_resident->world.center[0];
+        active_resident->center[1] = active_resident->world.center[1];
+        active_resident->radius = active_resident->world.radius;
+        active_resident->generation = 1;
+        if (!world_resident_validate_cpu(active_resident,
+                                         validate_x, validate_y,
+                                         world2_spawn_z) ||
+            !world_resident_resources_build(&active_resident->resources,
+                                            &active_resident->world)) {
+            fprintf(stderr, "world resident: initial GPU/collision build failed\n");
+            world_resident_free(active_resident);
+            return 1;
+        }
+        world.neighborhood = active_resident->world; /* non-owning active view */
+        scene = active_resident->world.scene;
+        tmapkey = active_resident->resources.texture_keys;
+        tmaptex = active_resident->resources.textures;
+        tmapmode = active_resident->resources.texture_modes;
+        ntmap = active_resident->resources.texture_count;
+        obst = active_resident->resources.obstacles;
+        obstz = active_resident->resources.obstacle_z;
+        obstsrc = active_resident->resources.obstacle_src;
+        nobst = active_resident->resources.obstacle_count;
+        if (resident_audit) {
+            long triangles = 0;
+            for (int i = 0; i < scene.count; i++) triangles += scene.meshes[i].nidx/3;
+            printf("RESIDENT AUDIT track=%s center=(%.1f,%.1f) radius=%.1f "
+                   "cpu=%.1fms gpu=%.1fms\n",
+                   trackname, active_resident->center[0], active_resident->center[1],
+                   active_resident->radius, resident_cpu_ms,
+                   (double)(SDL_GetTicks() - resident_gpu_begin));
+            printf("RESIDENT counts meshes=%d triangles=%ld batches=%d textures=%d "
+                   "lights=%d obstacles=%d support=%s z=%.3f\n",
+                   scene.count, triangles,
+                   active_resident->resources.ordinary_count,
+                   active_resident->resources.texture_count,
+                   world.neighborhood.nlights,
+                   active_resident->resources.obstacle_count,
+                   world2_support_cat == WSURF_ROAD ? "ROAD" : "TERRAIN",
+                   world2_spawn_z);
+            world_resident_free(active_resident);
+            active_resident = NULL;
+            memset(&world.neighborhood, 0, sizeof world.neighborhood);
+            world_city_free(&world.city);
+            SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
+            return 0;
+        }
+    } else {
+        ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
+    }
     printf("track textures bound: %d distinct\n", ntmap);
     GLuint district_light_tex = 0;
     for (int j = 0; j < ntmap; j++)
@@ -2780,7 +2960,7 @@ int main(int argc, char **argv) {
             district_light_tex = tmaptex[j]; break;
         }
     printf("authored light texture: %s\n",
-           world.nlights == 0 ? "not needed" : district_light_tex ? "resolved" : "missing");
+           world.neighborhood.nlights == 0 ? "not needed" : district_light_tex ? "resolved" : "missing");
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
         printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
@@ -2788,23 +2968,23 @@ int main(int argc, char **argv) {
 
 
     /* GPS self-check: route across the city so a broken graph is loud at load. */
-    if (world.nnav > 0 && world.ndist >= 2) {
+    if (world.city.nnav > 0 && world.city.ndist >= 2) {
         int a = -1, b = -1;
-        for (int i = 0; i < world.ndist; i++) {
-            if (!strcmp(world.dist[i].tok, "UC")) a = i;
-            if (!strcmp(world.dist[i].tok, "IP")) b = i;
+        for (int i = 0; i < world.city.ndist; i++) {
+            if (!strcmp(world.city.dist[i].tok, "UC")) a = i;
+            if (!strcmp(world.city.dist[i].tok, "IP")) b = i;
         }
         if (a < 0) a = 0;
-        if (b < 0) b = world.ndist - 1;
-        int s0 = world_nav_nearest(&world, world.dist[a].cx, world.dist[a].cy);
-        int g0 = world_nav_nearest(&world, world.dist[b].cx, world.dist[b].cy);
+        if (b < 0) b = world.city.ndist - 1;
+        int s0 = world_nav_nearest(&world, world.city.dist[a].cx, world.city.dist[a].cy);
+        int g0 = world_nav_nearest(&world, world.city.dist[b].cx, world.city.dist[b].cy);
         static int path[8192]; float dist = 0;
         uint32_t t0 = SDL_GetTicks();
         int n = world_route(&world, s0, g0, path, 8192, &dist);
         uint32_t t1 = SDL_GetTicks();
         printf("GPS test %s (%s) -> %s (%s): %d nodes, %.0f m, %u ms\n",
-               world.dist[a].tok, world_district_name(world.dist[a].tok),
-               world.dist[b].tok, world_district_name(world.dist[b].tok),
+               world.city.dist[a].tok, world_district_name(world.city.dist[a].tok),
+               world.city.dist[b].tok, world_district_name(world.city.dist[b].tok),
                n, dist, t1 - t0);
     }
 
@@ -2814,19 +2994,19 @@ int main(int argc, char **argv) {
        where the on-circuit sample finds no reroutable pair) and flooded the
        console -- exactly the automated race telemetry the manual-testing
        protocol drops. The barrier/checkpoint logic in world.c is unchanged. */
-    if (want_event_id && world.nev > 0) {
+    if (want_event_id && world.city.nev > 0) {
         int wi = -1;
-        for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
+        for (int i = 0; i < world.city.nev; i++) if (world.city.ev[i].id == want_event_id) wi = i;
         if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
         else {
             world_race_start(&world, troot, wi, want_laps);
             if (rtrace) {
-                printf("RT closures: %d\n", world.nbar);
-                for (int b=0; b<world.nbar; b++)
+                printf("RT closures: %d\n", world.city.nbar);
+                for (int b=0; b<world.city.nbar; b++)
                     printf("RT   barrier %d at (%.3f %.3f) dir(%.4f %.4f) nodes %d->%d\n",
-                           b, world.bar[b].x, world.bar[b].y,
-                           world.bar[b].dx, world.bar[b].dy,
-                           world.bar[b].a, world.bar[b].b);
+                           b, world.city.bar[b].x, world.city.bar[b].y,
+                           world.city.bar[b].dx, world.city.bar[b].dy,
+                           world.city.bar[b].a, world.city.bar[b].b);
             }
         }
     }
@@ -2842,16 +3022,19 @@ int main(int argc, char **argv) {
                sdefs[i].name, sdefs[i].hash, sdefs[i].w, sdefs[i].l, sdefs[i].h);
     /* resolve each mesh's texture once — the per-frame key scan was fine for
        one region, not for a whole city of meshes */
-    GLuint *mtex = (GLuint *)calloc(nm, sizeof *mtex);
-    unsigned char *mtexmode = (unsigned char *)calloc((size_t)(nm ? nm : 1), 1);
-    for (int i = 0; i < nm; i++)
-        for (int j = 0; j < ntmap; j++)
-            if (tmapkey[j] == scene.meshes[i].texkey) {
-                mtex[i] = tmaptex[j];
-                mtexmode[i] = (unsigned char)n2_world_draw_mode(
-                    &scene.meshes[i], tmapmode[j]);
-                break;
-            }
+    GLuint *mtex = world2 ? active_resident->resources.mesh_textures
+                          : (GLuint *)calloc(nm, sizeof *mtex);
+    unsigned char *mtexmode = world2 ? active_resident->resources.mesh_modes
+        : (unsigned char *)calloc((size_t)(nm ? nm : 1), 1);
+    if (!world2)
+        for (int i = 0; i < nm; i++)
+            for (int j = 0; j < ntmap; j++)
+                if (tmapkey[j] == scene.meshes[i].texkey) {
+                    mtex[i] = tmaptex[j];
+                    mtexmode[i] = (unsigned char)n2_world_draw_mode(
+                        &scene.meshes[i], tmapmode[j]);
+                    break;
+                }
     if (nansweep) {
         long bad = 0, badobj = 0;
         for (int i = 0; i < nm; i++) {
@@ -2879,7 +3062,7 @@ int main(int argc, char **argv) {
         static LodGrp g[24576]; int ng = 0;
         long grouped = 0, decreasing = 0, zoff = 0, samez = 0;
         for (int i = 0; i < nm; i++) {
-            const float *bb = world.mbb[i];
+            const float *bb = world.neighborhood.mbb[i];
             float q[4] = { roundf(bb[0]*100)/100, roundf(bb[1]*100)/100,
                            roundf(bb[2]*100)/100, roundf(bb[3]*100)/100 };
             int f = -1;
@@ -3206,7 +3389,7 @@ int main(int argc, char **argv) {
        for --shot-static / --static-spawn-audit and, when it finds a valid
        candidate, replaces `spawn` before the camera is seeded. */
     if (sstatic || sspawn || sstack) {
-        const float (*mbb)[4] = (const float (*)[4])world.mbb;
+        const float (*mbb)[4] = (const float (*)[4])world.neighborhood.mbb;
         float oldsp[3] = { spawn[0], spawn[1], spawn[2] };
         if (citypose) {
             /* --city-pose: seed the SAME safe-road selector at the built-up
@@ -3469,14 +3652,14 @@ int main(int argc, char **argv) {
     static int sprintev[WORLD_MAXEVENT]; int nsprint = 0, selsprint = 0;
     {
         const char *stem = strncmp(trackname, "STREAM", 6) ? trackname : trackname + 6;
-        for (int i = 0; i < world.nev && nsprint < WORLD_MAXEVENT; i++)
-            if (!strcmp(world.ev[i].reg, stem)) sprintev[nsprint++] = i;
+        for (int i = 0; i < world.city.nev && nsprint < WORLD_MAXEVENT; i++)
+            if (!strcmp(world.city.ev[i].reg, stem)) sprintev[nsprint++] = i;
         if (!ncirc && nsprint)
             printf("sprint events available: %d (menu: [ / ]) -- selected id %d "
                    "(%s, %d outline points)\n", nsprint,
-                   world.ev[sprintev[0]].id,
-                   world.ev[sprintev[0]].circuit ? "circuit" : "sprint",
-                   world.ev[sprintev[0]].npoly);
+                   world.city.ev[sprintev[0]].id,
+                   world.city.ev[sprintev[0]].circuit ? "circuit" : "sprint",
+                   world.city.ev[sprintev[0]].npoly);
     }
     if (raudit) { printf("RA circuit list for %s (bbox filter mn %.0f %.0f mx %.0f %.0f):\n",
                          trackname, mn[0], mn[1], mx[0], mx[1]);
@@ -3578,10 +3761,10 @@ int main(int argc, char **argv) {
             }
             printf("  %d slots for event %d\n", slot, gaudit);
             free(gd);
-            if (world.race.active) {
-                printf("  armed race gates (%d):\n", world.race.ngate);
-                for (int g = 0; g < world.race.ngate; g++) {
-                    const WGate *G = &world.race.gate[g];
+            if (world.city.race.active) {
+                printf("  armed race gates (%d):\n", world.city.race.ngate);
+                for (int g = 0; g < world.city.race.ngate; g++) {
+                    const WGate *G = &world.city.race.gate[g];
                     float gz3 = 0;
                     int c3 = world_ground_at(&scene, G->x, G->y, 0.0f, &gz3);
                     printf("    gate %-2d (%10.3f %10.3f) dir(%+.4f %+.4f) hdg %+7.4f "
@@ -3715,8 +3898,8 @@ int main(int argc, char **argv) {
         int nfound = 0;
         for (int i = 0; i < nm; i++) {
             const N2Mesh *m = &scene.meshes[i];
-            if (cpx < world.mbb[i][0] || cpx > world.mbb[i][2] ||
-                cpy < world.mbb[i][1] || cpy > world.mbb[i][3]) continue;
+            if (cpx < world.neighborhood.mbb[i][0] || cpx > world.neighborhood.mbb[i][2] ||
+                cpy < world.neighborhood.mbb[i][1] || cpy > world.neighborhood.mbb[i][3]) continue;
             for (int t = 0; t + 2 < m->nidx; t += 3) {
                 const float *A = m->verts + m->idx[t]*5;
                 const float *B = m->verts + m->idx[t+1]*5;
@@ -3759,7 +3942,7 @@ int main(int argc, char **argv) {
        if nothing passes, the shipped pose is left exactly as it was. */
     if (!capture_policy.preserve_explicit_pose && !sstatic && !sspawn && !sstack &&
         (citypose || !strcmp(trackname, "STREAML4RA"))) {
-        const float (*wmbb)[4] = (const float (*)[4])world.mbb;
+        const float (*wmbb)[4] = (const float (*)[4])world.neighborhood.mbb;
         float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
         if (hl < 0.5f) hl = 2.20f;
         if (hw < 0.5f) hw = 0.90f;
@@ -3875,7 +4058,7 @@ int main(int argc, char **argv) {
        does not run the M80 selector, does not touch the Enter branch or the route
        start, and does not alter --shot-static's own spawn. */
     if (shaudit) {
-        const float (*smbb)[4] = (const float (*)[4])world.mbb;
+        const float (*smbb)[4] = (const float (*)[4])world.neighborhood.mbb;
         float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
         if (hl < 0.5f) hl = 2.20f;
         if (hw < 0.5f) hw = 0.90f;
@@ -4078,7 +4261,7 @@ int main(int argc, char **argv) {
             int ip = (i - 1 + aipath.n) % aipath.n, in = (i + 1) % aipath.n;
             float head = atan2f(aipath.xy[in*2+1]-aipath.xy[ip*2+1],
                                 aipath.xy[in*2]  -aipath.xy[ip*2]);
-            int n = ss_stack(&scene, (const float (*)[4])world.mbb, x, y, hit, 8192);
+            int n = ss_stack(&scene, (const float (*)[4])world.neighborhood.mbb, x, y, hit, 8192);
             int wall = ss_in_wall(obst, nobst, x, y, 1.3f);
             int printed = 0, isafe = 0; float bestz = 0;
             for (int a = 0; a < n; a++) {
@@ -4087,9 +4270,9 @@ int main(int argc, char **argv) {
                 nroadlayer++;
                 float rz = hit[a].z;
                 float pr[5][4];
-                int patch = ss_patch(&scene, (const float (*)[4])world.mbb, x, y, rz,
+                int patch = ss_patch(&scene, (const float (*)[4])world.neighborhood.mbb, x, y, rz,
                                      head, half_l, half_w, pr);
-                float ceil = ss_ceiling_above(&scene, (const float (*)[4])world.mbb, x, y, rz);
+                float ceil = ss_ceiling_above(&scene, (const float (*)[4])world.neighborhood.mbb, x, y, rz);
                 float clear = ceil - rz;
                 int ok = patch && !wall && clear >= SS_CLEAR_M;
                 if (ok) { neligible++; if (!isafe) { isafe = 1; bestz = rz; } }
@@ -4154,7 +4337,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    GLuint texTerr = world.have_grass ? upload_tex(&world.grass) : 0;
+    GLuint texTerr = world2 ? active_resident->resources.terrain_texture
+        : (world.neighborhood.have_grass ? upload_tex(&world.neighborhood.grass) : 0);
     GLuint texWheel = make_wheel_tex();   /* radial alloy-rim look for the tyres */
     /* Above ~40 km/h the 5-spoke pattern is turning faster than the frame rate
        can sample, so crisp spokes alias into a strobing mess. Swap to the
@@ -4221,27 +4405,47 @@ int main(int argc, char **argv) {
        the ordinary opaque city batches. Print a note if a region genuinely
        has no SKYDOME mesh — the shader just falls back to the flat fog
        clear colour, which is correct but worth knowing about. */
-    N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch, NULL);
-    N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch, NULL);
+    N2Batch *skybatch = world2 ? active_resident->resources.sky : NULL;
+    int nsky = world2 ? active_resident->resources.sky_count
+                      : upload_cat_batches(&scene, N2_SKY, mtex, &skybatch, NULL);
+    N2Batch *glowbatch = world2 ? active_resident->resources.glow : NULL;
+    int nglow = world2 ? active_resident->resources.glow_count
+                       : upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch, NULL);
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
     /* M132: authored backdrop impostors, batched into their own list. They come
-       from world.vista, which no ground / collision / nav / spawn query can see,
+       from world.neighborhood.vista, which no ground / collision / nav / spawn query can see,
        so this is purely a rendering tier. */
-    N2Batch *vbatch = NULL; int nvista = 0; long vista_tris = 0; int *vmesh = NULL;
+    N2Batch *vbatch = world2 ? active_resident->resources.vista : NULL;
+    int nvista = world2 && tier == 2 ? active_resident->resources.vista_count : 0;
+    long vista_tris = 0;
+    int *vmesh = world2 ? active_resident->resources.vista_mesh : NULL;
     float vista_far = 2000.0f;
     /* Ordinary and baseline never batch or draw vista content. The shared
        world_bind_textures pass may already have resolved a vista key into
        tmap; this gate prevents vista-specific upload and per-frame work. The
        separate scene keeps exclusion from ground/collision/nav/spawn provable. */
-    if (tier == 2 && world.vista.count) {
+    if (world2 && tier == 2 && world.neighborhood.vista.count) {
+        for (int i = 0; i < world.neighborhood.vista.count; i++)
+            vista_tris += world.neighborhood.vista.meshes[i].nidx/3;
+        for (int k = 0; k < nvista; k++)
+            for (int c = 0; c < 2; c++) {
+                float a = fabsf(vbatch[k].bbox_min[c]);
+                float b2 = fabsf(vbatch[k].bbox_max[c]);
+                if (a > vista_far) vista_far = a;
+                if (b2 > vista_far) vista_far = b2;
+            }
+        vista_far *= 2.5f;
+        printf("vista batched: %d meshes (%ld tris) -> %d batches, far plane %.0f m\n",
+               world.neighborhood.vista.count, vista_tris, nvista, vista_far);
+    } else if (!world2 && tier == 2 && world.neighborhood.vista.count) {
         printf("vista: EXPERIMENTAL tier requested (--tier full); known "
                "opaque-sheet artifacts remain\n");
-        GLuint *vtex = (GLuint *)calloc((size_t)world.vista.count, sizeof *vtex);
-        for (int i = 0; i < world.vista.count; i++)
+        GLuint *vtex = (GLuint *)calloc((size_t)world.neighborhood.vista.count, sizeof *vtex);
+        for (int i = 0; i < world.neighborhood.vista.count; i++)
             for (int j = 0; j < ntmap; j++)
-                if (tmapkey[j] == world.vista.meshes[i].texkey) { vtex[i] = tmaptex[j]; break; }
+                if (tmapkey[j] == world.neighborhood.vista.meshes[i].texkey) { vtex[i] = tmaptex[j]; break; }
         /* ONE batch per vista mesh, and the source mesh index kept alongside.
            The foreground decision below needs REAL geometry distance, and a
            merged batch has no per-mesh vertices left to measure. Vista scenes
@@ -4250,11 +4454,11 @@ int main(int argc, char **argv) {
            than one batch for a mesh (it splits on BATCH_MAXVERTS), so sizing
            this array by mesh count would under-allocate the moment a backdrop
            sheet exceeds the vertex limit. */
-        for (int i = 0; i < world.vista.count; i++) {
-            N2Scene one = { &world.vista.meshes[i], 1, 1 };
+        for (int i = 0; i < world.neighborhood.vista.count; i++) {
+            N2Scene one = { &world.neighborhood.vista.meshes[i], 1, 1 };
             GLuint t1 = vtex[i];
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part, NULL);
+            int np = upload_cat_batches(&one, world.neighborhood.vista.meshes[i].cat, &t1, &part, NULL);
             if (np) {
                 vbatch = (N2Batch *)realloc(vbatch, (size_t)(nvista+np) * sizeof *vbatch);
                 vmesh  = (int *)realloc(vmesh,      (size_t)(nvista+np) * sizeof *vmesh);
@@ -4266,10 +4470,10 @@ int main(int argc, char **argv) {
         }
         /* deterministic proof that every batch has a valid source mesh */
         for (int k = 0; k < nvista; k++)
-            assert(vmesh[k] >= 0 && vmesh[k] < world.vista.count);
+            assert(vmesh[k] >= 0 && vmesh[k] < world.neighborhood.vista.count);
         int textured = 0;
-        for (int i = 0; i < world.vista.count; i++) {
-            vista_tris += world.vista.meshes[i].nidx/3;
+        for (int i = 0; i < world.neighborhood.vista.count; i++) {
+            vista_tris += world.neighborhood.vista.meshes[i].nidx/3;
             if (vtex[i]) textured++;
         }
         /* the pass needs a frustum that actually reaches the backdrop */
@@ -4281,7 +4485,7 @@ int main(int argc, char **argv) {
             }
         vista_far *= 2.5f;      /* the camera can stand on the far side of them */
         printf("vista batched: %d meshes (%ld tris, %d textured) -> %d batches, "
-               "far plane %.0f m\n", world.vista.count, vista_tris, textured,
+               "far plane %.0f m\n", world.neighborhood.vista.count, vista_tris, textured,
                nvista, vista_far);
         free(vtex);
     }
@@ -4309,11 +4513,11 @@ int main(int argc, char **argv) {
         printf("mark-repaired: %d repaired meshes -> %d batches\n", nrm, nrep);
         for (int i = 0, shown = 0; i < nm && shown < 61; i++) {
             if (!scene.meshes[i].vrepair) continue;
-            const float *bb = world.mbb[i];
+            const float *bb = world.neighborhood.mbb[i];
             float best = 1e30f;
             for (int j = 0; j < nm; j++) {
                 if (scene.meshes[j].cat != N2_ROAD) continue;
-                const float *rb = world.mbb[j];
+                const float *rb = world.neighborhood.mbb[j];
                 float dx = (bb[0]+bb[2])*0.5f, dy = (bb[1]+bb[3])*0.5f;
                 float qx = dx < rb[0] ? rb[0]-dx : (dx > rb[2] ? dx-rb[2] : 0);
                 float qy = dy < rb[1] ? rb[1]-dy : (dy > rb[3] ? dy-rb[3] : 0);
@@ -4326,16 +4530,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    N2Batch *wbatch = NULL;
-    static int *meshbatch = NULL;
-    meshbatch = (int *)malloc((size_t)(nm ? nm : 1) * sizeof *meshbatch);
-    int nbatch = upload_world_batches(&scene, (const float (*)[4])world.mbb,
-                                      mtex, texTerr, &wbatch, bmesh, meshbatch,
-                                      mtexmode);
+    N2Batch *wbatch = world2 ? active_resident->resources.ordinary : NULL;
+    int *meshbatch = world2 ? active_resident->resources.mesh_batch
+                            : (int *)malloc((size_t)(nm ? nm : 1) * sizeof *meshbatch);
+    int nbatch = world2 ? active_resident->resources.ordinary_count
+        : upload_world_batches(&scene, (const float (*)[4])world.neighborhood.mbb,
+                               mtex, texTerr, &wbatch, bmesh, meshbatch,
+                               mtexmode);
     /* the local-scene audit reads per-mesh texture resolution every frame, so
        the table has to outlive batching when it is enabled */
-    if (!lsaudit) { free(mtex); mtex = NULL; }
-    free(mtexmode); mtexmode = NULL;
+    if (!world2 && !lsaudit) { free(mtex); mtex = NULL; }
+    if (!world2) { free(mtexmode); mtexmode = NULL; }
     printf("world batched: %d meshes -> %d batches\n", nm, nbatch);
     if (baudit) return 0;   /* --batch-audit: report printed above, nothing to draw */
 
@@ -4344,12 +4549,15 @@ int main(int argc, char **argv) {
        Shared GL handles (owned by wbatch) -> no extra VRAM, no separate upload. */
     GLuint dbgprog = world_debug_program_load("src/world_debug_120.vert",
                                               "src/world_debug_120.frag");
-    WorldMeshBatch *wmbatch = (WorldMeshBatch *)calloc((size_t)(nbatch > 0 ? nbatch : 1),
-                                                       sizeof *wmbatch);
-    for (int k = 0; k < nbatch; k++) {
-        wmbatch[k].vbo = wbatch[k].vbo; wmbatch[k].ibo = wbatch[k].ibo;
-        wmbatch[k].index_count = wbatch[k].index_count; wmbatch[k].chunk_id = (uint32_t)k;
-    }
+    WorldMeshBatch *wmbatch = world2 ? active_resident->resources.debug_batches
+        : (WorldMeshBatch *)calloc((size_t)(nbatch > 0 ? nbatch : 1),
+                                   sizeof *wmbatch);
+    if (!world2)
+        for (int k = 0; k < nbatch; k++) {
+            wmbatch[k].vbo = wbatch[k].vbo; wmbatch[k].ibo = wbatch[k].ibo;
+            wmbatch[k].index_count = wbatch[k].index_count;
+            wmbatch[k].chunk_id = (uint32_t)k;
+        }
     int g_debug_mode = rendermode;   /* F3 cycles: 0 default, 1 prelight, 2 normals, 3 wireframe */
     if (daylight) g_dbg.night_mode = 0;   /* --daylight: headless mode matrix needs light */
     if (!dbgprog) fprintf(stderr, "world_debug shaders failed to load; F3 disabled\n");
@@ -4399,10 +4607,11 @@ int main(int argc, char **argv) {
     int p_lap = 0, p_prev = 0;   /* player lap + previous loop-progress */
     /* race flow: 3 = pre-race menu, 0 = countdown, 1 = racing, 2 = finished */
     const int COUNTDOWN = 180, LAP_TARGET = 2;
-    int race_state = shot ? 1 : 3, racetimer = 0, finish_place = 0;
+    int race_state = (shot || resident_route_audit) ? 1 : 3;
+    int racetimer = 0, finish_place = 0;
     int gear = 1; float shift_t = 0.0f;   /* virtual gearbox (engine audio) */
     float menuspin = 0.0f;   /* orbit-camera angle on the menu screen */
-    int running = 1, shotframe = 0;
+    int running = 1, shotframe = 0, final_status = 0;
     uint32_t t0 = SDL_GetTicks();   /* --shot prints avg ms/frame at exit */
     /* tyre skid marks: a ring buffer of oriented ground SEGMENTS (ax,ay,az,
        bx,by,bz, life) — life starts at 1 and decays so marks fade over time.
@@ -4419,6 +4628,23 @@ int main(int argc, char **argv) {
     float ca_fmin[3]={1e30f,1e30f,1e30f}, ca_fmax[3]={-1e30f,-1e30f,-1e30f};
     float ca_rmin[3]={1e30f,1e30f,1e30f}, ca_rmax[3]={-1e30f,-1e30f,-1e30f};
     float ca_axlemax[3]={0,0,0};
+    WResidentBuildArgs resident_args = {
+        troot, trackname, scenery_event, sky_profile, resident_policy
+    };
+    float failed_resident_cell[2] = {NAN, NAN};
+    int resident_route_frame = 0, resident_route_swaps = 0;
+    int resident_route_pending = 0, resident_route_failed = 0;
+    float resident_route_expected[2] = {0.0f, 0.0f};
+    float resident_route_visited[3][2] = {{0.0f, 0.0f}};
+    int resident_route_visited_count = 0;
+    if (resident_route_audit) {
+        world_set_mode(&world, MODE_FREEROAM, -1);
+        world.city.race.active = 0;
+        nai = 0;
+        resident_route_visited[0][0] = active_resident->center[0];
+        resident_route_visited[0][1] = active_resident->center[1];
+        resident_route_visited_count = 1;
+    }
     while (running) {
         /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
            the production race_state==3 Enter branch runs exactly as written. */
@@ -4535,7 +4761,7 @@ int main(int argc, char **argv) {
                            the supported showcase road pose, open the whole loaded
                            bundle's nav graph, and enable ordinary WASD physics. */
                         world_set_mode(&world, MODE_FREEROAM, -1);
-                        world.race.active = 0;
+                        world.city.race.active = 0;
                         vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
                         race_state = 1; racetimer = 0;
                         printf("freeroam: whole %s bundle driveable from (%.3f %.3f %.3f)\n",
@@ -4550,8 +4776,8 @@ int main(int argc, char **argv) {
                                !ncirc && nsprint > 1) {
                         selsprint = (selsprint + (k==SDLK_RIGHTBRACKET?1:nsprint-1)) % nsprint;
                         printf("sprint selected: event %d (%d outline points)\n",
-                               world.ev[sprintev[selsprint]].id,
-                               world.ev[sprintev[selsprint]].npoly);
+                               world.city.ev[sprintev[selsprint]].id,
+                               world.city.ev[sprintev[selsprint]].npoly);
                     } else if ((k==SDLK_LEFTBRACKET || k==SDLK_RIGHTBRACKET) && ncirc > 1) {
                         selcirc = (selcirc + (k==SDLK_RIGHTBRACKET?1:ncirc-1)) % ncirc;
                         nai = load_circuit(dataroot, circlist[selcirc], &scene,
@@ -4578,11 +4804,11 @@ int main(int argc, char **argv) {
                             int ng = world_race_start(&world, troot, ev, want_laps);
                             if (ng > 0 && race_place_on_grid(&world, &scene, carpos, &heading)) {
                                 printf("sprint armed: event %d, %d gates\n",
-                                       world.ev[ev].id, ng);
+                                       world.city.ev[ev].id, ng);
                             } else
                                 printf("sprint event %d could not be armed (%d gates) - "
                                        "starting from the showcase pose\n",
-                                       world.ev[ev].id, ng);
+                                       world.city.ev[ev].id, ng);
                             vel[0]=vel[1]=0; speed=0;
                         }
                         else if (aipath.n > 0) {
@@ -4593,7 +4819,7 @@ int main(int argc, char **argv) {
                             int seed = start_idx + 1;
                             if (posefrac >= 0.0f)
                                 seed = start_idx + 1 + (int)(posefrac * aipath.n);
-                            int si = sl_first_safe(&scene, (const float (*)[4])world.mbb,
+                            int si = sl_first_safe(&scene, (const float (*)[4])world.neighborhood.mbb,
                                                    aipath.xy, aipath.n, seed,
                                                    obst, nobst, hl, hw, &sz, &sh);
                             if (si >= 0) {
@@ -4620,6 +4846,160 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        }
+
+        if (resident_route_audit &&
+            (resident_route_frame == 2 || resident_route_frame == 6)) {
+            float next_pos[3], next_center[2];
+            if (!world_resident_route_point(
+                    &resident_policy, active_resident, &world.city,
+                    carpos[0], carpos[1], carpos[2],
+                    (const float (*)[2])resident_route_visited,
+                    resident_route_visited_count, next_pos, next_center)) {
+                fprintf(stderr, "resident route: no supported unvisited cell from "
+                        "generation %lu\n", active_resident->generation);
+                resident_route_failed = 1;
+            } else {
+                heading = atan2f(next_pos[1] - carpos[1],
+                                 next_pos[0] - carpos[0]);
+                shotyaw = heading;
+                memcpy(carpos, next_pos, sizeof next_pos);
+                vel[0] = vel[1] = 0.0f;
+                speed = 0.0f;
+                resident_route_expected[0] = next_center[0];
+                resident_route_expected[1] = next_center[1];
+                resident_route_pending = 1;
+                printf("resident route step=%d player=(%.3f,%.3f,%.3f) "
+                       "target=(%.0f,%.0f)\n",
+                       resident_route_swaps + 1,
+                       carpos[0], carpos[1], carpos[2],
+                       next_center[0], next_center[1]);
+            }
+        }
+
+        /* M144: build a complete replacement while the previous neighborhood
+           remains active, then swap every CPU/GPU/collision owner together at
+           this frame boundary. Player, contact and camera state are not members
+           of either resident and therefore cannot be reset by the transaction. */
+        if (world2 && race_state == 1 && world.city.mode == MODE_FREEROAM &&
+            (!shot || daudit) && !sstatic &&
+            (!capture_policy.freeze_motion || resident_route_audit)) {
+            float target[2];
+            if (!candidate_resident &&
+                world_resident_target(&resident_policy, carpos[0], carpos[1],
+                                      active_resident->center[0],
+                                      active_resident->center[1], target) &&
+                !(target[0] == failed_resident_cell[0] &&
+                  target[1] == failed_resident_cell[1])) {
+                float saved_pos[3] = {carpos[0], carpos[1], carpos[2]};
+                float saved_vel[2] = {vel[0], vel[1]};
+                float saved_heading = heading;
+                PhysRideState saved_ride = g_ride;
+                int saved_ride_ready = g_ride_ready;
+                uint32_t build_begin = SDL_GetTicks();
+                candidate_resident = (WorldResident *)calloc(
+                    1, sizeof *candidate_resident);
+                if (!candidate_resident ||
+                    !world_resident_build(candidate_resident, &resident_args,
+                                          target[0], target[1],
+                                          carpos[0], carpos[1], carpos[2])) {
+                    world_resident_free(candidate_resident);
+                    candidate_resident = NULL;
+                    failed_resident_cell[0] = target[0];
+                    failed_resident_cell[1] = target[1];
+                    fprintf(stderr, "resident build failed at cell (%.0f, %.0f); "
+                            "keeping generation %lu\n", target[0], target[1],
+                            active_resident->generation);
+                } else {
+                    world_resident_activate(&active_resident,
+                                            &candidate_resident);
+                    world.neighborhood = active_resident->world;
+                    scene = active_resident->world.scene;
+                    nm = scene.count;
+                    WorldResidentResources *wr = &active_resident->resources;
+                    tmapkey = wr->texture_keys;
+                    tmaptex = wr->textures;
+                    tmapmode = wr->texture_modes;
+                    ntmap = wr->texture_count;
+                    mtex = wr->mesh_textures;
+                    mtexmode = wr->mesh_modes;
+                    meshbatch = wr->mesh_batch;
+                    texTerr = wr->terrain_texture;
+                    wbatch = wr->ordinary; nbatch = wr->ordinary_count;
+                    skybatch = wr->sky; nsky = wr->sky_count;
+                    glowbatch = wr->glow; nglow = wr->glow_count;
+                    vbatch = wr->vista;
+                    nvista = tier == 2 ? wr->vista_count : 0;
+                    vmesh = wr->vista_mesh;
+                    wmbatch = wr->debug_batches;
+                    obst = wr->obstacles; obstz = wr->obstacle_z;
+                    obstsrc = wr->obstacle_src; nobst = wr->obstacle_count;
+                    district_light_tex = 0;
+                    for (int j = 0; j < ntmap; j++)
+                        if (tmapkey[j] == N2_TEX_SFX_FLARE_GLOWA) {
+                            district_light_tex = tmaptex[j]; break;
+                        }
+                    vista_far = 2000.0f;
+                    for (int k = 0; k < nvista; k++)
+                        for (int c = 0; c < 2; c++) {
+                            float a = fabsf(vbatch[k].bbox_min[c]);
+                            float b2 = fabsf(vbatch[k].bbox_max[c]);
+                            if (a > vista_far) vista_far = a;
+                            if (b2 > vista_far) vista_far = b2;
+                        }
+                    if (nvista) vista_far *= 2.5f;
+                    world_resident_free(candidate_resident); /* previous */
+                    candidate_resident = NULL;
+                    failed_resident_cell[0] = failed_resident_cell[1] = NAN;
+                    assert(!memcmp(carpos, saved_pos, sizeof saved_pos));
+                    assert(!memcmp(vel, saved_vel, sizeof saved_vel));
+                    assert(heading == saved_heading);
+                    assert(g_ride_ready == saved_ride_ready);
+                    assert(!memcmp(&g_ride, &saved_ride, sizeof g_ride));
+                    printf("resident activated gen=%lu center=(%.0f,%.0f) "
+                           "meshes=%d batches=%d textures=%d lights=%d "
+                           "obstacles=%d build=%u ms\n",
+                           active_resident->generation,
+                           active_resident->center[0], active_resident->center[1],
+                           nm, nbatch, ntmap, world.neighborhood.nlights, nobst,
+                           SDL_GetTicks() - build_begin);
+                }
+            }
+        }
+        if (resident_route_pending) {
+            int source_fail = 0;
+            for (int i = 0; i < nobst; i++)
+                if (obstsrc[i] < 0 || obstsrc[i] >= scene.count) source_fail++;
+            for (int i = 0; i < nm; i++)
+                if (meshbatch[i] < -1 || meshbatch[i] >= nbatch) source_fail++;
+            WGroundHit route_support;
+            int route_cat = world_ground_hit(&scene, carpos[0], carpos[1],
+                                             carpos[2], &route_support);
+            if (active_resident->center[0] != resident_route_expected[0] ||
+                active_resident->center[1] != resident_route_expected[1] ||
+                route_cat == WSURF_NONE || source_fail) {
+                fprintf(stderr, "resident route: activation validation failed "
+                        "center=(%.0f,%.0f) support=%d source-fail=%d\n",
+                        active_resident->center[0], active_resident->center[1],
+                        route_cat, source_fail);
+                resident_route_failed = 1;
+            } else {
+                resident_route_swaps++;
+                resident_route_visited[resident_route_visited_count][0] =
+                    active_resident->center[0];
+                resident_route_visited[resident_route_visited_count][1] =
+                    active_resident->center[1];
+                resident_route_visited_count++;
+                printf("resident route accepted step=%d gen=%lu center=(%.0f,%.0f) "
+                       "meshes=%d batches=%d textures=%d obstacles=%d "
+                       "support=%s z=%.3f source-fail=0\n",
+                       resident_route_swaps, active_resident->generation,
+                       active_resident->center[0], active_resident->center[1],
+                       nm, nbatch, ntmap, nobst,
+                       route_cat == WSURF_ROAD ? "ROAD" : "TERRAIN",
+                       route_support.z);
+            }
+            resident_route_pending = 0;
         }
         const Uint8 *ks = SDL_GetKeyboardState(NULL);
         if (g_dbg.freecam) {                 /* fly the camera; WASD move, arrows look */
@@ -4718,42 +5098,42 @@ int main(int argc, char **argv) {
            0 km/h; pre-existing, not the race system). */
         static int rpath[8192]; static int rpn = 0, rp_gate = -1, rp_at = 0;
         int race_auto = shot && !sstatic && !capture_policy.freeze_motion &&
-                        world.race.active && !world.race.finished;
+                        world.city.race.active && !world.city.race.finished;
         if (race_auto) {
-            if (rp_gate != world.race.next) {
+            if (rp_gate != world.city.race.next) {
                 int s = world_nav_nearest(&world, carpos[0], carpos[1]);
-                int gnode = world.race.gate[world.race.next].node;
+                int gnode = world.city.race.gate[world.city.race.next].node;
                 rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
-                if (rpn <= 1 && world.mode == MODE_RACE_EVENT) {
+                if (rpn <= 1 && world.city.mode == MODE_RACE_EVENT) {
                     /* the corridor mask can disconnect the spawn/previous node
                        from this gate; without a route the car would beeline
                        straight through the city. Re-route on the UNMASKED road
                        graph (fully connected) so it always stays on asphalt. */
-                    int mode = world.mode; world.mode = MODE_FREEROAM;
+                    int mode = world.city.mode; world.city.mode = MODE_FREEROAM;
                     rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
-                    world.mode = mode;
+                    world.city.mode = mode;
                 }
                 if (rtrace) {
-                    const WGate *G = &world.race.gate[world.race.next];
+                    const WGate *G = &world.city.race.gate[world.city.race.next];
                     float gz4 = 0;
                     int c4 = world_ground_at(&scene, G->x, G->y, carpos[2], &gz4);
                     printf("RT retarget: next=%d/%d  gate(%.3f %.3f) node %d  "
                            "car(%.3f %.3f) start-node %d  route %d nodes  "
                            "gate-support %s z %.3f  lap %d cleared %d\n",
-                           world.race.next, world.race.ngate, G->x, G->y, gnode,
+                           world.city.race.next, world.city.race.ngate, G->x, G->y, gnode,
                            carpos[0], carpos[1], s, rpn,
                            c4 == WSURF_ROAD ? "ROAD" : c4 == WSURF_TERRAIN ? "TERRAIN"
                                                                            : "NONE", gz4,
-                           world.race.lap, world.race.cleared);
+                           world.city.race.lap, world.city.race.cleared);
                     if (rpn > 1)
                         printf("RT   route ends at node %d (%.3f %.3f), gate node "
                                "%d (%.3f %.3f)\n", rpath[rpn-1],
-                               world.nav[rpath[rpn-1]*2], world.nav[rpath[rpn-1]*2+1],
-                               gnode, world.nav[gnode*2], world.nav[gnode*2+1]);
+                               world.city.nav[rpath[rpn-1]*2], world.city.nav[rpath[rpn-1]*2+1],
+                               gnode, world.city.nav[gnode*2], world.city.nav[gnode*2+1]);
                 }
-                rp_gate = world.race.next; rp_at = 0;
+                rp_gate = world.city.race.next; rp_at = 0;
             }
-            const WGate *ng = &world.race.gate[world.race.next];
+            const WGate *ng = &world.city.race.gate[world.city.race.next];
             float gdx = ng->x - carpos[0], gdy = ng->y - carpos[1];
             float dx, dy;
             if (gdx*gdx + gdy*gdy < 9.0f*9.0f) {
@@ -4766,11 +5146,11 @@ int main(int argc, char **argv) {
                     /* hug each node (advance at 3 m) so the aim tracks the road
                        polyline rather than cutting toward the distant gate */
                     if (rp_at < rpn - 1) {
-                        float ax = world.nav[rpath[rp_at]*2]   - carpos[0];
-                        float ay = world.nav[rpath[rp_at]*2+1] - carpos[1];
+                        float ax = world.city.nav[rpath[rp_at]*2]   - carpos[0];
+                        float ay = world.city.nav[rpath[rp_at]*2+1] - carpos[1];
                         if (ax*ax + ay*ay < 9.0f) rp_at++;
                     }
-                    tx = world.nav[rpath[rp_at]*2]; ty = world.nav[rpath[rp_at]*2+1];
+                    tx = world.city.nav[rpath[rp_at]*2]; ty = world.city.nav[rpath[rp_at]*2+1];
                 }
                 dx = tx - carpos[0]; dy = ty - carpos[1];
             }
@@ -5128,7 +5508,7 @@ int main(int argc, char **argv) {
                     float x = aipath.xy[i*2], y = aipath.xy[i*2+1];
                     if (!ss_in_wall(obst, nobst, x, y, 1.3f)) continue;
                     float rz = 0;
-                    int hasroad = ss_road_z(&scene, (const float (*)[4])world.mbb, x, y,
+                    int hasroad = ss_road_z(&scene, (const float (*)[4])world.neighborhood.mbb, x, y,
                                             carpos[2], &rz);
                     /* probe the production rail test on a COPY: no side effects */
                     WRailHit rh; rh.mesh = -1;
@@ -5519,7 +5899,7 @@ int main(int argc, char **argv) {
                    3D, to the camera. Cheap enough to do per frame at this scale
                    (188 meshes / ~20k vertices), and it discards only geometry
                    that genuinely comes nearer than the ordinary horizon. */
-                const N2Mesh *vm = &world.vista.meshes[vmesh[k]];
+                const N2Mesh *vm = &world.neighborhood.vista.meshes[vmesh[k]];
                 /* A second measured rejection: a backdrop buried far below the
                    ground the player is standing on can only ever be seen from
                    beneath, and is never a horizon. The drawn set splits cleanly
@@ -5760,13 +6140,13 @@ int main(int argc, char **argv) {
            like an invisible wall. Draw a lightweight neon barricade across each
            nearby closed road. Geometry comes from the exact WBarrier used by
            world_barrier_push -- no second placement rule. */
-        if (world.mode == MODE_RACE_EVENT && world.nbar > 0 && race_state != 3) {
+        if (world.city.mode == MODE_RACE_EVENT && world.city.nbar > 0 && race_state != 3) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,0.0f);
             glUniform3f(uColor, 1.0f, 0.10f, 0.03f); glUniform1f(uAlpha,0.78f);
-            for (int bi=0; bi<world.nbar; bi++) {
-                const WBarrier *b=&world.bar[bi];
+            for (int bi=0; bi<world.city.nbar; bi++) {
+                const WBarrier *b=&world.city.bar[bi];
                 float qx=b->x-carpos[0], qy=b->y-carpos[1];
                 if (qx*qx+qy*qy > 180.0f*180.0f) continue;
                 float px=-b->dy, py=b->dx;
@@ -6347,10 +6727,10 @@ int main(int argc, char **argv) {
         }
 
         /* Authored point lights are render-only; gameplay owns no part of this pass. */
-        if (world.nlights && district_light_tex && g_dbg.show_track &&
+        if (world.neighborhood.nlights && district_light_tex && g_dbg.show_track &&
             g_dbg.night_mode && (passmode == 0 || passmode == 2)) {
             districtdraws = render_district_lights(&rp, &quad, district_light_tex,
-                world.lights, world.nlights, cam, look, MVP, VIEW_DIST);
+                world.neighborhood.lights, world.neighborhood.nlights, cam, look, MVP, VIEW_DIST);
             g_dbg.drawn += districtdraws;
         }
 
@@ -6568,20 +6948,20 @@ int main(int argc, char **argv) {
         }
         glEnable(GL_DEPTH_TEST);
 
-        g_dbg.nav = world.nav; g_dbg.nnav = world.nnav;
-        g_dbg.navedge = world.navedge; g_dbg.nnavedge = world.nnavedge;
-        g_dbg.navcomp = world.navcomp; g_dbg.ndist = world.ndist;
-        for (int i = 0; i < world.ndist && i < 8; i++) {
-            snprintf(g_dbg.dist_tok[i], 4, "%s", world.dist[i].tok);
-            snprintf(g_dbg.dist_name[i], 24, "%s", world_district_name(world.dist[i].tok));
+        g_dbg.nav = world.city.nav; g_dbg.nnav = world.city.nnav;
+        g_dbg.navedge = world.city.navedge; g_dbg.nnavedge = world.city.nnavedge;
+        g_dbg.navcomp = world.city.navcomp; g_dbg.ndist = world.city.ndist;
+        for (int i = 0; i < world.city.ndist && i < 8; i++) {
+            snprintf(g_dbg.dist_tok[i], 4, "%s", world.city.dist[i].tok);
+            snprintf(g_dbg.dist_name[i], 24, "%s", world_district_name(world.city.dist[i].tok));
         }
         /* Race & Track Manager: mirror the catalog, apply panel mode switches */
-        g_dbg.ev = world.ev;  g_dbg.ev_count  = world.nev;
-        g_dbg.bar = world.bar; g_dbg.bar_count = world.nbar;
-        g_dbg.mode = world.mode; g_dbg.active_ev = world.active_ev;
-        g_dbg.masked_links = world.nmasked;
-        g_dbg.navopen = world.mode == MODE_RACE_EVENT ? world.navopen : NULL;
-        g_dbg.race = &world.race;
+        g_dbg.ev = world.city.ev;  g_dbg.ev_count  = world.city.nev;
+        g_dbg.bar = world.city.bar; g_dbg.bar_count = world.city.nbar;
+        g_dbg.mode = world.city.mode; g_dbg.active_ev = world.city.active_ev;
+        g_dbg.masked_links = world.city.nmasked;
+        g_dbg.navopen = world.city.mode == MODE_RACE_EVENT ? world.city.navopen : NULL;
+        g_dbg.race = &world.city.race;
         if (g_dbg.mode_request) {
             g_dbg.mode_request = 0;
             world_race_stop(&world);
@@ -6590,8 +6970,8 @@ int main(int argc, char **argv) {
         }
         if (g_dbg.race_start_request) {
             g_dbg.race_start_request = 0;
-            if (world.active_ev >= 0)
-                world_race_start(&world, troot, world.active_ev, g_dbg.race_maxlaps_want);
+            if (world.city.active_ev >= 0)
+                world_race_start(&world, troot, world.city.active_ev, g_dbg.race_maxlaps_want);
         }
         if (g_dbg.race_stop_request) { g_dbg.race_stop_request = 0; world_race_stop(&world); }
         /* GPS: solve a fresh route whenever the panel asks for a destination */
@@ -6607,23 +6987,23 @@ int main(int argc, char **argv) {
                 printf("GPS route: %d nodes, %.0f m, %d ms\n", gn, gd, g_dbg.gps_ms);
             }
         }
-        for (int i = 0; i < 4; i++) g_dbg.navbb[i] = world.navbb[i];
+        for (int i = 0; i < 4; i++) g_dbg.navbb[i] = world.city.navbb[i];
         /* live district tracking: log every boundary crossing */
         {   static int lastzone = -2;
             int zi = world_district_at(&world, carpos[0], carpos[1], 150.0f);
             static char zbuf[24];
-            if (zi >= 0 && zi < world.ndist) snprintf(zbuf, sizeof zbuf, "%s", world.dist[zi].tok);
+            if (zi >= 0 && zi < world.city.ndist) snprintf(zbuf, sizeof zbuf, "%s", world.city.dist[zi].tok);
             else snprintf(zbuf, sizeof zbuf, "-");
             const char *zn = zbuf;
             if (zi != lastzone) {
                 if (lastzone != -2)
                     printf("Transition: %s -> %s   at (%.0f, %.0f)\n",
-                           (lastzone >= 0 && lastzone < world.ndist) ? world.dist[lastzone].tok : "-", zn,
+                           (lastzone >= 0 && lastzone < world.city.ndist) ? world.city.dist[lastzone].tok : "-", zn,
                            carpos[0], carpos[1]);
                 lastzone = zi;
             }
             snprintf(g_dbg.zone_name, sizeof g_dbg.zone_name, "%s", zn);
-            g_dbg.zone_count = world.ndist;
+            g_dbg.zone_count = world.city.ndist;
         }
 #ifdef DEBUG_UI     /* debug readouts + ImGui overlay, drawn on top of everything */
         g_dbg.cam[0]=cam[0]; g_dbg.cam[1]=cam[1]; g_dbg.cam[2]=cam[2];
@@ -6648,7 +7028,7 @@ int main(int argc, char **argv) {
             int nn = 0;
             for (int i = 0; i < nm && nn < 12; i++) {
                 if (!scene.meshes[i].scen || !scene.meshes[i].sname[0]) continue;
-                float *bb = world.mbb[i];
+                float *bb = world.neighborhood.mbb[i];
                 float dx = carpos[0]<bb[0]?bb[0]-carpos[0]:(carpos[0]>bb[2]?carpos[0]-bb[2]:0);
                 float dy = carpos[1]<bb[1]?bb[1]-carpos[1]:(carpos[1]>bb[3]?carpos[1]-bb[3]:0);
                 float dd = sqrtf(dx*dx+dy*dy);
@@ -6833,7 +7213,7 @@ int main(int argc, char **argv) {
                         WGroundHit ph; int pc = world_ground_hit(&scene, carpos[0],
                                                                  carpos[1], carpos[2], &ph);
                         printf("POSE track=%s %s\n", trackname,
-                               world.active_ev >= 0 ? "event" : "circuit");
+                               world.city.active_ev >= 0 ? "event" : "circuit");
                         printf("POSE car   (%.3f, %.3f, %.3f)  heading %+.4f  frozen %ld "
                                "frames after start\n", carpos[0], carpos[1], carpos[2],
                                heading, r);
@@ -6853,10 +7233,10 @@ int main(int argc, char **argv) {
                                (double)VIEW_DIST, zfar);
                         printf("COUNT sky      draws %4d\n", skydraws);
                         printf("COUNT lights   sources %4d  draws %4d\n",
-                               world.nlights, districtdraws);
+                               world.neighborhood.nlights, districtdraws);
                         printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                                "(skipped %d meshes in %d batches)\n",
-                               vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
+                               vistamesh, world.neighborhood.vista.count, vistadrawn, nvista, vistadraws,
                                vistanearmesh, vistanear);
                         printf("COUNT vista    of the skipped, %d were buried more "
                                "than %.0f m below the player's ground\n",
@@ -6901,7 +7281,7 @@ int main(int argc, char **argv) {
                             long pop = 0, acct = 0;
                             for (int i = 0; i < nm; i++) {
                                 const N2Mesh *me = &scene.meshes[i];
-                                const float *bb = world.mbb[i];
+                                const float *bb = world.neighborhood.mbb[i];
                                 float bx = carpos[0] < bb[0] ? bb[0]-carpos[0]
                                          : (carpos[0] > bb[2] ? carpos[0]-bb[2] : 0);
                                 float by = carpos[1] < bb[1] ? bb[1]-carpos[1]
@@ -7049,6 +7429,31 @@ int main(int argc, char **argv) {
             write_png(sp, W, H, fl); free(px); free(fl);
             printf("DA spawn frame written: %s\n", sp);
         }
+        if (resident_route_audit) {
+            static const int capture_frames[] = {0, 2, 3, 6, 7};
+            static const char *capture_names[] = {
+                "before", "swap1", "after1", "swap2", "after2"
+            };
+            for (int i = 0; i < 5; i++)
+                if (resident_route_frame == capture_frames[i]) {
+                    char path[1024];
+                    snprintf(path, sizeof path, "%s_%s.png",
+                             resident_route_audit, capture_names[i]);
+                    if (!capture_frame_png(path, W, H)) resident_route_failed = 1;
+                    printf("resident route capture %s\n", path);
+                }
+            if (resident_route_frame++ >= 7) {
+                if (resident_route_swaps != 2) resident_route_failed = 1;
+                printf("RESIDENT ROUTE SUMMARY track=%s swaps=%d status=%s "
+                       "final-gen=%lu center=(%.0f,%.0f)\n",
+                       trackname, resident_route_swaps,
+                       resident_route_failed ? "FAIL" : "PASS",
+                       active_resident->generation,
+                       active_resident->center[0], active_resident->center[1]);
+                final_status = resident_route_failed ? 1 : 0;
+                running = 0;
+            }
+        }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
@@ -7064,10 +7469,10 @@ int main(int argc, char **argv) {
                    (double)VIEW_DIST, zfar);
             printf("COUNT sky      draws %4d\n", skydraws);
             printf("COUNT lights   sources %4d  draws %4d\n",
-                   world.nlights, districtdraws);
+                   world.neighborhood.nlights, districtdraws);
             printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
                    "(skipped %d meshes in %d batches)\n",
-                   vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
+                   vistamesh, world.neighborhood.vista.count, vistadrawn, nvista, vistadraws,
                    vistanearmesh, vistanear);
             printf("COUNT vista    nearest DRAWN surface %.1f m, nearest REJECTED "
                    "surface %.1f m (cutoff %.1f m)\n",
@@ -7184,11 +7589,19 @@ int main(int argc, char **argv) {
 #ifdef DEBUG_UI
     dbgui_shutdown();
 #endif
-    n2_free_scene(&scene);   /* region buffers already freed after texture upload */
-    free(world.lights);
-    free(wmbatch);           /* wraps wbatch's GL handles; frees the array only */
+    if (world2) {
+        world_resident_free(candidate_resident);
+        world_resident_free(active_resident);
+        active_resident = candidate_resident = NULL;
+        memset(&world.neighborhood, 0, sizeof world.neighborhood);
+    } else {
+        n2_free_scene(&scene);   /* region buffers already freed after texture upload */
+        free(world.neighborhood.lights);
+        free(wmbatch);           /* wraps wbatch's GL handles; frees the array only */
+    }
+    world_city_free(&world.city);
     if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
-    return 0;
+    return final_status;
 }

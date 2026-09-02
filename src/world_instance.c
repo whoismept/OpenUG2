@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "nfsu2.h"
+#include "world_scenery.h"
 
 #define WINST_WORLD_LIMIT 1e8f
 
@@ -679,7 +680,7 @@ static int winst_bbox_in_range(const WInstPlacement *placement,
 static int winst_visit_section(const WInstSection *section,
                                float focus_x, float focus_y, float view_radius,
                                WInstInternalVisitFn visit, void *userdata,
-                               WInstStats *stats) {
+                               WInstStats *stats, const WGSelection *scenery) {
     for (int i = 0; i < section->placement_count; i++) {
         WInstPlacement placement;
         const unsigned char *record = section->placements + (long)i * 64;
@@ -692,6 +693,10 @@ static int winst_visit_section(const WInstSection *section,
         if (stats) stats->instances_in_range++;
         if (placement.type_index >= (unsigned)section->type_count) {
             winst_reject(stats);
+            continue;
+        }
+        if (!wg_selection_visible(scenery, (unsigned)section->region_id, (unsigned)i)) {
+            if (stats) stats->scenery_hidden++;
             continue;
         }
         char type_name[33];
@@ -714,6 +719,7 @@ typedef struct {
     WInstInternalVisitFn visit;
     void *userdata;
     WInstStats *stats;
+    const WGSelection *scenery;
 } WInstWalk;
 
 static int winst_walk_sections(const unsigned char *data, long begin, long end,
@@ -733,7 +739,7 @@ static int winst_walk_sections(const unsigned char *data, long begin, long end,
             if (selected && walk->visit &&
                 !winst_visit_section(&section, walk->focus_x, walk->focus_y,
                                      walk->view_radius, walk->visit,
-                                     walk->userdata, walk->stats)) return 0;
+                                     walk->userdata, walk->stats, walk->scenery)) return 0;
         } else if (magic != 0 && (magic >> 28) == 8) {
             if (!winst_walk_sections(data, pos + 8, child_end, walk)) return 0;
         }
@@ -886,12 +892,38 @@ static int winst_commit_scenes(N2Scene *scene, N2Scene *vista,
     return 1;
 }
 
-int world_instance_build(N2Scene *scene, N2Scene *vista,
+/* Validate every override before filtering, including records outside focus.
+ * Missing/duplicate sections, stale flags or row indices cannot hide scenery. */
+static int winst_check_scenery(const unsigned char *data,long begin,long end,
+                               unsigned depth,WGSelection *selection) {
+    if(depth>64)return 0;
+    for(long p=begin;p<end;) {
+        long next;
+        if(end-p<8 || !chunk_end(p+8,n2_u32(data+p+4),end,&next))return 0;
+        uint32_t id=n2_u32(data+p);
+        if(id==0x80034100u) {
+            WInstSection s;
+            if(!winst_parse_section(data,p+8,next,&s))return 0;
+            for(size_t i=0;i<selection->count;i++) {
+                WGSelected *item=selection->items+i;
+                if(item->section!=s.region_id)continue;
+                if(item->checked || item->row>=s.placement_count)return 0;
+                const unsigned char *r=s.placements+64L*item->row;
+                if(winst_u16(r+0x1a)!=item->flags || winst_u16(r+0x18)>=s.type_count)return 0;
+                item->checked=1;
+            }
+        } else if((id>>28)==8 && !winst_check_scenery(data,p+8,next,depth+1,selection))return 0;
+        p=next;
+    }
+    return 1;
+}
+
+int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                          const char *track_root,
                          const char *const *bundles, int bundle_count,
                          float focus_x, float focus_y, float view_radius,
                          const unsigned char *shared, long shared_len,
-                         WInstStats *stats) {
+                         WInstStats *stats, int scenery_event) {
     WInstStats local_stats;
     WInstRegion *regions = NULL;
     int region_count = 0, region_cap = 0;
@@ -899,6 +931,7 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
     long bundle_len = 0;
     WInstLibrary library;
     N2Scene built_scene, built_vista;
+    WGSelection scenery = {0};
     int ok = 0;
     memset(&local_stats, 0, sizeof local_stats);
     local_stats.home_region = -1;
@@ -908,7 +941,8 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
     if (stats) *stats = local_stats;
     if (!scene || !vista || !track_root || !bundles || bundle_count <= 0 ||
         !isfinite(focus_x) || !isfinite(focus_y) || !isfinite(view_radius) ||
-        view_radius < 0.0f || shared_len < 0) goto cleanup;
+        view_radius < 0.0f || shared_len < 0 ||
+        scenery_event < -1 || scenery_event > 65535) goto cleanup;
 
     for (int i = 0; i < bundle_count; i++) {
         const char *bundle = bundles[i];
@@ -963,6 +997,18 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
      * until a complete temporary assembly has been built and committed. */
     if (!bundle_data) goto cleanup;
 
+    if (scenery_event) {
+        const char *stem = !strncmp(local_stats.bundle,"STREAM",6)
+                         ? local_stats.bundle+6 : local_stats.bundle;
+        long len=0;unsigned char *data=winst_read_named(track_root,stem,&len);
+        WGTable table;
+        int valid=data && wg_open_file(data,(size_t)len,&table) &&
+                  wg_selection_open(&table,scenery_event,&scenery);
+        free(data); /* selection owns copied membership, not borrowed bytes */
+        if(!valid || !winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
+        for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+    }
+
     uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
     if (!keys) goto cleanup;
     N2Tpk tpk = n2_tpk_open(bundle_data, bundle_len);
@@ -988,12 +1034,14 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
     collect.visit = winst_build_visit;
     collect.userdata = &visit;
     collect.stats = &local_stats;
+    collect.scenery = scenery_event ? &scenery : NULL;
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;
     ok = 1;
 
 cleanup:
+    free(scenery.items);
     if (!ok) {
         winst_free_scene(&built_scene);
         winst_free_scene(&built_vista);
@@ -1004,4 +1052,14 @@ cleanup:
     winst_free_regions(regions, region_count);
     if (stats) *stats = local_stats;
     return ok;
+}
+
+int world_instance_build(N2Scene *scene, N2Scene *vista,
+                         const char *track_root,
+                         const char *const *bundles, int bundle_count,
+                         float focus_x, float focus_y, float view_radius,
+                         const unsigned char *shared, long shared_len,
+                         WInstStats *stats) {
+    return world_instance_build_for_event(scene, vista, track_root, bundles, bundle_count,
+                                focus_x, focus_y, view_radius, shared, shared_len, stats, 0);
 }

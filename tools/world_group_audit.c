@@ -1,7 +1,7 @@
 /* GL-free, read-only ownership audit. Uses the production U2 section decoder,
  * including its filler/boundary rules; no scene is built or filtered. */
 #include "../src/world_instance.c"
-#include "world_group_reader.h"
+#include "../src/world_group_reader.h"
 
 typedef struct {
     WInstSection *sections;

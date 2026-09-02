@@ -22,6 +22,10 @@ unsigned char *res_map_file(const char *path, long *len) {
     return (unsigned char *)p;
 }
 
+void res_unmap_file(unsigned char *data, long len) {
+    if (data && len > 0) munmap(data, (size_t)len);
+}
+
 int res_list_tracks(const char *troot, char (*list)[64], int max,
                     const char *cur, int *sel) {
     int n = 0;

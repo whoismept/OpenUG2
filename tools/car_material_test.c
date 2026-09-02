@@ -789,6 +789,42 @@ int main(void) {
     }
 
     /* -------------------------------------------------------------------
+     * Fixture H (M143): a structurally complete two-triangle material
+     * partition followed by one orphan u16 index. The renderer cannot form a
+     * triangle from that tail; the production GOLF_KIT00_TRUNK_A has this
+     * exact shape (585 partitioned indices + one orphan). The useful ranges
+     * must still split into BODY and GLASS instead of smearing the one
+     * resolved badge texture over the whole trunk object.
+     * ------------------------------------------------------------------- */
+    printf("  H complete material partition with one trailing orphan index\n");
+    {
+        Buf f; f.n = 0;
+        float pos[6][3] = {{0,0,0},{1,0,0},{0,1,0},{0,0,1},{1,0,1},{0,1,1}};
+        uint16_t idx[7] = {0,1,2, 3,4,5, 0};
+        uint32_t tex[2] = {0xAAAAAAAAu, 0xBBBBBBBBu};
+        uint32_t keys[1] = {0xBBBBBBBBu};
+        uint32_t mat[2] = {N2_MAT_CARSKIN, N2_MAT_WINDSHIELD};
+        SubSpec sub[2] = {
+            {3, 0, 0, 0},
+            {3, 1, 1, 3},
+        };
+        object(&f, "TESTCAR_KIT00_TRUNK_A", tex, 2, mat, 2,
+               sub, 2, pos, 6, idx, 7);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, keys, 1, NULL);
+        chk("orphan tail does not force whole-object fallback", n == 2);
+        chk("usable triangles retain BODY and GLASS material classes",
+            count_by_cat(&sc, N2_CAR_BODY) == 1 &&
+            count_by_cat(&sc, N2_CAR_GLASS) == 1);
+        chk("orphan index is discarded; six partitioned indices remain",
+            total_nidx(&sc) == 6);
+        for (int i=0;i<sc.count;i++) {
+            free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol);
+        }
+        free(sc.meshes);
+    }
+
+    /* -------------------------------------------------------------------
      * Fixture B: two spatially-overlapping detail tiers of one part family.
      * Lower tier ("_A"): one BODY slice only, 12 indices.
      * Higher tier ("_B"): BODY (30 idx) + an unmatched GLASS slice (6 idx),

@@ -318,13 +318,43 @@ nor career-stage activation is proven here. The placement's `+0x1c` is **not**
 a global override index (6,430/6,431 RA reverse-link attempts fail); join by
 the override's section and placement fields instead.
 
-The checked, read-only reader is currently tool-only:
-`tools/world_group_reader.h`, consumed by `tools/world_group_audit.c`.
+The checked reader is `src/world_group_reader.h`, shared by the instance
+builder and `tools/world_group_audit.c` (moved out of `tools/` in M140).
 `make world-group-test world-group-audit` builds asset-free corruption tests
 and an audit that verifies the complete companion table before visiting members.
 It rejects malformed chunk boundaries, duplicate tables, excessive nesting,
 unterminated names, hash/refcount mismatches and out-of-range references. The
-runtime loader does not yet apply these groups as a visibility/collision policy.
+normal runtime loader does not apply these groups as a visibility/collision
+policy unless the explicit, capture-only scenery preview below is requested.
+
+**M140 preview policy, not retail activation semantics.**
+`--world2 --scenery-preview free|EVENT` accepts only an instance audit or a
+fixed `--shot` capture. `src/world_scenery.h` recognizes complete numeric
+`BARRIERS_<id>` / `PLAYER_BARRIERS_<id>` group names, unions membership by
+`(section id, placement row)`, and suppresses a placement only when all its
+memberships are numeric event groups and none matches the selection. `free`
+selects no event. Non-event, unknown, ungrouped and shared-with-non-event
+placements stay visible. Model names, whole sections and undecoded flag bits
+are not visibility rules. In particular, forward/backward graphics in a selected
+event remain together, and RB's six ungrouped graphics remain present.
+
+The builder checks every override target in the chosen home bundle, including
+targets outside the viewing radius: section/row/type bounds, matching copied
+flags and unique targets. Missing/inconsistent data or an unknown requested
+event fails assembly before replacing the caller's scenes. The compact
+selection owns its data after the companion file is released. Filtering occurs
+before instance emission, so render meshes and collision extraction consume
+the same scene; ground prototypes and all placement transforms are unchanged.
+`world_instance_build` remains an unchanged-policy wrapper; the explicit
+`world_instance_build_for_event` argument is `0` (off), `-1` (free) or a
+positive event id. This is a load-time comparison, not live race/career switching.
+
+The runtime's current first instance chunk is a 1000 m placement neighborhood.
+This radius is policy, not a file-format field. At the L4RA airport reference it
+selects 2,149 placements and emits 13,797 meshes after dedup; the former 700 m
+chunk emitted 12,017. A 7000 m whole-bundle measurement emitted 96,841 meshes,
+confirming that full residency is not a substitute for moving-neighborhood
+streaming. ROAD/TERRAIN prototypes remain the separately emitted support base.
 
 ### Object identity, duplicates and vista objects
 

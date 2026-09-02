@@ -142,6 +142,7 @@ int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
  * treatment, so their callers pass mtexmode = NULL (-> N2_DRAW_OPAQUE). */
 int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                         const unsigned char *mtexmode);
+void render_batch_array_free(N2Batch **batches, int *count);
 void draw_batch(const N2Batch *b);
 GLuint   upload_tex(const N2Tex *t);
 /* Upload a decoded TPK texture, preferring a direct glCompressedTexImage2D of

@@ -1736,10 +1736,13 @@ static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
  * of n2_mesh_submeshes so world/road callers of that function are completely
  * unaffected. Requires: the first range starts at index 0; every later range
  * starts exactly where the previous one ended (no gap, no overlap); every
- * range holds at least one whole triangle; the last range ends exactly at
- * the (post-filler) end of the decoded index buffer. Any violation means the
- * caller must fall back to the whole-object path rather than trust a
- * partial/garbled split. */
+ * range holds at least one whole triangle; after the last range, at most two
+ * orphan indices may remain. Those cannot form a triangle and n2_add_pair's
+ * whole-object path already discards the same tail. Requiring byte-for-byte
+ * equality rejected real GOLF_KIT00_TRUNK_A (585 useful indices + one orphan)
+ * and smeared its small badge texture over the whole trunk. A tail of three or
+ * more still means a complete triangle went unclaimed and is rejected. Any
+ * other violation falls back to the whole-object path. */
 static int n2_car_submesh_partition_ok(const N2Sub *sub, int nsub, long total_idx) {
     if (nsub <= 0 || total_idx <= 0) return 0;
     long want = 0;
@@ -1750,7 +1753,7 @@ static int n2_car_submesh_partition_ok(const N2Sub *sub, int nsub, long total_id
         if (end > total_idx) return 0;
         want = end;
     }
-    return want == total_idx;
+    return total_idx - want < 3;
 }
 
 /* Every key in a car object's own 0x134013 list, BY POSITION (8-byte entries:

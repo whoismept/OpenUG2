@@ -723,6 +723,20 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     return nb;
 }
 
+void render_batch_array_free(N2Batch **batches, int *count) {
+    if (!batches) return;
+    if (*batches) {
+        int n = count && *count > 0 ? *count : 0;
+        for (int i = 0; i < n; i++) {
+            if ((*batches)[i].vbo) glDeleteBuffers(1, &(*batches)[i].vbo);
+            if ((*batches)[i].ibo) glDeleteBuffers(1, &(*batches)[i].ibo);
+        }
+        free(*batches);
+    }
+    *batches = NULL;
+    if (count) *count = 0;
+}
+
 void draw_batch(const N2Batch *b) {
     glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
     glEnableVertexAttribArray(0);

@@ -8,6 +8,7 @@
 
 #include "nfsu2.h"
 #include "world_instance.h"
+#include "physics.h"
 #include "world_capture_policy.h"
 
 /* Test the private prototype library without widening the production API. The
@@ -19,6 +20,7 @@
 #define winst_decode_placement winst_decode_placement_test_copy
 #define winst_place_mesh winst_place_mesh_test_copy
 #define world_instance_build world_instance_build_test_copy
+#define world_instance_build_for_event world_instance_build_for_event_test_copy
 #define winst_test_collect_placements winst_test_collect_placements_test_copy
 #define winst_test_placement_live_allocations winst_test_placement_live_allocations_test_copy
 #define static
@@ -27,6 +29,7 @@
 #undef winst_test_placement_live_allocations
 #undef winst_test_collect_placements
 #undef world_instance_build
+#undef world_instance_build_for_event
 #undef winst_place_mesh
 #undef winst_decode_placement
 #undef winst_select_regions
@@ -319,7 +322,8 @@ static void make_instance_record(unsigned char record[64], int type,
 static long add_section(unsigned char *buf, long pos, int region_id,
                         const char *type_name,
                         const unsigned char *placements, int placement_count) {
-    unsigned char info[60], type[68], instances[12 + 2 * 64];
+    unsigned char info[60], type[68], instances[12 + 5 * 64];
+    assert(placement_count >= 0 && placement_count <= 5);
     memset(info, 0, sizeof info);
     memset(type, 0, sizeof type);
     memset(instances, 0x11, 12);
@@ -622,6 +626,96 @@ static void test_builder_authored_model_keys(void) {
     remove(companion_path); remove(stream_path); rmdir(root);
 }
 
+static long fixture_group(unsigned char *dst, const char *name,
+                           const unsigned *refs, int count) {
+    long size = (52 + 2 * count + 3) & ~3;
+    memset(dst, 0, (size_t)size);
+    strcpy((char *)dst + 8, name);
+    uint32_t hash = 0xffffffffu;
+    for (const char *p=name; *p; p++) hash=hash*33u+(unsigned char)*p;
+    put_u32(dst+40,hash);put_u32(dst+48,(unsigned)count);
+    for (int i=0;i<count;i++) put_u16(dst+52+2*i,refs[i]);
+    return size;
+}
+
+/* Missing event filtering used to emit every race's props; filtering by model
+ * name instead would also remove the identically named ordinary neighbors. */
+static void test_scenery_event_assembly(void) {
+    const char *root="build/world_instance_event_fixture";
+    const char *cp="build/world_instance_event_fixture/L4RA.BUN";
+    const char *sp="build/world_instance_event_fixture/STREAML4RA.BUN";
+    assert(mkdir(root,0777)==0 || errno==EEXIST);
+    unsigned char companion[1024],stream[4096],placements[5*64],ov[32]={0},groups[256];
+    long clen=make_regions(companion,sizeof companion), glen=0;
+    const unsigned a[]={0,1,2}, b[]={1,3}, smoke[]={2};
+    glen+=fixture_group(groups+glen,"BARRIERS_7",a,3);
+    glen+=fixture_group(groups+glen,"PLAYER_BARRIERS_8",b,2);
+    glen+=fixture_group(groups+glen,"SMOKEABLE",smoke,1);
+    const unsigned rows[]={0,1,2,4},refs[]={1,2,2,1};
+    for(int i=0;i<4;i++){put_u16(ov+8*i,17);put_u16(ov+8*i+2,rows[i]);put_u16(ov+8*i+6,refs[i]);}
+    clen=add_leaf(companion,clen,0x34107,ov,sizeof ov);
+    clen=add_leaf(companion,clen,0x34108,groups,glen);
+    assert(write_fixture_file(cp,companion,clen));
+    long slen=add_keyed_model(stream,0,"XB_SAME_MODEL",0x12345678,4);
+    N2Leaf vb[1];int nvb=0;
+    n2_find_leaves(stream,0,slen,0x134b01,vb,&nvb,1);assert(nvb==1);
+    /* Vertical 4 m wide, 3 m high wall, eligible in the real collider path. */
+    put_f32(stream+vb[0].off+48+4,0);
+    put_f32(stream+vb[0].off+48+8,3);
+    for(int i=0;i<5;i++){
+        make_instance_record(placements+64*i,0,(float)(i*10),-1,(float)(i*10+4),1);
+        put_f32(placements+64*i+0x20,(float)(i*10));
+    }
+    slen=add_section(stream,slen,17,"XB_SAME_MODEL",placements,5);
+    assert(write_fixture_file(sp,stream,slen));
+    const char *bundles[]={"STREAML4RA"};
+    const struct {int event,count;unsigned rows;} cases[]={
+        {0,5,31},{-1,2,12},{7,4,15},{8,4,30},{-1,2,12}};
+    for(int i=0;i<5;i++){
+        N2Scene scene={0},vista={0};WInstStats stats;
+        assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
+        assert(scene.count==cases[i].count && vista.count==0);
+        unsigned seen=0;
+        for(int j=0;j<scene.count;j++){
+            int row=(int)lroundf(scene.meshes[j].verts[0]/10);
+            assert(row>=0&&row<5);seen|=1u<<row;
+            assert(scene.meshes[j].nidx==3 && scene.meshes[j].texkey==0x1234);
+        }
+        assert(seen==cases[i].rows);
+        float ob[5][4],oz[5][2];int src[5];
+        int nwall=phys_collect_walls(&scene,ob,src,oz,5);
+        assert(nwall==cases[i].count);
+        for(int row=0;row<5;row++) {
+            float p[3]={(float)(row*10+1),0.5f,0.5f},v[2]={0,-1};
+            int hits=collide_walls(p,v,(const float(*)[4])ob,(const float(*)[2])oz,
+                                   nwall,1.0f,0.3f,1.8f,&scene,src,NULL,0);
+            assert(hits==((cases[i].rows>>row)&1u));
+            assert(hits ? v[1]==0 : v[1]==-1);
+        }
+        free_scene(&scene);free_scene(&vista);
+    }
+    N2Scene scene={0},vista={0};WInstStats stats;
+    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,999));
+    assert(!scene.count&&!vista.count);
+    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,-2));
+    /* Every override is checked, including row 4 outside this local view.
+     * Bad row, missing section, stale flags and duplicate targets fail atomically. */
+    for(int badcase=0;badcase<4;badcase++) {
+        unsigned char invalid[sizeof ov];memcpy(invalid,ov,sizeof ov);
+        if(badcase==0)put_u16(invalid+24+2,65535);
+        if(badcase==1)put_u16(invalid+24,999);
+        if(badcase==2)put_u16(invalid+24+4,1);
+        if(badcase==3)put_u16(invalid+24+2,0);
+        long bad=make_regions(companion,sizeof companion);
+        bad=add_leaf(companion,bad,0x34107,invalid,sizeof invalid);
+        bad=add_leaf(companion,bad,0x34108,groups,glen);
+        assert(write_fixture_file(cp,companion,bad));
+        assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,-1));
+        assert(!scene.count&&!vista.count);
+    }
+    remove(cp);remove(sp);rmdir(root);
+}
+
 static void test_positioned_model_name_boundaries(void) {
     unsigned char data[512], header[192]; char name[8];
     memset(header, 0, sizeof header);
@@ -913,6 +1007,7 @@ static void test_world2_capture_policy(void) {
 }
 
 int main(void) {
+    test_scenery_event_assembly();
     test_builder_authored_model_keys();
     test_positioned_model_name_boundaries();
     test_regions();

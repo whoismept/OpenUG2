@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
-#include "world_group_reader.h"
+#include "../src/world_group_reader.h"
 
 static void u16(unsigned char *p, unsigned n) {p[0]=(unsigned char)n;p[1]=(unsigned char)(n>>8);}
 static void u32(unsigned char *p, unsigned n) {u16(p,n);u16(p+2,n>>16);}

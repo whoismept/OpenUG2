@@ -12,20 +12,68 @@
 static void grid_build(World *w);
 static void nav_build_adj(World *w);
 
+static void world_scene_free(N2Scene *scene) {
+    if (!scene) return;
+    for (int i = 0; i < scene->count; i++) {
+        free(scene->meshes[i].verts);
+        free(scene->meshes[i].idx);
+        free(scene->meshes[i].vcol);
+    }
+    free(scene->meshes);
+    memset(scene, 0, sizeof *scene);
+}
+
+void world_neighborhood_free(WorldNeighborhood *neighborhood) {
+    if (!neighborhood) return;
+    world_ground_grid_free(&neighborhood->grid);
+    world_scene_free(&neighborhood->scene);
+    world_scene_free(&neighborhood->vista);
+    for (int i = 0; i < WORLD_MAXREG; i++) {
+        free(neighborhood->rgn[i].tpk.blk);
+        free(neighborhood->rgn[i].data);
+    }
+    free(neighborhood->loc4);
+    free(neighborhood->mastertpk.blk);
+    if (neighborhood->master_mapped)
+        res_unmap_file(neighborhood->master, neighborhood->masterlen);
+    else
+        free(neighborhood->master);
+    free(neighborhood->commontpk.blk);
+    free(neighborhood->common);
+    free(neighborhood->grass.rgb);
+    free(neighborhood->grass.alpha);
+    free(neighborhood->grass.dxt);
+    free(neighborhood->lights);
+    free(neighborhood->mbb);
+    memset(neighborhood, 0, sizeof *neighborhood);
+}
+
+void world_city_free(WorldCity *city) {
+    if (!city) return;
+    free(city->navcomp);
+    free(city->nav);
+    free(city->navedge);
+    free(city->adjstart);
+    free(city->adjlist);
+    free(city->navev);
+    free(city->navopen);
+    memset(city, 0, sizeof *city);
+}
+
 static void world_append_lights(World *w, const N2LightSrc *src, int count) {
     for (int i = 0; i < count; i++) {
         int duplicate = 0;
-        for (int j = 0; j < w->nlights; j++)
-            if (n2_light_same(w->lights + j, src + i)) { duplicate = 1; break; }
+        for (int j = 0; j < w->neighborhood.nlights; j++)
+            if (n2_light_same(w->neighborhood.lights + j, src + i)) { duplicate = 1; break; }
         if (duplicate) continue;
-        if (w->nlights == w->lightcap) {
-            int next = w->lightcap ? w->lightcap * 2 : 256;
+        if (w->neighborhood.nlights == w->neighborhood.lightcap) {
+            int next = w->neighborhood.lightcap ? w->neighborhood.lightcap * 2 : 256;
             N2LightSrc *grown = (N2LightSrc *)realloc(
-                w->lights, (size_t)next * sizeof *grown);
+                w->neighborhood.lights, (size_t)next * sizeof *grown);
             if (!grown) return;
-            w->lights = grown; w->lightcap = next;
+            w->neighborhood.lights = grown; w->neighborhood.lightcap = next;
         }
-        w->lights[w->nlights++] = src[i];
+        w->neighborhood.lights[w->neighborhood.nlights++] = src[i];
     }
 }
 
@@ -65,10 +113,10 @@ static int dd_same(int a, int b) {
     return n2_mesh_same_content(ma, mb);
 }
 
-/* Compact w->scene to unique meshes, fix each region's [mesh0,mesh1) range to
+/* Compact w->neighborhood.scene to unique meshes, fix each region's [mesh0,mesh1) range to
    the compacted positions, free the dropped geometry. Returns meshes removed. */
 static int world_dedup(World *w) {
-    N2Scene *s = &w->scene;
+    N2Scene *s = &w->neighborhood.scene;
     int nm = s->count;
     if (nm < 2) return 0;
 
@@ -91,9 +139,9 @@ static int world_dedup(World *w) {
     int *keptbefore = (int *)malloc((size_t)(nm + 1) * sizeof *keptbefore);
     keptbefore[0] = 0;
     for (int i = 0; i < nm; i++) keptbefore[i + 1] = keptbefore[i] + (drop[i] ? 0 : 1);
-    for (int r = 0; r < w->nreg; r++) {
-        w->rgn[r].mesh0 = keptbefore[w->rgn[r].mesh0];
-        w->rgn[r].mesh1 = keptbefore[w->rgn[r].mesh1];
+    for (int r = 0; r < w->neighborhood.nreg; r++) {
+        w->neighborhood.rgn[r].mesh0 = keptbefore[w->neighborhood.rgn[r].mesh0];
+        w->neighborhood.rgn[r].mesh1 = keptbefore[w->neighborhood.rgn[r].mesh1];
     }
 
     int wr = 0;
@@ -107,8 +155,8 @@ static int world_dedup(World *w) {
 
     /* region ranges must stay well-formed and cover exactly the survivors */
     assert(wr == keptbefore[nm]);
-    for (int r = 0; r < w->nreg; r++)
-        assert(w->rgn[r].mesh0 <= w->rgn[r].mesh1 && w->rgn[r].mesh1 <= wr);
+    for (int r = 0; r < w->neighborhood.nreg; r++)
+        assert(w->neighborhood.rgn[r].mesh0 <= w->neighborhood.rgn[r].mesh1 && w->neighborhood.rgn[r].mesh1 <= wr);
 
     /* z-fight proof: rebuild the key over survivors and confirm none collide.
        Cheap (load-time, one pass) and it is the actual deliverable — if this
@@ -171,9 +219,10 @@ static int world_dedup(World *w) {
  * physics ground query, and the GPU batches all see one clean surface
  * layer. It keeps the first copy of each (texkey, xyz-bbox, tri, vert)
  * and drops the rest. */
-int world_load_ex(World *w, const char *troot, const char *trackname,
-                  const WLoadOptions *options) {
-    memset(w, 0, sizeof *w);
+static int world_neighborhood_load_facade(World *w, const char *troot,
+                                          const char *trackname,
+                                          const WLoadOptions *options) {
+    memset(&w->neighborhood, 0, sizeof w->neighborhood);
     const int instance_world = options && options->enabled;
     if (instance_world && !strcmp(trackname, "ALL")) {
         fprintf(stderr, "instance world requires one explicit STREAM bundle; "
@@ -191,21 +240,21 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
         nreg = res_list_tracks(troot, regs, WORLD_MAXREG, "", &dummy);
     }
     if (!nreg) { snprintf(regs[0], sizeof regs[0], "%s", trackname); nreg = 1; }
-    w->nreg = nreg;
+    w->neighborhood.nreg = nreg;
 
     char loc4p[1024]; snprintf(loc4p, sizeof loc4p, "%s/LOC4DYNTEX.BIN", troot);
-    w->loc4 = n2_read_file(loc4p, &w->loc4len);
+    w->neighborhood.loc4 = n2_read_file(loc4p, &w->neighborhood.loc4len);
 
     /* per-region: own TPK keys + shared LOC4 keys pick each mesh's diffuse
        slot; single-region mode also pulls a big "master" neighbour's TPK for
        mid-size regions whose buildings reference it. */
     static uint32_t tkeys[16384];
     for (int r = 0; r < nreg; r++) {
-        WRegion *g = &w->rgn[r];
+        WRegion *g = &w->neighborhood.rgn[r];
         snprintf(g->name, sizeof g->name, "%s", regs[r]);
         char trackp[1024]; snprintf(trackp, sizeof trackp, "%s/%s.BUN", troot, regs[r]);
         g->data = n2_read_file(trackp, &g->len);
-        g->mesh0 = g->mesh1 = w->scene.count;
+        g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
         {
             const int light_cap = 8192;
@@ -220,27 +269,28 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
         }
         g->tpk = n2_tpk_open(g->data, g->len);
         int ntk = n2_tpk_keys(g->data, g->tpk, tkeys, 16384);
-        if (w->loc4 && ntk < 16384)
-            ntk += n2_car_tex_keys(w->loc4, w->loc4len, tkeys + ntk, 16384 - ntk);
+        if (w->neighborhood.loc4 && ntk < 16384)
+            ntk += n2_car_tex_keys(w->neighborhood.loc4, w->neighborhood.loc4len, tkeys + ntk, 16384 - ntk);
         if (nreg == 1 && g->len > 8L*1024*1024 && g->len < 60L*1024*1024) {
             /* Location-4 shared library; use the other big region if we ARE it */
             const char *mn = strcmp(regs[r], "STREAML4RD") ? "STREAML4RD" : "STREAML4RA";
             char mp[1024]; snprintf(mp, sizeof mp, "%s/%s.BUN", troot, mn);
-            w->master = res_map_file(mp, &w->masterlen);
-            if (w->master) {
-                w->mastertpk = n2_tpk_open(w->master, w->masterlen);
+            w->neighborhood.master = res_map_file(mp, &w->neighborhood.masterlen);
+            if (w->neighborhood.master) {
+                w->neighborhood.master_mapped = 1;
+                w->neighborhood.mastertpk = n2_tpk_open(w->neighborhood.master, w->neighborhood.masterlen);
                 if (ntk < 16384)
-                    ntk += n2_tpk_keys(w->master, w->mastertpk, tkeys + ntk, 16384 - ntk);
+                    ntk += n2_tpk_keys(w->neighborhood.master, w->neighborhood.mastertpk, tkeys + ntk, 16384 - ntk);
             }
         }
         if (!instance_world) {
-            n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
-            n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+            n2_vista_out = &w->neighborhood.vista;      /* backdrop impostors go here, not away */
+            n2_walk_meshes(g->data, 0, g->len, &w->neighborhood.scene, tkeys, ntk);
             n2_vista_out = NULL;
         }
-        g->mesh1 = w->scene.count;
-        if (!w->have_grass)
-            w->have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->grass);
+        g->mesh1 = w->neighborhood.scene.count;
+        if (!w->neighborhood.have_grass)
+            w->neighborhood.have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->neighborhood.grass);
         if (!instance_world) {
             printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
                    regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
@@ -255,27 +305,31 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
     if (instance_world) {
         const char *bundle_names[WORLD_MAXREG];
         for (int r = 0; r < nreg; r++) bundle_names[r] = regs[r];
-        if (!world_instance_build(&w->scene, &w->vista, troot,
+        if (!world_instance_build_for_event(&w->neighborhood.scene, &w->neighborhood.vista, troot,
                                   bundle_names, nreg,
                                   options->focus_x, options->focus_y,
                                   options->view_radius,
-                                  w->loc4, w->loc4len, &w->inst_stats)) {
+                                  w->neighborhood.loc4, w->neighborhood.loc4len, &w->neighborhood.inst_stats, options->scenery_event)) {
             fprintf(stderr, "instance world: no complete home district at "
                             "(%.1f, %.1f)\n",
                     options->focus_x, options->focus_y);
             return 0;
         }
+        if (options->scenery_event)
+            printf("SCENERY PREVIEW event=%d hidden-placements=%ld "
+                   "[load-time only; shared/unknown groups and direction flags unchanged]\n",
+                   options->scenery_event, w->neighborhood.inst_stats.scenery_hidden);
         for (int r = 0; r < nreg; r++) {
-            w->rgn[r].mesh0 = 0;
-            w->rgn[r].mesh1 = !strcmp(w->rgn[r].name, w->inst_stats.bundle)
-                            ? w->scene.count : 0;
+            w->neighborhood.rgn[r].mesh0 = 0;
+            w->neighborhood.rgn[r].mesh1 = !strcmp(w->neighborhood.rgn[r].name, w->neighborhood.inst_stats.bundle)
+                            ? w->neighborhood.scene.count : 0;
             printf("region %-12s: %3ld MB, %5d instance meshes\n",
-                   w->rgn[r].name, w->rgn[r].len >> 20,
-                   w->rgn[r].mesh1 - w->rgn[r].mesh0);
+                   w->neighborhood.rgn[r].name, w->neighborhood.rgn[r].len >> 20,
+                   w->neighborhood.rgn[r].mesh1 - w->neighborhood.rgn[r].mesh0);
         }
     }
 
-    printf("authored local light sources: %d\n", w->nlights);
+    printf("authored local light sources: %d\n", w->neighborhood.nlights);
 
     /* strip coplanar duplicates before anything downstream sees the scene.
        This handles the overlapping-superset bundles under --track ALL: the 8
@@ -295,49 +349,88 @@ int world_load_ex(World *w, const char *troot, const char *trackname,
        ponytail: a flat world-space bias, not glPolygonOffset — the fight is on
        the near ground the camera looks straight at, where 5 cm is many depth
        units; distant coplanar ground fades into fog before it can shimmer. */
-    for (int i = 0; i < w->scene.count; i++) {
-        N2Mesh *m = &w->scene.meshes[i];
+    for (int i = 0; i < w->neighborhood.scene.count; i++) {
+        N2Mesh *m = &w->neighborhood.scene.meshes[i];
         if (m->cat != N2_TERRAIN) continue;
         for (int v = 0; v < m->nverts; v++) m->verts[v*5+2] -= 0.05f;
     }
 
     /* per-mesh XY bounds — the draw cull and the ground grid both key off it */
-    int nm = w->scene.count;
-    w->mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
+    int nm = w->neighborhood.scene.count;
+    w->neighborhood.mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
     for (int i = 0; i < nm; i++) {
-        N2Mesh *m = &w->scene.meshes[i];
+        N2Mesh *m = &w->neighborhood.scene.meshes[i];
         float x0=1e30f, y0=1e30f, x1=-1e30f, y1=-1e30f;
         for (int v = 0; v < m->nverts; v++) {
             float *p = m->verts + v*5;
             if (p[0]<x0)x0=p[0]; if (p[0]>x1)x1=p[0];
             if (p[1]<y0)y0=p[1]; if (p[1]>y1)y1=p[1];
         }
-        w->mbb[i][0]=x0; w->mbb[i][1]=y0; w->mbb[i][2]=x1; w->mbb[i][3]=y1;
+        w->neighborhood.mbb[i][0]=x0; w->neighborhood.mbb[i][1]=y0; w->neighborhood.mbb[i][2]=x1; w->neighborhood.mbb[i][3]=y1;
     }
     grid_build(w);
-    world_load_events(w, troot);   /* before the nav load: it tags nodes per event */
-    world_load_nav(w, troot);
-    nav_build_adj(w);
-    world_set_mode(w, MODE_FREEROAM, -1);
-    world_build_districts(w);
-    printf("districts: %d area codes fused onto %d nav nodes\n"
-           "  (nearest TRN_ terrain mesh per node; codes are the artists' own)\n",
-           w->ndist, w->nnav);
-    for (int i = 0; i < w->ndist; i++)
-        printf("  %-3s nodes %5d  centroid (%8.1f,%8.1f)  medianZ %7.1f  "
-               "X[%7.0f..%7.0f] Y[%7.0f..%7.0f]\n",
-               w->dist[i].tok, w->dist[i].n, w->dist[i].cx, w->dist[i].cy,
-               w->dist[i].medz, w->dist[i].bb[0], w->dist[i].bb[1],
-               w->dist[i].bb[2], w->dist[i].bb[3]);
     /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Do not
        add their keys to geometry/material selection: this is only the last
        texture-resolution source, with existing regional precedence intact. */
     char commonp[1024];
     int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
     if (plen >= 0 && (size_t)plen < sizeof commonp) {
-        w->common = n2_read_file(commonp, &w->commonlen);
-        if (w->common) w->commontpk = n2_tpk_open(w->common, w->commonlen);
+        w->neighborhood.common = n2_read_file(commonp, &w->neighborhood.commonlen);
+        if (w->neighborhood.common) w->neighborhood.commontpk = n2_tpk_open(w->neighborhood.common, w->neighborhood.commonlen);
     }
+    if (options) {
+        w->neighborhood.center[0] = options->focus_x;
+        w->neighborhood.center[1] = options->focus_y;
+        w->neighborhood.radius = options->view_radius;
+    }
+    return nm;
+}
+
+int world_neighborhood_load(WorldNeighborhood *neighborhood,
+                            const char *troot, const char *trackname,
+                            const WLoadOptions *options) {
+    if (!neighborhood || !troot || !trackname) return 0;
+    World facade;
+    memset(&facade, 0, sizeof facade);
+    int nm = world_neighborhood_load_facade(&facade, troot, trackname, options);
+    *neighborhood = facade.neighborhood;
+    return nm;
+}
+
+int world_city_load(WorldCity *city,
+                    const WorldNeighborhood *initial_neighborhood,
+                    const char *troot, const char *trackname) {
+    if (!city || !initial_neighborhood || !troot || !trackname) return 0;
+    World facade;
+    memset(&facade, 0, sizeof facade);
+    facade.neighborhood = *initial_neighborhood;
+    world_load_events(&facade, troot);   /* tags nodes loaded immediately after */
+    world_load_nav(&facade, troot);
+    nav_build_adj(&facade);
+    world_set_mode(&facade, MODE_FREEROAM, -1);
+    world_build_districts(&facade);
+    printf("districts: %d area codes fused onto %d nav nodes\n"
+           "  (nearest TRN_ terrain mesh per node; codes are the artists' own)\n",
+           facade.city.ndist, facade.city.nnav);
+    for (int i = 0; i < facade.city.ndist; i++)
+        printf("  %-3s nodes %5d  centroid (%8.1f,%8.1f)  medianZ %7.1f  "
+               "X[%7.0f..%7.0f] Y[%7.0f..%7.0f]\n",
+               facade.city.dist[i].tok, facade.city.dist[i].n,
+               facade.city.dist[i].cx, facade.city.dist[i].cy,
+               facade.city.dist[i].medz, facade.city.dist[i].bb[0],
+               facade.city.dist[i].bb[1], facade.city.dist[i].bb[2],
+               facade.city.dist[i].bb[3]);
+    *city = facade.city;
+    return city->nnav;
+}
+
+int world_load_ex(World *w, const char *troot, const char *trackname,
+                  const WLoadOptions *options) {
+    if (!w) return 0;
+    memset(w, 0, sizeof *w);
+    int nm = world_neighborhood_load(&w->neighborhood, troot, trackname, options);
+    world_ground_grid_activate(&w->neighborhood.grid);
+    world_city_load(&w->city, &w->neighborhood, troot, trackname);
     return nm;
 }
 
@@ -351,16 +444,16 @@ int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
 static int world_texture_decode(const World *w, const WRegion *g,
                                 uint32_t key, N2Tex *tex, int common_only) {
     if (common_only) {
-        int ok = n2_tpk_decode(w->common, w->commonlen, w->commontpk, key, tex);
+        int ok = n2_tpk_decode(w->neighborhood.common, w->neighborhood.commonlen, w->neighborhood.commontpk, key, tex);
         if (ok && g_world_texaudit)
             printf("TEXSOURCE key %08x  GLOBAL/InGameCommon.bun\n", key);
         return ok;
     }
     int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
-    if (!ok && w->loc4)
-        ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, key, tex);
-    if (!ok && w->master)
-        ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, key, tex);
+    if (!ok && w->neighborhood.loc4)
+        ok = n2_load_car_tex_by_key(w->neighborhood.loc4, w->neighborhood.loc4len, key, tex);
+    if (!ok && w->neighborhood.master)
+        ok = n2_tpk_decode(w->neighborhood.master, w->neighborhood.masterlen, w->neighborhood.mastertpk, key, tex);
     return ok;
 }
 
@@ -370,12 +463,12 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
     /* Finish the original binding order across ALL regions first. Only then
        retry still-unbound requests against common; never borrow from an
        unrelated region or preempt a later region's successful old lookup. */
-    for (int pass = 0; pass < (w->common ? 2 : 1); pass++)
-    for (int r = 0; r < w->nreg; r++) {
-        WRegion *g = &w->rgn[r];
+    for (int pass = 0; pass < (w->neighborhood.common ? 2 : 1); pass++)
+    for (int r = 0; r < w->neighborhood.nreg; r++) {
+        WRegion *g = &w->neighborhood.rgn[r];
         if (!g->data) continue;
         for (int i = g->mesh0; i < g->mesh1; i++) {
-            uint32_t tk = w->scene.meshes[i].texkey; if (!tk) continue;
+            uint32_t tk = w->neighborhood.scene.meshes[i].texkey; if (!tk) continue;
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
@@ -391,14 +484,14 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                 if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
                 n++;
             }
-            else if (g_world_texaudit && (ok || pass || !w->common)) {
+            else if (g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
                        ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
                        pass ? "not in common TPK" : "not in region/LOC4/master",
-                       w->scene.meshes[i].sname, w->scene.meshes[i].cat);
+                       w->neighborhood.scene.meshes[i].sname, w->neighborhood.scene.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
@@ -406,7 +499,7 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
         /* District light records have no mesh-owned texture slot. Request
            their shipped flare through this same regional/shared resolver
            while the STREAM bytes are still alive. */
-        if (w->nlights > 0 && n < cap) {
+        if (w->neighborhood.nlights > 0 && n < cap) {
             uint32_t tk = N2_TEX_SFX_FLARE_GLOWA;
             int seen = 0;
             for (int j = 0; j < n; j++) if (keys[j] == tk) { seen = 1; break; }
@@ -425,8 +518,8 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
            decoded from the same TPK, in the same pass, before the region bytes
            are released. They are not region-tagged, so every region gets a
            chance at every key; a miss is silent and harmless. */
-        for (int i = 0; i < w->vista.count; i++) {
-            uint32_t tk = w->vista.meshes[i].texkey; if (!tk) continue;
+        for (int i = 0; i < w->neighborhood.vista.count; i++) {
+            uint32_t tk = w->neighborhood.vista.meshes[i].texkey; if (!tk) continue;
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
             N2Tex tt = {0};
@@ -439,28 +532,28 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                 if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
                 n++;
             }
-            else if (g_world_texaudit && (ok || pass || !w->common)) {
+            else if (g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
                    fixes and the old counters merged them. M133-R: `i` here
-                   indexes w->vista, not w->scene -- attribute to the vista
+                   indexes w->neighborhood.vista, not w->neighborhood.scene -- attribute to the vista
                    mesh that actually owns this key, not whatever scene mesh
                    happens to share the same index. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
                        ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
                        pass ? "not in common TPK" : "not in region/LOC4/master",
-                       w->vista.meshes[i].sname, w->vista.meshes[i].cat);
+                       w->neighborhood.vista.meshes[i].sname, w->neighborhood.vista.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
         }
     }
     /* Keep every region alive until the last shared-fallback decision. */
-    for (int r = 0; r < w->nreg; r++) {
-        free(w->rgn[r].data); w->rgn[r].data = NULL;
+    for (int r = 0; r < w->neighborhood.nreg; r++) {
+        free(w->neighborhood.rgn[r].data); w->neighborhood.rgn[r].data = NULL;
     }
-    free(w->commontpk.blk); memset(&w->commontpk, 0, sizeof w->commontpk);
-    free(w->common); w->common = NULL; w->commonlen = 0;
+    free(w->neighborhood.commontpk.blk); memset(&w->neighborhood.commontpk, 0, sizeof w->neighborhood.commontpk);
+    free(w->neighborhood.common); w->neighborhood.common = NULL; w->neighborhood.commonlen = 0;
     return n;
 }
 
@@ -468,55 +561,98 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
    Uniform XY grid over the road/terrain meshes; each cell lists the meshes
    whose bbox overlaps it (CSR layout). A query tests only that cell's meshes
    with the exact n2_ground_z triangle scan, so overpasses still resolve to
-   the highest surface under the point, same as the brute force.
-   ponytail: module-global singleton — the process loads exactly one world. */
+   the highest surface under the point, same as the brute force. */
 #define GCELL 64.0f
-static struct {
-    const N2Mesh *meshes;          /* identifies the scene the grid was built
-                                      for — main copies the N2Scene struct, so
-                                      match on the shared meshes array */
-    float x0, y0; int gw, gh;
-    int *start;                    /* gw*gh+1 prefix offsets into list */
-    int *list;                     /* mesh indices */
-} g_grid;
+static WGroundGrid g_empty_grid;
+static const WGroundGrid *g_active_grid = &g_empty_grid;
+#define g_grid (*g_active_grid)
+
+void world_ground_grid_activate(const WGroundGrid *grid) {
+    g_active_grid = grid ? grid : &g_empty_grid;
+}
+
+void world_ground_grid_free(WGroundGrid *grid) {
+    if (!grid) return;
+    if (g_active_grid == grid) g_active_grid = &g_empty_grid;
+    free(grid->start);
+    free(grid->list);
+    memset(grid, 0, sizeof *grid);
+}
+
+int world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
+                            const float (*mbb)[4]) {
+    if (!grid || !scene || !mbb || scene->count <= 0 || !scene->meshes) return 0;
+    WGroundGrid next = {0};
+    float x0=1e30f, y0=1e30f, x1=-1e30f, y1=-1e30f;
+    for (int i = 0; i < scene->count; i++) {
+        if (scene->meshes[i].cat != N2_ROAD &&
+            scene->meshes[i].cat != N2_TERRAIN) continue;
+        if (mbb[i][0]<x0)x0=mbb[i][0]; if (mbb[i][1]<y0)y0=mbb[i][1];
+        if (mbb[i][2]>x1)x1=mbb[i][2]; if (mbb[i][3]>y1)y1=mbb[i][3];
+    }
+    if (x0 > x1 || y0 > y1 || !isfinite(x0) || !isfinite(y0) ||
+        !isfinite(x1) || !isfinite(y1)) return 0;
+
+    int gw = (int)((x1-x0)/GCELL) + 1;
+    int gh = (int)((y1-y0)/GCELL) + 1;
+    if (gw <= 0 || gh <= 0 || (size_t)gw > (size_t)-1 / (size_t)gh) return 0;
+    size_t cells = (size_t)gw * (size_t)gh;
+    if (cells > ((size_t)-1 / sizeof(int)) - 1) return 0;
+
+    int *start = (int *)calloc(cells + 1, sizeof *start);
+    if (!start) return 0;
+    for (int i = 0; i < scene->count; i++) {
+        if (scene->meshes[i].cat != N2_ROAD &&
+            scene->meshes[i].cat != N2_TERRAIN) continue;
+        int cx0=(int)((mbb[i][0]-x0)/GCELL), cy0=(int)((mbb[i][1]-y0)/GCELL);
+        int cx1=(int)((mbb[i][2]-x0)/GCELL), cy1=(int)((mbb[i][3]-y0)/GCELL);
+        if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+        if (cx1 >= gw) cx1 = gw-1; if (cy1 >= gh) cy1 = gh-1;
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++) start[(size_t)cy*gw+cx+1]++;
+    }
+    for (size_t c = 0; c < cells; c++) start[c+1] += start[c];
+    int total = start[cells];
+    int *list = total ? (int *)malloc((size_t)total * sizeof *list) : NULL;
+    int *cursor = (int *)malloc(cells * sizeof *cursor);
+    if ((total && !list) || !cursor) {
+        free(start); free(list); free(cursor);
+        return 0;
+    }
+    memcpy(cursor, start, cells * sizeof *cursor);
+    for (int i = 0; i < scene->count; i++) {
+        if (scene->meshes[i].cat != N2_ROAD &&
+            scene->meshes[i].cat != N2_TERRAIN) continue;
+        int cx0=(int)((mbb[i][0]-x0)/GCELL), cy0=(int)((mbb[i][1]-y0)/GCELL);
+        int cx1=(int)((mbb[i][2]-x0)/GCELL), cy1=(int)((mbb[i][3]-y0)/GCELL);
+        if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+        if (cx1 >= gw) cx1 = gw-1; if (cy1 >= gh) cy1 = gh-1;
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++) {
+                size_t c = (size_t)cy*gw+cx;
+                list[cursor[c]++] = i;
+            }
+    }
+    free(cursor);
+
+    next.meshes = scene->meshes;
+    next.x0 = x0; next.y0 = y0;
+    next.gw = gw; next.gh = gh;
+    next.start = start; next.list = list;
+    world_ground_grid_free(grid);
+    *grid = next;
+    return 1;
+}
 
 static void grid_build(World *w) {
-    const N2Scene *s = &w->scene;
-    float x0=1e30f, y0=1e30f, x1=-1e30f, y1=-1e30f;
-    for (int i = 0; i < s->count; i++) {
-        if (s->meshes[i].cat != N2_ROAD && s->meshes[i].cat != N2_TERRAIN) continue;
-        if (w->mbb[i][0]<x0)x0=w->mbb[i][0]; if (w->mbb[i][1]<y0)y0=w->mbb[i][1];
-        if (w->mbb[i][2]>x1)x1=w->mbb[i][2]; if (w->mbb[i][3]>y1)y1=w->mbb[i][3];
-    }
-    if (x0 > x1) return;                       /* no ground meshes at all */
-    int gw = (int)((x1-x0)/GCELL) + 1, gh = (int)((y1-y0)/GCELL) + 1;
-    int *start = (int *)calloc((size_t)gw*gh + 1, sizeof(int));
-    /* count pass, prefix sum, fill pass */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < s->count; i++) {
-            if (s->meshes[i].cat != N2_ROAD && s->meshes[i].cat != N2_TERRAIN) continue;
-            int cx0=(int)((w->mbb[i][0]-x0)/GCELL), cy0=(int)((w->mbb[i][1]-y0)/GCELL);
-            int cx1=(int)((w->mbb[i][2]-x0)/GCELL), cy1=(int)((w->mbb[i][3]-y0)/GCELL);
-            for (int cy = cy0; cy <= cy1; cy++) for (int cx = cx0; cx <= cx1; cx++) {
-                if (pass == 0) start[cy*gw+cx + 1]++;
-                else           g_grid.list[start[cy*gw+cx]++] = i;
-            }
-        }
-        if (pass == 0) {
-            for (int c = 0; c < gw*gh; c++) start[c+1] += start[c];
-            g_grid.list = (int *)malloc((size_t)start[gw*gh] * sizeof(int));
-        }
-    }
-    /* fill pass advanced each start[c] to its end; shift back down one cell */
-    memmove(start + 1, start, (size_t)gw*gh * sizeof(int));
-    start[0] = 0;
-    g_grid.meshes = s->meshes; g_grid.x0 = x0; g_grid.y0 = y0;
-    g_grid.gw = gw; g_grid.gh = gh; g_grid.start = start;
-    printf("ground grid: %dx%d cells, %d mesh refs\n", gw, gh, start[gw*gh]);
-    if (w->vista.count) {
+    if (!world_ground_grid_build(&w->neighborhood.grid, &w->neighborhood.scene,
+                                 (const float (*)[4])w->neighborhood.mbb)) return;
+    printf("ground grid: %dx%d cells, %d mesh refs\n", w->neighborhood.grid.gw, w->neighborhood.grid.gh,
+           w->neighborhood.grid.start[w->neighborhood.grid.gw*w->neighborhood.grid.gh]);
+    if (w->neighborhood.vista.count) {
         float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}; long tri=0;
-        for (int i = 0; i < w->vista.count; i++) {
-            const N2Mesh *m = &w->vista.meshes[i]; tri += m->nidx/3;
+        for (int i = 0; i < w->neighborhood.vista.count; i++) {
+            const N2Mesh *m = &w->neighborhood.vista.meshes[i]; tri += m->nidx/3;
             for (int v = 0; v < m->nverts; v++)
                 for (int c = 0; c < 3; c++) {
                     float q = m->verts[v*5+c];
@@ -530,27 +666,27 @@ static void grid_build(World *w) {
             printf("VALPHA name                         key        fmt   w x h    "
                    "amin amax   a=0%%   0<a<255%%   a=255%%   vcol amin amax\n");
             uint32_t seen[512]; int nseen = 0;
-            for (int i = 0; i < w->vista.count; i++) {
-                const N2Mesh *m = &w->vista.meshes[i];
+            for (int i = 0; i < w->neighborhood.vista.count; i++) {
+                const N2Mesh *m = &w->neighborhood.vista.meshes[i];
                 uint32_t tk = m->texkey;
                 int dup = 0; for (int j = 0; j < nseen; j++) if (seen[j] == tk) dup = 1;
                 if (dup || nseen >= 512) continue;
                 seen[nseen++] = tk;
                 int vamin = 255, vamax = 0;
-                for (int q = 0; q < w->vista.count; q++)
-                    if (w->vista.meshes[q].texkey == tk && w->vista.meshes[q].vcol)
-                        for (int v = 0; v < w->vista.meshes[q].nverts; v++) {
-                            int a = w->vista.meshes[q].vcol[v*4+3];
+                for (int q = 0; q < w->neighborhood.vista.count; q++)
+                    if (w->neighborhood.vista.meshes[q].texkey == tk && w->neighborhood.vista.meshes[q].vcol)
+                        for (int v = 0; v < w->neighborhood.vista.meshes[q].nverts; v++) {
+                            int a = w->neighborhood.vista.meshes[q].vcol[v*4+3];
                             if (a < vamin) vamin = a; if (a > vamax) vamax = a;
                         }
                 N2Tex tt = {0};
                 int ok = 0;
-                for (int r2 = 0; r2 < w->nreg && !ok; r2++)
-                    if (w->rgn[r2].data)
-                        ok = n2_tpk_decode(w->rgn[r2].data, w->rgn[r2].len,
-                                           w->rgn[r2].tpk, tk, &tt);
-                if (!ok && w->master)
-                    ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+                for (int r2 = 0; r2 < w->neighborhood.nreg && !ok; r2++)
+                    if (w->neighborhood.rgn[r2].data)
+                        ok = n2_tpk_decode(w->neighborhood.rgn[r2].data, w->neighborhood.rgn[r2].len,
+                                           w->neighborhood.rgn[r2].tpk, tk, &tt);
+                if (!ok && w->neighborhood.master)
+                    ok = n2_tpk_decode(w->neighborhood.master, w->neighborhood.masterlen, w->neighborhood.mastertpk, tk, &tt);
                 if (!ok) { printf("VALPHA %-28s %08x   UNRESOLVED\n", m->sname, tk); continue; }
                 long n = (long)tt.w*tt.h, z = 0, part = 0, full = 0;
                 int amin = 255, amax = 0;
@@ -571,8 +707,8 @@ static void grid_build(World *w) {
         }
         if (getenv("OPENUG2_VISTA_CENSUS")) {
             printf("VISTA per-mesh census (name, tris, world AABB, planarity proxy):\n");
-            for (int i = 0; i < w->vista.count; i++) {
-                const N2Mesh *m = &w->vista.meshes[i];
+            for (int i = 0; i < w->neighborhood.vista.count; i++) {
+                const N2Mesh *m = &w->neighborhood.vista.meshes[i];
                 float a[3]={1e30f,1e30f,1e30f}, b[3]={-1e30f,-1e30f,-1e30f};
                 for (int v = 0; v < m->nverts; v++)
                     for (int c = 0; c < 3; c++) {
@@ -586,7 +722,7 @@ static void grid_build(World *w) {
         }
         printf("vista: %d meshes (%ld tris) from %ld objects (%ld PAN_, %ld family) "
                "bounds x[%.0f %.0f] y[%.0f %.0f] z[%.0f %.0f]\n",
-               w->vista.count, tri, n2_vista_objs, n2_vista_pan, n2_vista_fam,
+               w->neighborhood.vista.count, tri, n2_vista_objs, n2_vista_pan, n2_vista_fam,
                mn[0],mx[0],mn[1],mx[1],mn[2],mx[2]);
     } else printf("vista: none in this region\n");
 }
@@ -635,8 +771,8 @@ static void sd_scan(const unsigned char *d, long len,
 int world_scripted_defs(const World *w, const char *troot,
                         ScriptedDef *out, int cap) {
     int n = 0;
-    for (int r = 0; r < w->nreg && n < cap; r++) {
-        const char *rn = w->rgn[r].name;
+    for (int r = 0; r < w->neighborhood.nreg && n < cap; r++) {
+        const char *rn = w->neighborhood.rgn[r].name;
         /* companion file drops the STREAM prefix: STREAML4RA -> L4RA.BUN */
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         char p[1024]; snprintf(p, sizeof p, "%s/%s.BUN", troot, stem);
@@ -678,9 +814,9 @@ int world_scripted_defs(const World *w, const char *troot,
    positions are exactly the links where the freeroam graph leaves the event
    corridor -- computed below, never typed in. */
 int world_load_events(World *w, const char *troot) {
-    w->nev = 0; w->mode = MODE_FREEROAM; w->active_ev = -1;
-    for (int r = 0; r < w->nreg; r++) {
-        const char *rn = w->rgn[r].name;
+    w->city.nev = 0; w->city.mode = MODE_FREEROAM; w->city.active_ev = -1;
+    for (int r = 0; r < w->neighborhood.nreg; r++) {
+        const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         unsigned char *d = NULL; long len = 0;
         for (int fi = 0; fi < 4000 && !d; fi++) {   /* first Paths file that exists */
@@ -693,9 +829,9 @@ int world_load_events(World *w, const char *troot) {
         n2_find_leaves(d, 0, len, 0x0003414cu, leaf, &nl, 4);
         for (int L = 0; L < nl; L++) {
             int n = (int)leaf[L].size / 272;
-            for (int i = 0; i < n && w->nev < WORLD_MAXEVENT; i++) {
+            for (int i = 0; i < n && w->city.nev < WORLD_MAXEVENT; i++) {
                 const unsigned char *b = d + leaf[L].off + i * 272;
-                WEvent *e = &w->ev[w->nev];
+                WEvent *e = &w->city.ev[w->city.nev];
                 e->id      = b[0] | (b[1] << 8);
                 e->npoly   = b[2];
                 e->circuit = b[3];
@@ -712,32 +848,32 @@ int world_load_events(World *w, const char *troot) {
                     if (e->poly[k][1] > e->bb[3]) e->bb[3] = e->poly[k][1];
                 }
                 e->node0 = e->node1 = 0;
-                w->nev++;
+                w->city.nev++;
             }
         }
         free(d);
     }
-    {   int nc = 0; for (int i = 0; i < w->nev; i++) nc += w->ev[i].circuit;
+    {   int nc = 0; for (int i = 0; i < w->city.nev; i++) nc += w->city.ev[i].circuit;
         printf("race events: %d parsed from Paths*.bin chunk 0x3414c "
-               "(%d circuits, %d sprints)\n", w->nev, nc, w->nev - nc); }
-    return w->nev;
+               "(%d circuits, %d sprints)\n", w->city.nev, nc, w->city.nev - nc); }
+    return w->city.nev;
 }
 
 /* Index of the event with this id, or -1. */
 static int ev_by_id(const World *w, int id) {
-    for (int i = 0; i < w->nev; i++) if (w->ev[i].id == id) return i;
+    for (int i = 0; i < w->city.nev; i++) if (w->city.ev[i].id == id) return i;
     return -1;
 }
 
 int world_load_nav(World *w, const char *troot) {
     int cap = 4096, ecap = 4096;
-    w->nav = (float *)malloc((size_t)cap * 2 * sizeof(float));
-    w->navedge = (int *)malloc((size_t)ecap * 2 * sizeof(int));
-    w->nnav = w->nnavedge = 0;
-    w->navbb[0] = w->navbb[2] = 1e30f; w->navbb[1] = w->navbb[3] = -1e30f;
+    w->city.nav = (float *)malloc((size_t)cap * 2 * sizeof(float));
+    w->city.navedge = (int *)malloc((size_t)ecap * 2 * sizeof(int));
+    w->city.nnav = w->city.nnavedge = 0;
+    w->city.navbb[0] = w->city.navbb[2] = 1e30f; w->city.navbb[1] = w->city.navbb[3] = -1e30f;
 
-    for (int r = 0; r < w->nreg; r++) {
-        const char *rn = w->rgn[r].name;
+    for (int r = 0; r < w->neighborhood.nreg; r++) {
+        const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         for (int fi = 0; fi < 4000; fi++) {          /* Paths<id>.bin ids are sparse */
             char p[1024];
@@ -747,7 +883,7 @@ int world_load_nav(World *w, const char *troot) {
             /* remember which race event contributed which nodes: 0x34148 is the
                event's OWN racing line, so the range below IS its corridor seed */
             int evi = ev_by_id(w, 4000 + fi);
-            if (evi >= 0) w->ev[evi].node0 = w->nnav;
+            if (evi >= 0) w->city.ev[evi].node0 = w->city.nnav;
             N2Leaf leaf[8]; int nl = 0;
             n2_find_leaves(d, 0, len, 0x00034148u, leaf, &nl, 8);
             for (int L = 0; L < nl; L++) {
@@ -758,41 +894,41 @@ int world_load_nav(World *w, const char *troot) {
                     memcpy(&y, d + leaf[L].off + i*24 + 4, 4);
                     if (!(x == x && y == y) || x < -1e5f || x > 1e5f ||
                         y < -1e5f || y > 1e5f) { prev = -1; continue; }
-                    if (w->nnav == cap) { cap *= 2;
-                        w->nav = (float *)realloc(w->nav, (size_t)cap*2*sizeof(float)); }
-                    int id = w->nnav++;
-                    w->nav[id*2] = x; w->nav[id*2+1] = y;
-                    if (x < w->navbb[0]) w->navbb[0] = x;
-                    if (x > w->navbb[1]) w->navbb[1] = x;
-                    if (y < w->navbb[2]) w->navbb[2] = y;
-                    if (y > w->navbb[3]) w->navbb[3] = y;
+                    if (w->city.nnav == cap) { cap *= 2;
+                        w->city.nav = (float *)realloc(w->city.nav, (size_t)cap*2*sizeof(float)); }
+                    int id = w->city.nnav++;
+                    w->city.nav[id*2] = x; w->city.nav[id*2+1] = y;
+                    if (x < w->city.navbb[0]) w->city.navbb[0] = x;
+                    if (x > w->city.navbb[1]) w->city.navbb[1] = x;
+                    if (y < w->city.navbb[2]) w->city.navbb[2] = y;
+                    if (y > w->city.navbb[3]) w->city.navbb[3] = y;
                     if (prev >= 0) {
-                        float dx = x - w->nav[prev*2], dy = y - w->nav[prev*2+1];
+                        float dx = x - w->city.nav[prev*2], dy = y - w->city.nav[prev*2+1];
                         if (dx*dx + dy*dy <= NAV_LINK_MAX*NAV_LINK_MAX) {
-                            if (w->nnavedge == ecap) { ecap *= 2;
-                                w->navedge = (int *)realloc(w->navedge, (size_t)ecap*2*sizeof(int)); }
-                            w->navedge[w->nnavedge*2]   = prev;
-                            w->navedge[w->nnavedge*2+1] = id;
-                            w->nnavedge++;
+                            if (w->city.nnavedge == ecap) { ecap *= 2;
+                                w->city.navedge = (int *)realloc(w->city.navedge, (size_t)ecap*2*sizeof(int)); }
+                            w->city.navedge[w->city.nnavedge*2]   = prev;
+                            w->city.navedge[w->city.nnavedge*2+1] = id;
+                            w->city.nnavedge++;
                         }
                     }
                     prev = id;
                 }
             }
-            if (evi >= 0) w->ev[evi].node1 = w->nnav;
+            if (evi >= 0) w->city.ev[evi].node1 = w->city.nnav;
             free(d);
         }
     }
-    w->navev   = (int  *)malloc((size_t)(w->nnav ? w->nnav : 1) * sizeof(int));
-    w->navopen = (char *)malloc((size_t)(w->nnav ? w->nnav : 1));
-    for (int i = 0; i < w->nnav; i++) { w->navev[i] = -1; w->navopen[i] = 1; }
-    for (int e = 0; e < w->nev; e++)
-        for (int i = w->ev[e].node0; i < w->ev[e].node1; i++) w->navev[i] = e;
+    w->city.navev   = (int  *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1) * sizeof(int));
+    w->city.navopen = (char *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1));
+    for (int i = 0; i < w->city.nnav; i++) { w->city.navev[i] = -1; w->city.navopen[i] = 1; }
+    for (int e = 0; e < w->city.nev; e++)
+        for (int i = w->city.ev[e].node0; i < w->city.ev[e].node1; i++) w->city.navev[i] = e;
     printf("nav graph: %d nodes, %d edges from TRACKS/ROUTES*/Paths*.bin (chunk 0x34148)\n",
-           w->nnav, w->nnavedge);
-    if (w->nnav) printf("  extent X[%.0f..%.0f] Y[%.0f..%.0f]\n",
-                        w->navbb[0], w->navbb[1], w->navbb[2], w->navbb[3]);
-    return w->nnav;
+           w->city.nnav, w->city.nnavedge);
+    if (w->city.nnav) printf("  extent X[%.0f..%.0f] Y[%.0f..%.0f]\n",
+                        w->city.navbb[0], w->city.navbb[1], w->city.navbb[2], w->city.navbb[3]);
+    return w->city.nnav;
 }
 
 /* ---- topological districts (Phase 68) -------------------------------------
@@ -833,25 +969,25 @@ const char *world_district_name(const char *tok) {
 
 /* Promote welds to edges, then build a CSR adjacency over the whole graph. */
 static void nav_build_adj(World *w) {
-    int cap = w->nnavedge * 2 + 64, ne = w->nnavedge;
+    int cap = w->city.nnavedge * 2 + 64, ne = w->city.nnavedge;
     int *ea = (int *)malloc((size_t)cap * 2 * sizeof(int));
-    for (int e = 0; e < ne; e++) { ea[e*2] = w->navedge[e*2]; ea[e*2+1] = w->navedge[e*2+1]; }
-    {   int nb = w->nnav * 2 + 7;
+    for (int e = 0; e < ne; e++) { ea[e*2] = w->city.navedge[e*2]; ea[e*2+1] = w->city.navedge[e*2+1]; }
+    {   int nb = w->city.nnav * 2 + 7;
         int *head = (int *)malloc((size_t)nb * sizeof(int));
-        int *next = (int *)malloc((size_t)w->nnav * sizeof(int));
+        int *next = (int *)malloc((size_t)w->city.nnav * sizeof(int));
         for (int i = 0; i < nb; i++) head[i] = -1;
-        for (int i = 0; i < w->nnav; i++) {
-            int cx = (int)floorf(w->nav[i*2]/NAV_WELD), cy = (int)floorf(w->nav[i*2+1]/NAV_WELD);
+        for (int i = 0; i < w->city.nnav; i++) {
+            int cx = (int)floorf(w->city.nav[i*2]/NAV_WELD), cy = (int)floorf(w->city.nav[i*2+1]/NAV_WELD);
             unsigned h = ((unsigned)cx*73856093u) ^ ((unsigned)cy*19349663u);
             int b = (int)(h % (unsigned)nb); next[i] = head[b]; head[b] = i;
         }
-        for (int i = 0; i < w->nnav; i++) {
-            int cx = (int)floorf(w->nav[i*2]/NAV_WELD), cy = (int)floorf(w->nav[i*2+1]/NAV_WELD);
+        for (int i = 0; i < w->city.nnav; i++) {
+            int cx = (int)floorf(w->city.nav[i*2]/NAV_WELD), cy = (int)floorf(w->city.nav[i*2+1]/NAV_WELD);
             for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
                 unsigned h = ((unsigned)(cx+dx)*73856093u) ^ ((unsigned)(cy+dy)*19349663u);
                 for (int j = head[(int)(h % (unsigned)nb)]; j >= 0; j = next[j]) {
                     if (j <= i) continue;
-                    float ddx = w->nav[i*2]-w->nav[j*2], ddy = w->nav[i*2+1]-w->nav[j*2+1];
+                    float ddx = w->city.nav[i*2]-w->city.nav[j*2], ddy = w->city.nav[i*2+1]-w->city.nav[j*2+1];
                     if (ddx*ddx + ddy*ddy > NAV_WELD*NAV_WELD) continue;
                     if (ne == cap) { cap *= 2; ea = (int *)realloc(ea, (size_t)cap*2*sizeof(int)); }
                     ea[ne*2] = i; ea[ne*2+1] = j; ne++;
@@ -860,20 +996,20 @@ static void nav_build_adj(World *w) {
         }
         free(head); free(next);
     }
-    w->adjstart = (int *)calloc((size_t)w->nnav + 1, sizeof(int));
-    for (int e = 0; e < ne; e++) { w->adjstart[ea[e*2]+1]++; w->adjstart[ea[e*2+1]+1]++; }
-    for (int i = 0; i < w->nnav; i++) w->adjstart[i+1] += w->adjstart[i];
-    w->nadj = w->adjstart[w->nnav];
-    w->adjlist = (int *)malloc((size_t)w->nadj * sizeof(int));
-    int *fill = (int *)malloc((size_t)w->nnav * sizeof(int));
-    for (int i = 0; i < w->nnav; i++) fill[i] = w->adjstart[i];
+    w->city.adjstart = (int *)calloc((size_t)w->city.nnav + 1, sizeof(int));
+    for (int e = 0; e < ne; e++) { w->city.adjstart[ea[e*2]+1]++; w->city.adjstart[ea[e*2+1]+1]++; }
+    for (int i = 0; i < w->city.nnav; i++) w->city.adjstart[i+1] += w->city.adjstart[i];
+    w->city.nadj = w->city.adjstart[w->city.nnav];
+    w->city.adjlist = (int *)malloc((size_t)w->city.nadj * sizeof(int));
+    int *fill = (int *)malloc((size_t)w->city.nnav * sizeof(int));
+    for (int i = 0; i < w->city.nnav; i++) fill[i] = w->city.adjstart[i];
     for (int e = 0; e < ne; e++) {
         int a = ea[e*2], b = ea[e*2+1];
-        w->adjlist[fill[a]++] = b; w->adjlist[fill[b]++] = a;
+        w->city.adjlist[fill[a]++] = b; w->city.adjlist[fill[b]++] = a;
     }
     free(fill); free(ea);
     printf("routing graph: %d nodes, %d directed links (%d edges after welding)\n",
-           w->nnav, w->nadj, ne);
+           w->city.nnav, w->city.nadj, ne);
 }
 
 /* ---- TrackManager: freeroam vs race event (Phase 71) ----------------------
@@ -886,50 +1022,50 @@ static void nav_build_adj(World *w) {
 #define BAR_REACH 40.0f    /* only test barriers this close to the car */
 
 int world_set_mode(World *w, int mode, int evidx) {
-    w->nbar = 0; w->nmasked = 0;
-    if (!w->navopen || !w->adjstart) return 0;
-    if (mode != MODE_RACE_EVENT || evidx < 0 || evidx >= w->nev) {
-        w->mode = MODE_FREEROAM; w->active_ev = -1;
-        for (int i = 0; i < w->nnav; i++) w->navopen[i] = 1;
+    w->city.nbar = 0; w->city.nmasked = 0;
+    if (!w->city.navopen || !w->city.adjstart) return 0;
+    if (mode != MODE_RACE_EVENT || evidx < 0 || evidx >= w->city.nev) {
+        w->city.mode = MODE_FREEROAM; w->city.active_ev = -1;
+        for (int i = 0; i < w->city.nnav; i++) w->city.navopen[i] = 1;
         return 0;
     }
-    w->mode = MODE_RACE_EVENT; w->active_ev = evidx;
-    const WEvent *e = &w->ev[evidx];
-    for (int i = 0; i < w->nnav; i++) w->navopen[i] = 0;
-    for (int i = e->node0; i < e->node1; i++) w->navopen[i] = 1;
+    w->city.mode = MODE_RACE_EVENT; w->city.active_ev = evidx;
+    const WEvent *e = &w->city.ev[evidx];
+    for (int i = 0; i < w->city.nnav; i++) w->city.navopen[i] = 0;
+    for (int i = e->node0; i < e->node1; i++) w->city.navopen[i] = 1;
     /* promote welded twins; chains of coincident nodes are short, so a handful
        of sweeps reaches a fixed point (the loop exits as soon as one is idle). */
     for (int pass = 0; pass < 8; pass++) {
         int changed = 0;
-        for (int i = 0; i < w->nnav; i++) {
-            if (!w->navopen[i]) continue;
-            for (int k = w->adjstart[i]; k < w->adjstart[i+1]; k++) {
-                int nb = w->adjlist[k];
-                if (w->navopen[nb]) continue;
-                float dx = w->nav[nb*2]-w->nav[i*2], dy = w->nav[nb*2+1]-w->nav[i*2+1];
-                if (dx*dx + dy*dy <= NAV_WELD*NAV_WELD) { w->navopen[nb] = 1; changed = 1; }
+        for (int i = 0; i < w->city.nnav; i++) {
+            if (!w->city.navopen[i]) continue;
+            for (int k = w->city.adjstart[i]; k < w->city.adjstart[i+1]; k++) {
+                int nb = w->city.adjlist[k];
+                if (w->city.navopen[nb]) continue;
+                float dx = w->city.nav[nb*2]-w->city.nav[i*2], dy = w->city.nav[nb*2+1]-w->city.nav[i*2+1];
+                if (dx*dx + dy*dy <= NAV_WELD*NAV_WELD) { w->city.navopen[nb] = 1; changed = 1; }
             }
         }
         if (!changed) break;
     }
     /* every remaining link out of the corridor is a road the race closes */
-    for (int i = 0; i < w->nnav; i++) {
-        if (!w->navopen[i]) continue;
-        for (int k = w->adjstart[i]; k < w->adjstart[i+1]; k++) {
-            int nb = w->adjlist[k];
-            if (w->navopen[nb]) continue;
-            w->nmasked++;
-            float dx = w->nav[nb*2]-w->nav[i*2], dy = w->nav[nb*2+1]-w->nav[i*2+1];
+    for (int i = 0; i < w->city.nnav; i++) {
+        if (!w->city.navopen[i]) continue;
+        for (int k = w->city.adjstart[i]; k < w->city.adjstart[i+1]; k++) {
+            int nb = w->city.adjlist[k];
+            if (w->city.navopen[nb]) continue;
+            w->city.nmasked++;
+            float dx = w->city.nav[nb*2]-w->city.nav[i*2], dy = w->city.nav[nb*2+1]-w->city.nav[i*2+1];
             float d = sqrtf(dx*dx + dy*dy);
             if (d < 1e-3f) continue;
-            float mx = w->nav[i*2] + dx*0.5f, my = w->nav[i*2+1] + dy*0.5f;
+            float mx = w->city.nav[i*2] + dx*0.5f, my = w->city.nav[i*2+1] + dy*0.5f;
             int dup = 0;                       /* one blockade per closed mouth */
-            for (int b = 0; b < w->nbar && !dup; b++) {
-                float ex = w->bar[b].x-mx, ey = w->bar[b].y-my;
+            for (int b = 0; b < w->city.nbar && !dup; b++) {
+                float ex = w->city.bar[b].x-mx, ey = w->city.bar[b].y-my;
                 if (ex*ex + ey*ey < BAR_HALF*BAR_HALF) dup = 1;
             }
-            if (dup || w->nbar >= WORLD_MAXBARRIER) continue;
-            WBarrier *bar = &w->bar[w->nbar++];
+            if (dup || w->city.nbar >= WORLD_MAXBARRIER) continue;
+            WBarrier *bar = &w->city.bar[w->city.nbar++];
             bar->x = mx; bar->y = my; bar->dx = dx/d; bar->dy = dy/d;
             bar->a = i;  bar->b = nb;
         }
@@ -937,15 +1073,15 @@ int world_set_mode(World *w, int mode, int evidx) {
     printf("race event %d (%s, %s, ~%d00 m): corridor nodes %d, "
            "barriers %d, directed links masked %d\n",
            e->id, e->reg, e->circuit ? "circuit" : "sprint", e->len100m,
-           e->node1 - e->node0, w->nbar, w->nmasked);
-    return w->nbar;
+           e->node1 - e->node0, w->city.nbar, w->city.nmasked);
+    return w->city.nbar;
 }
 
 int world_barrier_push(const World *w, float *pos, float r) {
-    if (w->mode != MODE_RACE_EVENT) return 0;
+    if (w->city.mode != MODE_RACE_EVENT) return 0;
     int hit = 0;
-    for (int i = 0; i < w->nbar; i++) {
-        const WBarrier *b = &w->bar[i];
+    for (int i = 0; i < w->city.nbar; i++) {
+        const WBarrier *b = &w->city.bar[i];
         float rx = pos[0]-b->x, ry = pos[1]-b->y;
         if (rx*rx + ry*ry > BAR_REACH*BAR_REACH) continue;
         float s = rx*b->dx + ry*b->dy;              /* along the closed road */
@@ -975,8 +1111,8 @@ int world_barrier_push(const World *w, float *pos, float r) {
 static int race_load_grid(const World *w, const char *troot, int evid,
                           float (*out)[3], int cap) {
     int n = 0;
-    for (int r = 0; r < w->nreg && n < cap; r++) {
-        const char *rn = w->rgn[r].name;
+    for (int r = 0; r < w->neighborhood.nreg && n < cap; r++) {
+        const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         char p[1024];
         snprintf(p, sizeof p, "%s/ROUTES%s/TrackPosMarkersAll.bin", troot, stem);
@@ -1003,11 +1139,11 @@ static int race_load_grid(const World *w, const char *troot, int evid,
 }
 
 int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
-    WRace *R = &w->race;
+    WRace *R = &w->city.race;
     memset(R, 0, sizeof *R);
-    if (evidx < 0 || evidx >= w->nev) return 0;
+    if (evidx < 0 || evidx >= w->city.nev) return 0;
     world_set_mode(w, MODE_RACE_EVENT, evidx);
-    const WEvent *e = &w->ev[evidx];
+    const WEvent *e = &w->city.ev[evidx];
     R->ev = evidx; R->maxlaps = maxlaps > 0 ? maxlaps : 2;
 
     /* the outline closes (pts[n-1] == pts[0]), so the last vertex is a repeat */
@@ -1018,14 +1154,14 @@ int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
            on the road rather than on the decimated outline corner */
         int best = -1; float bd = 1e30f;
         for (int i = e->node0; i < e->node1; i++) {
-            float dx = w->nav[i*2] - e->poly[k][0], dy = w->nav[i*2+1] - e->poly[k][1];
+            float dx = w->city.nav[i*2] - e->poly[k][0], dy = w->city.nav[i*2+1] - e->poly[k][1];
             float d2 = dx*dx + dy*dy;
             if (d2 < bd) { bd = d2; best = i; }
         }
         WGate *g = &R->gate[R->ngate];
         g->node = best;
-        g->x = best >= 0 ? w->nav[best*2]   : e->poly[k][0];
-        g->y = best >= 0 ? w->nav[best*2+1] : e->poly[k][1];
+        g->x = best >= 0 ? w->city.nav[best*2]   : e->poly[k][0];
+        g->y = best >= 0 ? w->city.nav[best*2+1] : e->poly[k][1];
         /* direction of travel: central difference along the ordered outline */
         int kp = (k - 1 + np) % np, kn = (k + 1) % np;
         if (!e->circuit) { if (k == 0) kp = 0; if (k == np-1) kn = np-1; }
@@ -1045,7 +1181,7 @@ int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
     return R->ngate;
 }
 
-void world_race_stop(World *w) { w->race.active = 0; }
+void world_race_stop(World *w) { w->city.race.active = 0; }
 
 /* Do segments AB and CD properly straddle each other? */
 static int seg_cross(float ax, float ay, float bx, float by,
@@ -1058,7 +1194,7 @@ static int seg_cross(float ax, float ay, float bx, float by,
 }
 
 int world_race_update(World *w, float x, float y) {
-    WRace *R = &w->race;
+    WRace *R = &w->city.race;
     if (!R->active || R->finished) return 0;
     if (!R->havep) { R->px = x; R->py = y; R->havep = 1; return 0; }
     float px = R->px, py = R->py;
@@ -1073,7 +1209,7 @@ int world_race_update(World *w, float x, float y) {
     /* and only in the direction of travel, so reversing back out un-scores nothing */
     if ((x-px)*g->dx + (y-py)*g->dy <= 0.0f) return 0;
 
-    const WEvent *e = &w->ev[R->ev];
+    const WEvent *e = &w->city.ev[R->ev];
     int was = R->next;
     if (was == 0) {
         if (R->lap == 0) { R->lap = 1; printf("race: start line crossed, lap 1/%d\n", R->maxlaps); }
@@ -1098,8 +1234,8 @@ int world_race_update(World *w, float x, float y) {
 
 int world_nav_nearest(const World *w, float x, float y) {
     int best = -1; float bd = 1e30f;
-    for (int i = 0; i < w->nnav; i++) {
-        float dx = w->nav[i*2]-x, dy = w->nav[i*2+1]-y;
+    for (int i = 0; i < w->city.nnav; i++) {
+        float dx = w->city.nav[i*2]-x, dy = w->city.nav[i*2+1]-y;
         float d2 = dx*dx + dy*dy;
         if (d2 < bd) { bd = d2; best = i; }
     }
@@ -1125,21 +1261,21 @@ static HeapIt heap_pop(HeapIt *h, int *n) {
 
 int world_route(const World *w, int start, int goal, int *out, int cap, float *outdist) {
     if (outdist) *outdist = 0.0f;
-    if (!w->adjstart || start < 0 || goal < 0 || start >= w->nnav || goal >= w->nnav) return 0;
+    if (!w->city.adjstart || start < 0 || goal < 0 || start >= w->city.nnav || goal >= w->city.nnav) return 0;
     /* Race mode prunes the graph to the active corridor, so a route that would
        cross a barrier is either re-routed inside it or reported unreachable. */
-    if (w->mode == MODE_RACE_EVENT && w->navopen &&
-        (!w->navopen[start] || !w->navopen[goal])) return 0;
-    float *g = (float *)malloc((size_t)w->nnav * sizeof(float));
-    int *came = (int *)malloc((size_t)w->nnav * sizeof(int));
-    char *closed = (char *)calloc((size_t)w->nnav, 1);
-    for (int i = 0; i < w->nnav; i++) { g[i] = 1e30f; came[i] = -1; }
-    HeapIt *heap = (HeapIt *)malloc((size_t)(w->nadj + 16) * sizeof(HeapIt));
+    if (w->city.mode == MODE_RACE_EVENT && w->city.navopen &&
+        (!w->city.navopen[start] || !w->city.navopen[goal])) return 0;
+    float *g = (float *)malloc((size_t)w->city.nnav * sizeof(float));
+    int *came = (int *)malloc((size_t)w->city.nnav * sizeof(int));
+    char *closed = (char *)calloc((size_t)w->city.nnav, 1);
+    for (int i = 0; i < w->city.nnav; i++) { g[i] = 1e30f; came[i] = -1; }
+    HeapIt *heap = (HeapIt *)malloc((size_t)(w->city.nadj + 16) * sizeof(HeapIt));
     int hn = 0;
-    float gx = w->nav[goal*2], gy = w->nav[goal*2+1];
+    float gx = w->city.nav[goal*2], gy = w->city.nav[goal*2+1];
     g[start] = 0.0f;
     HeapIt s0; s0.n = start;
-    s0.f = hypotf(w->nav[start*2]-gx, w->nav[start*2+1]-gy);
+    s0.f = hypotf(w->city.nav[start*2]-gx, w->city.nav[start*2+1]-gy);
     heap_push(heap, &hn, s0);
     int found = 0;
     while (hn > 0) {
@@ -1147,17 +1283,17 @@ int world_route(const World *w, int start, int goal, int *out, int cap, float *o
         if (cur.n == goal) { found = 1; break; }
         if (closed[cur.n]) continue;
         closed[cur.n] = 1;
-        for (int k = w->adjstart[cur.n]; k < w->adjstart[cur.n+1]; k++) {
-            int nb = w->adjlist[k];
+        for (int k = w->city.adjstart[cur.n]; k < w->city.adjstart[cur.n+1]; k++) {
+            int nb = w->city.adjlist[k];
             if (closed[nb]) continue;
-            if (w->mode == MODE_RACE_EVENT && !w->navopen[nb]) continue;  /* barrier */
-            float dx = w->nav[nb*2]-w->nav[cur.n*2], dy = w->nav[nb*2+1]-w->nav[cur.n*2+1];
+            if (w->city.mode == MODE_RACE_EVENT && !w->city.navopen[nb]) continue;  /* barrier */
+            float dx = w->city.nav[nb*2]-w->city.nav[cur.n*2], dy = w->city.nav[nb*2+1]-w->city.nav[cur.n*2+1];
             float ng = g[cur.n] + hypotf(dx, dy);
             if (ng >= g[nb]) continue;
             g[nb] = ng; came[nb] = cur.n;
             HeapIt it; it.n = nb;
-            it.f = ng + hypotf(w->nav[nb*2]-gx, w->nav[nb*2+1]-gy);
-            if (hn < w->nadj + 15) heap_push(heap, &hn, it);
+            it.f = ng + hypotf(w->city.nav[nb*2]-gx, w->city.nav[nb*2+1]-gy);
+            if (hn < w->city.nadj + 15) heap_push(heap, &hn, it);
         }
     }
     int n = 0;
@@ -1183,13 +1319,13 @@ int world_route(const World *w, int start, int goal, int *out, int cap, float *o
 #define TRN_CELL 128.0f
 
 static int wd_slot(World *w, const char *tok) {
-    for (int i = 0; i < w->ndist; i++) if (!strcmp(w->dist[i].tok, tok)) return i;
-    if (w->ndist >= WORLD_MAXDIST) return -1;
-    WDistrict *d = &w->dist[w->ndist];
+    for (int i = 0; i < w->city.ndist; i++) if (!strcmp(w->city.dist[i].tok, tok)) return i;
+    if (w->city.ndist >= WORLD_MAXDIST) return -1;
+    WDistrict *d = &w->city.dist[w->city.ndist];
     snprintf(d->tok, sizeof d->tok, "%s", tok);
     d->n = 0; d->cx = d->cy = 0; d->medz = 0;
     d->bb[0] = d->bb[2] = 1e30f; d->bb[1] = d->bb[3] = -1e30f;
-    return w->ndist++;
+    return w->city.ndist++;
 }
 static int cmp_f(const void *a, const void *b) {
     float x = *(const float *)a, y = *(const float *)b;
@@ -1197,20 +1333,20 @@ static int cmp_f(const void *a, const void *b) {
 }
 
 int world_build_districts(World *w) {
-    w->ndist = 0;
-    if (w->nnav <= 0) return 0;
+    w->city.ndist = 0;
+    if (w->city.nnav <= 0) return 0;
 
     int cap = 4096, nt = 0;
     float *tc = (float *)malloc((size_t)cap * 3 * sizeof(float));   /* x, y, z */
     int   *ta = (int *)malloc((size_t)cap * sizeof(int));           /* district slot */
-    for (int i = 0; i < w->scene.count; i++) {
-        const char *nm = w->scene.meshes[i].sname;
+    for (int i = 0; i < w->neighborhood.scene.count; i++) {
+        const char *nm = w->neighborhood.scene.meshes[i].sname;
         if (strncmp(nm, "TRN_", 4)) continue;
         const char *a = nm + 4;
         if (!isalpha((unsigned char)a[0]) || !isalpha((unsigned char)a[1]) || a[2] != '_') continue;
         char tok[4]; tok[0]=a[0]; tok[1]=a[1]; tok[2]=0; tok[3]=0;
         int k = wd_slot(w, tok); if (k < 0) continue;
-        float bb[6]; n2_mesh_bbox(&w->scene.meshes[i], bb);
+        float bb[6]; n2_mesh_bbox(&w->neighborhood.scene.meshes[i], bb);
         if (nt == cap) { cap *= 2;
             tc = (float *)realloc(tc, (size_t)cap*3*sizeof(float));
             ta = (int *)realloc(ta, (size_t)cap*sizeof(int)); }
@@ -1241,10 +1377,10 @@ int world_build_districts(World *w) {
         nxt[i] = head[cy*gw+cx]; head[cy*gw+cx] = i;
     }
 
-    w->navcomp = (int *)malloc((size_t)w->nnav * sizeof(int));
+    w->city.navcomp = (int *)malloc((size_t)w->city.nnav * sizeof(int));
     float *zs = (float *)malloc((size_t)nt * sizeof(float));
-    for (int i = 0; i < w->nnav; i++) {
-        float x = w->nav[i*2], y = w->nav[i*2+1];
+    for (int i = 0; i < w->city.nnav; i++) {
+        float x = w->city.nav[i*2], y = w->city.nav[i*2+1];
         int cx = (int)((x-gx0)/TRN_CELL), cy = (int)((y-gy0)/TRN_CELL);
         int best = -1; float bd = 1e30f;
         for (int ring = 0; ring <= 10 && best < 0; ring++) {
@@ -1260,23 +1396,23 @@ int world_build_districts(World *w) {
             }
         }
         int k = best >= 0 ? ta[best] : -1;
-        w->navcomp[i] = k;
+        w->city.navcomp[i] = k;
         if (k < 0) continue;
-        WDistrict *d = &w->dist[k];
+        WDistrict *d = &w->city.dist[k];
         d->n++; d->cx += x; d->cy += y;
         if (x < d->bb[0]) d->bb[0] = x;
         if (x > d->bb[1]) d->bb[1] = x;
         if (y < d->bb[2]) d->bb[2] = y;
         if (y > d->bb[3]) d->bb[3] = y;
     }
-    for (int k = 0; k < w->ndist; k++) {
-        if (w->dist[k].n) { w->dist[k].cx /= w->dist[k].n; w->dist[k].cy /= w->dist[k].n; }
+    for (int k = 0; k < w->city.ndist; k++) {
+        if (w->city.dist[k].n) { w->city.dist[k].cx /= w->city.dist[k].n; w->city.dist[k].cy /= w->city.dist[k].n; }
         int nzs = 0;
         for (int i = 0; i < nt; i++) if (ta[i] == k) zs[nzs++] = tc[i*3+2];
-        if (nzs) { qsort(zs, (size_t)nzs, sizeof(float), cmp_f); w->dist[k].medz = zs[nzs/2]; }
+        if (nzs) { qsort(zs, (size_t)nzs, sizeof(float), cmp_f); w->city.dist[k].medz = zs[nzs/2]; }
     }
     free(tc); free(ta); free(head); free(nxt); free(zs);
-    return w->ndist;
+    return w->city.ndist;
 }
 
 int world_district_at(const World *w, float x, float y, float maxdist) {
@@ -1284,14 +1420,14 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
        has nav nodes but no district-tokened terrain -- L4RB names its ground
        TRN_RDP_ and TRN_ROADDRAG_, three-letter tokens the slot parser skips. No
        districts means no district here. */
-    if (!w->navcomp) return -1;
+    if (!w->city.navcomp) return -1;
     int best = -1; float bd = maxdist*maxdist;
-    for (int i = 0; i < w->nnav; i++) {
-        float dx = w->nav[i*2]-x, dy = w->nav[i*2+1]-y;
+    for (int i = 0; i < w->city.nnav; i++) {
+        float dx = w->city.nav[i*2]-x, dy = w->city.nav[i*2+1]-y;
         float d2 = dx*dx + dy*dy;
         if (d2 < bd) { bd = d2; best = i; }
     }
-    return best >= 0 ? w->navcomp[best] : -1;
+    return best >= 0 ? w->city.navcomp[best] : -1;
 }
 
 /* The one layer-selection rule (was inlined in n2_ground_z_ref; lifted here so

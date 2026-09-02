@@ -48,49 +48,59 @@ typedef struct {
     int mesh0, mesh1;                /* this region's mesh range in the scene */
 } WRegion;
 
+/* Owned uniform-grid acceleration data for ROAD/TERRAIN queries. Building a
+ * second grid does not affect the active world; activation is explicit so a
+ * replacement neighborhood can be validated before any gameplay query sees
+ * it. */
+typedef struct {
+    const N2Mesh *meshes;
+    float x0, y0;
+    int gw, gh;
+    int *start;
+    int *list;
+} WGroundGrid;
+
 typedef struct {
     N2Scene scene;
-    WRegion rgn[WORLD_MAXREG]; int nreg;
-    unsigned char *loc4; long loc4len;                       /* shared tex library */
-    unsigned char *master; long masterlen; N2Tpk mastertpk;  /* single-region mode */
-    /* Texture-only shared fallback; never enters model/placement assembly.
-       Released, including its TPK index, after world_bind_textures. */
-    unsigned char *common; long commonlen; N2Tpk commontpk;
-    N2Tex grass; int have_grass;                             /* terrain fallback */
-    N2LightSrc *lights; int nlights, lightcap;                /* authored 0x135003 */
-    float (*mbb)[4];   /* per-mesh XY bbox (x0,y0,x1,y1) for culling + ground grid */
-    WDistrict dist[WORLD_MAXDIST]; int ndist;  /* connected road components */
-    int *navcomp;                             /* district index per nav node, -1 = none */
-    /* AI/GPS navigation graph: the real drivable road network (see world_load_nav) */
-    float *nav;        /* nnav * 2 floats: world X,Y of each node */
-    int    nnav;
-    int   *navedge;    /* nnavedge * 2 node indices */
-    int    nnavedge;
-    float  navbb[4];   /* x0,x1,y0,y1 over all nodes, for map framing */
-    int   *adjstart;   /* CSR adjacency over the welded graph: nnav+1 offsets */
-    int   *adjlist;    /* neighbour node indices */
-    int    nadj;
-    /* --- race events vs freeroam (Phase 71) --- */
-    WEvent ev[WORLD_MAXEVENT]; int nev;
-    int   *navev;      /* event index that contributed each nav node, -1 = none */
-    char  *navopen;    /* 1 = node is inside the active corridor (all 1 in freeroam) */
-    WBarrier bar[WORLD_MAXBARRIER]; int nbar;
-    int    mode;       /* MODE_FREEROAM / MODE_RACE_EVENT */
-    int    active_ev;  /* index into ev[], -1 in freeroam */
-    int    nmasked;    /* directed CSR links disabled by the active barriers */
-    WRace  race;       /* checkpoint / lap tracking (Phase 72) */
-    /* M132: authored backdrop impostors (PAN_*, TRN_PANARAMA*, *_WORLD_LOD),
-     * kept in their own scene. They are rendered as a background pass and are
-     * deliberately invisible to ground selection, wheel support, collision,
-     * navigation and spawn -- every one of those queries w->scene. */
     N2Scene vista;
-    WInstStats inst_stats;  /* populated only by explicit instance-world loads */
+    WRegion rgn[WORLD_MAXREG];
+    int nreg;
+    unsigned char *loc4; long loc4len;
+    unsigned char *master; long masterlen; N2Tpk mastertpk; int master_mapped;
+    unsigned char *common; long commonlen; N2Tpk commontpk;
+    N2Tex grass; int have_grass;
+    N2LightSrc *lights; int nlights, lightcap;
+    float (*mbb)[4];
+    WGroundGrid grid;
+    WInstStats inst_stats;
+    float center[2], radius;
+} WorldNeighborhood;
+
+typedef struct {
+    WDistrict dist[WORLD_MAXDIST]; int ndist;
+    int *navcomp;
+    float *nav; int nnav;
+    int *navedge; int nnavedge;
+    float navbb[4];
+    int *adjstart, *adjlist; int nadj;
+    WEvent ev[WORLD_MAXEVENT]; int nev;
+    int *navev;
+    char *navopen;
+    WBarrier bar[WORLD_MAXBARRIER]; int nbar;
+    int mode, active_ev, nmasked;
+    WRace race;
+} WorldCity;
+
+typedef struct {
+    WorldNeighborhood neighborhood;
+    WorldCity city;
 } World;
 
 typedef struct {
     int enabled;
     float focus_x, focus_y;
     float view_radius;
+    int scenery_event; /* 0 unchanged, -1 free, positive event; load-time preview */
 } WLoadOptions;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/
@@ -185,6 +195,21 @@ int world_barrier_push(const World *w, float *pos, float r);
 int world_load(World *w, const char *troot, const char *trackname);
 int world_load_ex(World *w, const char *troot, const char *trackname,
                   const WLoadOptions *options);
+
+int world_neighborhood_load(WorldNeighborhood *neighborhood,
+                            const char *troot, const char *trackname,
+                            const WLoadOptions *options);
+int world_city_load(WorldCity *city,
+                    const WorldNeighborhood *initial_neighborhood,
+                    const char *troot, const char *trackname);
+
+void world_neighborhood_free(WorldNeighborhood *neighborhood);
+void world_city_free(WorldCity *city);
+
+int  world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
+                             const float (*mbb)[4]);
+void world_ground_grid_activate(const WGroundGrid *grid);
+void world_ground_grid_free(WGroundGrid *grid);
 
 /* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master).
  * After all original region attempts, retry unbound requests against
