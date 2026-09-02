@@ -4,7 +4,7 @@
 > maintainer can reasonably research, implement and test alone. Contributors
 > and future maintainers are welcome across asset formats, rendering, physics,
 > racing, AI, tooling, documentation and platform support. See
-> **[Help Wanted — issue #1](https://github.com/whoismept/OpenUG2/issues/1)**
+> **[Help Wanted — community roadmap #5](https://github.com/whoismept/OpenUG2/issues/5)**
 > and the [contribution areas below](#help-wanted).
 
 An open, from-scratch reimplementation of the **Need for Speed: Underground 2**
@@ -188,7 +188,7 @@ evidence, scope and acceptance test.
 OpenUG2 needs contributors and maintainers across the **entire project**. Its
 reverse engineering, engine work, validation and platform coverage are too
 broad for one person to sustain alone. Start with
-**[Help Wanted — issue #1](https://github.com/whoismept/OpenUG2/issues/1)**,
+**[Help Wanted — community roadmap #5](https://github.com/whoismept/OpenUG2/issues/5)**,
 or open a focused issue before beginning a large change.
 
 High-value contribution areas:
