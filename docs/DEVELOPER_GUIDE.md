@@ -103,15 +103,20 @@ data root
        -> race state -> camera -> render passes -> optional diagnostics
 ```
 
-### Opt-in instance-driven district flow
+### Default instance-driven district flow
 
-The legacy STREAM object walk remains the default. `--world2` is a diagnostic
-instance-world path and must be paired with one explicit `--track STREAM...`
-and `--spawn start` or `--spawn X,Y`; it refuses `--track ALL`. The named
-`start` pose is only a repeatable L4RA reference focus, not a new freeroam
-spawn policy.
+Normal free roam uses the instance-world path. With no track argument the
+engine opens `STREAML4RA`; selecting any single `--track STREAM...` keeps the
+same path. `--world2` remains a backward-compatible alias for old scripts and
+`--track ALL` remains a separate legacy research union, never a playable map.
 
-For this path, `main` resolves the requested XY before `world_load_ex`.
+Without a developer `--spawn` override, `main` intersects companion region
+polygons with section ids actually present in the selected STREAM bundle,
+chooses a deterministic authored focus, builds the resident, then selects the
+nearest ROAD triangle whose full car footprint has support, collision clearance
+and headroom. This removes the old hard-coded L4RA `--spawn start` requirement.
+
+For this path, `main` resolves the authored focus before `world_load_ex`.
 `world_instance_build` reads companion district polygons, selects the smallest
 containing home district and nearby district ids, then chooses one bundle that
 has the home section. It builds a local prototype library from that bundle,
@@ -132,25 +137,25 @@ Keyed records never fall back to a similarly named object. The bounded object
 name is used for diagnostics and scenery classification. Name-only compatibility
 is restricted to records with no keys. Multiple resident copies of the SAME
 key still use the first copy; district-specific copy selection and live streaming
-are separate, unimplemented work. This does not enable `--world2` by default.
+are separate, unimplemented work.
 
 ```text
---world2 focus
+single-STREAM authored focus
   -> companion polygon selection
   -> one home-section STREAM bundle
   -> local prototype library + instance placements
   -> world_dedup -> terrain bias -> bounds/ground grid -> nav -> textures/batches
 ```
 
-After the completed ground grid exists, the diagnostic spawn Z is resolved
-against the nearest authored ROAD/TERRAIN layer. This establishes load-time
-support evidence only; it does not establish vertical contact, collision,
-physics, alpha/glass, lighting, or vista behavior.
+After the completed ground grid exists, the provisional pose is resolved from
+an authored ROAD/TERRAIN triangle. Once the car dimensions and collision scene
+are available, the final free-roam pose is refined by the same patch, wall and
+headroom rules used by safe-spawn diagnostics.
 
 Use the GL-free audit for deterministic assembly evidence:
 
 ```sh
-./nfsu2 DATA_ROOT --track STREAML4RA --world2 --spawn start --heading -101 --instance-audit
+./nfsu2 DATA_ROOT --track STREAML4RA --instance-audit
 ```
 
 It reports selected bundle/home district, region and instance totals, placed
@@ -159,9 +164,9 @@ totals, keyed/explicit-LOD/name-only resolution counts, finite-coordinate failur
 and the ROAD/TERRAIN support result; it
 exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
 normalizing only machine-specific absolute paths or elapsed time if present.
-For a fixed render check, retain the same arguments, replace the audit switch
-with `--shot OUTPUT.png`, and change only `--heading` (for example `-101`,
-`-11`, `79`, or `169`). In this explicit `--world2 --shot` mode, `--heading`
+For a fixed render check, add `--spawn X,Y --heading DEG`, replace the audit
+switch with `--shot OUTPUT.png`, and change only the heading (for example
+`-101`, `-11`, `79`, or `169`). In this explicit-pose `--shot` mode, `--heading`
 is the fixed camera direction (and seeds the parked car yaw); the requested
 supported spawn is preserved, with no legacy showcase selection, race-grid
 placement, or capture autopilot. `--instance-audit` remains GL-free and has no
@@ -739,7 +744,7 @@ wall-contact responses, shared memberships, unknown events and corrupt targets.
 Runtime direction/career selection is still unimplemented. Do not present this
 preview as retail free-roam fidelity or automatic Enter/finish activation.
 
-### Moving world neighborhood (M144, `--world2` free-roam)
+### Moving world neighborhood (M144, default free-roam)
 
 The instance-driven world keeps one replaceable `WorldResident`. Persistent
 navigation, districts, events and race state stay in `WorldCity`; geometry,
@@ -763,7 +768,7 @@ Build failure leaves the old resident active and the failed snapped cell is not
 retried until the player targets another cell. Player position, velocity,
 heading, sprung ride/contact state, camera and input are deliberately outside
 the resident and must remain byte-identical across activation. This path is
-free-roam-only, requires one explicit STREAM bundle and never uses `--track ALL`.
+free-roam-only, uses one STREAM bundle and never uses `--track ALL`.
 
 `WorldNeighborhood.master` records whether the master resource came from
 `mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only
@@ -782,8 +787,8 @@ the supported L4RA start / L4RB sprint-grid pose:
 | **1400** | **23768 / 4528 / 694 / 1077** | **4142 / 1059 / 277 / 101** |
 | 1600 | 31557 / 5397 / 777 / 1546 | 6916 / 1449 / 371 / 135 |
 
-Use `--resident-audit RADIUS X Y` with `--world2`, one explicit `--track` and
-`--spawn` to measure the real loader/uploader. The audit is rejected for legacy,
+Use `--resident-audit RADIUS X Y` with one explicit `--track` to measure the
+real loader/uploader. `--spawn` is optional. The audit is rejected for legacy,
 `ALL` and `--event` modes. Times are synchronous development measurements, not
 frame-budget promises; asynchronous/background loading is intentionally not in
 M144.

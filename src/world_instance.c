@@ -748,6 +748,80 @@ static int winst_walk_sections(const unsigned char *data, long begin, long end,
     return 1;
 }
 
+static int winst_mark_section_ids(const unsigned char *data, long begin, long end,
+                                  unsigned depth, unsigned char *present,
+                                  int present_cap) {
+    if (depth > 64) return 0;
+    for (long pos=begin; pos<end;) {
+        if (end-pos<8) return 0;
+        uint32_t magic=n2_u32(data+pos); long child_end=0;
+        if (!chunk_end(pos+8,n2_u32(data+pos+4),end,&child_end)) return 0;
+        if (magic==0x80034100u) {
+            WInstSection section;
+            if (!winst_parse_section(data,pos+8,child_end,&section) ||
+                section.region_id<0 || section.region_id>=present_cap) return 0;
+            present[section.region_id]=1;
+        } else if (magic && (magic>>28)==8 &&
+                   !winst_mark_section_ids(data,pos+8,child_end,depth+1,
+                                           present,present_cap)) return 0;
+        pos=child_end;
+    }
+    return 1;
+}
+
+int winst_default_focus(const unsigned char *companion, long companion_len,
+                        const unsigned char *stream, long stream_len,
+                        float out_xy[2]) {
+    if (!companion || companion_len < 0 || !stream || stream_len < 0 || !out_xy)
+        return 0;
+    WInstRegion *regions = NULL;
+    int count = 0;
+    if (!winst_parse_regions(companion, companion_len, &regions, &count)) return 0;
+    unsigned char *present=(unsigned char *)calloc(65536,1);
+    if (!present || !winst_mark_section_ids(stream,0,stream_len,0,present,65536)) {
+        free(present);
+        winst_free_regions(regions,count);
+        return 0;
+    }
+
+    int best = -1;
+    float best_x = 0.0f, best_y = 0.0f;
+    double best_d2 = 0.0;
+    for (int i = 0; i < count; i++) {
+        if (regions[i].id<0 || regions[i].id>=65536 || !present[regions[i].id]) continue;
+
+        double sx = 0.0, sy = 0.0;
+        for (int p = 0; p < regions[i].nxy; p++) {
+            sx += regions[i].xy[p * 2];
+            sy += regions[i].xy[p * 2 + 1];
+        }
+        float x = (float)(sx / regions[i].nxy);
+        float y = (float)(sy / regions[i].nxy);
+        if (!in_polygon(&regions[i], x, y)) {
+            x = 0.5f * (regions[i].bb[0] + regions[i].bb[2]);
+            y = 0.5f * (regions[i].bb[1] + regions[i].bb[3]);
+        }
+        if (!in_polygon(&regions[i], x, y)) {
+            x = regions[i].xy[0];
+            y = regions[i].xy[1];
+        }
+        double d2 = (double)x * x + (double)y * y;
+        if (best < 0 || d2 < best_d2 ||
+            (d2 == best_d2 && regions[i].id < regions[best].id)) {
+            best = i;
+            best_x = x;
+            best_y = y;
+            best_d2 = d2;
+        }
+    }
+    free(present);
+    winst_free_regions(regions, count);
+    if (best < 0) return 0;
+    out_xy[0] = best_x;
+    out_xy[1] = best_y;
+    return 1;
+}
+
 #ifdef WORLD_INSTANCE_TESTING
 int winst_test_collect_placements(const unsigned char *section_data,
                                   long section_len,

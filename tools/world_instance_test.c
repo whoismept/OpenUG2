@@ -15,6 +15,7 @@
  * normal translation unit is still linked by the Makefile; rename only its
  * public functions in this isolated copy and expose its private helpers here. */
 #define winst_parse_regions winst_parse_regions_test_copy
+#define winst_default_focus winst_default_focus_test_copy
 #define winst_free_regions winst_free_regions_test_copy
 #define winst_select_regions winst_select_regions_test_copy
 #define winst_decode_placement winst_decode_placement_test_copy
@@ -35,6 +36,7 @@
 #undef winst_select_regions
 #undef winst_free_regions
 #undef winst_parse_regions
+#undef winst_default_focus
 
 /* Test-only observation hook; it is deliberately not part of world_instance.h. */
 long winst_test_placement_live_allocations(void);
@@ -68,6 +70,12 @@ static int near(float a, float b) {
 static int close3(const float *v, float x, float y, float z) {
     return near(v[0], x) && near(v[1], y) && near(v[2], z);
 }
+
+static void make_instance_record(unsigned char record[64], int type,
+                                 float x0, float y0, float x1, float y1);
+static long add_section(unsigned char *buf, long pos, int region_id,
+                        const char *type_name,
+                        const unsigned char *placements, int placement_count);
 
 static void free_scene(N2Scene *scene) {
     for (int i = 0; i < scene->count; i++) {
@@ -135,6 +143,24 @@ static void test_regions(void) {
     nr = 0;
     assert(winst_parse_regions(buf, used - 1, &r, &nr) == 0);
     assert(r == NULL && nr == 0);
+}
+
+static void test_default_focus_uses_a_region_present_in_stream(void) {
+    unsigned char companion[256], stream[512], placement[64];
+    long companion_len = make_regions(companion, sizeof companion);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+
+    long stream_len = add_section(stream, 0, 17, "XO_HOME", placement, 1);
+    float focus[2] = {99.0f, 99.0f};
+    assert(winst_default_focus(companion, companion_len, stream, stream_len,
+                               focus) == 1);
+    assert(near(focus[0], 0.0f) && near(focus[1], 0.0f));
+
+    stream_len = add_section(stream, 0, 23, "XO_FOREIGN", placement, 1);
+    focus[0] = focus[1] = 99.0f;
+    assert(winst_default_focus(companion, companion_len, stream, stream_len,
+                               focus) == 0);
+    assert(near(focus[0], 99.0f) && near(focus[1], 99.0f));
 }
 
 static void test_placement(void) {
@@ -1011,6 +1037,7 @@ int main(void) {
     test_builder_authored_model_keys();
     test_positioned_model_name_boundaries();
     test_regions();
+    test_default_focus_uses_a_region_present_in_stream();
     test_placement();
     test_decoded_asymmetric_placement();
     test_direct_placement();

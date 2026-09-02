@@ -139,11 +139,11 @@ world-cli-test: nfsu2
 	if test $$spawn_missing -eq 2 && test $$heading_missing -eq 2 && \
 	   test $$spawn_bad -eq 2 && test $$heading_bad -eq 2 && \
 	   test $$scenery_missing -eq 2 && test $$scenery_bad -eq 2 && \
-	   test $$scenery_legacy -eq 2 && test $$scenery_live -eq 2 && \
+	   test $$scenery_legacy -eq 1 && test $$scenery_live -eq 2 && \
 	   test $$scenery_spawn -eq 2 && test $$scenery_stack -eq 2 && \
-	   test $$world2_load_fail -eq 1 && test $$resident_legacy -eq 2 && \
+	   test $$world2_load_fail -eq 1 && test $$resident_legacy -eq 1 && \
 	   test $$resident_all -eq 2 && test $$resident_race -eq 2 && \
-	   test $$resident_valid -eq 1 && test $$resident_route_legacy -eq 2 && \
+	   test $$resident_valid -eq 1 && test $$resident_route_legacy -eq 1 && \
 	   test $$resident_route_race -eq 2 && test $$resident_route_valid -eq 1; then \
 	  echo "world_cli_test: PASS"; \
 	else \

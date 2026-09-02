@@ -45,6 +45,11 @@ int  winst_select_regions(const WInstRegion *regions, int count,
                           float x, float y, float radius,
                           unsigned char *selected, int selected_cap,
                           int *home_index);
+/* Choose a deterministic authored focus from a companion-region polygon whose
+ * region id is actually present in the selected STREAM bundle. */
+int  winst_default_focus(const unsigned char *companion, long companion_len,
+                         const unsigned char *stream, long stream_len,
+                         float out_xy[2]);
 int  winst_decode_placement(const unsigned char *record, long len,
                             WInstPlacement *out);
 int  winst_place_mesh(N2Scene *dst, const N2Mesh *src,

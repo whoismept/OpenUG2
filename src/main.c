@@ -793,6 +793,81 @@ static int ss_in_wall(const float obst[][4], int nobst, float x, float y, float 
     return 0;
 }
 
+/* Pick a supported triangle near an authored region focus. This is the
+ * provisional pre-car pose used to validate/build the first resident. ROAD is
+ * preferred; TERRAIN is only a fallback for bundles with no nearby road. */
+static int ss_nearest_surface(const N2Scene *s, float seedx, float seedy,
+                              float out[3], float *heading) {
+    int found = 0;
+    float best = 0.0f;
+    for (int pass = 0; pass < 2 && !found; pass++) {
+        int want = pass == 0 ? N2_ROAD : N2_TERRAIN;
+        for (int mi = 0; mi < s->count; mi++) {
+            const N2Mesh *m = &s->meshes[mi];
+            if (m->cat != want) continue;
+            for (int q = 0; q + 2 < m->nidx; q += 3) {
+                int ia=m->idx[q], ib=m->idx[q+1], ic=m->idx[q+2];
+                if (ia<0 || ib<0 || ic<0 || ia>=m->nverts || ib>=m->nverts || ic>=m->nverts)
+                    continue;
+                const float *a=m->verts+ia*5, *b=m->verts+ib*5, *c=m->verts+ic*5;
+                float ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2];
+                float vx=c[0]-a[0], vy=c[1]-a[1], vz=c[2]-a[2];
+                float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+                float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+                if (nl < 1e-5f || fabsf(nz)/nl < 0.5f) continue;
+                float x=(a[0]+b[0]+c[0])/3.0f, y=(a[1]+b[1]+c[1])/3.0f;
+                float d=(x-seedx)*(x-seedx)+(y-seedy)*(y-seedy);
+                if (!found || d < best) {
+                    float eab=ux*ux+uy*uy, eac=vx*vx+vy*vy;
+                    float bcx=c[0]-b[0], bcy=c[1]-b[1], ebc=bcx*bcx+bcy*bcy;
+                    float dx=ux, dy=uy;
+                    if (eac > eab && eac >= ebc) { dx=vx; dy=vy; }
+                    else if (ebc > eab && ebc > eac) { dx=bcx; dy=bcy; }
+                    out[0]=x; out[1]=y; out[2]=(a[2]+b[2]+c[2])/3.0f;
+                    *heading=atan2f(dy,dx); best=d; found=1;
+                }
+            }
+        }
+    }
+    return found;
+}
+
+/* Final player pose: nearest road triangle whose full car footprint is on the
+ * same layer, outside collision footprints, with useful headroom. */
+static int ss_nearest_safe_road(const N2Scene *s, const float (*mbb)[4],
+                                const float obst[][4], int nobst,
+                                float seedx, float seedy, float hl, float hw,
+                                float out[3], float *heading) {
+    int found = 0; float best = 0.0f;
+    for (int mi = 0; mi < s->count; mi++) {
+        const N2Mesh *m = &s->meshes[mi];
+        if (m->cat != N2_ROAD) continue;
+        for (int q=0; q+2<m->nidx; q+=3) {
+            int ia=m->idx[q], ib=m->idx[q+1], ic=m->idx[q+2];
+            if (ia<0 || ib<0 || ic<0 || ia>=m->nverts || ib>=m->nverts || ic>=m->nverts)
+                continue;
+            const float *a=m->verts+ia*5, *b=m->verts+ib*5, *c=m->verts+ic*5;
+            float x=(a[0]+b[0]+c[0])/3.0f, y=(a[1]+b[1]+c[1])/3.0f;
+            float d=(x-seedx)*(x-seedx)+(y-seedy)*(y-seedy);
+            if (found && d >= best) continue;
+            float dx=b[0]-a[0], dy=b[1]-a[1], d2=dx*dx+dy*dy;
+            float ex=c[0]-a[0], ey=c[1]-a[1], e2=ex*ex+ey*ey;
+            float fx=c[0]-b[0], fy=c[1]-b[1], f2=fx*fx+fy*fy;
+            if (e2>d2 && e2>=f2) { dx=ex; dy=ey; }
+            else if (f2>d2 && f2>e2) { dx=fx; dy=fy; }
+            float hd=atan2f(dy,dx), z=(a[2]+b[2]+c[2])/3.0f;
+            WGroundHit centre; float normal[3];
+            int cat=world_ground_hit(s,x,y,z,&centre);
+            if (cat!=WSURF_ROAD || fabsf(centre.z-z)>0.10f ||
+                ss_in_wall(obst,nobst,x,y,1.3f) ||
+                !world_ground_patch_normal(s,x,y,hd,hl,-hl,hw,&centre,normal) ||
+                ss_ceiling_above(s,mbb,x,y,centre.z)-centre.z < SS_CLEAR_M) continue;
+            out[0]=x; out[1]=y; out[2]=centre.z; *heading=hd; best=d; found=1;
+        }
+    }
+    return found;
+}
+
 /* First waypoint at or after `from` (wrapping the closed loop) whose road layer
  * passes the M91 tests: layers come from the exact covering triangles, never
  * from world_ground_z; the whole car footprint must stand on road (ss_patch);
@@ -1202,16 +1277,16 @@ int main(int argc, char **argv) {
     /* Point at your own NFSU2 install/data directory (contains TRACKS/, CARS/).
        Usage: nfsu2 [DATA_DIR] [options]
          --car NAME       car folder under CARS/ (default HUMMER)
-         --track NAME     STREAM .BUN under TRACKS/, or ALL = diagnostic union (default).
+         --track NAME     STREAM .BUN under TRACKS/ (default STREAML4RA).
                           The bundles overlap as route/event supersets; ALL is
                           not a supported playable open-world composition.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
-         --world2         opt into diagnostic instance-driven world assembly
+         --world2         legacy alias; instance world is automatic for one STREAM
          --scenery-preview free|EVENT  load-time event-only scenery test (world2 capture/audit only)
          --sky PROFILE    authored sky: night (default), sunrise, or sunset
-         --spawn start|X,Y  focus/spawn for --world2 (required)
+         --spawn start|X,Y  developer override for the automatic authored spawn
          --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
@@ -1273,14 +1348,14 @@ int main(int argc, char **argv) {
     int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
-    int world2 = 0, instance_audit = 0;
+    int world2 = 1, world2_explicit = 0, instance_audit = 0;
     int resident_audit = 0;
     const char *resident_route_audit = NULL;
     float resident_audit_radius = 0.0f, resident_audit_xy[2] = {0.0f, 0.0f};
     int scenery_event = 0;
     int world2_spawn_set = 0, world2_heading_set = 0;
     float world2_spawn_xy[2] = {0, 0}, world2_heading_deg = 0.0f;
-    const char *carname = "HUMMER", *trackname = "ALL";
+    const char *carname = "HUMMER", *trackname = "STREAML4RA";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
@@ -1400,7 +1475,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vista-census")) { vcensus = 1;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
-        else if (!strcmp(argv[i], "--world2")) world2 = 1;
+        else if (!strcmp(argv[i], "--world2")) { world2 = 1; world2_explicit = 1; }
         else if (!strcmp(argv[i], "--resident-audit")) {
             if (i+3 >= argc) {
                 fprintf(stderr, "--resident-audit requires RADIUS X Y\n");
@@ -1481,27 +1556,33 @@ int main(int argc, char **argv) {
         }
         else dataroot = argv[i];
     }
+    /* Closed-circuit loading still uses the verified route/world path. Keep an
+       explicit --circuit working while free roam and sprint events use the
+       instance-driven neighborhood by default. */
+    if (explicit_circuit && !world2_explicit) world2 = 0;
+    if (!strcmp(trackname, "ALL")) {
+        if (world2_explicit) {
+            fprintf(stderr, "--world2 cannot compose --track ALL; select one STREAM bundle\n");
+            return 2;
+        }
+        world2 = 0; /* explicit legacy research union */
+    }
+    if ((world2_spawn_set || world2_heading_set) && !world2) {
+        fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
+        return 2;
+    }
     if (scenery_event && (!world2 || (!instance_audit && !shot) || sshot || sspawn || sstack ||
                          want_event_id || daudit || raudit || poseshot || shaudit)) {
-        fprintf(stderr,"--scenery-preview needs --world2 with --instance-audit or --shot; "
+        fprintf(stderr,"--scenery-preview needs one STREAM with --instance-audit or --shot; "
                        "not interactive/race/alternate-spawn modes\n");
         return 2;
     }
     if (instance_audit && !world2) {
-        fprintf(stderr, "--instance-audit requires explicit --world2\n");
-        return 2;
-    }
-    if (world2 && !world2_spawn_set) {
-        fprintf(stderr, "--world2 requires --spawn start or --spawn X,Y\n");
-        return 2;
-    }
-    if (world2 && !strcmp(trackname, "ALL")) {
-        fprintf(stderr, "--world2 requires one explicit --track STREAM... bundle; "
-                        "ALL is only a legacy diagnostic union\n");
+        fprintf(stderr, "--instance-audit requires one STREAM bundle\n");
         return 2;
     }
     if (resident_audit && !world2) {
-        fprintf(stderr, "--resident-audit requires --world2\n");
+        fprintf(stderr, "--resident-audit requires one STREAM bundle\n");
         return 2;
     }
     if (resident_audit && want_event_id) {
@@ -1509,7 +1590,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (resident_route_audit && !world2) {
-        fprintf(stderr, "--resident-route-audit requires --world2\n");
+        fprintf(stderr, "--resident-route-audit requires one STREAM bundle\n");
         return 2;
     }
     if (resident_route_audit && want_event_id) {
@@ -2130,6 +2211,25 @@ int main(int argc, char **argv) {
     static World world;
     WorldResident *active_resident = NULL, *candidate_resident = NULL;
     const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
+    if (world2 && !world2_spawn_set) {
+        const char *stem = !strncmp(trackname,"STREAM",6) ? trackname+6 : trackname;
+        char companion_path[1024], stream_path[1024];
+        snprintf(companion_path,sizeof companion_path,"%s/%s.BUN",troot,stem);
+        snprintf(stream_path,sizeof stream_path,"%s/%s%s",troot,trackname,
+                 strstr(trackname,".BUN") ? "" : ".BUN");
+        long companion_len=0, stream_len=0;
+        unsigned char *companion=n2_read_file(companion_path,&companion_len);
+        unsigned char *stream=n2_read_file(stream_path,&stream_len);
+        int focused=companion && stream &&
+            winst_default_focus(companion,companion_len,stream,stream_len,world2_spawn_xy);
+        free(companion); free(stream);
+        if (!focused) {
+            fprintf(stderr,"cannot derive an authored start region for %s\n",trackname);
+            return 1;
+        }
+        printf("open world: %s authored focus (%.3f, %.3f)\n",trackname,
+               world2_spawn_xy[0],world2_spawn_xy[1]);
+    }
     /* First open-world chunk: wide enough to include the neighboring airport/
        city set dressing without attempting the measured 97k-mesh whole bundle.
        A later atomic neighbor swap can reuse the same explicit radius. */
@@ -2146,14 +2246,28 @@ int main(int argc, char **argv) {
     double resident_cpu_ms = 1000.0 * (double)(clock() - resident_cpu_begin) /
                              (double)CLOCKS_PER_SEC;
     if (world2 && nm <= 0) {
-        fprintf(stderr, "--world2 load failed for %s at requested focus "
+        fprintf(stderr, "open-world load failed for %s at requested focus "
                         "(%.3f, %.3f); exiting before SDL/GL initialization\n",
                 trackname, world2_spawn_xy[0], world2_spawn_xy[1]);
         return 1;
     }
     float world2_spawn_z = 0.0f, world2_support_ref = 0.0f;
     int world2_support_cat = WSURF_NONE;
-    if (world2 && nm > 0) {
+    if (world2 && nm > 0 && !world2_spawn_set && !resident_audit) {
+        float provisional[3], provisional_heading=0.0f;
+        if (ss_nearest_surface(&world.neighborhood.scene,
+                               world2_spawn_xy[0],world2_spawn_xy[1],
+                               provisional,&provisional_heading)) {
+            world2_spawn_xy[0]=provisional[0];
+            world2_spawn_xy[1]=provisional[1];
+            world2_spawn_z=world2_support_ref=provisional[2];
+            world2_support_cat=world_ground_hit(&world.neighborhood.scene,
+                                                provisional[0],provisional[1],
+                                                provisional[2],NULL);
+            if (!world2_heading_set)
+                world2_heading_deg=provisional_heading*180.0f/3.14159265f;
+        }
+    } else if (world2 && nm > 0) {
         float support_x = resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0];
         float support_y = resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1];
         float bestd = 1e30f;
@@ -2219,7 +2333,7 @@ int main(int argc, char **argv) {
         return nm > 0 && !finite_failures && world2_support_cat != WSURF_NONE ? 0 : 1;
     }
     if (world2 && nm > 0 && world2_support_cat == WSURF_NONE) {
-        fprintf(stderr, "--world2 spawn (%.3f, %.3f) has no ROAD/TERRAIN support "
+        fprintf(stderr, "open-world spawn (%.3f, %.3f) has no ROAD/TERRAIN support "
                         "near the authored layer reference %.3f\n",
                 resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0],
                 resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1],
@@ -3367,6 +3481,24 @@ int main(int argc, char **argv) {
             }
             if (got) { free(vt.rgb); free(vt.alpha); free(vt.dxt); }
             free(vdata);
+        }
+        if (world2 && !world2_spawn_set) {
+            float hl=(carbb[3]-carbb[0])*0.5f, hw=(carbb[4]-carbb[1])*0.5f;
+            if (hl<0.5f) hl=2.20f;
+            if (hw<0.5f) hw=0.90f;
+            float safe[3], safe_heading=0.0f;
+            if (ss_nearest_safe_road(&scene,
+                    (const float (*)[4])world.neighborhood.mbb,
+                    obst,nobst,world_options.focus_x,world_options.focus_y,
+                    hl,hw,safe,&safe_heading)) {
+                memcpy(spawn,safe,sizeof safe);
+                world2_spawn_xy[0]=safe[0]; world2_spawn_xy[1]=safe[1];
+                world2_spawn_z=safe[2]; world2_support_ref=safe[2];
+                world2_support_cat=WSURF_ROAD;
+                if (!world2_heading_set) heading0=safe_heading;
+                printf("open world: safe ROAD spawn (%.3f, %.3f, %.3f) heading %.3f\n",
+                       safe[0],safe[1],safe[2],heading0);
+            }
         }
         /* spawn on the road mesh nearest the track centre; aim inward so a
            straight run stays on the populated track (user steers in play). */
