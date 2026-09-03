@@ -521,7 +521,7 @@ void collide_walls_selftest(void) {
     assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f, NULL, NULL, NULL, 0) == 1);
 }
 
-#define WALL_MIN_HEIGHT 2.5f    /* z-extent below this = flat prop, not a wall */
+#define WALL_MIN_HEIGHT 2.5f    /* heuristic mesh below this = flat, not a wall */
 #define WALL_MAX_SPAN   300.0f  /* skip oversized shells (sky domes etc.) */
 
 /* Which scenery stops a car (Phase 65). Each mesh now carries its asset-name
@@ -560,7 +560,12 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
             if(p[0]<ox0)ox0=p[0]; if(p[0]>ox1)ox1=p[0];
             if(p[1]<oy0)oy0=p[1]; if(p[1]>oy1)oy1=p[1];
             if(p[2]<oz0)oz0=p[2]; if(p[2]>oz1)oz1=p[2]; }
-        if (oz1-oz0 < WALL_MIN_HEIGHT) continue;             /* flat: not a wall */
+        /* BUILDING/WALL/STRUCT are authored solid semantics, so their height
+         * is not a classifier. In particular L4RA's XW_SANDSTONEBASE pieces
+         * are only 0.548 m tall but have real 0.539 m vertical faces. Let the
+         * geometric narrow phase distinguish those from a sub-0.30 m seam.
+         * Keep the 2.5 m heuristic for props/unclassified meshes only. */
+        if (!scen_is_wall(sc) && oz1-oz0 < WALL_MIN_HEIGHT) continue;
         if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
         if (prop_check) {   /* thin street furniture: leave it drivable-through */
             float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;

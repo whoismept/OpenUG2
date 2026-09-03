@@ -88,6 +88,11 @@ world-resident-test: tools/world_resident_test.c src/world_resident.c src/world.
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DWORLD_RESIDENT_TESTING -Isrc tools/world_resident_test.c src/world_resident.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/world_resident_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/world_resident_test
 
+district-collision-test: tools/district_collision_test.c src/physics.c src/physics.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/district_collision_test.c src/physics.c -o build/district_collision_test -lm
+	./build/district_collision_test
+
 world-group-test: tools/world_group_test.c src/world_group_reader.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_test.c -o build/world_group_test
@@ -163,4 +168,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test light-state-test world-texture-test world-group-test world-group-audit
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test light-state-test world-texture-test world-group-test world-group-audit
