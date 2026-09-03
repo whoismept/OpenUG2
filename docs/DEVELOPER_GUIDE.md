@@ -705,12 +705,14 @@ is proven; activation timing, race direction and career-stage state are not.
 Some venue graphics (six in RB) have no override membership. Do not convert
 this audit into a blanket name-prefix filter or section-level suppression.
 
-### Scenery preview (M140, opt-in; not live activation)
+### Scenery selection (M140/M147, conservative; not live activation)
 
-The checked reader is shared from `src/world_group_reader.h`. The separate
-selection policy in `src/world_scenery.h` hides only exclusively numeric-event
+The checked reader is shared from `src/world_group_reader.h`. The selection
+policy in `src/world_scenery.h` hides only exclusively numeric-event
 memberships; ordinary/shared/unknown placements remain. Both rendering and
-collision are built from that same filtered scene. Default loading is unchanged.
+collision are built from that same filtered scene. Normal instance-driven free
+roam selects `free` by default; live `--event` races remain unfiltered until
+retail direction/career activation timing is decoded.
 
 For a bounded city comparison, run these as three independent loads:
 

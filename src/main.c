@@ -35,6 +35,7 @@
 #include "world_resident.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "world_capture_policy.h"
+#include "world_scenery.h"
 #include "debug.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
@@ -1352,7 +1353,7 @@ int main(int argc, char **argv) {
     int resident_audit = 0;
     const char *resident_route_audit = NULL;
     float resident_audit_radius = 0.0f, resident_audit_xy[2] = {0.0f, 0.0f};
-    int scenery_event = 0;
+    int scenery_event = 0, scenery_preview_set = 0;
     int world2_spawn_set = 0, world2_heading_set = 0;
     float world2_spawn_xy[2] = {0, 0}, world2_heading_deg = 0.0f;
     const char *carname = "HUMMER", *trackname = "STREAML4RA";
@@ -1501,6 +1502,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--resident-route-audit") && i+1 < argc)
             resident_route_audit = argv[++i];
         else if (!strcmp(argv[i], "--scenery-preview")) {
+            scenery_preview_set = 1;
             if (i+1 >= argc) {
                 fprintf(stderr,"--scenery-preview requires free or a positive event id\n");return 2;
             }
@@ -1571,8 +1573,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
         return 2;
     }
-    if (scenery_event && (!world2 || (!instance_audit && !shot) || sshot || sspawn || sstack ||
-                         want_event_id || daudit || raudit || poseshot || shaudit)) {
+    if (scenery_preview_set &&
+        (!world2 || (!instance_audit && !shot) || sshot || sspawn || sstack ||
+         want_event_id || daudit || raudit || poseshot || shaudit)) {
         fprintf(stderr,"--scenery-preview needs one STREAM with --instance-audit or --shot; "
                        "not interactive/race/alternate-spawn modes\n");
         return 2;
@@ -1597,6 +1600,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--resident-route-audit is free-roam only; --event is not supported\n");
         return 2;
     }
+    const int runtime_scenery_event = world2
+        ? wg_runtime_selection(scenery_preview_set, scenery_event, want_event_id)
+        : 0;
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
        capture tail, but every dynamic subsystem below is gated off it — no
        circuit load, no AI, no start-line snap, no autopilot, no throttle, no
@@ -2238,7 +2244,7 @@ int main(int argc, char **argv) {
         resident_audit ? resident_audit_xy[0] : world2_spawn_xy[0],
         resident_audit ? resident_audit_xy[1] : world2_spawn_xy[1],
         resident_audit ? resident_audit_radius : resident_policy.resident_radius,
-        scenery_event
+        runtime_scenery_event
     };
     clock_t resident_cpu_begin = clock();
     int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
@@ -4761,7 +4767,7 @@ int main(int argc, char **argv) {
     float ca_rmin[3]={1e30f,1e30f,1e30f}, ca_rmax[3]={-1e30f,-1e30f,-1e30f};
     float ca_axlemax[3]={0,0,0};
     WResidentBuildArgs resident_args = {
-        troot, trackname, scenery_event, sky_profile, resident_policy
+        troot, trackname, runtime_scenery_event, sky_profile, resident_policy
     };
     float failed_resident_cell[2] = {NAN, NAN};
     int resident_route_frame = 0, resident_route_swaps = 0;

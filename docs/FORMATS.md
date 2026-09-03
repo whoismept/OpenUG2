@@ -324,10 +324,13 @@ builder and `tools/world_group_audit.c` (moved out of `tools/` in M140).
 and an audit that verifies the complete companion table before visiting members.
 It rejects malformed chunk boundaries, duplicate tables, excessive nesting,
 unterminated names, hash/refcount mismatches and out-of-range references. The
-normal runtime loader does not apply these groups as a visibility/collision
-policy unless the explicit, capture-only scenery preview below is requested.
+normal instance-driven free-roam loader applies the conservative `free`
+selection: placements exclusively owned by numeric event groups are absent
+from both rendering and collision. Explicit capture-only previews may select
+one numeric event. Live `--event` races retain the prior unfiltered scene until
+retail direction/career activation timing is decoded.
 
-**M140 preview policy, not retail activation semantics.**
+**M140/M147 conservative selection policy, not retail activation semantics.**
 `--world2 --scenery-preview free|EVENT` accepts only an instance audit or a
 fixed `--shot` capture. `src/world_scenery.h` recognizes complete numeric
 `BARRIERS_<id>` / `PLAYER_BARRIERS_<id>` group names, unions membership by

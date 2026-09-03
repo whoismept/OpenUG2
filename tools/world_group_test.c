@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "../src/world_group_reader.h"
+#include "../src/world_scenery.h"
 
 static void u16(unsigned char *p, unsigned n) {p[0]=(unsigned char)n;p[1]=(unsigned char)(n>>8);}
 static void u32(unsigned char *p, unsigned n) {u16(p,n);u16(p+2,n>>16);}
@@ -29,6 +30,14 @@ static int check_member(const WGMember *m, void *ctx) {
 }
 static int cancel(const WGMember *m, void *ctx) {(void)m;(*(int*)ctx)++;return 0;}
 int main(void) {
+    /* Normal open-world free roam must use the conservative selection that
+     * removes event-exclusive placements. Explicit previews retain their
+     * requested mode, while live races keep the established unfiltered path
+     * until retail activation timing is decoded. */
+    assert(wg_runtime_selection(0, 0, 0) == -1);
+    assert(wg_runtime_selection(1, -1, 0) == -1);
+    assert(wg_runtime_selection(1, 4144, 0) == 4144);
+    assert(wg_runtime_selection(0, 0, 4201) == 0);
     unsigned char ov[16], g[112];WGTable t;
     fixture(ov,g);
     /* Catches missing decoder, wrong field offsets and a global/local index mixup. */

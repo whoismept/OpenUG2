@@ -316,8 +316,9 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             return 0;
         }
         if (options->scenery_event)
-            printf("SCENERY PREVIEW event=%d hidden-placements=%ld "
+            printf("SCENERY SELECTION mode=%s event=%d hidden-placements=%ld "
                    "[load-time only; shared/unknown groups and direction flags unchanged]\n",
+                   options->scenery_event == -1 ? "free" : "event",
                    options->scenery_event, w->neighborhood.inst_stats.scenery_hidden);
         for (int r = 0; r < nreg; r++) {
             w->neighborhood.rgn[r].mesh0 = 0;

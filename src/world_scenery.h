@@ -12,6 +12,15 @@ typedef struct {
 typedef struct { WGSelected *items; size_t count; } WGSelection;
 enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4 };
 
+/* Runtime policy remains deliberately narrower than retail semantics. Normal
+ * free roam hides only placements proven exclusive to numeric event groups.
+ * A requested preview keeps its explicit selection. Live races retain the
+ * prior unfiltered scene until direction/career activation timing is decoded. */
+static int wg_runtime_selection(int preview_set,int preview_event,int race_event) {
+    if(preview_set)return preview_event;
+    return race_event>0?0:-1;
+}
+
 static int wg_event_id(const char *name) {
     const char *p=NULL;
     if(!strncmp(name,"BARRIERS_",9))p=name+9;
