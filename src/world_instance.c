@@ -1089,6 +1089,26 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     int nkeys = n2_tpk_keys(bundle_data, tpk, keys, 16384);
     if (shared && nkeys < 16384)
         nkeys += n2_car_tex_keys(shared, shared_len, keys + nkeys, 16384 - nkeys);
+    /* Instance prototypes can reference shared gameplay textures that are
+     * authored only in GLOBAL/InGameCommon.bun. Those keys must participate
+     * in per-submesh resolution; otherwise the affected ranges lose exact
+     * material ownership and are conservatively rendered as opaque. */
+    if (nkeys < 16384) {
+        char path[1024];
+        int length = snprintf(path, sizeof path,
+                              "%s/../GLOBAL/InGameCommon.bun", track_root);
+        if (length >= 0 && (size_t)length < sizeof path) {
+            long common_len = 0;
+            unsigned char *common = n2_read_file(path, &common_len);
+            if (common) {
+                N2Tpk common_tpk = n2_tpk_open(common, common_len);
+                nkeys += n2_tpk_keys(common, common_tpk, keys + nkeys,
+                                     16384 - nkeys);
+                free(common_tpk.blk);
+                free(common);
+            }
+        }
+    }
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
     free(keys);
 

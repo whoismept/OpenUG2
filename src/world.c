@@ -369,9 +369,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         w->neighborhood.mbb[i][0]=x0; w->neighborhood.mbb[i][1]=y0; w->neighborhood.mbb[i][2]=x1; w->neighborhood.mbb[i][3]=y1;
     }
     grid_build(w);
-    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Do not
-       add their keys to geometry/material selection: this is only the last
-       texture-resolution source, with existing regional precedence intact. */
+    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Instance
+       prototype material matching already inventories this archive during
+       its build; retain the bytes here as the final texture-resolution source,
+       with existing regional precedence intact. */
     char commonp[1024];
     int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
     if (plen >= 0 && (size_t)plen < sizeof commonp) {

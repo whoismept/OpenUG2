@@ -1032,6 +1032,99 @@ static void test_world2_capture_policy(void) {
     assert(!legacy_static.freeze_motion);
 }
 
+static long add_common_material_model(unsigned char *buf, long pos,
+                                      uint32_t model_key,
+                                      uint32_t slot0, uint32_t slot1) {
+    unsigned char header[8 + 192], slots[16], subs[120];
+    unsigned char verts[72], indices[12];
+    memset(header, 0, sizeof header); memset(header, 0x11, 8);
+    memset(slots, 0, sizeof slots); memset(subs, 0, sizeof subs);
+    memset(verts, 0, sizeof verts); memset(indices, 0, sizeof indices);
+    put_u32(header + 8 + 0x10, model_key);
+    for (int i = 0; i < 16; i++)
+        put_f32(header + 8 + 0x40 + i * 4, i % 5 == 0 ? 1.0f : 0.0f);
+    memcpy(header + 8 + 0xa4, "XO_COMMON_MATERIAL", 19);
+    put_u32(slots, slot0); put_u32(slots + 8, slot1);
+    put_u32(subs + 12, 3); put_u32(subs + 28, 0); put_u32(subs + 52, 0);
+    put_u32(subs + 60 + 12, 3); put_u32(subs + 60 + 28, 1);
+    put_u32(subs + 60 + 52, 3);
+    put_f32(verts + 24, 1.0f); put_f32(verts + 48 + 4, 1.0f);
+    put_u16(indices, 0); put_u16(indices + 2, 1); put_u16(indices + 4, 2);
+    put_u16(indices + 6, 0); put_u16(indices + 8, 2); put_u16(indices + 10, 1);
+    long start = pos; pos += 8;
+    pos = add_leaf(buf, pos, 0x00134011ul, header, sizeof header);
+    pos = add_leaf(buf, pos, 0x00134012ul, slots, sizeof slots);
+    pos = add_leaf(buf, pos, 0x00134b02ul, subs, sizeof subs);
+    pos = add_leaf(buf, pos, 0x00134b01ul, verts, sizeof verts);
+    pos = add_leaf(buf, pos, 0x00134b03ul, indices, sizeof indices);
+    put_u32(buf + start, 0x80134010ul);
+    put_u32(buf + start + 4, (unsigned long)(pos - start - 8));
+    return pos;
+}
+
+static long make_common_tpk(unsigned char *buf, size_t cap,
+                            uint32_t slot0, uint32_t slot1) {
+    const long record_size = 0x7c, header_size = 2 * record_size;
+    const long pixel_chunk = 8 + header_size;
+    const long used = pixel_chunk + 9;
+    assert(cap >= (size_t)used);
+    memset(buf, 0, cap);
+    put_u32(buf, 0xb3310000ul); put_u32(buf + 4, (unsigned long)header_size);
+    memcpy(buf + 8, "COMMON_SLOT_ZERO", 17);
+    put_u32(buf + 8 + 0x18, slot0);
+    memcpy(buf + 8 + record_size, "COMMON_SLOT_ONE", 16);
+    put_u32(buf + 8 + record_size + 0x18, slot1);
+    put_u32(buf + pixel_chunk, 0x33320002ul);
+    return used;
+}
+
+/* M145 integration regression: exercise the public builder with slot keys
+   available only from GLOBAL/InGameCommon.bun. Removing common-key inventory
+   assembly must make the exact per-submesh assertions fail. */
+static void test_common_key_submesh_resolution(void) {
+    const char *base = "build/world_instance_common_fixture";
+    const char *tracks = "build/world_instance_common_fixture/TRACKS";
+    const char *global = "build/world_instance_common_fixture/GLOBAL";
+    const char *companion_path =
+        "build/world_instance_common_fixture/TRACKS/L4RA.BUN";
+    const char *stream_path =
+        "build/world_instance_common_fixture/TRACKS/STREAML4RA.BUN";
+    const char *common_path =
+        "build/world_instance_common_fixture/GLOBAL/InGameCommon.bun";
+    const uint32_t model_key = 0x55667788u;
+    const uint32_t slot0 = 0xaabbccddu, slot1 = 0x11223344u;
+    assert(mkdir(base, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(tracks, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(global, 0777) == 0 || errno == EEXIST);
+
+    unsigned char companion[256], stream[4096], common[512], placement[64];
+    long companion_len = make_regions(companion, sizeof companion);
+    long stream_len = add_common_material_model(stream, 0, model_key, slot0, slot1);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+    long section = stream_len;
+    stream_len = add_section(stream, stream_len, 17, "XO_COMMON_MATERIAL", placement, 1);
+    N2Leaf types[1]; int ntypes = 0;
+    n2_find_leaves(stream, section + 8, stream_len, 0x34102, types, &ntypes, 1);
+    assert(ntypes == 1);
+    put_u32(stream + types[0].off + 0x20, model_key);
+    long common_len = make_common_tpk(common, sizeof common, slot0, slot1);
+    assert(write_fixture_file(companion_path, companion, companion_len));
+    assert(write_fixture_file(stream_path, stream, stream_len));
+    assert(write_fixture_file(common_path, common, common_len));
+
+    const char *bundles[] = {"STREAML4RA"};
+    N2Scene scene = {0}, vista = {0}; WInstStats stats = {0};
+    assert(world_instance_build(&scene, &vista, tracks, bundles, 1,
+                                0, 0, 5, NULL, 0, &stats) == 1);
+    assert(scene.count == 2 && vista.count == 0);
+    assert(scene.meshes[0].mat_exact == 1 && scene.meshes[0].texkey == slot0);
+    assert(scene.meshes[1].mat_exact == 1 && scene.meshes[1].texkey == slot1);
+    free_scene(&scene); free_scene(&vista);
+
+    remove(common_path); remove(companion_path); remove(stream_path);
+    rmdir(global); rmdir(tracks); rmdir(base);
+}
+
 int main(void) {
     test_scenery_event_assembly();
     test_builder_authored_model_keys();
@@ -1048,6 +1141,7 @@ int main(void) {
     test_builder_uses_bounds_across_unmapped_sections();
     test_builder_home_atomicity_and_bundle_isolation();
     test_world2_capture_policy();
+    test_common_key_submesh_resolution();
     puts("world_instance_test: PASS");
     return 0;
 }
