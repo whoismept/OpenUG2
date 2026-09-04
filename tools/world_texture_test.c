@@ -153,7 +153,7 @@ static void test_resident_resource_build(const char *region_path) {
     neighborhood.mbb[0][2]=4; neighborhood.mbb[0][3]=4;
 
     WorldResidentResources resources = {0};
-    assert(world_resident_resources_build(&resources, &neighborhood));
+    assert(world_resident_resources_build(&resources, &neighborhood, NULL));
     assert(resources.texture_count == 1 && resources.textures[0]);
     assert(resources.mesh_count == 1 && resources.mesh_textures[0]);
     assert(resources.ordinary_count > 0 && resources.ordinary[0].vbo &&

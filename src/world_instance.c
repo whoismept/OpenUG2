@@ -294,7 +294,12 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
     int is_vista = 0;
-    if (n2_vista_family(name)) {
+    /* Match n2_walk_meshes' established PAN_* contract. These authored
+       horizon models render through the vista tier, but must never enter the
+       ordinary scene where TERRAIN members become ground/collision support. */
+    if (!strncmp(name, "PAN", 3)) {
+        is_vista = 1;
+    } else if (n2_vista_family(name)) {
         N2Geom geometry;
         is_vista = n2_obj_geom(data, begin, end, matrix, &geometry) &&
                    n2_is_vista_impostor(name, &geometry);

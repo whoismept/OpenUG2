@@ -285,6 +285,14 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
                         WGroundHit *hit, WGroundHit *cand, int *verdict);
 
+/* Earliest above-to-below crossing of a ROAD/TERRAIN triangle by a segment.
+ * Returns a movement fraction [0,1], 1 for no crossing. Both endpoints below
+ * a sheet do not collide: this is not an overhead-layer recovery query.
+ * The caller supplies the wheel's upper contact envelope, not the body origin.
+ * Does not move the car, change the contact window, or mutate grid ownership. */
+float world_ground_sweep(const N2Scene *s, const float from[3],
+                         const float to[3], WGroundHit *hit);
+
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 void world_ground_selftest(void);
 
@@ -295,6 +303,9 @@ void world_ground_selftest(void);
  * the push itself is unchanged. */
 typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
+/* Non-mutating form used when validating a spawn candidate. Returns 1 only
+   when world_wall_push would leave the candidate untouched. */
+int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r);
 /* M133 texture-binding census: set before world_bind_textures to report every
  * key that produced no GPU texture, split by cause. Diagnostic only. */
 extern int g_world_texaudit, g_world_texnoise, g_world_texmiss;

@@ -1032,9 +1032,23 @@ static void test_world2_capture_policy(void) {
     assert(!legacy_static.freeze_motion);
 }
 
-static long add_common_material_model(unsigned char *buf, long pos,
-                                      uint32_t model_key,
-                                      uint32_t slot0, uint32_t slot1) {
+/* M150 regression: "start" means the selected STREAM bundle's authored
+   focus, not a hard-coded L4RA coordinate. Explicit X,Y remains an override. */
+static void test_world_spawn_policy(void) {
+    float xy[2] = {-99.0f, -99.0f};
+    assert(world_spawn_parse("start", xy) == WORLD_SPAWN_AUTHORED);
+    assert(xy[0] == -99.0f && xy[1] == -99.0f);
+    assert(world_spawn_parse("12.5,-7.25", xy) == WORLD_SPAWN_EXPLICIT);
+    assert(fabsf(xy[0] - 12.5f) < 0.001f);
+    assert(fabsf(xy[1] + 7.25f) < 0.001f);
+    assert(world_spawn_parse("12.5,-7.25junk", xy) == WORLD_SPAWN_INVALID);
+    assert(world_spawn_parse(NULL, xy) == WORLD_SPAWN_INVALID);
+}
+
+static long add_common_material_model_named(unsigned char *buf, long pos,
+                                            uint32_t model_key,
+                                            uint32_t slot0, uint32_t slot1,
+                                            const char *name) {
     unsigned char header[8 + 192], slots[16], subs[120];
     unsigned char verts[72], indices[12];
     memset(header, 0, sizeof header); memset(header, 0x11, 8);
@@ -1043,7 +1057,8 @@ static long add_common_material_model(unsigned char *buf, long pos,
     put_u32(header + 8 + 0x10, model_key);
     for (int i = 0; i < 16; i++)
         put_f32(header + 8 + 0x40 + i * 4, i % 5 == 0 ? 1.0f : 0.0f);
-    memcpy(header + 8 + 0xa4, "XO_COMMON_MATERIAL", 19);
+    snprintf((char *)header + 8 + 0xa4,
+             sizeof header - (8 + 0xa4), "%s", name);
     put_u32(slots, slot0); put_u32(slots + 8, slot1);
     put_u32(subs + 12, 3); put_u32(subs + 28, 0); put_u32(subs + 52, 0);
     put_u32(subs + 60 + 12, 3); put_u32(subs + 60 + 28, 1);
@@ -1060,6 +1075,33 @@ static long add_common_material_model(unsigned char *buf, long pos,
     put_u32(buf + start, 0x80134010ul);
     put_u32(buf + start + 4, (unsigned long)(pos - start - 8));
     return pos;
+}
+
+static long add_common_material_model(unsigned char *buf, long pos,
+                                      uint32_t model_key,
+                                      uint32_t slot0, uint32_t slot1) {
+    return add_common_material_model_named(buf, pos, model_key, slot0, slot1,
+                                           "XO_COMMON_MATERIAL");
+}
+
+/* M149 regression: PAN_* prototypes are authored far-horizon geometry. The
+   legacy parser already routes them away from the physical scene, and the
+   instance builder must preserve that contract. Otherwise PAN_HILLRIDGE is
+   classified as TERRAIN and becomes a support plane hundreds of metres above
+   the city. */
+static void test_panorama_prototype_routes_to_vista(void) {
+    static const char *names[] = { "PAN_HILLRIDGE", "PAN_HILLRIDGEHILL" };
+    for (int i = 0; i < 2; i++) {
+        unsigned char object[4096];
+        uint32_t keys[2] = { 0xaabbccddu, 0x11223344u };
+        WInstLibrary library = {0};
+        long length = add_common_material_model_named(
+            object, 0, 0x55667788u, keys[0], keys[1], names[i]);
+        winst_collect_models(&library, object, 0, length, keys, 2);
+        assert(library.count == 1);
+        assert(library.items[0].is_vista == 1);
+        winst_library_free(&library);
+    }
 }
 
 static long make_common_tpk(unsigned char *buf, size_t cap,
@@ -1141,7 +1183,9 @@ int main(void) {
     test_builder_uses_bounds_across_unmapped_sections();
     test_builder_home_atomicity_and_bundle_isolation();
     test_world2_capture_policy();
+    test_world_spawn_policy();
     test_common_key_submesh_resolution();
+    test_panorama_prototype_routes_to_vista();
     puts("world_instance_test: PASS");
     return 0;
 }

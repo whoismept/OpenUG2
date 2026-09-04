@@ -185,7 +185,9 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
  *
  * scene/src (optional, NULL to skip) turn the rect into a broad phase only: a
  * hit is confirmed against the SOURCE MESH's own geometry -- some near-vertical
- * face within r in XY whose height span overlaps the car. The stored rect is the
+ * face clipped to the car's Z interval and then within r in XY. Testing just
+ * the face's Z bounds is insufficient: an upper edge can project near the car
+ * even when the face at car height is metres away. The stored rect is the
  * mesh's full XY extent at every height, which is not the building's footprint
  * (measured: XB_HTECHTOWERQ_1B_00 occupies 37% of its 40x50 m rect, and its
  * nearest wall face to the pinned car was 5.6 m away and 42 m up). Same

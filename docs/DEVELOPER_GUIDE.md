@@ -558,13 +558,31 @@ spawn or layer transition.
 The horizontal model uses metres/tick; the ride integrator uses metres/second.
 Mixing those units creates violent launch or damping errors.
 
+Before gathering support, `ground_motion_limit` (in `src/ground_motion.h`)
+checks the XY move proposed by `phys_car_step`. `world_ground_sweep` finds
+above-to-below crossings of actual ROAD/TERRAIN triangles by each wheel's
+upper contact envelope. The move stops before a crossing; only velocity into
+the face is removed. Z remains owned by the ride integrator, and overhead
+layers are not recovery targets. The query uses the active ground grid without
+a capped list of candidate meshes. Accepted yaw is reconstructed and rechecked
+because wheel endpoints do not interpolate linearly through a turn.
+
+Run `make ground-motion-test` for synthetic slope, overhead, winding, dense-grid
+and turning regressions. This is sampled wheel-envelope protection, not full
+rigid-body continuous collision detection. It does not cover subsequent wall
+pushes, vertical/angular suspension integration, or restore missing support.
+In particular, support loss can still leave the car at the ride tilt limit;
+passing these tests is not evidence of retail handling or a playable lap.
+
 ### Collision
 
 Building rectangles are broad phase only. `cw_mesh_feature` confirms a nearby
-source-mesh face overlapping the car's vertical envelope, rejects combined wall
+source-mesh face clipped to the car's vertical envelope, rejects combined wall
 spans below `WALL_MIN_FACE_SPAN`, and returns the closest feature normal and
 penetration. `collide_walls` pushes along that normal and removes only the
 into-wall velocity component.
+Clipping must happen **before** projecting the face into XY: overlapping Z
+bounds alone allow a distant upper edge to cause a false ground-level contact.
 
 `world_wall_push` handles near-vertical road/terrain guardrail faces using a
 measured height band. `world_barrier_push` is race-corridor closure. These are
@@ -755,10 +773,12 @@ ground grid, regional texture sources, lights and bounds live in
 ordinary/sky/glow/vista batches, per-mesh material maps and solid-collision
 arrays. Do not cache a scene mesh or batch index outside that package.
 
-Resident replacement is transactional and synchronous:
+Resident replacement is transactional. Normal free-roam prepares CPU geometry
+on one worker; `--resident-sync` selects the synchronous diagnostic control:
 
 1. `world_resident_target` snaps the player to a deterministic 400 m cell.
-2. `world_neighborhood_load` builds a candidate without activating its grid.
+2. `world_resident_prepare` / `world_neighborhood_load` builds a detached CPU
+   candidate without activating its grid or making GL calls.
 3. CPU validation checks finite geometry/index/bounds, zero rejected instances
    and ROAD/TERRAIN support under the current player layer.
 4. `world_resident_resources_build` resolves textures and uploads every pass,
@@ -771,6 +791,15 @@ retried until the player targets another cell. Player position, velocity,
 heading, sprung ride/contact state, camera and input are deliberately outside
 the resident and must remain byte-identical across activation. This path is
 free-roam-only, uses one STREAM bundle and never uses `--track ALL`.
+
+The worker owns copied request strings and a zero-initialised candidate.
+Completion is atomically published; the frame thread joins it before validating
+the **current** player pose and calling `world_resident_finish`. Stale results
+are discarded, and shutdown joins any outstanding job before freeing data.
+Texture decode/upload, batches and cleanup still block the frame thread.
+`--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
+physics paced at approximately 60 Hz; unpaced audits otherwise use the sync
+control. A successful resident swap does not prove continuous ground contact.
 
 `WorldNeighborhood.master` records whether the master resource came from
 `mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only
@@ -792,8 +821,7 @@ the supported L4RA start / L4RB sprint-grid pose:
 Use `--resident-audit RADIUS X Y` with one explicit `--track` to measure the
 real loader/uploader. `--spawn` is optional. The audit is rejected for legacy,
 `ALL` and `--event` modes. Times are synchronous development measurements, not
-frame-budget promises; asynchronous/background loading is intentionally not in
-M144.
+frame-budget promises. They predate the background CPU preparation above.
 
 Use `--resident-route-audit PREFIX` with the same mode guards to exercise the
 production transaction across two supported navigation points. The audit takes

@@ -26,6 +26,7 @@ scratchpad/
 *.o
 *.obj
 *.exe
+*.dSYM
 
 # --- Screenshots / generated ---
 *.png

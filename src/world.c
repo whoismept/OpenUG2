@@ -1622,6 +1622,66 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
     return WSURF_NONE;
 }
 
+static void wgs_mesh(const N2Mesh *m, int mi, const float p[3], const float q[3],
+                     float *best, WGroundHit *hit) {
+    if (m->cat != N2_ROAD && m->cat != N2_TERRAIN) return;
+    for (int t=0; t+2<m->nidx; t+=3) {
+        const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5,
+                    *c=m->verts+m->idx[t+2]*5;
+        /* Double intermediates keep centimetre-scale tests stable at city
+         * coordinates thousands of metres from the origin. */
+        double ex=b[0]-a[0], ey=b[1]-a[1], ez=b[2]-a[2];
+        double fx=c[0]-a[0], fy=c[1]-a[1], fz=c[2]-a[2];
+        double nx=ey*fz-ez*fy, ny=ez*fx-ex*fz, nz=ex*fy-ey*fx;
+        if (fabs(nz)<1e-9) continue;
+        if (nz<0) {nx=-nx;ny=-ny;nz=-nz;}
+        double d0=(nx*(p[0]-a[0])+ny*(p[1]-a[1])+nz*(p[2]-a[2]))/nz;
+        double d1=(nx*(q[0]-a[0])+ny*(q[1]-a[1])+nz*(q[2]-a[2]))/nz;
+        if (d0<0 || d1>=0) continue;
+        double f=d0/(d0-d1);
+        if (f>=*best) continue;
+        double x=p[0]+(q[0]-p[0])*f, y=p[1]+(q[1]-p[1])*f;
+        double det=ex*fy-ey*fx;
+        double u=((x-a[0])*fy-(y-a[1])*fx)/det;
+        double v=(ex*(y-a[1])-ey*(x-a[0]))/det;
+        if (u<0 || v<0 || u+v>1) continue;
+        *best=(float)f;
+        if (hit) {
+            double len=sqrt(nx*nx+ny*ny+nz*nz);
+            hit->mesh=mi;hit->tri=t/3;
+            hit->cat=m->cat==N2_ROAD?WSURF_ROAD:WSURF_TERRAIN;
+            hit->z=(float)(p[2]+(q[2]-p[2])*f);
+            hit->normal[0]=(float)(nx/len);hit->normal[1]=(float)(ny/len);
+            hit->normal[2]=(float)(nz/len);
+        }
+    }
+}
+
+float world_ground_sweep(const N2Scene *s, const float from[3],
+                         const float to[3], WGroundHit *hit) {
+    float best=1;
+    if (hit) { memset(hit,0,sizeof *hit);hit->mesh=hit->tri=-1; }
+    if (!s || !s->meshes) return best;
+    if (s->meshes!=g_grid.meshes) {
+        for(int i=0;i<s->count;i++)wgs_mesh(&s->meshes[i],i,from,to,&best,hit);
+    } else {
+        int x0=(int)floorf((fminf(from[0],to[0])-g_grid.x0)/GCELL);
+        int x1=(int)floorf((fmaxf(from[0],to[0])-g_grid.x0)/GCELL);
+        int y0=(int)floorf((fminf(from[1],to[1])-g_grid.y0)/GCELL);
+        int y1=(int)floorf((fmaxf(from[1],to[1])-g_grid.y0)/GCELL);
+        if(x0<0)x0=0;if(y0<0)y0=0;
+        if(x1>=g_grid.gw)x1=g_grid.gw-1;if(y1>=g_grid.gh)y1=g_grid.gh-1;
+        /* Traverse all source indices, without a capped scratch scene. */
+        for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++) {
+            int cell=y*g_grid.gw+x;
+            for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
+                int i=g_grid.list[k];wgs_mesh(&s->meshes[i],i,from,to,&best,hit);
+            }
+        }
+    }
+    return best;
+}
+
 int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {
     return wg_at(s, x, y, fallback, outz, NULL, NULL);
 }
@@ -1804,4 +1864,9 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
         }
     }
     return pushed;
+}
+
+int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r) {
+    float probe[3] = {x,y,z};
+    return !world_wall_push(s,probe,r,NULL);
 }

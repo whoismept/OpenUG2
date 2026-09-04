@@ -36,6 +36,7 @@
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "world_capture_policy.h"
 #include "world_scenery.h"
+#include "ground_motion.h"
 #include "debug.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
@@ -429,6 +430,26 @@ static int ss_road_z(const N2Scene *s, const float (*mbb)[4], float x, float y,
     }
     if (found) *outz = best;
     return found;
+}
+
+/* Local direction of the selected support triangle. This is the same
+   longest-XY-edge rule used by the production instance-world spawn picker;
+   unlike a heading aimed at a distant seed, it keeps the car aligned with the
+   road patch it actually stands on. */
+static float ss_surface_heading(const N2Scene *s, const WGroundHit *hit) {
+    if (!s || !hit || hit->mesh < 0 || hit->mesh >= s->count) return 0.0f;
+    const N2Mesh *m = &s->meshes[hit->mesh];
+    int q = hit->tri * 3;
+    if (q < 0 || q + 2 >= m->nidx) return 0.0f;
+    const float *a=m->verts+m->idx[q]*5;
+    const float *b=m->verts+m->idx[q+1]*5;
+    const float *c=m->verts+m->idx[q+2]*5;
+    float dx=b[0]-a[0], dy=b[1]-a[1], best=dx*dx+dy*dy;
+    float ex=c[0]-a[0], ey=c[1]-a[1], e2=ex*ex+ey*ey;
+    float fx=c[0]-b[0], fy=c[1]-b[1], f2=fx*fx+fy*fy;
+    if (e2 > best && e2 >= f2) { dx=ex; dy=ey; }
+    else if (f2 > best && f2 > e2) { dx=fx; dy=fy; }
+    return atan2f(dy,dx);
 }
 
 /* Lowest ROAD/TERRAIN triangle strictly above `z`; 1e30f when the sky is open. */
@@ -861,6 +882,7 @@ static int ss_nearest_safe_road(const N2Scene *s, const float (*mbb)[4],
             int cat=world_ground_hit(s,x,y,z,&centre);
             if (cat!=WSURF_ROAD || fabsf(centre.z-z)>0.10f ||
                 ss_in_wall(obst,nobst,x,y,1.3f) ||
+                !world_wall_clear_at(s,x,y,centre.z,1.3f) ||
                 !world_ground_patch_normal(s,x,y,hd,hl,-hl,hw,&centre,normal) ||
                 ss_ceiling_above(s,mbb,x,y,centre.z)-centre.z < SS_CLEAR_M) continue;
             out[0]=x; out[1]=y; out[2]=centre.z; *heading=hd; best=d; found=1;
@@ -1288,6 +1310,8 @@ int main(int argc, char **argv) {
          --scenery-preview free|EVENT  load-time event-only scenery test (world2 capture/audit only)
          --sky PROFILE    authored sky: night (default), sunrise, or sunset
          --spawn start|X,Y  developer override for the automatic authored spawn
+         --resident-sync  diagnostic control: prepare replacements synchronously
+         --resident-realtime  pace --resident-drive-audit at approximately 60 Hz
          --heading DEG    requested --world2 heading; fixed camera heading for --shot evidence
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
@@ -1352,6 +1376,15 @@ int main(int argc, char **argv) {
     int world2 = 1, world2_explicit = 0, instance_audit = 0;
     int resident_audit = 0;
     const char *resident_route_audit = NULL;
+    const char *resident_drive_audit = NULL;  /* M151: physics-driven boundary audit */
+    int resident_sync = 0; /* M154 synchronous A/B control; production prepares off-thread */
+    int resident_realtime = 0;
+    /* M145 diagnostic: after the resident-route-audit's two swaps complete,
+       teleport within the still-active resident (no new swap) to an exact
+       X,Y,HEADING pose and capture one more frame. Production resident
+       builder/draw loop only; adds no new load path. */
+    int resident_route_hold_set = 0;
+    float resident_route_hold[3] = {0.0f, 0.0f, 0.0f};
     float resident_audit_radius = 0.0f, resident_audit_xy[2] = {0.0f, 0.0f};
     int scenery_event = 0, scenery_preview_set = 0;
     int world2_spawn_set = 0, world2_heading_set = 0;
@@ -1501,6 +1534,16 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--resident-route-audit") && i+1 < argc)
             resident_route_audit = argv[++i];
+        else if (!strcmp(argv[i], "--resident-drive-audit") && i+1 < argc)
+            resident_drive_audit = argv[++i];
+        else if (!strcmp(argv[i], "--resident-sync")) resident_sync = 1;
+        else if (!strcmp(argv[i], "--resident-realtime")) resident_realtime = 1;
+        else if (!strcmp(argv[i], "--resident-route-hold") && i+3 < argc) {
+            resident_route_hold_set = 1;
+            resident_route_hold[0] = (float)atof(argv[++i]);
+            resident_route_hold[1] = (float)atof(argv[++i]);
+            resident_route_hold[2] = (float)atof(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--scenery-preview")) {
             scenery_preview_set = 1;
             if (i+1 >= argc) {
@@ -1528,20 +1571,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             const char *value = argv[++i];
-            if (!strcmp(value, "start")) {
-                world2_spawn_xy[0] = 1695.2f;
-                world2_spawn_xy[1] = -883.6f;
-                world2_spawn_set = 1;
-            } else {
-                char tail = 0;
-                if (sscanf(value, "%f,%f%c", &world2_spawn_xy[0],
-                           &world2_spawn_xy[1], &tail) != 2 ||
-                    !isfinite(world2_spawn_xy[0]) || !isfinite(world2_spawn_xy[1])) {
-                    fprintf(stderr, "invalid --spawn '%s' (expected start or X,Y)\n", value);
-                    return 2;
-                }
-                world2_spawn_set = 1;
+            int spawn_kind = world_spawn_parse(value, world2_spawn_xy);
+            if (spawn_kind == WORLD_SPAWN_INVALID) {
+                fprintf(stderr, "invalid --spawn '%s' (expected start or X,Y)\n", value);
+                return 2;
             }
+            world2_spawn_set = spawn_kind == WORLD_SPAWN_EXPLICIT;
         }
         else if (!strcmp(argv[i], "--heading")) {
             if (i+1 >= argc || !strncmp(argv[i+1], "--", 2)) {
@@ -1600,6 +1635,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--resident-route-audit is free-roam only; --event is not supported\n");
         return 2;
     }
+    if (resident_drive_audit && !world2) {
+        fprintf(stderr, "--resident-drive-audit requires one STREAM bundle\n");
+        return 2;
+    }
+    if (resident_drive_audit && want_event_id) {
+        fprintf(stderr, "--resident-drive-audit is free-roam only\n");
+        return 2;
+    }
+    if (resident_realtime && !resident_drive_audit) {
+        fprintf(stderr, "--resident-realtime requires --resident-drive-audit\n");
+        return 2;
+    }
+    if (resident_route_hold_set && !resident_route_audit) {
+        fprintf(stderr, "--resident-route-hold requires --resident-route-audit\n");
+        return 2;
+    }
     const int runtime_scenery_event = world2
         ? wg_runtime_selection(scenery_preview_set, scenery_event, want_event_id)
         : 0;
@@ -1619,10 +1670,27 @@ int main(int argc, char **argv) {
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
     WorldCapturePolicy capture_policy = world_capture_policy(
         world2, shot != NULL, sstatic, world2_heading_set);
+    /* --drive-audit is a moving physics trace, even when --heading supplies a
+       deterministic initial yaw. The ordinary --shot + --heading contract
+       remains a frozen evidence capture. */
+    if (daudit) {
+        capture_policy.fixed_camera = 0;
+        capture_policy.freeze_motion = 0;
+    }
     if (resident_route_audit) {
         capture_policy.preserve_explicit_pose = 1;
         capture_policy.freeze_motion = 1;
         shotyaw = 0.0f;
+    }
+    if (resident_drive_audit) {
+        /* M151: reuse the --shot headless machinery like daudit does, but with
+           physics driving. shotframes is set very high; the RDA exit logic
+           terminates the loop before the shot timer fires. */
+        static char rdashot[1024];
+        snprintf(rdashot, sizeof rdashot, "%s_end.png", resident_drive_audit);
+        shot = rdashot; shotframes = 999999;
+        capture_policy.fixed_camera = 0;
+        capture_policy.freeze_motion = 0;
     }
     if (capture_policy.fixed_camera)
         shotyaw = world2_heading_deg * 3.14159265f / 180.0f;
@@ -2980,6 +3048,20 @@ int main(int argc, char **argv) {
             printf("n2_tpk_decode returns:            %s  %d x %d   -> raw==decoded: %s\n",
                    ok ? "ok" : "FAILED", chk.w, chk.h,
                    (ok && chk.w == firstw && chk.h == firsth) ? "YES" : "NO");
+            /* M145: authored draw-mode bytes and alpha range -- not printed
+               by the original M99 dump, needed for batch/mode attribution. */
+            if (ok) {
+                int amin = 256, amax = -1;
+                if (chk.alpha)
+                    for (long q = 0; q < (long)chk.w*chk.h; q++) {
+                        if (chk.alpha[q] < amin) amin = chk.alpha[q];
+                        if (chk.alpha[q] > amax) amax = chk.alpha[q];
+                    }
+                printf("authored draw bytes (order,usage,blend,wz) = (%u,%u,%u,%u) "
+                       "-> n2_tex_mode=%d   alpha %s [%d..%d]\n",
+                       chk.order, chk.usage, chk.blend, chk.wz, n2_tex_mode(&chk),
+                       chk.alpha ? "present" : "NULL(opaque)", amin, amax);
+            }
             /* 1x nearest PNG of the SELECTED record, straight from its own bytes */
             if (ok && f_d && f_psz >= 1024 &&
                 f_dbase + f_pal + 1024 <= f_len &&
@@ -3031,7 +3113,7 @@ int main(int argc, char **argv) {
                                          validate_x, validate_y,
                                          world2_spawn_z) ||
             !world_resident_resources_build(&active_resident->resources,
-                                            &active_resident->world)) {
+                                            &active_resident->world, NULL)) {
             fprintf(stderr, "world resident: initial GPU/collision build failed\n");
             world_resident_free(active_resident);
             return 1;
@@ -3594,7 +3676,8 @@ int main(int argc, char **argv) {
         if (half_w < 0.5f) half_w = 0.90f;
         int chosen = -1; float czl = 0, cclear = 0, chead = 0;
         static float cprobe[5][4];
-        int tried = 0, rej_road = 0, rej_wall = 0, rej_low = 0, rej_patch = 0;
+        int tried = 0, rej_road = 0, rej_wall = 0, rej_rail = 0;
+        int rej_low = 0, rej_patch = 0;
         for (int pass = 0; pass < ncand; pass++) {
             int a = -1; float bd = 1e30f;
             for (int q = 0; q < ncand; q++)
@@ -3604,12 +3687,16 @@ int main(int argc, char **argv) {
             float x = cand[a][0], y = cand[a][1], vz = cand[a][2], rz;
             tried++;
             if (!ss_road_z(&scene, mbb, x, y, vz, &rz))        { rej_road++; continue; }
+            WGroundHit centre;
+            if (world_ground_hit(&scene,x,y,rz,&centre)!=WSURF_ROAD)
+                                                               { rej_road++; continue; }
             if (ss_in_wall(obst, nobst, x, y, 1.3f))           { rej_wall++; continue; }
+            if (!world_wall_clear_at(&scene, x, y, rz, 1.3f))  { rej_rail++; continue; }
             float ceil = ss_ceiling_above(&scene, mbb, x, y, rz);
             if (ceil - rz < SS_CLEAR_M)                        { rej_low++;  continue; }
             /* the whole car footprint must stand on road, at the heading the
                static camera will use (M82) */
-            float hd = atan2f(densy - y, densx - x);
+            float hd = ss_surface_heading(&scene,&centre);
             float pr[5][4];
             if (!ss_patch(&scene, mbb, x, y, rz, hd, half_l, half_w, pr)) { rej_patch++; continue; }
             chosen = a; czl = rz; cclear = ceil - rz; chead = hd;
@@ -3618,7 +3705,7 @@ int main(int argc, char **argv) {
         }
         if (chosen >= 0) {
             spawn[0] = cand[chosen][0]; spawn[1] = cand[chosen][1]; spawn[2] = czl;
-            heading0 = atan2f(densy - spawn[1], densx - spawn[0]);
+            heading0 = chead;
         }
         if (camat) {   /* diagnostic: put the same static capture at a given XY */
             spawn[0] = camx; spawn[1] = camy;
@@ -3634,9 +3721,10 @@ int main(int argc, char **argv) {
             printf("\nMILESTONE: 80  static-spawn-audit  track=%s\n", trackname);
             printf("dense build-up centre   (%.1f, %.1f)\n", densx, densy);
             printf("candidates             %d road vertices, %d tested\n", ncand, tried);
-            printf("  rejected: no road tri %d   in wall footprint %d   headroom < %.0f m %d"
-                   "   incomplete road patch %d\n",
-                   rej_road, rej_wall, (double)SS_CLEAR_M, rej_low, rej_patch);
+            printf("  rejected: no road tri %d   in wall footprint %d   near rail %d   "
+                   "headroom < %.0f m %d   incomplete road patch %d\n",
+                   rej_road, rej_wall, rej_rail, (double)SS_CLEAR_M,
+                   rej_low, rej_patch);
             printf("footprint              half-length %.3f  half-width %.3f  (from %s body AABB)\n",
                    half_l, half_w, carname);
             printf("OLD candidate          (%.3f, %.3f, %.3f)  road_tri=%s  ground_z=%.3f\n"
@@ -4745,7 +4833,7 @@ int main(int argc, char **argv) {
     int p_lap = 0, p_prev = 0;   /* player lap + previous loop-progress */
     /* race flow: 3 = pre-race menu, 0 = countdown, 1 = racing, 2 = finished */
     const int COUNTDOWN = 180, LAP_TARGET = 2;
-    int race_state = (shot || resident_route_audit) ? 1 : 3;
+    int race_state = (shot || resident_route_audit || resident_drive_audit) ? 1 : 3;
     int racetimer = 0, finish_place = 0;
     int gear = 1; float shift_t = 0.0f;   /* virtual gearbox (engine audio) */
     float menuspin = 0.0f;   /* orbit-camera angle on the menu screen */
@@ -4783,7 +4871,75 @@ int main(int argc, char **argv) {
         resident_route_visited[0][1] = active_resident->center[1];
         resident_route_visited_count = 1;
     }
+    /* M151: physics-driven boundary crossing audit. The car is driven through
+       normal throttle/steer → phys_car_step; carpos is NEVER directly written
+       after the initial spawn. A nav-graph route selects successive waypoints
+       that cross at least two 400 m resident cell boundaries. */
+    #define RDA_MAX_SWAPS 4
+    #define RDA_WINDOW 30  /* frames ± around each swap for wall/rail logging */
+    typedef struct {
+        long frame; uint32_t wall_ms;
+        float old_center[2], new_center[2];
+        unsigned long old_gen, new_gen;
+        float pos[3], vel[2], speed_kmh, heading_rad;
+        int grounded, contact_mask;
+        float ride_z, ride_vz, ride_pitch, ride_roll;
+        int scene_meshes, batches, textures, lights, obstacles;
+        int invalid_batch, invalid_src;
+        float max_pos_delta, max_z_delta, max_cam_delta;
+        /* build timing split (ms) */
+        uint32_t t_neighborhood, t_validate, t_textures, t_batches, t_collision, t_activate;
+        uint32_t t_total, t_cpu_background;
+        int walls_near, rails_near;  /* wall/rail responses in ±RDA_WINDOW */
+    } RDASwapRecord;
+    RDASwapRecord rda_swaps[RDA_MAX_SWAPS];
+    int rda_nswaps = 0, rda_failed = 0;
+    long rda_frame = 0;
+    int rda_nav_path[4096]; int rda_nav_n = 0, rda_nav_at = 0;
+    float rda_target[3] = {0}; /* current nav target XYZ */
+    int rda_have_target = 0;
+    float rda_visited_centers[8][2]; int rda_visited_n = 0;
+    float rda_max_pos_delta = 0, rda_max_z_delta = 0, rda_max_cam_delta = 0;
+    float rda_prev_pos[3] = {0,0,0}, rda_prev_cam[3] = {0,0,0};
+    int rda_control_mode = 0;  /* 0 = drive-to-boundary, 1 = control (stay in cell) */
+    long rda_control_start = 0, rda_control_limit = 0;
+    float rda_control_max_pos_delta = 0, rda_control_max_z_delta = 0;
+    uint32_t rda_control_longest_ms = 0;
+    if (resident_drive_audit) {
+        world_set_mode(&world, MODE_FREEROAM, -1);
+        world.city.race.active = 0;
+        nai = 0;
+        rda_visited_centers[0][0] = active_resident->center[0];
+        rda_visited_centers[0][1] = active_resident->center[1];
+        rda_visited_n = 1;
+        /* Build a route from spawn toward the next cell boundary using nav nodes.
+           Use world_resident_route_point to find a supported nav node in an
+           unvisited cell, then A* from nearest-to-car to nearest-to-target. */
+        float rp[3], rc[2];
+        if (world_resident_route_point(&resident_policy, active_resident,
+                &world.city, carpos[0], carpos[1], carpos[2],
+                (const float (*)[2])rda_visited_centers, rda_visited_n, rp, rc)) {
+            int s = world_nav_nearest(&world, carpos[0], carpos[1]);
+            int g = world_nav_nearest(&world, rp[0], rp[1]);
+            rda_nav_n = world_route(&world, s, g, rda_nav_path, 4096, NULL);
+            rda_nav_at = 0;
+            rda_target[0] = rp[0]; rda_target[1] = rp[1]; rda_target[2] = rp[2];
+            rda_have_target = 1;
+            printf("RDA route: spawn=(%.3f,%.3f,%.3f) -> target=(%.3f,%.3f,%.3f) "
+                   "cell=(%.0f,%.0f) route=%d nodes\n",
+                   carpos[0], carpos[1], carpos[2], rp[0], rp[1], rp[2],
+                   rc[0], rc[1], rda_nav_n);
+        } else {
+            fprintf(stderr, "RDA: no unvisited cell reachable from spawn\n");
+            rda_failed = 1;
+        }
+        rda_prev_pos[0] = carpos[0]; rda_prev_pos[1] = carpos[1]; rda_prev_pos[2] = carpos[2];
+    }
+    WResidentJob *resident_job = NULL;
+    unsigned resident_wait_frames = 0;
     while (running) {
+        uint32_t resident_frame_begin = SDL_GetTicks();
+        Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
         /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
            the production race_state==3 Enter branch runs exactly as written. */
         static long ra_f = 0; static int ra_sent = 0, ra_start = -1;
@@ -5015,18 +5171,35 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* M144: build a complete replacement while the previous neighborhood
-           remains active, then swap every CPU/GPU/collision owner together at
-           this frame boundary. Player, contact and camera state are not members
-           of either resident and therefore cannot be reset by the transaction. */
-        if (world2 && race_state == 1 && world.city.mode == MODE_FREEROAM &&
-            (!shot || daudit) && !sstatic &&
-            (!capture_policy.freeze_motion || resident_route_audit)) {
-            float target[2];
-            if (!candidate_resident &&
+        /* M154: only CPU/file preparation runs on the single worker. Join before
+           validating/uploading/activating/freeing any resident. The active grid
+           stays immutable while the worker builds its detached grid. Unpaced
+           capture/audit runs retain synchronous preparation: their simulated
+           time can outrun wall-clock I/O by orders of magnitude. The paced
+           physics-driven audit exercises the ordinary asynchronous path. */
+        int resident_enabled = world2 && race_state == 1 && world.city.mode == MODE_FREEROAM &&
+            (!shot || daudit || resident_drive_audit) && !sstatic &&
+            (!capture_policy.freeze_motion || resident_route_audit || resident_drive_audit);
+        float target[2] = {0, 0};
+        int resident_wanted = resident_enabled &&
                 world_resident_target(&resident_policy, carpos[0], carpos[1],
                                       active_resident->center[0],
-                                      active_resident->center[1], target) &&
+                                      active_resident->center[1], target);
+        WorldResident *prepared = NULL;
+        WResidentBuildTiming prepared_timing = {0};
+        if (resident_job) resident_wait_frames++;
+        int prepared_status = world_resident_job_take(&resident_job, &prepared,
+                                                      &prepared_timing);
+        if (prepared_status && (!resident_wanted ||
+            prepared->center[0] != target[0] || prepared->center[1] != target[1])) {
+            printf("resident CPU result discarded: obsolete target (%.0f,%.0f)\n",
+                   prepared->center[0], prepared->center[1]);
+            world_resident_free(prepared);
+            prepared = NULL;
+            prepared_status = 0;
+        }
+        if (resident_wanted) {
+            if (!candidate_resident &&
                 !(target[0] == failed_resident_cell[0] &&
                   target[1] == failed_resident_cell[1])) {
                 float saved_pos[3] = {carpos[0], carpos[1], carpos[2]};
@@ -5034,13 +5207,34 @@ int main(int argc, char **argv) {
                 float saved_heading = heading;
                 PhysRideState saved_ride = g_ride;
                 int saved_ride_ready = g_ride_ready;
+                float pre_swap_center[2] = {active_resident->center[0],
+                                             active_resident->center[1]};
                 uint32_t build_begin = SDL_GetTicks();
-                candidate_resident = (WorldResident *)calloc(
-                    1, sizeof *candidate_resident);
-                if (!candidate_resident ||
-                    !world_resident_build(candidate_resident, &resident_args,
+                WResidentBuildTiming build_timing = {0};
+                int background = !resident_sync && !resident_route_audit &&
+                                 (!shot || (resident_drive_audit && resident_realtime));
+                int build_status = 0; /* pending is not a failed build */
+                if (!background) {
+                    candidate_resident = calloc(1, sizeof *candidate_resident);
+                    build_status = candidate_resident &&
+                        world_resident_build(candidate_resident, &resident_args,
                                           target[0], target[1],
-                                          carpos[0], carpos[1], carpos[2])) {
+                                          carpos[0], carpos[1], carpos[2],
+                                          &build_timing) ? 1 : -1;
+                } else if (prepared_status) {
+                    candidate_resident = prepared;
+                    prepared = NULL;
+                    build_timing = prepared_timing;
+                    build_status = prepared_status > 0 &&
+                        world_resident_finish(candidate_resident,
+                            carpos[0], carpos[1], carpos[2], &build_timing) ? 1 : -1;
+                } else if (!resident_job) {
+                    resident_wait_frames = 0;
+                    if (!world_resident_job_start(&resident_job, &resident_args,
+                                                  target[0], target[1]))
+                        build_status = -1;
+                }
+                if (build_status < 0) {
                     world_resident_free(candidate_resident);
                     candidate_resident = NULL;
                     failed_resident_cell[0] = target[0];
@@ -5048,7 +5242,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "resident build failed at cell (%.0f, %.0f); "
                             "keeping generation %lu\n", target[0], target[1],
                             active_resident->generation);
-                } else {
+                } else if (build_status > 0) {
                     world_resident_activate(&active_resident,
                                             &candidate_resident);
                     world.neighborhood = active_resident->world;
@@ -5094,16 +5288,110 @@ int main(int argc, char **argv) {
                     assert(heading == saved_heading);
                     assert(g_ride_ready == saved_ride_ready);
                     assert(!memcmp(&g_ride, &saved_ride, sizeof g_ride));
+                    uint32_t build_end = SDL_GetTicks();
+                    printf("resident prepare=%s CPU=%u ms frames-running=%u "
+                           "blocking-finish=%u ms\n", background ? "worker" : "sync",
+                           build_timing.neighborhood_ms,
+                           background ? resident_wait_frames : 0,
+                           build_end - build_begin);
                     printf("resident activated gen=%lu center=(%.0f,%.0f) "
                            "meshes=%d batches=%d textures=%d lights=%d "
                            "obstacles=%d build=%u ms\n",
                            active_resident->generation,
                            active_resident->center[0], active_resident->center[1],
                            nm, nbatch, ntmap, world.neighborhood.nlights, nobst,
-                           SDL_GetTicks() - build_begin);
+                           build_end - build_begin);
+                    /* M151: record boundary crossing telemetry */
+                    if (resident_drive_audit && rda_nswaps < RDA_MAX_SWAPS) {
+                        RDASwapRecord *r = &rda_swaps[rda_nswaps];
+                        r->frame = rda_frame;
+                        r->wall_ms = build_end - build_begin;
+                        r->old_center[0] = pre_swap_center[0];
+                        r->old_center[1] = pre_swap_center[1];
+                        r->new_center[0] = active_resident->center[0];
+                        r->new_center[1] = active_resident->center[1];
+                        r->old_gen = active_resident->generation - 1;
+                        r->new_gen = active_resident->generation;
+                        r->pos[0] = carpos[0]; r->pos[1] = carpos[1]; r->pos[2] = carpos[2];
+                        r->vel[0] = vel[0]; r->vel[1] = vel[1];
+                        r->speed_kmh = PHYS_KMH(speed);
+                        r->heading_rad = heading;
+                        r->grounded = g_ride.contact_mask ? 1 : 0;
+                        r->contact_mask = (int)g_ride.contact_mask;
+                        r->ride_z = g_ride.z; r->ride_vz = g_ride.vz;
+                        r->ride_pitch = g_ride.pitch; r->ride_roll = g_ride.roll;
+                        r->scene_meshes = nm; r->batches = nbatch;
+                        r->textures = ntmap;
+                        r->lights = world.neighborhood.nlights;
+                        r->obstacles = nobst;
+                        /* check for invalid ownership */
+                        int inv_batch = 0, inv_src = 0;
+                        for (int j = 0; j < nobst; j++)
+                            if (obstsrc[j] < 0 || obstsrc[j] >= nm) inv_src++;
+                        for (int j = 0; j < nm; j++)
+                            if (meshbatch[j] < -1 || meshbatch[j] >= nbatch) inv_batch++;
+                        r->invalid_batch = inv_batch;
+                        r->invalid_src = inv_src;
+                        r->t_total = build_end - build_begin;
+                        r->t_neighborhood = build_timing.neighborhood_ms;
+                        r->t_cpu_background = background ? build_timing.neighborhood_ms : 0;
+                        r->t_validate = build_timing.validate_ms;
+                        r->t_textures = build_timing.textures_ms;
+                        r->t_batches = build_timing.batches_ms;
+                        r->t_collision = build_timing.collision_ms;
+                        uint32_t measured_blocking = build_timing.total_ms -
+                            (background ? build_timing.neighborhood_ms : 0);
+                        r->t_activate = r->t_total > measured_blocking
+                                      ? r->t_total - measured_blocking : 0;
+                        r->max_pos_delta = 0; r->max_z_delta = 0; r->max_cam_delta = 0;
+                        r->walls_near = 0; r->rails_near = 0;
+                        /* track visited center */
+                        if (rda_visited_n < 8) {
+                            rda_visited_centers[rda_visited_n][0] = active_resident->center[0];
+                            rda_visited_centers[rda_visited_n][1] = active_resident->center[1];
+                            rda_visited_n++;
+                        }
+                        rda_nswaps++;
+                        printf("RDA SWAP %d: frame=%ld build=%u ms "
+                               "[neigh=%u valid=%u tex=%u batch=%u coll=%u act=%u] "
+                               "old=(%.0f,%.0f) new=(%.0f,%.0f) gen=%lu "
+                               "player=(%.3f,%.3f,%.3f) speed=%.1f km/h "
+                               "grounded=%d contact=0x%x "
+                               "meshes=%d batches=%d textures=%d obstacles=%d "
+                               "inv_batch=%d inv_src=%d\n",
+                               rda_nswaps, rda_frame, r->t_total,
+                               r->t_neighborhood, r->t_validate, r->t_textures,
+                               r->t_batches, r->t_collision, r->t_activate,
+                               r->old_center[0], r->old_center[1],
+                               r->new_center[0], r->new_center[1], r->new_gen,
+                               carpos[0], carpos[1], carpos[2], r->speed_kmh,
+                               r->grounded, r->contact_mask,
+                               nm, nbatch, ntmap, nobst, inv_batch, inv_src);
+                        /* Plan next route segment to the next unvisited cell */
+                        float rp2[3], rc2[2];
+                        if (world_resident_route_point(&resident_policy,
+                                active_resident, &world.city,
+                                carpos[0], carpos[1], carpos[2],
+                                (const float (*)[2])rda_visited_centers,
+                                rda_visited_n, rp2, rc2)) {
+                            int s2 = world_nav_nearest(&world, carpos[0], carpos[1]);
+                            int g2 = world_nav_nearest(&world, rp2[0], rp2[1]);
+                            rda_nav_n = world_route(&world, s2, g2, rda_nav_path, 4096, NULL);
+                            rda_nav_at = 0;
+                            rda_target[0] = rp2[0]; rda_target[1] = rp2[1]; rda_target[2] = rp2[2];
+                            printf("RDA reroute: -> target=(%.3f,%.3f) cell=(%.0f,%.0f) "
+                                   "route=%d nodes\n",
+                                   rp2[0], rp2[1], rc2[0], rc2[1], rda_nav_n);
+                        } else {
+                            rda_have_target = 0;  /* no more cells; will start control run */
+                            printf("RDA: no more unvisited cells after %d swaps\n", rda_nswaps);
+                        }
+                    }
                 }
             }
         }
+        /* Includes a ready result whose cell has since been marked failed. */
+        world_resident_free(prepared);
         if (resident_route_pending) {
             int source_fail = 0;
             for (int i = 0; i < nobst; i++)
@@ -5202,6 +5490,93 @@ int main(int argc, char **argv) {
             else if (r < 1800) { throttle = 1.0f; steer = ((r-600)/120) % 2 ? -1.0f : 1.0f; }
             else if (r < 1950) { throttle = -1.0f; steer = 0.0f; }
             else               { throttle =  0.0f; steer = 0.0f; }
+            handbrake = 0;
+        }
+        /* M151: physics-driven nav-node-following controller. Produces throttle +
+           steer through the normal input variables; phys_car_step does the rest. */
+        if (resident_drive_audit && rda_have_target && !rda_control_mode) {
+            /* advance along A* path: skip all nodes within 20 m */
+            while (rda_nav_n > 1 && rda_nav_at < rda_nav_n - 1) {
+                float nx = world.city.nav[rda_nav_path[rda_nav_at]*2];
+                float ny = world.city.nav[rda_nav_path[rda_nav_at]*2+1];
+                float adx = nx - carpos[0], ady = ny - carpos[1];
+                if (adx*adx + ady*ady > 400.0f) break; /* 20m */
+                rda_nav_at++;
+            }
+            /* aim toward the farthest route node within 80 m — this smooths the
+               path and avoids aiming at a node behind a building wall */
+            float tx, ty;
+            if (rda_nav_n > 1 && rda_nav_at < rda_nav_n) {
+                int look = rda_nav_at;
+                for (int k = rda_nav_at; k < rda_nav_n && k < rda_nav_at + 10; k++) {
+                    float lx = world.city.nav[rda_nav_path[k]*2];
+                    float ly = world.city.nav[rda_nav_path[k]*2+1];
+                    float ld = (lx-carpos[0])*(lx-carpos[0]) + (ly-carpos[1])*(ly-carpos[1]);
+                    if (ld < 6400.0f) look = k;  /* 80m */
+                }
+                tx = world.city.nav[rda_nav_path[look]*2];
+                ty = world.city.nav[rda_nav_path[look]*2+1];
+            } else {
+                tx = rda_target[0]; ty = rda_target[1];
+            }
+            float ddx = tx - carpos[0], ddy = ty - carpos[1];
+            float dd = sqrtf(ddx*ddx + ddy*ddy);
+            /* stuck detection: if speed < 2 km/h for > 120 frames (2s), reverse
+               briefly then resume. This handles wall-pinned situations. */
+            static int rda_stuck_count = 0, rda_reverse_timer = 0;
+            float abs_spd = speed < 0 ? -speed : speed;
+            if (PHYS_KMH(abs_spd) < 3.0f && rda_frame > 60)
+                rda_stuck_count++;
+            else
+                rda_stuck_count = 0;
+            if (rda_stuck_count > 180) {  /* 3s stuck -> reverse + reroute */
+                rda_reverse_timer = 120;  /* reverse for 2s */
+                rda_stuck_count = 0;
+                /* reroute from current position — the original A* may cross
+                   buildings the car can't physically traverse */
+                int s3 = world_nav_nearest(&world, carpos[0], carpos[1]);
+                int g3 = world_nav_nearest(&world, rda_target[0], rda_target[1]);
+                if (s3 >= 0 && g3 >= 0) {
+                    rda_nav_n = world_route(&world, s3, g3, rda_nav_path, 4096, NULL);
+                    rda_nav_at = 0;
+                }
+            }
+            if (rda_reverse_timer > 0) {
+                throttle = -0.7f;
+                /* steer toward the heading-aligned axis so we back away from
+                   the wall and turn toward open road */
+                steer = (rda_reverse_timer > 60) ? -0.8f : 0.8f;
+                rda_reverse_timer--;
+            } else if (dd > 0.5f) {
+                float want_hdg = atan2f(ddy, ddx);
+                float err = want_hdg - heading;
+                while (err >  3.14159265f) err -= 6.28318530f;
+                while (err < -3.14159265f) err += 6.28318530f;
+                /* proportional steer: ±1 at ≥30 deg error */
+                steer = err / 0.52f;
+                if (steer >  1.0f) steer =  1.0f;
+                if (steer < -1.0f) steer = -1.0f;
+                /* slow down for sharp turns */
+                float abserr = err < 0 ? -err : err;
+                throttle = abserr > 0.8f ? 0.3f : 1.0f;
+            } else {
+                throttle = 1.0f; steer = 0.0f;
+            }
+            handbrake = 0;
+            /* periodic progress log */
+            if (rda_frame % 600 == 0) {
+                float cdx = carpos[0] - active_resident->center[0];
+                float cdy = carpos[1] - active_resident->center[1];
+                float cdist = sqrtf(cdx*cdx + cdy*cdy);
+                printf("RDA f%ld pos=(%.1f,%.1f,%.1f) speed=%.1f km/h "
+                       "dist-from-center=%.1f node=%d/%d\n",
+                       rda_frame, carpos[0], carpos[1], carpos[2],
+                       PHYS_KMH(speed), cdist, rda_nav_at, rda_nav_n);
+            }
+        } else if (resident_drive_audit && rda_control_mode) {
+            /* Control run: drive in a gentle circle inside the cell */
+            throttle = 0.8f;
+            steer = 0.15f;
             handbrake = 0;
         }
         steer_filtered=phys_steer_response(steer_filtered,steer);
@@ -5324,10 +5699,26 @@ int main(int argc, char **argv) {
             if (da> 0.06f) da= 0.06f; if (da<-0.06f) da=-0.06f;
             heading += da;
         }
+        float ground_old[3]={carpos[0],carpos[1],carpos[2]}, ground_oldh=heading;
         float dmag = (sstatic || capture_policy.freeze_motion) ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
                                    throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
+        if (g_ride_ready && race_state==1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
+            WGroundHit h;
+            float fraction=ground_motion_limit(&scene,&g_ride,&g_sup,ground_old,ground_oldh,
+                                               carpos,&heading,vel,&h);
+            if(fraction<1) {
+                speed=vel[0]*cosf(heading)+vel[1]*sinf(heading);
+                dmag=fabsf(vel[0]*sinf(heading)-vel[1]*cosf(heading));
+                if(raudit || resident_drive_audit) {
+                    static unsigned logged=0;
+                    if(logged++<32)
+                        printf("GROUND SWEEP mesh=%d tri=%d fraction=%.6f pos=(%.3f,%.3f,%.3f)\n",
+                               h.mesh,h.tri,fraction,carpos[0],carpos[1],carpos[2]);
+                }
+            }
+        }
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the
@@ -5372,6 +5763,13 @@ int main(int argc, char **argv) {
             (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
+            if (daudit && da_walls == 1 && nwc > 0) {
+                int mi = wc[0].mesh;
+                printf("DA FIRST WALL mesh=%d tri=%d name=%s normal=(%+.3f,%+.3f) "
+                       "pen=%.4f span=%.3f\n", mi, wc[0].tri,
+                       mi >= 0 && mi < scene.count ? scene.meshes[mi].sname : "?",
+                       wc[0].nx, wc[0].ny, wc[0].pen, wc[0].span);
+            }
             if (raudit) {
                 float dx = carpos[0]-m94_prex, dy = carpos[1]-m94_prey;
                 float corr = sqrtf(dx*dx+dy*dy);
@@ -5388,12 +5786,19 @@ int main(int argc, char **argv) {
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) &&
-                        world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
+                        world_wall_push(&scene, carpos, 1.3f,
+                                        (raudit || daudit) ? &rh : NULL);
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
           if (rpushed) {
             vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
             da_rails++; ra_rails++;
+            if (daudit && da_rails == 1 && rh.mesh >= 0)
+                printf("DA FIRST RAIL mesh=%d tri=%d name=%s at=(%.3f,%.3f,%.3f) "
+                       "nz=%+.3f z=[%.3f,%.3f] span=%.3f edge=%.3f\n",
+                       rh.mesh, rh.tri, scene.meshes[rh.mesh].sname,
+                       m94_prex, m94_prey, m94_prez, rh.nz, rh.zlo, rh.zhi,
+                       rh.zhi-rh.zlo, rh.edged);
           }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
@@ -7580,7 +7985,70 @@ int main(int argc, char **argv) {
                     if (!capture_frame_png(path, W, H)) resident_route_failed = 1;
                     printf("resident route capture %s\n", path);
                 }
-            if (resident_route_frame++ >= 7) {
+            /* M145: at frame 7 (after2, both swaps done), optionally teleport
+               within the still-active resident to an exact pose and capture
+               one more frame before exiting. No new resident load: the target
+               is expected to stay inside the current cell's trigger radius,
+               same as ordinary in-resident movement. */
+            if (resident_route_hold_set && resident_route_frame == 7) {
+                WGroundHit hit;
+                world_ground_hit(&active_resident->world.scene,
+                                 resident_route_hold[0], resident_route_hold[1],
+                                 carpos[2], &hit);
+                carpos[0] = resident_route_hold[0];
+                carpos[1] = resident_route_hold[1];
+                carpos[2] = hit.z;
+                heading = resident_route_hold[2] * 3.14159265f / 180.0f;
+                shotyaw = heading;
+                vel[0] = vel[1] = 0.0f;
+                speed = 0.0f;
+                printf("resident route hold pos=(%.3f,%.3f,%.3f) center=(%.0f,%.0f)\n",
+                       carpos[0], carpos[1], carpos[2],
+                       active_resident->center[0], active_resident->center[1]);
+                /* M145: dump every mesh from the SAME activated resident
+                   (not a re-derived load) whose XY bbox overlaps a box
+                   around the hold point, with its resolved draw mode/
+                   batch/texture -- draw-time attribution, not emission
+                   order, and no separate loader. */
+                float qx0 = carpos[0]-45.0f, qx1 = carpos[0]+45.0f;
+                float qy0 = carpos[1]-45.0f, qy1 = carpos[1]+45.0f;
+                const N2Scene *hs = &active_resident->world.scene;
+                const WorldResidentResources *hr = &active_resident->resources;
+                printf("M145 mesh dump near hold (box [%.0f..%.0f][%.0f..%.0f]):\n",
+                       qx0, qx1, qy0, qy1);
+                for (int mi = 0; mi < hs->count; mi++) {
+                    const float *bb = active_resident->world.mbb[mi];
+                    if (bb[2] < qx0 || bb[0] > qx1 || bb[3] < qy0 || bb[1] > qy1)
+                        continue;
+                    const N2Mesh *m = &hs->meshes[mi];
+                    float z0=1e30f, z1=-1e30f;
+                    for (int v = 0; v < m->nverts; v++) {
+                        float z = m->verts[v*5+2];
+                        if (z < z0) z0 = z; if (z > z1) z1 = z;
+                    }
+                    static const char *modenm[4] = {"OPAQUE","CUTOUT","BLEND","ADD"};
+                    unsigned char md = (hr->mesh_modes && mi < hr->mesh_count) ?
+                                       hr->mesh_modes[mi] : 0;
+                    int batch = (hr->mesh_batch && mi < hr->mesh_count) ?
+                               hr->mesh_batch[mi] : -1;
+                    printf("  mesh[%5d] %-27s aname=%-27s cat=%d scen=%-8s "
+                           "texkey=%08x exact=%d mode=%-6s batch=%d tris=%d "
+                           "xy=[%.1f..%.1f][%.1f..%.1f] z=[%.2f..%.2f] inst=%d\n",
+                           mi, m->sname[0] ? m->sname : "(unnamed)",
+                           m->aname[0] ? m->aname : "-",
+                           m->cat, n2_scen_name(m->scen), m->texkey, m->mat_exact,
+                           md < 4 ? modenm[md] : "?", batch, m->nidx/3,
+                           bb[0], bb[2], bb[1], bb[3], z0, z1, m->inst);
+                }
+            }
+            int route_last_frame = resident_route_hold_set ? 9 : 7;
+            if (resident_route_hold_set && resident_route_frame == route_last_frame) {
+                char path[1024];
+                snprintf(path, sizeof path, "%s_hold.png", resident_route_audit);
+                if (!capture_frame_png(path, W, H)) resident_route_failed = 1;
+                printf("resident route capture %s\n", path);
+            }
+            if (resident_route_frame++ >= route_last_frame) {
                 if (resident_route_swaps != 2) resident_route_failed = 1;
                 printf("RESIDENT ROUTE SUMMARY track=%s swaps=%d status=%s "
                        "final-gen=%lu center=(%.0f,%.0f)\n",
@@ -7591,6 +8059,151 @@ int main(int argc, char **argv) {
                 final_status = resident_route_failed ? 1 : 0;
                 running = 0;
             }
+        }
+        /* M151: physics-driven boundary audit per-frame tracking and exit */
+        if (resident_drive_audit) {
+            uint32_t rda_ft0 = resident_frame_begin;
+            /* track max position/Z/camera deltas per frame */
+            float pdx = carpos[0] - rda_prev_pos[0];
+            float pdy = carpos[1] - rda_prev_pos[1];
+            float pdz = carpos[2] - rda_prev_pos[2];
+            float pd = sqrtf(pdx*pdx + pdy*pdy + pdz*pdz);
+            float zd = pdz < 0 ? -pdz : pdz;
+            if (pd > rda_max_pos_delta) rda_max_pos_delta = pd;
+            if (zd > rda_max_z_delta) rda_max_z_delta = zd;
+            float cdx = cam[0] - rda_prev_cam[0];
+            float cdy = cam[1] - rda_prev_cam[1];
+            float cdz = cam[2] - rda_prev_cam[2];
+            float cd2 = sqrtf(cdx*cdx + cdy*cdy + cdz*cdz);
+            if (rda_frame > 0 && cd2 > rda_max_cam_delta) rda_max_cam_delta = cd2;
+            rda_prev_pos[0] = carpos[0]; rda_prev_pos[1] = carpos[1]; rda_prev_pos[2] = carpos[2];
+            rda_prev_cam[0] = cam[0]; rda_prev_cam[1] = cam[1]; rda_prev_cam[2] = cam[2];
+            /* capture PNGs: one frame before each swap is detected, and one after.
+               Since we can't predict before, capture at each swap frame and the
+               frame after. Swap records store the frame; capture at swap frame and
+               swap frame+1. */
+            for (int si = 0; si < rda_nswaps; si++) {
+                if (rda_frame == rda_swaps[si].frame ||
+                    rda_frame == rda_swaps[si].frame + 1) {
+                    char cappath[1024];
+                    snprintf(cappath, sizeof cappath, "%s_swap%d_%s.png",
+                             resident_drive_audit, si + 1,
+                             rda_frame == rda_swaps[si].frame ? "at" : "after");
+                    capture_frame_png(cappath, W, H);
+                    printf("RDA capture: %s\n", cappath);
+                }
+            }
+            /* Track frame time for longest-frame detection */
+            uint32_t rda_ft1 = SDL_GetTicks();
+            uint32_t frame_ms = rda_ft1 - rda_ft0;
+            /* The real stall is in the build, which we already timed in t_total.
+               Also track the render frame for completeness. */
+            if (rda_control_mode) {
+                if (frame_ms > rda_control_longest_ms)
+                    rda_control_longest_ms = frame_ms;
+                /* track control deltas */
+                if (pd > rda_control_max_pos_delta) rda_control_max_pos_delta = pd;
+                if (zd > rda_control_max_z_delta) rda_control_max_z_delta = zd;
+            }
+            /* Drive phase: once we have ≥2 swaps (or target exhausted), start control run */
+            if (!rda_control_mode && !rda_have_target && rda_nswaps >= 2) {
+                rda_control_mode = 1;
+                rda_control_start = rda_frame;
+                rda_control_limit = rda_frame;  /* will be set based on drive frames */
+                printf("RDA: entering control run at frame %ld (drive phase had %ld frames)\n",
+                       rda_frame, rda_frame);
+                rda_control_limit = rda_frame + rda_frame;  /* same duration as drive */
+            }
+            /* Timeout: if driving for too long without enough swaps, give up */
+            if (!rda_control_mode && rda_frame > 18000) {  /* 5 min at 60 Hz */
+                if (rda_nswaps < 2) {
+                    fprintf(stderr, "RDA: timeout after %ld frames with only %d swaps\n",
+                            rda_frame, rda_nswaps);
+                    rda_failed = 1;
+                }
+                if (rda_nswaps >= 2 && rda_have_target) {
+                    rda_have_target = 0;  /* stop driving, start control */
+                }
+                if (!rda_have_target && !rda_control_mode && rda_nswaps >= 2) {
+                    rda_control_mode = 1;
+                    rda_control_start = rda_frame;
+                    rda_control_limit = rda_frame + rda_frame;
+                    printf("RDA: timeout -> control run at frame %ld\n", rda_frame);
+                }
+            }
+            /* Exit: control run done or failed */
+            if (rda_failed || (rda_control_mode && rda_frame >= rda_control_limit)) {
+                /* Record max deltas into each swap record */
+                for (int si = 0; si < rda_nswaps; si++) {
+                    rda_swaps[si].max_pos_delta = rda_max_pos_delta;
+                    rda_swaps[si].max_z_delta = rda_max_z_delta;
+                    rda_swaps[si].max_cam_delta = rda_max_cam_delta;
+                }
+                /* Determine root cause category */
+                const char *root_cause;
+                if (rda_nswaps < 2) root_cause = "(a) route/controller failed to cross trigger";
+                else {
+                    int any_inv = 0;
+                    for (int si = 0; si < rda_nswaps; si++)
+                        if (rda_swaps[si].invalid_batch || rda_swaps[si].invalid_src) any_inv = 1;
+                    if (any_inv) root_cause = "(b) candidate build failure";
+                    else if (rda_max_pos_delta > 5.0f || rda_max_z_delta > 3.0f)
+                        root_cause = "(c) state jumps";
+                    else root_cause = "(d) synchronous-loading latency";
+                }
+                printf("\n=== RDA SUMMARY ===\n");
+                printf("MILESTONE: 151\n");
+                printf("RESULT: %s\n", rda_failed ? "FAIL" : "PASS");
+                printf("TRACK: %s\n", trackname);
+                printf("REAL-DRIVE ROUTE: %d swaps in %ld frames (%.1f s)\n",
+                       rda_nswaps, rda_frame, rda_frame / 60.0);
+                printf("\nBOUNDARY TABLE:\n");
+                printf("%-6s %-8s %-14s %-14s %-6s %-30s %-10s %-6s %-5s "
+                       "%-6s %-6s %-6s %-6s %-6s %-6s\n",
+                       "SWAP", "FRAME", "OLD_CENTER", "NEW_CENTER", "GEN",
+                       "PLAYER_POS", "SPEED", "GRND", "CONT",
+                       "MESH", "BATCH", "TEX", "OBST", "IBAT", "ISRC");
+                for (int si = 0; si < rda_nswaps; si++) {
+                    RDASwapRecord *r = &rda_swaps[si];
+                    printf("%-6d %-8ld (%.0f,%.0f)     (%.0f,%.0f)     %-6lu "
+                           "(%.1f,%.1f,%.1f)       %-10.1f %-6d 0x%-3x "
+                           "%-6d %-6d %-6d %-6d %-6d %-6d\n",
+                           si+1, r->frame,
+                           r->old_center[0], r->old_center[1],
+                           r->new_center[0], r->new_center[1], r->new_gen,
+                           r->pos[0], r->pos[1], r->pos[2], r->speed_kmh,
+                           r->grounded, r->contact_mask,
+                           r->scene_meshes, r->batches, r->textures,
+                           r->obstacles, r->invalid_batch, r->invalid_src);
+                }
+                printf("\nSTALL BREAKDOWN:\n");
+                for (int si = 0; si < rda_nswaps; si++) {
+                    RDASwapRecord *rs = &rda_swaps[si];
+                    printf("  swap %d: blocking=%u ms  cpu-background=%u "
+                           "cpu-blocking=%u validate=%u "
+                           "textures=%u batches=%u collision=%u activate=%u\n",
+                           si+1, rs->t_total, rs->t_cpu_background,
+                           rs->t_neighborhood - rs->t_cpu_background,
+                           rs->t_validate, rs->t_textures, rs->t_batches,
+                           rs->t_collision, rs->t_activate);
+                }
+                printf("\nSTATE CONTINUITY:\n");
+                printf("  max single-frame pos delta: %.4f m\n", rda_max_pos_delta);
+                printf("  max single-frame Z delta:   %.4f m\n", rda_max_z_delta);
+                printf("  max single-frame cam delta: %.4f m\n", rda_max_cam_delta);
+                if (rda_control_mode) {
+                    printf("\nCONTROL RUN (same cell, %ld frames):\n",
+                           rda_frame - rda_control_start);
+                    printf("  max pos delta: %.4f m\n", rda_control_max_pos_delta);
+                    printf("  max Z delta:   %.4f m\n", rda_control_max_z_delta);
+                    printf("  longest frame: %u ms\n", rda_control_longest_ms);
+                }
+                printf("\nROOT CAUSE: %s\n", root_cause);
+                printf("=== END RDA ===\n");
+                final_status = rda_failed ? 1 : 0;
+                running = 0;
+            }
+            rda_frame++;
         }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
@@ -7722,11 +8335,21 @@ int main(int argc, char **argv) {
             running = 0;
         }
         SDL_GL_SwapWindow(win);
+        /* Raw --shot audits can simulate seconds during a few milliseconds of
+           real I/O. Opt-in pacing makes worker latency comparable to interactive
+           60 Hz driving. No physics inputs or integration equations change. */
+        if (resident_drive_audit && resident_realtime && running) {
+            Uint64 freq = SDL_GetPerformanceFrequency();
+            Uint64 elapsed = SDL_GetPerformanceCounter() - resident_frame_counter;
+            if (elapsed < freq / 60)
+                SDL_Delay((Uint32)((freq / 60 - elapsed) * 1000 / freq));
+        }
     }
 
 #ifdef DEBUG_UI
     dbgui_shutdown();
 #endif
+    world_resident_job_cancel(&resident_job); /* join before active-grid/GL teardown */
     if (world2) {
         world_resident_free(candidate_resident);
         world_resident_free(active_resident);

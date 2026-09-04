@@ -382,11 +382,33 @@ void phys_selftest(void) {
 
 }
 
+/* Clip a convex face against one horizontal half-space. A triangle clipped
+ * by the car's two parallel height planes has at most five vertices (eight
+ * slots also accommodate duplicate boundary vertices). Crossing endpoints
+ * have different Z, so the interpolation denominator cannot be zero. */
+static int cw_clip_z(const float in[][3], int count, float out[][3],
+                     float z, int keep_above) {
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        const float *a = in[i], *b = in[(i+1)%count];
+        int ai = keep_above ? a[2] >= z : a[2] <= z;
+        int bi = keep_above ? b[2] >= z : b[2] <= z;
+        if (ai) { memcpy(out[n], a, sizeof out[n]); n++; }
+        if (ai != bi) {
+            float u = (z - a[2]) / (b[2] - a[2]);
+            out[n][0] = a[0] + (b[0] - a[0]) * u;
+            out[n][1] = a[1] + (b[1] - a[1]) * u;
+            out[n][2] = z;
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Does this mesh present an actual wall to the car here, and WHICH feature?
- * Near-vertical face, height span overlapping the car, XY projection within r.
- * Two passes over the same faces: the first finds the closest edge feature and
- * the union vertical span of every contacting face, the second is not needed --
- * the span is accumulated as we go. The normal comes from the closest point to
+ * Near-vertical face, clipped to car height before measuring XY distance.
+ * The union span still uses authored faces, so a thin height overlap with a
+ * tall wall is not mistaken for a mesh seam. The normal comes from the closest point to
  * the car centre, never from triangle winding, so a wall pushes the car away
  * from itself rather than along whatever axis its bounding box prefers. */
 int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
@@ -411,10 +433,20 @@ int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
         if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
         if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
-        const float *P[3] = { A, B, C };
+        const float *P[8] = { A, B, C };
+        int np = 3;
+        float clipped[8][3], work[8][3];
+        if (zlo < cz0 || zhi > cz1) {
+            memcpy(clipped[0], A, sizeof clipped[0]);
+            memcpy(clipped[1], B, sizeof clipped[1]);
+            memcpy(clipped[2], C, sizeof clipped[2]);
+            np = cw_clip_z(clipped, 3, work, cz0, 1);
+            np = cw_clip_z(work, np, clipped, cz1, 0);
+            for (int j = 0; j < np; j++) P[j] = clipped[j];
+        }
         int touched = 0;
-        for (int e = 0; e < 3; e++) {
-            const float *p0 = P[e], *p1 = P[(e+1)%3];
+        for (int e = 0; e < np; e++) {
+            const float *p0 = P[e], *p1 = P[(e+1)%np];
             float dx = p1[0]-p0[0], dy = p1[1]-p0[1], l2 = dx*dx+dy*dy;
             float u = l2 > 1e-9f ? ((px-p0[0])*dx + (py-p0[1])*dy) / l2 : 0.0f;
             if (u < 0) u = 0; if (u > 1) u = 1;
