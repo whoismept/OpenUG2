@@ -121,6 +121,52 @@ static void test_body_feature_edges_and_fallback(void) {
     assert(fabsf(p[0]-1.3f)<1e-5f);
 }
 
+static void test_rail_uses_body_footprint(void) {
+    /* First false L4RD/4401 rail response: the old fixed 1.3 m centre circle
+     * reaches this authored face while the MIATA-sized body capsule does not. */
+    const float p0[3]={-332.915100f,638.782104f,30.112734f};
+    const float p1[3]={-338.979919f,646.503601f,29.497175f};
+    const float p2[3]={-338.979919f,646.503601f,31.497177f};
+    float verts[15]={0};
+    for(int c=0;c<3;c++){verts[c]=p0[c];verts[5+c]=p1[c];verts[10+c]=p2[c];}
+    uint16_t idx[3]={0,1,2};
+    N2Mesh mesh={0};mesh.verts=verts;mesh.nverts=3;mesh.idx=idx;mesh.nidx=3;mesh.cat=N2_ROAD;
+    N2Scene scene={&mesh,1,1};
+    const float bb[6]={-1.973f,-.9415f,0,1.973f,.9415f,1.221f};
+    float pos[3]={-337.657928f,646.878296f,29.322237f};
+    float vel[2]={-.786421f,-.617691f},before[3];memcpy(before,pos,sizeof pos);
+    PhysWallContact hit={0};
+#ifdef M157_RAIL_CIRCLE_BASELINE
+    int n=cw_mesh_feature(&scene,0,pos[0],pos[1],1.3f,pos[2]-.5f,pos[2]+.5f,&hit);
+#else
+    int n=collide_body_mesh_wall(pos,vel,-1.1702f,bb,29.3f,30.6f,
+                                 &scene,0,.75f,2.5f,&hit);
+#endif
+    assert(n==0 && memcmp(pos,before,sizeof pos)==0);
+
+#ifndef M157_RAIL_CIRCLE_BASELINE
+    /* Ten centimetres closer is a real contact. Remove only inward velocity;
+     * the component along the barrier must survive. */
+    pos[0]=before[0]-.0786421f;pos[1]=before[1]-.0617691f;
+    vel[0]=-.786421f-.25f*.617691f;vel[1]=-.617691f+.25f*.786421f;
+    assert(collide_body_mesh_wall(pos,vel,-1.1702f,bb,29.3f,30.6f,
+                                  &scene,0,.75f,2.5f,&hit)==1);
+    assert(hit.pen>0 && hit.pen<.05f);
+    assert(fabsf(vel[0]*hit.nx+vel[1]*hit.ny)<1e-5f);
+    assert(fabsf(-vel[0]*hit.ny+vel[1]*hit.nx-.25f)<5e-5f);
+
+    /* Keep the measured empty height band: road seams are not rails and tall
+     * terrain faces stay owned by terrain/building collision. */
+    pos[0]=before[0]-.0786421f;pos[1]=before[1]-.0617691f;
+    vel[0]=-.786421f;vel[1]=-.617691f;verts[12]=29.9f;
+    assert(!collide_body_mesh_wall(pos,vel,-1.1702f,bb,29.3f,30.6f,
+                                   &scene,0,.75f,2.5f,&hit));
+    verts[12]=33.0f;
+    assert(!collide_body_mesh_wall(pos,vel,-1.1702f,bb,29.3f,30.6f,
+                                   &scene,0,.75f,2.5f,&hit));
+#endif
+}
+
 static void test_wall_contact_uses_car_height(void) {
     /* Vertical triangular wall: in its local (y,z) plane the vertices are
      * (0,0), (10,10), (0,10). At z=0.2..2.1 the actual face ends at y=2.1,
@@ -229,6 +275,7 @@ int main(void) {
     test_five_vertex_height_slice();
     test_body_ends_stay_on_wall_side();
     test_body_feature_edges_and_fallback();
+    test_rail_uses_body_footprint();
 
     puts("district_collision_test: PASS");
     return 0;

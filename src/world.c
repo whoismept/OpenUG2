@@ -7,6 +7,7 @@
 #include <math.h>
 
 #include "world.h"
+#include "physics.h"
 #include "resource.h"
 
 static void grid_build(World *w);
@@ -1862,6 +1863,33 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
             pos[0] = bx + hx/hl*r; pos[1] = by + hy/hl*r;        /* shove back to r */
             pushed = 1;
         }
+    }
+    return pushed;
+}
+
+int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
+                         const float bb[6],float z0,float z1,WRailHit *hit) {
+    if (s->meshes != g_grid.meshes) return 0;
+    int cx=(int)((pos[0]-g_grid.x0)/GCELL),cy=(int)((pos[1]-g_grid.y0)/GCELL);
+    if(cx<0||cy<0||cx>=g_grid.gw||cy>=g_grid.gh)return 0;
+    int cell=cy*g_grid.gw+cx,pushed=0;
+    for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
+        int mi=g_grid.list[k];PhysWallContact c;
+        if(!collide_body_mesh_wall(pos,vel,heading,bb,z0,z1,s,mi,
+                                   WALL_RAIL_MIN_H,WALL_RAIL_MAX_H,&c))continue;
+        if(hit&&!pushed) {
+            const N2Mesh *m=&s->meshes[mi];int q=c.tri*3;
+            const float *a=m->verts+m->idx[q]*5,*b=m->verts+m->idx[q+1]*5,
+                        *d=m->verts+m->idx[q+2]*5;
+            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2];
+            float e2x=d[0]-a[0],e2y=d[1]-a[1],e2z=d[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+            float len=sqrtf(nx*nx+ny*ny+nz*nz);
+            hit->mesh=mi;hit->tri=c.tri;hit->nz=len>1e-9f?nz/len:0;
+            hit->zlo=fminf(a[2],fminf(b[2],d[2]));
+            hit->zhi=fmaxf(a[2],fmaxf(b[2],d[2]));hit->edged=c.dist;
+        }
+        pushed=1;
     }
     return pushed;
 }

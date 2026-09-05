@@ -596,14 +596,17 @@ uses the returned production contacts, not a second circle-only query.
 
 This is an inscribed rounded approximation, not full rectangular body/corner
 coverage or swept rigid-body collision. It does not apply a yaw impulse, change
-the suspension, or change the rail/corridor/AI collision shapes. Sequential
+the suspension, or change the corridor/AI collision shapes. Sequential
 contacts can still pin a vehicle against multiple faces; a supported wheel
 mask is not proof of a playable route or an unobstructed chase camera.
 
-`world_wall_push` handles near-vertical road/terrain guardrail faces using a
-measured height band. `world_barrier_push` is race-corridor closure. These are
-three separate predicates; a threshold proven for one is not automatically
-valid for another.
+`world_body_wall_push` handles near-vertical road/terrain guardrail faces using
+the same oriented body capsule and face-local velocity response. Its measured
+0.75–2.5 m face-height band rejects surface seams and tall terrain walls.
+`world_wall_push` remains the circle helper for spawn probes;
+`world_barrier_push` is race-corridor closure. These predicates still have
+separate ownership, so a threshold proven for one is not automatically valid
+for another.
 
 ## 10. Racing, navigation and AI
 

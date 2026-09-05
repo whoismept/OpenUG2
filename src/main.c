@@ -5831,12 +5831,13 @@ int main(int argc, char **argv) {
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) &&
-                        world_wall_push(&scene, carpos, 1.3f,
-                                        (raudit || daudit) ? &rh : NULL);
+                        world_body_wall_push(&scene,carpos,vel,heading,carbb,
+                                             car_z0,car_z1,
+                                             (raudit || daudit) ? &rh : NULL);
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
           if (rpushed) {
-            vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
+            g_hit = 0.5f;
             da_rails++; ra_rails++;
             if (daudit && da_rails == 1 && rh.mesh >= 0)
                 printf("DA FIRST RAIL mesh=%d tri=%d name=%s at=(%.3f,%.3f,%.3f) "

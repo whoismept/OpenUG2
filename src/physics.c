@@ -445,7 +445,8 @@ static float cw_segment_pair(float ax,float ay,float bx,float by,
 }
 
 static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
-                    float qx, float qy, float r, float cz0, float cz1, PhysWallContact *out) {
+                    float qx, float qy, float r, float cz0, float cz1,
+                    float face_min,float face_max,PhysWallContact *out) {
     if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
     float r2 = r*r;
@@ -465,6 +466,7 @@ static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
         float zlo = A[2], zhi = A[2];
         if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
         if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
+        if (zhi-zlo < face_min || zhi-zlo > face_max) continue;
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
         const float *P[8] = { A, B, C };
         int np = 3;
@@ -524,12 +526,26 @@ static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
 
 int cw_mesh_feature(const N2Scene *s,int mi,float px,float py,
                     float r,float z0,float z1,PhysWallContact *out) {
-    return cw_shape_feature(s,mi,px,py,px,py,r,z0,z1,out);
+    return cw_shape_feature(s,mi,px,py,px,py,r,z0,z1,0,INFINITY,out);
 }
 
 int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
                      float r, float cz0, float cz1) {
     return cw_mesh_feature(s, mi, px, py, r, cz0, cz1, NULL);
+}
+
+static int cw_body_shape(float heading,const float bb[6],float *r,
+                         float *ax,float *ay,float *bx,float *by) {
+    *r=1.3f;*ax=*ay=*bx=*by=0;
+    if(!bb || !isfinite(bb[0]) || !isfinite(bb[1]) || !isfinite(bb[3]) ||
+       !isfinite(bb[4]) || bb[3]<=bb[0] || bb[4]<=bb[1])return 0;
+    *r=(bb[4]-bb[1])*.5f;
+    float mid=(bb[0]+bb[3])*.5f,side=(bb[1]+bb[4])*.5f;
+    float rear=fminf(bb[0]+*r,mid),front=fmaxf(bb[3]-*r,mid);
+    float c=cosf(heading),s=sinf(heading);
+    *ax=c*rear-s*side;*ay=s*rear+c*side;
+    *bx=c*front-s*side;*by=s*front+c*side;
+    return 1;
 }
 
 /* Resolution order is the obstacle order phys_collect_walls produced (mesh
@@ -552,7 +568,7 @@ static int cw_resolve(float *pos, float *vel, const float obst[][4],
             /* the rect was broad phase only: resolve against the FACE */
             PhysWallContact c;
             if (!cw_shape_feature(scene, src[o], pos[0]+ax, pos[1]+ay,
-                                  pos[0]+bx,pos[1]+by,r,cz0,cz1,&c))
+                                  pos[0]+bx,pos[1]+by,r,cz0,cz1,0,INFINITY,&c))
                 continue;
             float vn = vel[0]*c.nx + vel[1]*c.ny;
             if (c.pen <= 0.0f && vn >= 0.0f) continue;   /* touching, not colliding:
@@ -585,16 +601,25 @@ int collide_walls(float *pos,float *vel,const float obst[][4],
 int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
         const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
         const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
-    if(!scene || !src || !bb || !isfinite(bb[0]) || !isfinite(bb[1]) ||
-       !isfinite(bb[3]) || !isfinite(bb[4]) || bb[3]<=bb[0] || bb[4]<=bb[1])
+    float r,ax,ay,bx,by;
+    if(!scene || !src || !cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by))
         return collide_walls(pos,vel,obst,obz,nobst,1.3f,z0,z1,scene,src,log,maxlog);
-    /* Rounded footprint with the loaded body's actual longitudinal extent and
-     * width. It rotates with the car; no global length-radius sphere. */
-    float r=(bb[4]-bb[1])*.5f,mid=(bb[0]+bb[3])*.5f,side=(bb[1]+bb[4])*.5f;
-    float rear=fminf(bb[0]+r,mid),front=fmaxf(bb[3]-r,mid);
-    float c=cosf(heading),s=sinf(heading);
-    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,
-                       c*rear-s*side,s*rear+c*side,c*front-s*side,s*front+c*side);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,ax,ay,bx,by);
+}
+
+int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6],
+        float z0,float z1,const N2Scene *scene,int mesh,float face_min,
+        float face_max,PhysWallContact *contact) {
+    float r,ax,ay,bx,by;cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by);
+    PhysWallContact hit;
+    if(!cw_shape_feature(scene,mesh,pos[0]+ax,pos[1]+ay,pos[0]+bx,pos[1]+by,
+                         r,z0,z1,face_min,face_max,&hit)) return 0;
+    float vn=vel[0]*hit.nx+vel[1]*hit.ny;
+    if(hit.pen<=0 && vn>=0) return 0;
+    if(hit.pen>0){pos[0]+=hit.nx*hit.pen;pos[1]+=hit.ny*hit.pen;}
+    if(vn<0){vel[0]-=vn*hit.nx;vel[1]-=vn*hit.ny;}
+    if(contact)*contact=hit;
+    return 1;
 }
 void collide_walls_selftest(void) {
     float obst[1][4] = {{0,0,10,10}};

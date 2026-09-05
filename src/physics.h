@@ -236,6 +236,12 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
 int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
         const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
         const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog);
+/* Resolve one mesh's near-vertical faces against the same body capsule. The
+ * face-height range lets the road system admit low rails while rejecting both
+ * surface seams and tall terrain walls. */
+int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6],
+        float z0,float z1,const N2Scene *scene,int mesh,float face_min,
+        float face_max,PhysWallContact *contact);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 
