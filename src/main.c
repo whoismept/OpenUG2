@@ -38,6 +38,8 @@
 #include "world_scenery.h"
 #include "ground_motion.h"
 #include "debug.h"
+#include "frontend/frontend.h"
+#include "frontend/frontend_draw.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
@@ -2566,7 +2568,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
 
     /* engine sound, most to least authentic: the car's own Gnsu20 sweep
        recordings (matched by name), else an .abk sample bank (name-hash
@@ -2596,6 +2598,9 @@ int main(int argc, char **argv) {
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { fprintf(stderr, "GL ctx: %s\n", SDL_GetError()); return 1; }
+    SDL_GameController *controller = NULL;
+    for (int i = 0; i < SDL_NumJoysticks() && !controller; i++)
+        if (SDL_IsGameController(i)) controller = SDL_GameControllerOpen(i);
     SDL_GL_SetSwapInterval(shot ? 0 : 1);   /* raw frame times in shot mode */
     /* Detect S3TC so car/rim TPK textures can upload their DXT blocks directly
        (glCompressedTexImage2D) instead of the CPU-decoded RGBA. Legacy GL 2.1
@@ -4835,6 +4840,20 @@ int main(int argc, char **argv) {
     const int COUNTDOWN = 180, LAP_TARGET = 2;
     int race_state = (shot || resident_route_audit || resident_drive_audit) ? 1 : 3;
     int racetimer = 0, finish_place = 0;
+    Fe frontend;
+    FeDraw *frontend_draw = NULL;
+    int frontend_open = !shot && !sshot && !raudit && !daudit;
+    if (frontend_open) {
+        const FeMenuEntry entries[] = {
+            {"FREE ROAM", FE_ACTION_FREE_ROAM, 1},
+            {"RACE SELECT", FE_ACTION_RACE_SELECT, 1},
+            {"QUIT", FE_ACTION_QUIT, 1},
+        };
+        fe_init(&frontend);
+        fe_set_entries(&frontend, entries, 3);
+        frontend_draw = fed_init();
+        if (!frontend_draw) frontend_open = 0;
+    }
     int gear = 1; float shift_t = 0.0f;   /* virtual gearbox (engine audio) */
     float menuspin = 0.0f;   /* orbit-camera angle on the menu screen */
     int running = 1, shotframe = 0, final_status = 0;
@@ -4976,6 +4995,18 @@ int main(int argc, char **argv) {
             }
 #endif
             if (e.type == SDL_QUIT) running = 0;
+            else if (frontend_open && e.type == SDL_CONTROLLERBUTTONDOWN) {
+                if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP)
+                    fe_input(&frontend, FE_INPUT_UP);
+                else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+                    fe_input(&frontend, FE_INPUT_DOWN);
+                else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_A ||
+                         e.cbutton.button == SDL_CONTROLLER_BUTTON_START)
+                    fe_input(&frontend, FE_INPUT_CONFIRM);
+                else if (e.cbutton.button == SDL_CONTROLLER_BUTTON_B ||
+                         e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK)
+                    fe_input(&frontend, FE_INPUT_BACK);
+            }
             /* freecam mouse-look: hold right button to rotate (keeps the cursor
                free for the ImGui panel the rest of the time). */
             else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_RIGHT && g_dbg.freecam) {
@@ -4991,7 +5022,14 @@ int main(int argc, char **argv) {
             }
             else if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
-                if (k == SDLK_ESCAPE) running = 0;
+                if (frontend_open && !e.key.repeat &&
+                    (k == SDLK_UP || k == SDLK_DOWN || k == SDLK_RETURN ||
+                     k == SDLK_SPACE || k == SDLK_ESCAPE)) {
+                    fe_input(&frontend, k == SDLK_UP ? FE_INPUT_UP :
+                              k == SDLK_DOWN ? FE_INPUT_DOWN :
+                              k == SDLK_ESCAPE ? FE_INPUT_BACK : FE_INPUT_CONFIRM);
+                }
+                else if (k == SDLK_ESCAPE) running = 0;
                 else if (k == SDLK_f && race_state != 3) {
                     /* In the pre-race menu F starts free-roam below. Once
                        driving, the same key remains the existing freecam
@@ -5139,6 +5177,24 @@ int main(int argc, char **argv) {
                         race_state = 0; racetimer = 0;   /* -> 3-2-1 countdown */
                     }
                 }
+            }
+        }
+
+        if (frontend_open) {
+            const Uint8 *fks = SDL_GetKeyboardState(NULL);
+            int held = fks[SDL_SCANCODE_DOWN] ? 1 : fks[SDL_SCANCODE_UP] ? -1 : 0;
+            fe_held(&frontend, held, 1.0f/60.0f);
+            fe_update(&frontend, 1.0f/60.0f);
+            FeAction action = fe_poll_action(&frontend);
+            if (action == FE_ACTION_QUIT) running = 0;
+            else if (action == FE_ACTION_RACE_SELECT) frontend_open = 0;
+            else if (action == FE_ACTION_FREE_ROAM) {
+                world_set_mode(&world, MODE_FREEROAM, -1);
+                world.city.race.active = 0;
+                vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                race_state = 1; racetimer = 0; frontend_open = 0;
+                printf("freeroam: whole %s bundle driveable from (%.3f %.3f %.3f)\n",
+                       trackname, carpos[0], carpos[1], carpos[2]);
             }
         }
 
@@ -8323,6 +8379,11 @@ int main(int argc, char **argv) {
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }
+        if (frontend_open && frontend_draw) {
+            int fw, fh;
+            SDL_GL_GetDrawableSize(win, &fw, &fh);
+            fed_draw(frontend_draw, &frontend, fw, fh);
+        }
         SDL_GL_SwapWindow(win);
         /* Raw --shot audits can simulate seconds during a few milliseconds of
            real I/O. Opt-in pacing makes worker latency comparable to interactive
@@ -8352,6 +8413,8 @@ int main(int argc, char **argv) {
     world_city_free(&world.city);
     if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);
+    fed_free(frontend_draw);
+    if (controller) SDL_GameControllerClose(controller);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return final_status;
 }
