@@ -411,12 +411,45 @@ static int cw_clip_z(const float in[][3], int count, float out[][3],
  * tall wall is not mistaken for a mesh seam. The normal comes from the closest point to
  * the car centre, never from triangle winding, so a wall pushes the car away
  * from itself rather than along whatever axis its bounding box prefers. */
-int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
-                    float r, float cz0, float cz1, PhysWallContact *out) {
+/* Closest points of two XY segments. An intersection must be tested first:
+ * endpoint projections alone miss the middle of a long vehicle side. */
+static float cw_segment_pair(float ax,float ay,float bx,float by,
+        const float *p,const float *q,float *carx,float *cary,float *wallx,float *wally) {
+    float ux=bx-ax,uy=by-ay,vx=q[0]-p[0],vy=q[1]-p[1];
+    float det=ux*vy-uy*vx;
+    if(fabsf(det)>1e-9f) {
+        float dx=p[0]-ax,dy=p[1]-ay;
+        float t=(dx*vy-dy*vx)/det,u=(dx*uy-dy*ux)/det;
+        if(t>=0 && t<=1 && u>=0 && u<=1) {
+            *carx=*wallx=ax+t*ux;*cary=*wally=ay+t*uy;return 0;
+        }
+    }
+    float best=1e30f;
+    for(int i=0;i<4;i++) {
+        float x,y,cx,cy,wx,wy;
+        if(i<2) {
+            cx=i?bx:ax;cy=i?by:ay;
+            float l2=vx*vx+vy*vy;
+            float t=l2>1e-9f?((cx-p[0])*vx+(cy-p[1])*vy)/l2:0;
+            t=pv_clamp(t,0,1);wx=p[0]+t*vx;wy=p[1]+t*vy;
+        } else {
+            wx=i==2?p[0]:q[0];wy=i==2?p[1]:q[1];
+            float l2=ux*ux+uy*uy;
+            float t=l2>1e-9f?((wx-ax)*ux+(wy-ay)*uy)/l2:0;
+            t=pv_clamp(t,0,1);cx=ax+t*ux;cy=ay+t*uy;
+        }
+        x=cx-wx;y=cy-wy;float d=x*x+y*y;
+        if(d<best){best=d;*carx=cx;*cary=cy;*wallx=wx;*wally=wy;}
+    }
+    return best;
+}
+
+static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
+                    float qx, float qy, float r, float cz0, float cz1, PhysWallContact *out) {
     if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
     float r2 = r*r;
-    float bestd2 = 1e30f, bcx = 0, bcy = 0; int btri = -1;
+    float bestd2 = 1e30f, bcx = 0, bcy = 0, bodyx=px, bodyy=py; int btri = -1;
     float ulo = 1e30f, uhi = -1e30f;                 /* union span of contacts */
     float fnx = 0, fny = 0;                          /* winding normal, fallback */
     for (int t = 0; t + 2 < m->nidx; t += 3) {
@@ -451,13 +484,16 @@ int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
             float u = l2 > 1e-9f ? ((px-p0[0])*dx + (py-p0[1])*dy) / l2 : 0.0f;
             if (u < 0) u = 0; if (u > 1) u = 1;
             float sx = p0[0]+dx*u, sy = p0[1]+dy*u;
-            float qx = px - sx, qy = py - sy, d2 = qx*qx + qy*qy;
+            float ox = px - sx, oy = py - sy, d2 = ox*ox + oy*oy;
+            float hx=px,hy=py;
+            if(px!=qx || py!=qy)
+                d2=cw_segment_pair(px,py,qx,qy,p0,p1,&hx,&hy,&sx,&sy);
             if (d2 > r2) continue;
             touched = 1;
             /* closest feature wins; ties go to the lower triangle index, so the
                choice is the same on every run regardless of float noise */
             if (d2 < bestd2 || (d2 == bestd2 && btri >= 0 && t/3 < btri)) {
-                bestd2 = d2; bcx = sx; bcy = sy; btri = t/3;
+                bestd2 = d2; bcx = sx; bcy = sy; bodyx=hx;bodyy=hy;btri = t/3;
                 float nl = sqrtf(n[0]*n[0]+n[1]*n[1]);
                 if (nl > 1e-9f) { fnx = n[0]/nl; fny = n[1]/nl; }
             }
@@ -470,12 +506,25 @@ int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
     if (out) {
         out->mesh = mi; out->tri = btri; out->cx = bcx; out->cy = bcy;
         out->dist = sqrtf(bestd2); out->pen = r - out->dist; out->span = span;
-        float ox = px - bcx, oy = py - bcy;
+        float ox = bodyx - bcx, oy = bodyy - bcy;
         if (out->dist > 1e-6f) { out->nx = ox / out->dist; out->ny = oy / out->dist; }
-        else { out->nx = fnx; out->ny = fny; }   /* centre exactly on the face:
-                                                    winding normal is all there is */
+        else {
+            /* A segment can straddle a face. Choose the side of its midpoint
+             * and clear the whole segment, not just the intersection point. */
+            if((px!=qx || py!=qy) && ((px+qx)*.5f-bcx)*fnx+((py+qy)*.5f-bcy)*fny<0)
+                {fnx=-fnx;fny=-fny;}
+            out->nx=fnx;out->ny=fny;
+            if(px!=qx || py!=qy)
+                out->pen=r-fminf((px-bcx)*fnx+(py-bcy)*fny,
+                                 (qx-bcx)*fnx+(qy-bcy)*fny);
+        }
     }
     return 1;
+}
+
+int cw_mesh_feature(const N2Scene *s,int mi,float px,float py,
+                    float r,float z0,float z1,PhysWallContact *out) {
+    return cw_shape_feature(s,mi,px,py,px,py,r,z0,z1,out);
 }
 
 int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
@@ -487,20 +536,23 @@ int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
    index order, stable across runs). Each contact is resolved against the
    position the previous one left behind, so overlapping walls compose instead
    of fighting; within one mesh the closest feature wins. */
-int collide_walls(float *pos, float *vel, const float obst[][4],
+static int cw_resolve(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
-                  PhysWallContact *log, int maxlog) {
+                  PhysWallContact *log, int maxlog,
+                  float ax,float ay,float bx,float by) {
     int hits = 0;
     for (int o = 0; o < nobst; o++) {
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
-        if (pos[0]<=x0 || pos[0]>=x1 || pos[1]<=y0 || pos[1]>=y1) continue;
+        if (pos[0]+fmaxf(ax,bx)<=x0 || pos[0]+fminf(ax,bx)>=x1 ||
+            pos[1]+fmaxf(ay,by)<=y0 || pos[1]+fminf(ay,by)>=y1) continue;
         /* vertical volumes must actually overlap for this to be a collision */
         if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) continue;
         if (scene && src) {
             /* the rect was broad phase only: resolve against the FACE */
             PhysWallContact c;
-            if (!cw_mesh_feature(scene, src[o], pos[0], pos[1], r, cz0, cz1, &c))
+            if (!cw_shape_feature(scene, src[o], pos[0]+ax, pos[1]+ay,
+                                  pos[0]+bx,pos[1]+by,r,cz0,cz1,&c))
                 continue;
             float vn = vel[0]*c.nx + vel[1]*c.ny;
             if (c.pen <= 0.0f && vn >= 0.0f) continue;   /* touching, not colliding:
@@ -522,6 +574,27 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
         hits++;
     }
     return hits;
+}
+
+int collide_walls(float *pos,float *vel,const float obst[][4],
+        const float obz[][2],int nobst,float r,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,0,0,0,0);
+}
+
+int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
+    if(!scene || !src || !bb || !isfinite(bb[0]) || !isfinite(bb[1]) ||
+       !isfinite(bb[3]) || !isfinite(bb[4]) || bb[3]<=bb[0] || bb[4]<=bb[1])
+        return collide_walls(pos,vel,obst,obz,nobst,1.3f,z0,z1,scene,src,log,maxlog);
+    /* Rounded footprint with the loaded body's actual longitudinal extent and
+     * width. It rotates with the car; no global length-radius sphere. */
+    float r=(bb[4]-bb[1])*.5f,mid=(bb[0]+bb[3])*.5f,side=(bb[1]+bb[4])*.5f;
+    float rear=fminf(bb[0]+r,mid),front=fmaxf(bb[3]-r,mid);
+    float c=cosf(heading),s=sinf(heading);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,
+                       c*rear-s*side,s*rear+c*side,c*front-s*side,s*front+c*side);
 }
 void collide_walls_selftest(void) {
     float obst[1][4] = {{0,0,10,10}};

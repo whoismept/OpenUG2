@@ -5,6 +5,16 @@
 
 #include "physics.h"
 
+static int body_contact(float *p,float *v,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],const N2Scene *s,const int *src) {
+#ifdef M156_POINT_BASELINE
+    (void)heading;(void)bb;
+    return collide_walls(p,v,obst,obz,1,1.3f,.28f,2.1f,s,src,NULL,0);
+#else
+    return collide_body_walls(p,v,heading,bb,obst,obz,1,.28f,2.1f,s,src,NULL,0);
+#endif
+}
+
 static void make_vertical_panel(N2Scene *scene, N2Mesh *mesh,
                                 float verts[20], uint16_t idx[6],
                                 int scen, float height) {
@@ -34,6 +44,81 @@ static void make_vertical_panel(N2Scene *scene, N2Mesh *mesh,
 static int collect_one(N2Scene *scene, float obst[1][4], int src[1],
                        float obz[1][2]) {
     return phys_collect_walls(scene, obst, src, obz, 1);
+}
+
+static void test_body_ends_stay_on_wall_side(void) {
+    const float bb[6]={-2.4f,-1.2f,-.15f,2.4f,1.2f,1.7f};
+    for(int turn=0;turn<3;turn++)for(int rev=0;rev<2;rev++) {
+        float angle=turn*.71f,c=cosf(angle),s=sinf(angle);
+        N2Scene sc;N2Mesh m;float verts[20]={0},obst[1][4],obz[1][2];
+        uint16_t ix[6];int src[1];
+        make_vertical_panel(&sc,&m,verts,ix,N2_SC_WALL,3);
+        for(int i=0;i<4;i++){float y=verts[i*5+1];verts[i*5]=20-s*y;verts[i*5+1]=-30+c*y;}
+        if(rev)for(int i=0;i<6;i+=3){uint16_t t=ix[i];ix[i]=ix[i+2];ix[i+2]=t;}
+        assert(collect_one(&sc,obst,src,obz)==1);
+        /* At center distance2.25 the rear bumper is already15cm through the
+         * wall. A 1.3m center circle misses it. Test front-first and reverse. */
+        for(int dir=0;dir<2;dir++) {
+            float p[3]={20+2.25f*c,-30+2.25f*s,0},v[2]={-c-.25f*s,-s+.25f*c};
+            int n=body_contact(p,v,angle+dir*3.14159265f,bb,obst,obz,&sc,src);
+            float distance=(p[0]-20)*c+(p[1]+30)*s;
+            printf("body-wall: hits%d distance%.6f (required2.4)\n",n,distance);fflush(stdout);
+            assert(n>0 && distance>=2.3999f && distance<2.401f);
+            assert(fabsf(v[0]*c+v[1]*s)<1e-5f);
+            assert(fabsf(-v[0]*s+v[1]*c-.25f)<1e-5f);
+            assert(p[2]==0);
+        }
+        /* A side-on car uses width, not an oversized length-radius circle. */
+        float p[3]={20+1.21f*c,-30+1.21f*s,0},v[2]={c,s};
+        float before[3];memcpy(before,p,sizeof p);
+        assert(body_contact(p,v,angle+1.57079633f,bb,obst,obz,&sc,src)==0);
+        assert(memcmp(before,p,sizeof p)==0);
+        p[0]=20+1.1f*c;p[1]=-30+1.1f*s;v[0]=-c;v[1]=-s;
+        assert(body_contact(p,v,angle+1.57079633f,bb,obst,obz,&sc,src)>0);
+        assert(fabsf((p[0]-20)*c+(p[1]+30)*s-1.2f)<1e-4f);
+    }
+}
+
+static void test_body_feature_edges_and_fallback(void) {
+    const float bb[6]={-2.4f,-1.2f,-.15f,2.4f,1.2f,1.7f};
+    N2Scene sc;N2Mesh m;float verts[20]={0},obst[1][4],obz[1][2];
+    uint16_t ix[6];int src[1];
+    /* A short wall crosses the middle of the capsule axis. Neither capsule
+     * endpoint is inside the wall strip: segment intersection must find it. */
+    for(int rev=0;rev<2;rev++) {
+        make_vertical_panel(&sc,&m,verts,ix,N2_SC_WALL,3);
+        for(int i=0;i<4;i++)verts[i*5+1]*=.025f;
+        if(rev)for(int i=0;i<6;i+=3){uint16_t t=ix[i];ix[i]=ix[i+2];ix[i+2]=t;}
+        assert(collect_one(&sc,obst,src,obz)==1);
+        float p[3]={.1f,0,0},v[2]={-1,.3f};
+        assert(body_contact(p,v,0,bb,obst,obz,&sc,src)>0);
+        assert(fabsf(p[0]-2.4f)<1e-5f && fabsf(v[0])<1e-5f && v[1]==.3f);
+        /* The finite wall must not turn into an infinite plane. */
+        p[0]=.1f;p[1]=2;v[0]=-1;
+        assert(body_contact(p,v,0,bb,obst,obz,&sc,src)==0);
+        assert(p[0]==.1f && p[1]==2 && v[0]==-1);
+    }
+    /* Neither a seam nor a wall above the car becomes a collision because
+     * the footprint is longer. Existing height clipping remains mandatory. */
+    make_vertical_panel(&sc,&m,verts,ix,N2_SC_WALL,.10f);
+    for(int i=0;i<4;i++)verts[i*5+2]+=.5f; /* inside the car's height window */
+    assert(collect_one(&sc,obst,src,obz)==1);
+    float p[3]={2.25f,0,0},v[2]={-1,0};
+    assert(body_contact(p,v,0,bb,obst,obz,&sc,src)==0);
+    make_vertical_panel(&sc,&m,verts,ix,N2_SC_WALL,3);
+    for(int i=0;i<4;i++)verts[i*5+2]+=10;
+    assert(collect_one(&sc,obst,src,obz)==1);
+    assert(body_contact(p,v,0,bb,obst,obz,&sc,src)==0);
+    make_vertical_panel(&sc,&m,verts,ix,N2_SC_WALL,3);
+    assert(collect_one(&sc,obst,src,obz)==1);
+    const float asym[6]={-2.6f,-.9f,0,2.2f,1.1f,2};
+    p[0]=2.45f;p[1]=0;v[0]=-1;
+    assert(body_contact(p,v,0,asym,obst,obz,&sc,src)>0);
+    assert(fabsf(p[0]-2.6f)<1e-5f);
+    /* Missing model bounds keep the existing circle contract. */
+    p[0]=1.1f;v[0]=-1;
+    assert(body_contact(p,v,0,NULL,obst,obz,&sc,src)>0);
+    assert(fabsf(p[0]-1.3f)<1e-5f);
 }
 
 static void test_wall_contact_uses_car_height(void) {
@@ -142,6 +227,8 @@ int main(void) {
 
     test_wall_contact_uses_car_height();
     test_five_vertex_height_slice();
+    test_body_ends_stay_on_wall_side();
+    test_body_feature_edges_and_fallback();
 
     puts("district_collision_test: PASS");
     return 0;

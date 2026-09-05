@@ -584,6 +584,22 @@ into-wall velocity component.
 Clipping must happen **before** projecting the face into XY: overlapping Z
 bounds alone allow a distant upper edge to cause a false ground-level contact.
 
+The player uses `collide_body_walls`: an oriented capsule from the loaded body's
+longitudinal bounds and half-width, with asymmetric model offsets retained.
+The capsule axis is tested against the clipped face edges (including segment
+intersections), rather than testing only a 1.3 m circle at the car centre.
+This prevents the measured rear-axle excursion beyond the L4RB 4201 curb while
+the centre is still outside it. `collide_walls` remains the zero-axis circle
+wrapper; missing body measurements use its legacy fallback. Both share the
+face-local resolution and preserve tangential velocity. Race-audit attribution
+uses the returned production contacts, not a second circle-only query.
+
+This is an inscribed rounded approximation, not full rectangular body/corner
+coverage or swept rigid-body collision. It does not apply a yaw impulse, change
+the suspension, or change the rail/corridor/AI collision shapes. Sequential
+contacts can still pin a vehicle against multiple faces; a supported wheel
+mask is not proof of a playable route or an unobstructed chase camera.
+
 `world_wall_push` handles near-vertical road/terrain guardrail faces using a
 measured height band. `world_barrier_push` is race-corridor closure. These are
 three separate predicates; a threshold proven for one is not automatically

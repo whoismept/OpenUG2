@@ -201,9 +201,9 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
 typedef struct {
     int   mesh, tri;      /* source mesh and triangle that owns the feature   */
     float cx, cy;         /* closest point on that feature, XY                */
-    float nx, ny;         /* unit XY normal, closest point -> car centre      */
-    float dist;           /* XY distance from the car centre to it            */
-    float pen;            /* r - dist, the depth to resolve                   */
+    float nx, ny;         /* unit XY normal, feature -> circle/capsule axis   */
+    float dist;           /* closest XY distance to the shape's axis          */
+    float pen;            /* separating depth; r-dist unless axis straddles   */
     float span;           /* union vertical span of this mesh's contacting
                              faces: a 0.10 m seam is not a wall              */
 } PhysWallContact;
@@ -229,6 +229,13 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
                   PhysWallContact *log, int maxlog);
+/* Player wall footprint: an oriented capsule derived from body-local bounds
+ * [minX,minY,minZ,maxX,maxY,maxZ]. Same face clipping/normal response as the
+ * circle API; length and width are independent. No angular impulse or CCD.
+ * Missing body/scene data preserves the old 1.3m circle fallback. */
+int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 

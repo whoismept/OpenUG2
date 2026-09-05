@@ -5742,25 +5742,8 @@ int main(int argc, char **argv) {
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
         PhysWallContact wc[8]; int nwc = 0;
         float vpre[2] = { vel[0], vel[1] };
-        if (raudit && race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
-            /* read-only: the same rects collide_walls is about to test, before it
-               moves anything. Nothing here writes carpos or vel. */
-            for (int o = 0; o < nobst; o++) {
-                const float R = 1.3f;
-                if (carpos[0] <= obst[o][0]-R || carpos[0] >= obst[o][2]+R ||
-                    carpos[1] <= obst[o][1]-R || carpos[1] >= obst[o][3]+R) continue;
-                float z0 = car_z0, z1 = car_z1;
-                if (obstz[o][1] < z0 || obstz[o][0] > z1) continue;   /* same gate */
-                /* mirror the narrow phase too, so the attribution counts real
-                   responses and not broad-phase rect overlaps (M112) */
-                if (!cw_probe_contact(&scene, obstsrc[o], carpos[0], carpos[1],
-                                      R, z0, z1)) continue;
-                m94_wall(o, obstsrc[o], &scene, carpos, &aipath, ra_f);
-            }
-        }
-
         if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion &&
-            (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
+            (nwc = collide_body_walls(carpos, vel, heading, carbb, obst, obstz, nobst,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
             if (daudit && da_walls == 1 && nwc > 0) {
@@ -5771,6 +5754,12 @@ int main(int argc, char **argv) {
                        wc[0].nx, wc[0].ny, wc[0].pen, wc[0].span);
             }
             if (raudit) {
+                /* Attribute returned production contacts, not an independent
+                 * center-circle approximation of the new body footprint. */
+                const float before[3]={m94_prex,m94_prey,m94_prez};
+                for(int q=0;q<nwc && q<8;q++)
+                    m94_wall(-1,wc[q].mesh,&scene,before,&aipath,ra_f);
+                if(nwc>8)printf("RA WALL attribution truncated: %d additional contacts\n",nwc-8);
                 float dx = carpos[0]-m94_prex, dy = carpos[1]-m94_prey;
                 float corr = sqrtf(dx*dx+dy*dy);
                 if (corr > ra_maxwallcorr) ra_maxwallcorr = corr;
