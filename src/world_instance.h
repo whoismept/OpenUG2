@@ -32,6 +32,10 @@ typedef struct {
     long lod_fallbacks;
     long unkeyed_models;
     long scenery_hidden; /* explicit event preview only; before scene emission */
+    /* What the builder actually selected, which is not always what was asked:
+     * a positive request the bundle authors no group for degrades to 0
+     * (unfiltered). Diagnostics must report this, not the request. */
+    int  scenery_effective;
     int regions_total;
     int regions_selected;
     int home_region;

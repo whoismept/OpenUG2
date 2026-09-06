@@ -14,11 +14,22 @@ enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4 };
 
 /* Runtime policy remains deliberately narrower than retail semantics. Normal
  * free roam hides only placements proven exclusive to numeric event groups.
- * A requested preview keeps its explicit selection. Live races retain the
- * prior unfiltered scene until direction/career activation timing is decoded. */
+ * A requested preview keeps its explicit selection. A live race selects its
+ * OWN authored group, so another event's road closures no longer stand on the
+ * raced route. Direction/career activation timing is still undecoded: within
+ * the selected event nothing is further filtered.
+ *
+ * Measured on STREAML4RG event 4701 (M160): 4827 group placements are loaded,
+ * only 77 of them belong to BARRIERS_4701, and foreign-exclusive placements
+ * including two other events' start/finish gantries sit at 0.00 m from 4701's
+ * own 0x34148 racing line.
+ *
+ * A positive id here is a REQUEST. Some shipped events author no group at all
+ * (L4RB 4201/4202/4203, L4RC 4341), and the builder degrades those back to the
+ * unfiltered scene rather than failing to load. */
 static int wg_runtime_selection(int preview_set,int preview_event,int race_event) {
     if(preview_set)return preview_event;
-    return race_event>0?0:-1;
+    return race_event>0?race_event:-1;
 }
 
 static int wg_event_id(const char *name) {
@@ -32,6 +43,21 @@ static int wg_event_id(const char *name) {
         n=n*10+(unsigned)(*p-'0');
     }
     return n>0&&n<=65535?(int)n:0;
+}
+/* Does this bundle author a group for the requested event? Free roam (-1) and
+ * "unchanged" (0) are always answerable, so only a positive id is looked up.
+ * Absence is an authoring fact, NOT a malformed table: the caller uses this to
+ * tell the two apart instead of treating both as a load failure. */
+static int wg_event_group_present(const WGTable *table,int event) {
+    if(!table)return 0;
+    if(event<=0)return 1;
+    for(size_t p=0;p<table->group_bytes;) {
+        const unsigned char *g=table->groups+p;
+        uint32_t refs=wg_u32(g+48);
+        if(wg_event_id((const char *)g+8)==event)return 1;
+        p+=(size_t)((52ULL+2ULL*refs+3)&~3ULL);
+    }
+    return 0;
 }
 static int wg_selected_cmp(const void *aa,const void *bb) {
     const WGSelected *a=aa,*b=bb;

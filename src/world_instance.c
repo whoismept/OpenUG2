@@ -1076,17 +1076,28 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
      * until a complete temporary assembly has been built and committed. */
     if (!bundle_data) goto cleanup;
 
+    /* A requested event id the bundle does not author is degraded to the
+     * unfiltered scene. That is an authoring fact, not a corrupt table, so it
+     * must not fail the build: L4RB 4201/4202/4203 and L4RC 4341 are raceable
+     * events with no group of their own. Everything else still fails closed. */
+    int effective_event = scenery_event;
     if (scenery_event) {
         const char *stem = !strncmp(local_stats.bundle,"STREAM",6)
                          ? local_stats.bundle+6 : local_stats.bundle;
         long len=0;unsigned char *data=winst_read_named(track_root,stem,&len);
         WGTable table;
-        int valid=data && wg_open_file(data,(size_t)len,&table) &&
-                  wg_selection_open(&table,scenery_event,&scenery);
+        int valid=data && wg_open_file(data,(size_t)len,&table);
+        if(valid && !wg_event_group_present(&table,scenery_event))effective_event=0;
+        valid=valid && (!effective_event ||
+                        wg_selection_open(&table,effective_event,&scenery));
         free(data); /* selection owns copied membership, not borrowed bytes */
-        if(!valid || !winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
-        for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+        if(!valid)goto cleanup;
+        if(effective_event) {
+            if(!winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
+            for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+        }
     }
+    local_stats.scenery_effective = effective_event;
 
     uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
     if (!keys) goto cleanup;
@@ -1133,7 +1144,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     collect.visit = winst_build_visit;
     collect.userdata = &visit;
     collect.stats = &local_stats;
-    collect.scenery = scenery_event ? &scenery : NULL;
+    collect.scenery = effective_event ? &scenery : NULL;
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;

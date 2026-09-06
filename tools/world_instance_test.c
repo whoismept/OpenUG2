@@ -701,6 +701,9 @@ static void test_scenery_event_assembly(void) {
         N2Scene scene={0},vista={0};WInstStats stats;
         assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
         assert(scene.count==cases[i].count && vista.count==0);
+        /* An authored request is reported back unchanged; only an unauthored
+         * one degrades, so a diagnostic can never claim a filter that did not run. */
+        assert(stats.scenery_effective==cases[i].event);
         unsigned seen=0;
         for(int j=0;j<scene.count;j++){
             int row=(int)lroundf(scene.meshes[j].verts[0]/10);
@@ -721,9 +724,28 @@ static void test_scenery_event_assembly(void) {
         free_scene(&scene);free_scene(&vista);
     }
     N2Scene scene={0},vista={0};WInstStats stats;
-    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,999));
-    assert(!scene.count&&!vista.count);
+    /* M160: a positive id this bundle does not author is an authoring fact,
+     * not a corrupt table. It degrades to the unfiltered scene so a raceable
+     * event with no group of its own still loads; nothing is hidden and the
+     * event-preview accounting stays at zero. Compare 999 with case {0,5,31}
+     * above: same mesh count, same rows, same wall set. */
+    assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,999));
+    assert(scene.count==5 && vista.count==0 && stats.scenery_hidden==0);
+    assert(stats.scenery_effective==0);   /* degraded, and reported as degraded */
+    {   unsigned seen=0;
+        for(int j=0;j<scene.count;j++){
+            int row=(int)lroundf(scene.meshes[j].verts[0]/10);
+            assert(row>=0&&row<5);seen|=1u<<row;
+        }
+        assert(seen==31u);
+    }
+    free_scene(&scene);free_scene(&vista);
+    memset(&scene,0,sizeof scene);memset(&vista,0,sizeof vista);
+    /* Out-of-contract ids and corrupt tables still fail closed. */
     assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,-2));
+    assert(!scene.count&&!vista.count);
+    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,65536));
+    assert(!scene.count&&!vista.count);
     /* Every override is checked, including row 4 outside this local view.
      * Bad row, missing section, stale flags and duplicate targets fail atomically. */
     for(int badcase=0;badcase<4;badcase++) {

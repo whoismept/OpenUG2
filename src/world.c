@@ -316,11 +316,16 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                     options->focus_x, options->focus_y);
             return 0;
         }
-        if (options->scenery_event)
+        if (options->scenery_event) {
+            /* Report what was SELECTED. A race whose event authors no group of
+               its own degrades to the unfiltered scene; saying "event" there
+               would claim a filter that never ran. */
+            int eff = w->neighborhood.inst_stats.scenery_effective;
             printf("SCENERY SELECTION mode=%s event=%d hidden-placements=%ld "
                    "[load-time only; shared/unknown groups and direction flags unchanged]\n",
-                   options->scenery_event == -1 ? "free" : "event",
+                   eff == -1 ? "free" : eff ? "event" : "unfiltered(no authored group)",
                    options->scenery_event, w->neighborhood.inst_stats.scenery_hidden);
+        }
         for (int r = 0; r < nreg; r++) {
             w->neighborhood.rgn[r].mesh0 = 0;
             w->neighborhood.rgn[r].mesh1 = !strcmp(w->neighborhood.rgn[r].name, w->neighborhood.inst_stats.bundle)

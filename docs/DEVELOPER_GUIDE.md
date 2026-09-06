@@ -762,8 +762,9 @@ The checked reader is shared from `src/world_group_reader.h`. The selection
 policy in `src/world_scenery.h` hides only exclusively numeric-event
 memberships; ordinary/shared/unknown placements remain. Both rendering and
 collision are built from that same filtered scene. Normal instance-driven free
-roam selects `free` by default; live `--event` races remain unfiltered until
-retail direction/career activation timing is decoded.
+roam selects `free` by default; a live `--event` race selects that event's own
+authored group (M160, below). Retail direction/career activation timing is
+still undecoded, so nothing is filtered *within* the selected event.
 
 For a bounded city comparison, run these as three independent loads:
 
@@ -780,8 +781,9 @@ For a bounded city comparison, run these as three independent loads:
 `--instance-audit` can replace the capture flags for a GL-free assembly check.
 The preview cannot be used interactively, with `--event`, race/drive audits,
 or alternate-spawn captures/audits. Event selection here does not arm a race.
-An unrecognized numeric event or inconsistent group data fails loading; it
-does not silently fall back to an unfiltered scene.
+Inconsistent group data fails loading. A numeric event the bundle authors no
+group for degrades to the unfiltered scene instead (M160, below); that is the
+only fallback, and it is reported.
 
 At this RA pose with the current 1000 m chunk, free suppresses 258 placements;
 event 4144 suppresses 226, restoring 32 placements / 92 emitted meshes / 604
@@ -796,6 +798,54 @@ five placements with different memberships; it checks emitted meshes and real
 wall-contact responses, shared memberships, unknown events and corrupt targets.
 Runtime direction/career selection is still unimplemented. Do not present this
 preview as retail free-roam fidelity or automatic Enter/finish activation.
+
+### Per-event race selection (M160)
+
+`wg_runtime_selection` in `src/world_scenery.h` is the whole policy:
+
+| caller state | selection |
+|---|---|
+| explicit `--scenery-preview` | the requested value (the CLI still forbids pairing it with `--event`, so this beats a race id only at the function level) |
+| live race (`--event N`) | `N` — the event's own authored group |
+| everything else | `-1`, conservative free roam |
+
+Why it matters, measured on STREAML4RG event 4701: the bundle authors 4827
+group placements and only 77 belong to `BARRIERS_4701`. 143 sit within 40 m of
+the event's own `0x34148` racing line and 15 foreign-exclusive ones sit at
+0.00 m from it, including event 4707's start/finish gantry pair 17.6 m from
+4701's own start grid. Before M160 a race loaded all of them.
+
+**A positive id here is a request, not a guarantee.** Four shipped events
+author no group at all (L4RB 4201/4202/4203, L4RC 4341), and
+`wg_selection_open` rejects an absent group exactly as it rejects a corrupt
+table. `wg_event_group_present` separates the two:
+
+- group absent -> `world_instance_build_for_event` degrades `effective_event`
+  to 0 and builds the unfiltered scene. `collect.scenery` follows
+  `effective_event`, never the request, so nothing is half-filtered.
+- table malformed, duplicate or out-of-contract id -> still fails closed.
+
+`WInstStats.scenery_effective` carries what was actually selected back to the
+caller. The `SCENERY SELECTION` line prints that, not the request, so a
+degraded load reads `mode=unfiltered(no authored group)` and can never claim a
+filter that did not run. Check it when a race looks unfiltered:
+
+```sh
+./nfsu2 /path/to/NFSU2 --car MIATA --track STREAML4RG --event 4701 \
+  --race-audit /tmp/rg | grep 'SCENERY SELECTION'
+```
+
+Ownership of a specific contact is a separate question from selection. Barrier
+geometry also ships **ungrouped**, and those placements are outside this system
+entirely — no event selection can hide them. Attribute before assuming a
+contact is filterable: match the collision AABB to its two authored end posts,
+then look the posts up with `build/world_group_audit`.
+
+`make world-group-test` covers the policy table, `wg_event_group_present`
+against a real `BARRIERS_4701` group, and the sibling-id rejection that makes
+the predicate necessary. `make world-instance-test` covers the degrade path:
+an unauthored id must produce the same meshes, rows and wall set as the
+unfiltered build, with `scenery_hidden == 0` and `scenery_effective == 0`.
 
 ### Moving world neighborhood
 
