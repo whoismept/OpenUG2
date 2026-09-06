@@ -632,6 +632,7 @@ done:
 }
 
 static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
+                       const float vel[2], float old_heading,
                        const VehicleWheelConfig *wc, PhysRideSupport *sup,
                        WGroundHit hit[4], WGroundHit cand[4], int verdict[4]) {
     float fx = cosf(heading), fy = sinf(heading);
@@ -657,6 +658,8 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
         verdict[k] = why;
         sup->valid[k] = cat != WSURF_NONE;
         sup->z[k] = sup->valid[k] ? hit[k].z : wz;
+        sup->vz[k] = sup->valid[k] ? phys_ride_support_vz(hit[k].normal,vel,
+                                    old_heading,heading,ax[k],ay[k],1.0f/60.0f) : 0;
         if (sup->valid[k]) {
             /* how far outside its OWN window this contact was accepted: must
                never be positive, or the selector let in something unreachable */
@@ -5878,7 +5881,7 @@ int main(int argc, char **argv) {
         static WGroundHit ride_hit[4], ride_cand[4]; static int ride_reason[4];
         int ride_nsup = 0;
         if (!sstatic && !capture_policy.freeze_motion && !race_auto) {
-            ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
+            ride_nsup = ride_gather(&scene, carpos, heading, vel, ground_oldh, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
             float zprev = g_ride.z;

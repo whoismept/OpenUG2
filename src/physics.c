@@ -115,6 +115,14 @@ float phys_ride_reach_down(const PhysRideState *r, float dt) {
     return PHYS_RIDE_DROOP + fall;
 }
 
+float phys_ride_support_vz(const float normal[3], const float vel[2],
+                          float old_heading, float heading, float ax, float ay, float dt) {
+    if (dt <= 0 || fabsf(normal[2]) < 1e-6f) return 0;
+    float dc=cosf(heading)-cosf(old_heading), ds=sinf(heading)-sinf(old_heading);
+    float dx=vel[0]+dc*ax-ds*ay, dy=vel[1]+ds*ax+dc*ay;
+    return -(normal[0]*dx+normal[1]*dy)/(normal[2]*dt);
+}
+
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     const float w    = 6.2831853f * PHYS_RIDE_FREQ;   /* rad/s */
     const float K    = w * w;                          /* 1/s^2 per metre       */
@@ -145,7 +153,8 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         mask |= 1u << k;
         if (c > PHYS_RIDE_BUMP) c = PHYS_RIDE_BUMP;
         r->compression[k] = c;
-        force[k] = K*c - C*wv + PHYS_RIDE_G;
+        /* The damper resists suspension travel, not motion along a slope. */
+        force[k] = K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G;
     }
     r->contact_mask = mask;
 

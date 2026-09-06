@@ -144,11 +144,13 @@ typedef struct {
 
 /* One frame of support, gathered by the caller from the world. ax/ay are the
  * wheel offsets in body space (+x forward, +y left); the integrator re-centres
- * them on their own centroid so a car at rest generates exactly zero torque. */
+ * them on their own centroid so a car at rest generates exactly zero torque.
+ * Initialise vz for every wheel; zero means a stationary support height. */
 typedef struct {
     float z[4];      /* world support height under each wheel, m */
     int   valid[4];  /* 1 = reachable support this frame          */
     float ax[4], ay[4];
+    float vz[4];     /* support-height rate along wheel XY motion, m/s; 0 at rest */
 } PhysRideSupport;
 
 /* Static equilibrium on the given support. Solves heave, pitch and roll from
@@ -162,6 +164,11 @@ void phys_ride_init(PhysRideState *r, const PhysRideSupport *s);
 /* Downward contact reach for the NEXT gather: droop plus the distance the body
  * falls during one step, so a fast landing cannot tunnel past a floor. */
 float phys_ride_reach_down(const PhysRideState *r, float dt);
+/* Height rate on the selected static face. vel is resolved XY metres/tick;
+ * headings include accepted yaw only. Positional collision pushes are not
+ * velocity. No previous-face heights are differenced across seams/layers. */
+float phys_ride_support_vz(const float normal[3], const float vel[2],
+                          float old_heading, float heading, float ax, float ay, float dt);
 /* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
 /* World Z of wheel k's contact point under the current body pose. */

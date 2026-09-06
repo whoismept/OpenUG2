@@ -32,7 +32,70 @@ static void close_to(float a, float b) {
     assert(fabsf(a-b)<0.0001f);
 }
 
+static void slope_contact(float grade, float heading, float step, int reverse) {
+    /* A continuous 6% descent at 108 km/h: no edge, seam or missing mesh.
+     * A damper must resist suspension travel, not travel down the road. */
+    const float dt=1.0f/60.0f, co=cosf(heading), si=sinf(heading);
+    float v[]={-10,-10,0,0,0, 400,-10,0,0,0,
+                400,10,0,0,0, -10,10,0,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    for(int k=0;k<4;k++) {
+        float x=v[k*5],y=v[k*5+1];v[k*5+2]=grade*x;
+        v[k*5]=co*x-si*y;v[k*5+1]=si*x+co*y;
+    }
+    if(reverse)for(int k=0;k<6;k+=3){uint16_t t=idx[k];idx[k]=idx[k+2];idx[k+2]=t;}
+    N2Mesh m={0};m.verts=v;m.idx=idx;m.nverts=4;m.nidx=6;m.cat=N2_ROAD;
+    N2Scene sc={&m,1,1};PhysRideSupport s={0};PhysRideState r;
+    for(int k=0;k<4;k++) {
+        s.ax[k]=k<2?1.2f:-1.2f;s.ay[k]=(k&1)?-.7f:.7f;
+        s.z[k]=grade*s.ax[k];s.valid[k]=1;
+    }
+    phys_ride_init(&r,&s);r.vz=grade*step/dt;
+    int air=0,partial=0,missing=0;float maxerr=0;
+    for(int f=1;f<=600;f++) {
+        for(int k=0;k<4;k++) {
+            WGroundHit h;int why;
+            float x=f*step+s.ax[k],y=s.ay[k];
+            s.valid[k]=world_wheel_support(&sc,co*x-si*y,si*x+co*y,
+                phys_ride_wheel_z(&r,&s,k),PHYS_RIDE_REACH_UP,
+                phys_ride_reach_down(&r,dt),&h,NULL,&why)!=WSURF_NONE;
+            s.z[k]=h.z;if(!s.valid[k])missing++;
+            const float vel[]={co*step,si*step};
+            s.vz[k]=s.valid[k]?phys_ride_support_vz(h.normal,vel,heading,heading,s.ax[k],s.ay[k],dt):0;
+#ifdef SLOPE_DAMPING_BASELINE
+            s.vz[k]=0; /* Original damper used absolute wheel-Z velocity. */
+#endif
+        }
+        phys_ride_step(&r,&s,dt);
+        if(!r.contact_mask)air++;
+        if(r.contact_mask!=15)partial++;
+        maxerr=fmaxf(maxerr,fabsf(r.z-grade*f*step));
+    }
+    printf("continuous grade=%+.2f heading=%.2f step=%.2f: air=%d partial=%d rejected=%d max body error=%.6f m\n",
+           grade,heading,step,air,partial,missing,maxerr);fflush(stdout);
+    assert(air==0 && partial==0 && missing==0 && maxerr<fabsf(grade*step)+.005f);
+    /* No covering geometry: even a nonzero supplied rate cannot invent force. */
+    float vz=r.vz;
+    for(int k=0;k<4;k++)s.valid[k]=0;
+    phys_ride_step(&r,&s,dt);
+    assert(r.contact_mask==0);close_to(r.vz,vz-PHYS_RIDE_G*dt);
+}
+
 int main(void) {
+    slope_contact(-.06f,0,.5f,0);
+    slope_contact(-.06f,1.2f,.5f,1);
+    slope_contact(.06f,-.7f,.5f,0);
+    slope_contact(0,0,.5f,0);
+    slope_contact(.06f,.3f,0,1);
+    /* Height-rate geometry includes accepted yaw and respects winding. */
+    const float normal[]={-.1f,-.2f,1}, reversed[]={.1f,.2f,-1}, still[]={0,0};
+    close_to(phys_ride_support_vz(normal,still,0,1.5707963f,1,0,1),.1f);
+    close_to(phys_ride_support_vz(reversed,still,0,1.5707963f,1,0,1),.1f);
+    close_to(phys_ride_support_vz(normal,still,0,0,1,0,1),0);
+    close_to(phys_ride_support_vz(normal,still,0,0,1,0,0),0);
+    const float vertical[]={1,0,0}, contour[]={.2f,-.1f};
+    close_to(phys_ride_support_vz(vertical,contour,0,0,1,0,1),0);
+    close_to(phys_ride_support_vz(normal,contour,0,0,1,0,1),0);
     /* z=x, y in [-10,10]. Moving at z=.25 from x=0 to x=.5
      * reaches the face at x=.25, halfway through the step. */
     float v[]={-10,-10,-10,0,0, 10,-10,10,0,0,

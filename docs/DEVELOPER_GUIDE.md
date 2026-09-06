@@ -558,6 +558,14 @@ spawn or layer transition.
 The horizontal model uses metres/tick; the ride integrator uses metres/second.
 Mixing those units creates violent launch or damping errors.
 
+The ride damper uses wheel velocity relative to the selected face's height rate,
+not absolute world-Z velocity. `phys_ride_support_vz` derives that rate from the
+face normal, resolved XY velocity and accepted wheel rotation, converting to
+metres/second. Positional wall pushes are not velocity; height differences across
+unrelated faces/layers are not differenced into an impulse. Reach, spring tuning
+and bump/droop limits are unchanged. `make ground-motion-test` also checks
+continuous uphill/downhill contact, rotation/winding, rest and genuine free fall.
+
 Before gathering support, `ground_motion_limit` (in `src/ground_motion.h`)
 checks the XY move proposed by `phys_car_step`. `world_ground_sweep` finds
 above-to-below crossings of actual ROAD/TERRAIN triangles by each wheel's
