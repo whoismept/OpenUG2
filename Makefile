@@ -107,6 +107,10 @@ world-group-audit: tools/world_group_audit.c src/world_group_reader.h src/world_
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_audit.c -o build/world_group_audit -lm
 
+route-membership-audit: tools/m160_route_audit.c src/world_group_reader.h src/world_scenery.h src/world_instance.c src/world_instance.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) tools/m160_route_audit.c -o build/m160_route_audit -lm
+
 light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/light_state_test.c src/render.c -o build/light_state_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
