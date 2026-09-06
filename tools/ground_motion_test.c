@@ -82,6 +82,27 @@ static void slope_contact(float grade, float heading, float step, int reverse) {
 }
 
 int main(void) {
+    /* A road closure is a finite segment, not a nine-metre-deep slab.
+     * Entering beside its far side must not teleport a car under a slope. */
+    World barrier={0};barrier.city.mode=MODE_RACE_EVENT;barrier.city.nbar=1;
+    barrier.city.bar[0].dx=1;
+    float beside[]={8,9.5f,-.4f};
+    int pushed=world_barrier_push(&barrier,beside,1.3f);
+    printf("closure side approach: hit=%d x=%.3f (expected no hit, x=8)\n",pushed,beside[0]);fflush(stdout);
+    assert(!pushed);close_to(beside[0],8);close_to(beside[2],-.4f);
+    float corner[]={1.2f,10.2f,0};assert(!world_barrier_push(&barrier,corner,1.3f));
+    for(int side=-1;side<=1;side+=2) {
+        float face[]={side*.5f,0,2};assert(world_barrier_push(&barrier,face,1.3f));
+        close_to(face[0],side*1.3f);close_to(face[1],0);close_to(face[2],2);
+    }
+    float end[]={-.5f,9.6f,0};assert(world_barrier_push(&barrier,end,1.3f));
+    close_to(hypotf(end[0],end[1]-9),1.3f);
+    barrier.city.bar[0].dx=0;barrier.city.bar[0].dy=-1;
+    float turned[]={9.5f,-8,0};assert(!world_barrier_push(&barrier,turned,1.3f));
+    turned[0]=0;turned[1]=.5f;assert(world_barrier_push(&barrier,turned,1.3f));
+    close_to(turned[1],1.3f);
+    barrier.city.mode=MODE_FREEROAM;turned[1]=0;
+    assert(!world_barrier_push(&barrier,turned,1.3f));
     slope_contact(-.06f,0,.5f,0);
     slope_contact(-.06f,1.2f,.5f,1);
     slope_contact(.06f,-.7f,.5f,0);

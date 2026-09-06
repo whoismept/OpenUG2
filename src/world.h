@@ -185,8 +185,9 @@ int world_race_update(World *w, float x, float y);
 
 void world_race_stop(World *w);
 
-/* Push the car circle (centre pos[3], radius r) back inside the corridor if it
- * has crossed an active race barrier. No-op in freeroam. Returns 1 if it pushed. */
+/* Resolve car-circle overlap with the finite active race-barrier segments.
+ * Either side is solid; no far-side recovery teleport. Z is untouched.
+ * No-op in freeroam. Returns 1 if it pushed. */
 int world_barrier_push(const World *w, float *pos, float r);
 
 /* Load trackname ("ALL" = every STREAM*.BUN under troot, else one region)

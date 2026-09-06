@@ -1080,6 +1080,8 @@ int world_set_mode(World *w, int mode, int evidx) {
     return w->city.nbar;
 }
 
+static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float *ox,float *oy);
+
 int world_barrier_push(const World *w, float *pos, float r) {
     if (w->city.mode != MODE_RACE_EVENT) return 0;
     int hit = 0;
@@ -1087,12 +1089,16 @@ int world_barrier_push(const World *w, float *pos, float r) {
         const WBarrier *b = &w->city.bar[i];
         float rx = pos[0]-b->x, ry = pos[1]-b->y;
         if (rx*rx + ry*ry > BAR_REACH*BAR_REACH) continue;
-        float s = rx*b->dx + ry*b->dy;              /* along the closed road */
-        float t = -rx*b->dy + ry*b->dx;             /* across it */
-        if (s <= -r || s >= r + BAR_HALF) continue; /* behind, or already past */
-        if (t < -(BAR_HALF + r) || t > BAR_HALF + r) continue;
-        pos[0] -= b->dx * (s + r);                  /* back to the corridor side */
-        pos[1] -= b->dy * (s + r);
+        /* The rendered closure is one finite segment, not a deep volume on
+         * its far side. Resolve actual overlap to the nearest side/endpoint. */
+        float x,y;
+        float d2=seg_d2(pos[0],pos[1],b->x+b->dy*BAR_HALF,b->y-b->dx*BAR_HALF,
+                       b->x-b->dy*BAR_HALF,b->y+b->dx*BAR_HALF,&x,&y);
+        if(d2>=r*r)continue;
+        float d=sqrtf(d2),nx=d>1e-6f?(pos[0]-x)/d:-b->dx,
+                         ny=d>1e-6f?(pos[1]-y)/d:-b->dy;
+        pos[0]+=nx*(r-d);
+        pos[1]+=ny*(r-d);
         hit = 1;
     }
     return hit;

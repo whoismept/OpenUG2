@@ -551,14 +551,14 @@ static int ss_stack(const N2Scene *s, const float (*mbb)[4], float x, float y,
 }
 
 /* ---- --race-audit collision attribution (Milestone 94) --------------------
- * Every persistent collision response in the M93 trace, attributed to the exact
- * mesh (and triangle, for rails) that produced it. Observation only: the wall
- * probe reads the same rects collide_walls is about to test, before it resolves;
- * the rail record is filled inside world_wall_push's own pass. Nothing here
- * writes carpos or vel. */
+ * Production contacts, keyed by resident generation and source mesh/triangle.
+ * Copy source labels before their resident is freed. Observation only;
+ * nothing here writes carpos or vel. */
 typedef struct {
     int kind;                 /* 0 = building AABB, 1 = road/terrain rail face */
     int mesh, tri;
+    unsigned long generation;
+    char name[32]; int cat, scen; /* copied before the resident can be freed */
     float bb[6];              /* AABB x0 y0 x1 y1 z0 z1 (buildings) */
     float nz, zlo, zhi, edged;/* rails */
     float cx, cy, cz;         /* car XY/Z at the FIRST hit of this group */
@@ -567,6 +567,7 @@ typedef struct {
 } M94Grp;
 #define M94_MAXGRP 4096
 static M94Grp m94g[M94_MAXGRP]; static int m94n = 0;
+static unsigned long m94_generation = 1;
 typedef struct { int grp; long f; } M94Ev;
 #define M94_MAXEV 256
 static M94Ev m94ev[M94_MAXEV]; static int m94nev = 0;
@@ -690,8 +691,10 @@ static void m94_nearest_wp(const N2Path *ap, float x, float y, int *wp, float *s
     if (*wp >= 0) *segd = sqrtf(bd);
 }
 static void m94_add(M94Grp *k, long f) {
+    k->generation=m94_generation;
     for (int i = 0; i < m94n; i++)
-        if (m94g[i].kind == k->kind && m94g[i].mesh == k->mesh && m94g[i].tri == k->tri) {
+        if (m94g[i].generation == k->generation && m94g[i].kind == k->kind &&
+            m94g[i].mesh == k->mesh && m94g[i].tri == k->tri) {
             m94g[i].count++;
             if (m94nev < M94_MAXEV) { m94ev[m94nev].grp = i; m94ev[m94nev].f = f; m94nev++; }
             return;
@@ -707,6 +710,7 @@ static void m94_wall(int o, int mesh, const N2Scene *s, const float *car,
     M94Grp k; memset(&k, 0, sizeof k);
     k.kind = 0; k.mesh = mesh; k.tri = -1;
     const N2Mesh *m = &s->meshes[mesh];
+    memcpy(k.name,m->sname,sizeof k.name);k.cat=m->cat;k.scen=m->scen;
     k.bb[0]=k.bb[1]=k.bb[4]=1e30f; k.bb[2]=k.bb[3]=k.bb[5]=-1e30f;
     for (int v = 0; v < m->nverts; v++) { float *p = m->verts + v*5;
         if(p[0]<k.bb[0])k.bb[0]=p[0]; if(p[0]>k.bb[2])k.bb[2]=p[0];
@@ -718,9 +722,10 @@ static void m94_wall(int o, int mesh, const N2Scene *s, const float *car,
 }
 static void m94_rail(const WRailHit *rh, const N2Scene *s, float px, float py, float pz,
                      const N2Path *ap, long f) {
-    (void)s;
     M94Grp k; memset(&k, 0, sizeof k);
     k.kind = 1; k.mesh = rh->mesh; k.tri = rh->tri;
+    const N2Mesh *m=&s->meshes[rh->mesh];
+    memcpy(k.name,m->sname,sizeof k.name);k.cat=m->cat;k.scen=m->scen;
     k.nz = rh->nz; k.zlo = rh->zlo; k.zhi = rh->zhi; k.edged = rh->edged;
     k.cx=px; k.cy=py; k.cz=pz;
     m94_nearest_wp(ap, px, py, &k.wp, &k.segd);
@@ -5236,7 +5241,9 @@ int main(int argc, char **argv) {
            capture/audit runs retain synchronous preparation: their simulated
            time can outrun wall-clock I/O by orders of magnitude. The paced
            physics-driven audit exercises the ordinary asynchronous path. */
-        int resident_enabled = world2 && race_state == 1 && world.city.mode == MODE_FREEROAM &&
+        /* Race-grid placement may be kilometres from the menu resident.
+         * Prepare it during countdown, then keep following the player. */
+        int resident_enabled = world2 && (race_state == 0 || race_state == 1) &&
             (!shot || daudit || resident_drive_audit) && !sstatic &&
             (!capture_policy.freeze_motion || resident_route_audit || resident_drive_audit);
         float target[2] = {0, 0};
@@ -5270,7 +5277,7 @@ int main(int argc, char **argv) {
                                              active_resident->center[1]};
                 uint32_t build_begin = SDL_GetTicks();
                 WResidentBuildTiming build_timing = {0};
-                int background = !resident_sync && !resident_route_audit &&
+                int background = race_state != 0 && !raudit && !resident_sync && !resident_route_audit &&
                                  (!shot || (resident_drive_audit && resident_realtime));
                 int build_status = 0; /* pending is not a failed build */
                 if (!background) {
@@ -5301,10 +5308,13 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "resident build failed at cell (%.0f, %.0f); "
                             "keeping generation %lu\n", target[0], target[1],
                             active_resident->generation);
+                    if(race_state==0) { running=0; final_status=1; }
                 } else if (build_status > 0) {
                     world_resident_activate(&active_resident,
                                             &candidate_resident);
                     world.neighborhood = active_resident->world;
+                    m94_generation=active_resident->generation;
+                    ra_have_ground=0; /* old mesh indices belong to the old resident */
                     scene = active_resident->world.scene;
                     nm = scene.count;
                     WorldResidentResources *wr = &active_resident->resources;
@@ -6065,20 +6075,19 @@ int main(int argc, char **argv) {
                         if (m94g[i].count > bc) { bc = m94g[i].count; b = i; }
                     if (b < 0) break;
                     M94Grp *g = &m94g[b];
-                    const N2Mesh *m = &scene.meshes[g->mesh];
                     if (g->kind == 0)
-                        printf("  BUILDING x%-5d mesh %-6d %-30s %-8s "
+                        printf("  BUILDING x%-5d gen%lu mesh %-6d %-30s %-8s "
                                "AABB XY[%.1f %.1f][%.1f %.1f] Z[%.1f %.1f] "
                                "car(%.2f %.2f %.2f) wp %d d %.2f m first f%ld\n",
-                               g->count, g->mesh, m->sname[0]?m->sname:"(unnamed)",
-                               n2_scen_name(m->scen), g->bb[0],g->bb[2], g->bb[1],g->bb[3],
+                               g->count, g->generation, g->mesh, g->name[0]?g->name:"(unnamed)",
+                               n2_scen_name(g->scen), g->bb[0],g->bb[2], g->bb[1],g->bb[3],
                                g->bb[4],g->bb[5], g->cx,g->cy,g->cz, g->wp, g->segd, g->first);
                     else
-                        printf("  RAIL     x%-5d mesh %-6d %-30s %-8s tri %-6d "
+                        printf("  RAIL     x%-5d gen%lu mesh %-6d %-30s %-8s tri %-6d "
                                "nz %+.3f triZ[%.2f %.2f] edge %.3f m "
                                "car(%.2f %.2f %.2f) wp %d d %.2f m first f%ld\n",
-                               g->count, g->mesh, m->sname[0]?m->sname:"(unnamed)",
-                               bc_cat(m->cat), g->tri, g->nz, g->zlo, g->zhi, g->edged,
+                               g->count, g->generation, g->mesh, g->name[0]?g->name:"(unnamed)",
+                               bc_cat(g->cat), g->tri, g->nz, g->zlo, g->zhi, g->edged,
                                g->cx,g->cy,g->cz, g->wp, g->segd, g->first);
                     g->count = -g->count;   /* mark printed */
                 }
@@ -6086,10 +6095,9 @@ int main(int argc, char **argv) {
                 printf("first 20 chronological responses:\n");
                 for (int k = 0; k < 20 && k < m94nev; k++) {
                     M94Grp *g = &m94g[m94ev[k].grp];
-                    const N2Mesh *m = &scene.meshes[g->mesh];
-                    printf("  f%-6ld %-8s mesh %-6d %-30s tri %-6d wp %d\n",
-                           m94ev[k].f, g->kind ? "RAIL" : "BUILDING", g->mesh,
-                           m->sname[0]?m->sname:"(unnamed)", g->tri, g->wp);
+                    printf("  f%-6ld %-8s gen%lu mesh %-6d %-30s tri %-6d wp %d\n",
+                           m94ev[k].f, g->kind ? "RAIL" : "BUILDING", g->generation, g->mesh,
+                           g->name[0]?g->name:"(unnamed)", g->tri, g->wp);
                 }
                 /* M91 wall-rejected waypoints: what actually sits there? */
                 printf("\nM91 wall-rejected waypoints, classified:\n");

@@ -616,6 +616,12 @@ the same oriented body capsule and face-local velocity response. Its measured
 separate ownership, so a threshold proven for one is not automatically valid
 for another.
 
+Race-corridor closures resolve circle overlap with the same finite 18 m segment
+that is drawn. Both sides and rounded endpoints are solid; the far side is not
+a nine-metre-deep recovery volume. A side approach must not teleport the car
+back across a slope and leave its wheels below the road. These closures still
+use a circle and have no vertical-layer test or swept collision.
+
 ## 10. Racing, navigation and AI
 
 Content discovery maps `STREAM<stem>.BUN` to `ROUTES<stem>/`. Circuit lists
@@ -791,7 +797,7 @@ wall-contact responses, shared memberships, unknown events and corrupt targets.
 Runtime direction/career selection is still unimplemented. Do not present this
 preview as retail free-roam fidelity or automatic Enter/finish activation.
 
-### Moving world neighborhood (M144, default free-roam)
+### Moving world neighborhood
 
 The instance-driven world keeps one replaceable `WorldResident`. Persistent
 navigation, districts, events and race state stay in `WorldCity`; geometry,
@@ -800,7 +806,7 @@ ground grid, regional texture sources, lights and bounds live in
 ordinary/sky/glow/vista batches, per-mesh material maps and solid-collision
 arrays. Do not cache a scene mesh or batch index outside that package.
 
-Resident replacement is transactional. Normal free-roam prepares CPU geometry
+Resident replacement is transactional. Normal driving prepares CPU geometry
 on one worker; `--resident-sync` selects the synchronous diagnostic control:
 
 1. `world_resident_target` snaps the player to a deterministic 400 m cell.
@@ -816,8 +822,14 @@ on one worker; `--resident-sync` selects the synchronous diagnostic control:
 Build failure leaves the old resident active and the failed snapped cell is not
 retried until the player targets another cell. Player position, velocity,
 heading, sprung ride/contact state, camera and input are deliberately outside
-the resident and must remain byte-identical across activation. This path is
-free-roam-only, uses one STREAM bundle and never uses `--track ALL`.
+the resident and must remain byte-identical across activation. Free-roam and
+races use this path with one STREAM bundle, never `--track ALL`. Race countdown
+prepares synchronously after grid placement, before the player can drive with
+a neighborhood still centred kilometres away at the menu focus. A countdown
+load failure exits with an error instead of starting with missing collision.
+Scenery-group selection is unchanged. Race-audit source attribution snapshots
+labels and includes the resident generation; mesh indices alone are not stable
+across swaps.
 
 The worker owns copied request strings and a zero-initialised candidate.
 Completion is atomically published; the frame thread joins it before validating
@@ -825,7 +837,7 @@ the **current** player pose and calling `world_resident_finish`. Stale results
 are discarded, and shutdown joins any outstanding job before freeing data.
 Texture decode/upload, batches and cleanup still block the frame thread.
 `--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
-physics paced at approximately 60 Hz; unpaced audits otherwise use the sync
+physics paced at approximately 60 Hz; race audits and unpaced captures use the sync
 control. A successful resident swap does not prove continuous ground contact.
 
 `WorldNeighborhood.master` records whether the master resource came from
