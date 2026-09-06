@@ -847,6 +847,43 @@ the predicate necessary. `make world-instance-test` covers the degrade path:
 an unauthored id must produce the same meshes, rows and wall set as the
 unfiltered build, with `scenery_hidden == 0` and `scenery_effective == 0`.
 
+### Selection can never remove ground (M161)
+
+Event selection filters the section walk only. Drivable surface is not in that
+path at all:
+
+- `winst_place_ground_prototypes` walks the model library, places every ROAD
+  and TERRAIN mesh of every prototype, runs before the section walk, and takes
+  no selection argument.
+- `winst_build_visit`, the visitor the selection filters, skips every ROAD and
+  TERRAIN mesh outright.
+
+So hiding a placement removes only its non-ground meshes. This is load-bearing
+on real data: 1292 authored placements across 17 L4RB and L4RC events carry
+road-named prototypes (`TRN_ROADpiece*`, `TRN_ROADskid*`,
+`TRN_traintracks_lighting_*`) that ARE hidden when a sibling event is raced.
+`test_selection_never_hides_ground` pins both halves; it was verified to fail
+when either is removed. Do not add a selection argument to the ground path, and
+do not drop the ROAD/TERRAIN skip in the visitor.
+
+Validate the whole selection path against shipped data with:
+
+```sh
+make route-membership-audit
+./build/m160_route_audit /path/to/NFSU2/TRACKS --sweep 40   # all 105 events
+./build/m160_route_audit /path/to/NFSU2/TRACKS --assets     # what groups can hide
+```
+
+The sweep reports per-event own/foreign counts, how many foreign placements sit
+within the corridor of that event's own racing line, and any road-named
+placement a selection hides. Expect 0 failures and exactly 4 degrades. It
+exercises the selection path only and builds no scene, so a clean sweep is not
+a claim that every event loads and drives.
+
+Catalog exposure and runtime exposure are different numbers: L4RB/4211 has
+road-named placements in the catalog but hides nothing at runtime, because they
+sit outside the loaded neighborhood.
+
 ### Moving world neighborhood
 
 The instance-driven world keeps one replaceable `WorldResident`. Persistent

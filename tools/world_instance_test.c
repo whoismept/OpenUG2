@@ -664,6 +664,66 @@ static long fixture_group(unsigned char *dst, const char *name,
     return size;
 }
 
+/* Selection may hide trackside dressing; it must never remove the ground.
+ * Road and terrain meshes reach the scene through winst_place_ground_prototypes,
+ * which runs over the model library before the section walk and takes no
+ * selection, and winst_build_visit then skips every ROAD/TERRAIN mesh. Delete
+ * either half and a raced event opens a hole in the world.
+ *
+ * This matters on real data (M161): 1292 authored placements across 17 L4RB and
+ * L4RC events carry road-named prototypes (TRN_ROADpiece*, TRN_ROADskid*) and
+ * are exclusive to one event's group, so a sibling event's selection does hide
+ * those placements. It stays safe only because of the two rules above. */
+static void test_selection_never_hides_ground(void) {
+    const char *root="build/world_instance_ground_fixture";
+    const char *cp="build/world_instance_ground_fixture/L4RA.BUN";
+    const char *sp="build/world_instance_ground_fixture/STREAML4RA.BUN";
+    assert(mkdir(root,0777)==0 || errno==EEXIST);
+    unsigned char companion[1024],stream[8192],roads[2*64],walls[2*64],ov[24]={0},groups[256];
+    long clen=make_regions(companion,sizeof companion), glen=0;
+    /* override 0: a ROAD-classified placement, exclusive to event 7
+       override 1: a wall placement, exclusive to event 7
+       override 2: a wall placement, exclusive to event 8 */
+    const unsigned g7[]={0,1}, g8[]={2};
+    glen+=fixture_group(groups+glen,"BARRIERS_7",g7,2);
+    glen+=fixture_group(groups+glen,"BARRIERS_8",g8,1);
+    const unsigned sec[]={17,23,23}, row[]={0,0,1};
+    for(int i=0;i<3;i++){put_u16(ov+8*i,sec[i]);put_u16(ov+8*i+2,row[i]);put_u16(ov+8*i+6,1);}
+    clen=add_leaf(companion,clen,0x34107,ov,sizeof ov);
+    clen=add_leaf(companion,clen,0x34108,groups,glen);
+    assert(write_fixture_file(cp,companion,clen));
+
+    /* "ROAD" in the authored name is what n2_mesh_category keys on. */
+    long slen=add_keyed_model(stream,0,"XB_ROADSLAB",0x11112222,4);
+    slen=add_keyed_model(stream,slen,"XB_WALLPANEL",0x33334444,4);
+    for(int i=0;i<2;i++){
+        make_instance_record(roads+64*i,0,(float)(i*4-8),-4,(float)(i*4-4),-2);
+        make_instance_record(walls+64*i,0,(float)(i*4+0),2,(float)(i*4+4),4);
+    }
+    slen=add_section(stream,slen,17,"XB_ROADSLAB",roads,2);
+    slen=add_section(stream,slen,23,"XB_WALLPANEL",walls,2);
+    assert(write_fixture_file(sp,stream,slen));
+
+    const char *bundles[]={"STREAML4RA"};
+    /* event, total meshes, placements the selection hides */
+    const struct {int event,count;long hidden;} cases[]={{0,3,0},{7,2,1},{8,2,2}};
+    for(int i=0;i<3;i++){
+        N2Scene scene={0},vista={0};WInstStats stats;
+        assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
+        assert(scene.count==cases[i].count && vista.count==0);
+        assert(stats.scenery_hidden==cases[i].hidden);
+        assert(stats.scenery_effective==cases[i].event);
+        int nroad=0;
+        for(int j=0;j<scene.count;j++)
+            if(scene.meshes[j].cat==N2_ROAD||scene.meshes[j].cat==N2_TERRAIN)nroad++;
+        /* The invariant. Event 8 hides the road-named placement itself, yet the
+           drivable mesh is still there, placed once from the library. */
+        assert(nroad==1);
+        free_scene(&scene);free_scene(&vista);
+    }
+    remove(cp);remove(sp);rmdir(root);
+}
+
 /* Missing event filtering used to emit every race's props; filtering by model
  * name instead would also remove the identically named ordinary neighbors. */
 static void test_scenery_event_assembly(void) {
@@ -1191,6 +1251,7 @@ static void test_common_key_submesh_resolution(void) {
 
 int main(void) {
     test_scenery_event_assembly();
+    test_selection_never_hides_ground();
     test_builder_authored_model_keys();
     test_positioned_model_name_boundaries();
     test_regions();

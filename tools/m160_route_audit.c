@@ -124,6 +124,38 @@ static void group_names_for(const WGTable *t, unsigned override_index,
     }
 }
 
+/* Every event id this region's 0x3414c catalogs advertise. Paths files
+ * concatenate the whole regional catalog, so scanning all of them and
+ * de-duplicating is a superset of what world_load_events reads. */
+static int ev_cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+static int catalog_events(const char *troot, const char *reg, int *out, int cap) {
+    int n = 0;
+    for (int id = 4000; id < 8000; id++) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/ROUTES%s/Paths%04d.bin", troot, reg, id);
+        long len = 0;
+        unsigned char *d = n2_read_file(path, &len);
+        if (!d) continue;
+        N2Leaf leaf[8]; int nl = 0;
+        n2_find_leaves(d, 0, len, 0x0003414cu, leaf, &nl, 8);
+        for (int L = 0; L < nl; L++)
+            for (int i = 0; i < (int)(leaf[L].size / 272) && n < cap; i++) {
+                const unsigned char *b = d + leaf[L].off + i * 272;
+                int eid = b[0] | (b[1] << 8), npoly = b[2];
+                if (eid < 4000 || npoly < 3 || npoly > 33) continue;
+                int dup = 0;
+                for (int k = 0; k < n; k++) if (out[k] == eid) { dup = 1; break; }
+                if (!dup) out[n++] = eid;
+            }
+        free(d);
+    }
+    qsort(out, (size_t)n, sizeof *out, ev_cmp);
+    return n;
+}
+
 typedef struct {
     unsigned override_index, section, row;
     char name[33];
@@ -136,10 +168,261 @@ static int row_cmp(const void *a, const void *b) {
     return (p->dist > q->dist) - (p->dist < q->dist);
 }
 
+/* Catalog-wide validation of the per-event race selection. For every region
+ * and every advertised event this exercises exactly the load-path steps the
+ * selection change affects -- table open, group presence, selection open, and
+ * the full-bundle override cross-check -- and reports the defect magnitude the
+ * selection removes. It builds no scene: nothing downstream of the selection
+ * was changed, so a scene build would only add cost. */
+/* Superset of structural naming: anything that could be drivable surface or
+ * world terrain rather than trackside dressing. Deliberately broad; a hit is
+ * something to inspect, not automatically a defect. */
+static int structural_name(const char *n) {
+    return strstr(n, "TRN_") || strstr(n, "Terrain") || strstr(n, "TERRAIN") ||
+           strstr(n, "Road")  || strstr(n, "ROAD")   || strstr(n, "PAN_")    ||
+           strstr(n, "SKYDOME");
+}
+static int sweep(const char *troot, float corridor) {
+    static const char *regions[] = { "L4RA","L4RB","L4RC","L4RD","L4RF","L4RG","L4RH","L4RR" };
+    long tot_ev = 0, tot_degrade = 0, tot_fail = 0, tot_noroute = 0, tot_onroute = 0;
+    long tot_risky = 0;
+    int worst_on_route = 0, worst_ev = 0;
+    char worst_reg[8] = "";
+    printf("%-5s %-6s %6s %8s %8s %8s %7s %9s  %s\n",
+           "reg", "event", "own", "foreign", "nonev", "route", "onroute", "selection", "note");
+    for (size_t r = 0; r < sizeof regions / sizeof *regions; r++) {
+        const char *reg = regions[r];
+        char stream[16];
+        snprintf(stream, sizeof stream, "STREAM%s", reg);
+        long len = 0, clen = 0;
+        unsigned char *d = winst_read_named(troot, stream, &len);
+        unsigned char *c = winst_read_named(troot, reg, &clen);
+        int evs[512];
+        int nev = catalog_events(troot, reg, evs, 512);
+        if (!d || !c) {
+            printf("%-5s %-6s %6s %8s %8s %8s %7s %9s  no bundle (%d catalog events)\n",
+                   reg, "-", "-", "-", "-", "-", "-", "-", nev);
+            free(d); free(c);
+            continue;
+        }
+        Index idx = {0};
+        idx.sections = calloc(65536, sizeof *idx.sections);
+        idx.present  = calloc(65536, 1);
+        WGTable t;
+        int table_ok = idx.sections && idx.present &&
+                       wg_open_file(c, (size_t)clen, &t) &&
+                       index_sections(d, 0, len, 0, &idx);
+        if (!table_ok) {
+            printf("%-5s %-6s %6s %8s %8s %8s %7s %9s  TABLE OPEN FAILED\n",
+                   reg, "-", "-", "-", "-", "-", "-", "FAIL");
+            tot_fail++;
+        }
+        for (int e = 0; table_ok && e < nev; e++) {
+            int event = evs[e];
+            tot_ev++;
+            int present = wg_event_group_present(&t, event);
+            WGSelection sel = {0};
+            const char *verdict = "ok";
+            const char *note = "";
+            long own = 0, foreign = 0, nonev = 0, risky = 0;
+            int on_route = 0, npts = 0;
+            if (!present) {
+                tot_degrade++;
+                verdict = "degrade";
+                note = "no authored group; unfiltered scene";
+            } else if (!wg_selection_open(&t, event, &sel)) {
+                tot_fail++;
+                verdict = "FAIL";
+                note = "selection rejected an authored group";
+            } else if (!winst_check_scenery(d, 0, len, 0, &sel)) {
+                tot_fail++;
+                verdict = "FAIL";
+                note = "override cross-check failed";
+            } else {
+                for (size_t i = 0; i < sel.count; i++) {
+                    unsigned m = sel.items[i].membership;
+                    if (!(m & WG_EVENT)) nonev++;
+                    else if (m & WG_ACTIVE) own++;
+                    else if (!(m & WG_OTHER)) foreign++;
+                }
+                /* Selection may only ever remove race dressing. Report every
+                   hidden placement whose authored type name reads as road or
+                   terrain, so the claim stays checkable against shipped data.
+                   These are NOT lost ground: winst_build_visit skips every
+                   ROAD/TERRAIN mesh and winst_place_ground_prototypes places
+                   the surface from the model library without consulting any
+                   selection, so only dressing attached to a road-named
+                   prototype is removed. Pinned by
+                   test_selection_never_hides_ground. */
+                for (size_t i = 0; i < sel.count; i++) {
+                    const WGSelected *it = &sel.items[i];
+                    if (wg_selection_visible(&sel, it->section, it->row)) continue;
+                    if (!idx.present[it->section]) continue;
+                    const WInstSection *sec = &idx.sections[it->section];
+                    WInstPlacement pl;
+                    if (it->row >= (unsigned)sec->placement_count ||
+                        !winst_decode_placement(sec->placements + 64L * it->row, 64, &pl) ||
+                        pl.type_index >= (unsigned)sec->type_count) continue;
+                    char nm[33];
+                    memcpy(nm, sec->types + 68L * pl.type_index, 32);
+                    nm[32] = 0;
+                    if (!structural_name(nm)) continue;
+                    risky++;
+                    tot_risky++;
+                    printf("  ROADNAMED %s/%d hides section=%u row=%u %s XY=(%.3f,%.3f)\n",
+                           reg, event, it->section, it->row, nm,
+                           (double)pl.matrix[12], (double)pl.matrix[13]);
+                }
+                Route route = {0};
+                FILE *devnull = NULL; (void)devnull;
+                /* route_load prints one line per event; keep the sweep table
+                   readable by loading quietly through the same parser. */
+                char path[1024];
+                snprintf(path, sizeof path, "%s/ROUTES%s/Paths%04d.bin", troot, reg, event);
+                long rlen = 0;
+                unsigned char *rd = n2_read_file(path, &rlen);
+                if (rd) {
+                    N2Leaf leaf[8]; int nl = 0;
+                    n2_find_leaves(rd, 0, rlen, 0x00034148u, leaf, &nl, 8);
+                    for (int L = 0; L < nl; L++) {
+                        int n = (int)leaf[L].size / 24;
+                        float px = 0, py = 0; int have = 0;
+                        for (int i = 0; i < n; i++) {
+                            float x, y;
+                            memcpy(&x, rd + leaf[L].off + i * 24,     4);
+                            memcpy(&y, rd + leaf[L].off + i * 24 + 4, 4);
+                            if (!(x == x && y == y) || x < -1e5f || x > 1e5f ||
+                                y < -1e5f || y > 1e5f) { have = 0; continue; }
+                            if (have) {
+                                float dx = x - px, dy = y - py;
+                                float dist = sqrtf(dx * dx + dy * dy);
+                                if (dist <= NAV_LINK_MAX) {
+                                    int steps = (int)(dist / ROUTE_STEP);
+                                    for (int st = 1; st < steps; st++)
+                                        route_push(&route, px + dx * st / steps,
+                                                           py + dy * st / steps);
+                                }
+                            }
+                            route_push(&route, x, y);
+                            px = x; py = y; have = 1;
+                        }
+                    }
+                    free(rd);
+                }
+                npts = route.n;
+                if (!npts) { tot_noroute++; note = "no own racing line"; }
+                for (size_t i = 0; i < sel.count && npts; i++) {
+                    const WGSelected *it = &sel.items[i];
+                    if (wg_selection_visible(&sel, it->section, it->row)) continue;
+                    const WInstSection *sec = &idx.sections[it->section];
+                    WInstPlacement p;
+                    if (!idx.present[it->section] ||
+                        it->row >= (unsigned)sec->placement_count ||
+                        !winst_decode_placement(sec->placements + 64L * it->row, 64, &p))
+                        continue;
+                    for (int k = 0; k < route.n; k++)
+                        if (aabb_d(&p, route.xy[k * 2], route.xy[k * 2 + 1]) <= corridor) {
+                            on_route++; break;
+                        }
+                }
+                free(route.xy);
+                tot_onroute += on_route;
+                if (on_route > worst_on_route) {
+                    worst_on_route = on_route; worst_ev = event;
+                    snprintf(worst_reg, sizeof worst_reg, "%s", reg);
+                }
+            }
+            free(sel.items);
+            printf("%-5s %-6d %6ld %8ld %8ld %8d %7d %9s  %s%s\n",
+                   reg, event, own, foreign, nonev, npts, on_route, verdict,
+                   risky ? "road-named placements hidden (dressing only) " : "", note);
+        }
+        free(idx.sections); free(idx.present); free(d); free(c);
+    }
+    printf("\nSWEEP events=%ld degraded=%ld failed=%ld without_own_route=%ld\n",
+           tot_ev, tot_degrade, tot_fail, tot_noroute);
+    printf("SWEEP road-named placements some event selection hides: %ld "
+           "(dressing only; ground comes from the unfiltered prototype path)\n", tot_risky);
+    printf("SWEEP foreign placements standing within %.1f m of the raced route: "
+           "%ld total, worst %s/%d with %d\n",
+           (double)corridor, tot_onroute, worst_reg[0] ? worst_reg : "-",
+           worst_ev, worst_on_route);
+    return tot_fail ? 1 : 0;
+}
+
+/* What kinds of asset can event selection ever hide? Selecting one event's
+ * group only suppresses placements proven exclusive to OTHER numeric event
+ * groups, so this enumerates every distinct authored type name reachable that
+ * way. If the set is race dressing only, per-event selection cannot remove
+ * structural geometry no matter which event is raced. */
+typedef struct { char name[33]; long count; } AssetTally;
+static int asset_cmp(const void *a, const void *b) {
+    const AssetTally *p = a, *q = b;
+    if (p->count != q->count) return p->count < q->count ? 1 : -1;
+    return strcmp(p->name, q->name);
+}
+static int assets(const char *troot) {
+    static const char *regions[] = { "L4RA","L4RB","L4RC","L4RD","L4RF","L4RG","L4RH","L4RR" };
+    AssetTally *tally = calloc(4096, sizeof *tally);
+    size_t ntally = 0;
+    long total = 0;
+    if (!tally) return 1;
+    for (size_t r = 0; r < sizeof regions / sizeof *regions; r++) {
+        const char *reg = regions[r];
+        char stream[16];
+        snprintf(stream, sizeof stream, "STREAM%s", reg);
+        long len = 0, clen = 0;
+        unsigned char *d = winst_read_named(troot, stream, &len);
+        unsigned char *c = winst_read_named(troot, reg, &clen);
+        Index idx = {0};
+        idx.sections = calloc(65536, sizeof *idx.sections);
+        idx.present  = calloc(65536, 1);
+        WGTable t;
+        if (d && c && idx.sections && idx.present &&
+            wg_open_file(c, (size_t)clen, &t) && index_sections(d, 0, len, 0, &idx)) {
+            for (size_t i = 0; i < t.override_count; i++) {
+                const unsigned char *ov = t.overrides + 8 * i;
+                unsigned sid = wg_u16(ov), row = wg_u16(ov + 2);
+                if (!idx.present[sid]) continue;
+                const WInstSection *sec = &idx.sections[sid];
+                WInstPlacement p;
+                if (row >= (unsigned)sec->placement_count ||
+                    !winst_decode_placement(sec->placements + 64L * row, 64, &p) ||
+                    p.type_index >= (unsigned)sec->type_count) continue;
+                char name[33];
+                memcpy(name, sec->types + 68L * p.type_index, 32);
+                name[32] = 0;
+                total++;
+                size_t k = 0;
+                for (; k < ntally; k++) if (!strcmp(tally[k].name, name)) break;
+                if (k == ntally && ntally < 4096) {
+                    snprintf(tally[ntally].name, sizeof tally[ntally].name, "%s", name);
+                    ntally++;
+                }
+                if (k < 4096) tally[k].count++;
+            }
+        } else fprintf(stderr, "assets: skipped %s\n", reg);
+        free(idx.sections); free(idx.present); free(d); free(c);
+    }
+    qsort(tally, ntally, sizeof *tally, asset_cmp);
+    printf("ASSETS group-referenced placements=%ld distinct_types=%zu\n", total, ntally);
+    for (size_t i = 0; i < ntally; i++)
+        printf("  %8ld  %s\n", tally[i].count, tally[i].name);
+    free(tally);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[2], "--assets")) return assets(argv[1]);
+    if (argc >= 3 && !strcmp(argv[2], "--sweep")) {
+        float corridor = argc >= 4 ? (float)atof(argv[3]) : 40.0f;
+        if (!(corridor > 0.0f) || corridor > 5000.0f) return 2;
+        return sweep(argv[1], corridor);
+    }
     if (argc < 4) {
         fprintf(stderr, "usage: m160_route_audit TRACK_ROOT L4RG EVENT [CORRIDOR_M]\n"
-                        "       m160_route_audit TRACK_ROOT L4RG EVENT --near X Y R\n");
+                        "       m160_route_audit TRACK_ROOT L4RG EVENT --near X Y R\n"
+                        "       m160_route_audit TRACK_ROOT --sweep [CORRIDOR_M]\n");
         return 2;
     }
     const char *troot = argv[1], *reg = argv[2];
