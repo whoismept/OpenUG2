@@ -103,6 +103,9 @@ int world_resident_route_point(const WResidentPolicy *policy,
 
 void world_resident_resources_free(WorldResidentResources *resources) {
     if (!resources) return;
+    /* World textures belong to the process-wide key cache in world.c and are
+       shared with every other resident: this array only borrows them. The
+       grass upload is this build's own, so it is still released here. */
     if (resources->terrain_texture) {
         int shared = 0;
         for (int i = 0; i < resources->texture_count; i++)
@@ -110,8 +113,6 @@ void world_resident_resources_free(WorldResidentResources *resources) {
                 resources->textures[i] == resources->terrain_texture) shared = 1;
         if (!shared) glDeleteTextures(1, &resources->terrain_texture);
     }
-    if (resources->textures && resources->texture_count > 0)
-        glDeleteTextures(resources->texture_count, resources->textures);
     render_batch_array_free(&resources->ordinary, &resources->ordinary_count);
     render_batch_array_free(&resources->sky, &resources->sky_count);
     render_batch_array_free(&resources->glow, &resources->glow_count);
@@ -210,6 +211,7 @@ int world_resident_resources_build(WorldResidentResources *resources,
         &facade, resources->texture_keys, resources->textures,
         resources->texture_modes, texture_cap);
     *neighborhood = facade.neighborhood;
+    if (resources->texture_count < 0) goto fail;
     for (int i = 0; i < resources->texture_count; i++)
         if (!resources->textures[i]) goto fail;
 

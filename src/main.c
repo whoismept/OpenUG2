@@ -1403,12 +1403,13 @@ int main(int argc, char **argv) {
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
+    int shotframes_set = 0;
     int want_laps = 2;       /* --laps N: race distance for --event */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
         else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--frames")  && i+1 < argc) shotframes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frames")  && i+1 < argc) { shotframes = atoi(argv[++i]); shotframes_set = 1; }
         else if (!strcmp(argv[i], "--laps")    && i+1 < argc) want_laps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--track")   && i+1 < argc) trackname = argv[++i];
         else if (!strcmp(argv[i], "--circuit") && i+1 < argc) { circuit = argv[++i]; explicit_circuit = 1; }
@@ -1694,11 +1695,11 @@ int main(int argc, char **argv) {
     }
     if (resident_drive_audit) {
         /* M151: reuse the --shot headless machinery like daudit does, but with
-           physics driving. shotframes is set very high; the RDA exit logic
-           terminates the loop before the shot timer fires. */
+           physics driving. An explicit --frames bounds a transition sample;
+           otherwise the full RDA/control run owns termination. */
         static char rdashot[1024];
         snprintf(rdashot, sizeof rdashot, "%s_end.png", resident_drive_audit);
-        shot = rdashot; shotframes = 999999;
+        shot = rdashot; if (!shotframes_set) shotframes = 999999;
         capture_policy.fixed_camera = 0;
         capture_policy.freeze_motion = 0;
     }
@@ -3129,6 +3130,7 @@ int main(int argc, char **argv) {
                                             &active_resident->world, NULL)) {
             fprintf(stderr, "world resident: initial GPU/collision build failed\n");
             world_resident_free(active_resident);
+            world_texture_cache_clear();
             return 1;
         }
         world.neighborhood = active_resident->world; /* non-owning active view */
@@ -3162,11 +3164,17 @@ int main(int argc, char **argv) {
             active_resident = NULL;
             memset(&world.neighborhood, 0, sizeof world.neighborhood);
             world_city_free(&world.city);
+            world_texture_cache_clear();
             SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
             return 0;
         }
     } else {
         ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapmode, 2048);
+        if (ntmap < 0) {
+            fprintf(stderr, "world textures: allocation/upload failed\n");
+            world_texture_cache_clear();
+            return 1;
+        }
     }
     printf("track textures bound: %d distinct\n", ntmap);
     GLuint district_light_tex = 0;
@@ -5359,10 +5367,14 @@ int main(int argc, char **argv) {
                     assert(!memcmp(&g_ride, &saved_ride, sizeof g_ride));
                     uint32_t build_end = SDL_GetTicks();
                     printf("resident prepare=%s CPU=%u ms frames-running=%u "
-                           "blocking-finish=%u ms\n", background ? "worker" : "sync",
+                           "blocking-finish=%u ms "
+                           "[validate=%u tex=%u batches=%u collision=%u]\n",
+                           background ? "worker" : "sync",
                            build_timing.neighborhood_ms,
                            background ? resident_wait_frames : 0,
-                           build_end - build_begin);
+                           build_end - build_begin,
+                           build_timing.validate_ms, build_timing.textures_ms,
+                           build_timing.batches_ms, build_timing.collision_ms);
                     printf("resident activated gen=%lu center=(%.0f,%.0f) "
                            "meshes=%d batches=%d textures=%d lights=%d "
                            "obstacles=%d build=%u ms\n",
@@ -8427,6 +8439,7 @@ int main(int argc, char **argv) {
     if (adev) SDL_CloseAudioDevice(adev);
     fed_free(frontend_draw);
     if (controller) SDL_GameControllerClose(controller);
+    world_texture_cache_clear();
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return final_status;
 }

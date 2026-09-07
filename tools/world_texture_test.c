@@ -67,8 +67,10 @@ static void run_case(const char *tracks,const char *masterpath,
             assert(rgba[i*4]==(green?0:255));assert(rgba[i*4+1]==(green?255:0));
             assert(rgba[i*4+2]==0);assert(rgba[i*4+3]==((i&1)?255:0));
         }
-        glDeleteTextures(n,ids);
     }
+    /* Each case rewrites the fixture archives under the same key, so the
+       process-wide texture cache must not survive into the next one. */
+    world_texture_cache_clear();
     /* Only fixture-owned allocations; no production cleanup API added. */
     for(int i=0;i<w->neighborhood.nreg;i++)free(w->neighborhood.rgn[i].tpk.blk);
     free(w->neighborhood.loc4);free(w->neighborhood.master);free(w->neighborhood.mastertpk.blk);free(w->neighborhood.vista.meshes);
@@ -109,7 +111,7 @@ static void test_resident_resource_cleanup(void) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, resources.ordinary[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, 4, pixel, GL_STATIC_DRAW);
     }
-    GLuint texture0 = resources.textures[0];
+    GLuint texture0 = resources.textures[0], texture1 = resources.textures[1];
     GLuint vbo0 = resources.ordinary[0].vbo;
     GLuint ibo0 = resources.ordinary[0].ibo;
     assert(glIsTexture(texture0) && glIsBuffer(vbo0) && glIsBuffer(ibo0));
@@ -120,11 +122,18 @@ static void test_resident_resource_cleanup(void) {
            !resources.obstacle_z && !resources.obstacle_src);
     assert(resources.texture_count == 0 && resources.ordinary_count == 0 &&
            resources.obstacle_count == 0);
-    assert(!glIsTexture(texture0) && !glIsBuffer(vbo0) && !glIsBuffer(ibo0));
+    assert(!glIsBuffer(vbo0) && !glIsBuffer(ibo0));
+    /* World textures are borrowed from the process-wide key cache and shared
+       with the other resident, so freeing one resident must NOT delete them. */
+    assert(glIsTexture(texture0));
+    GLuint own[2] = {texture0, texture1};
+    glDeleteTextures(2, own);   /* this fixture's own, not the cache's */
     world_resident_resources_free(&resources);
 }
 
-static void test_resident_resource_build(const char *region_path) {
+/* Returns the GL name bound for KEY, so the caller can prove a second build
+ * reuses it instead of decoding and uploading the same record again. */
+static GLuint test_resident_resource_build(const char *region_path) {
     WorldNeighborhood neighborhood = {0};
     neighborhood.nreg = 1;
     neighborhood.rgn[0].data = n2_read_file(region_path,
@@ -159,8 +168,28 @@ static void test_resident_resource_build(const char *region_path) {
     assert(resources.ordinary_count > 0 && resources.ordinary[0].vbo &&
            resources.ordinary[0].ibo);
     assert(!neighborhood.rgn[0].data);
+    GLuint bound = resources.textures[0];
     world_resident_resources_free(&resources);
     world_neighborhood_free(&neighborhood);
+    return bound;
+}
+
+static void test_failed_upload_retry(const char *region_path) {
+    N2Mesh mesh={0};mesh.texkey=KEY;
+    for(int attempt=0;attempt<2;attempt++) {
+        World w={0};w.neighborhood.nreg=1;
+        w.neighborhood.scene.meshes=&mesh;w.neighborhood.scene.count=1;
+        WRegion *r=&w.neighborhood.rgn[0];r->mesh1=1;
+        r->data=n2_read_file(region_path,&r->len);assert(r->data);
+        r->tpk=n2_tpk_open(r->data,r->len);
+        uint32_t key=0;GLuint id=0;unsigned char mode=0;
+        if(!attempt)glEnable(0xdeadbeef); /* deterministic GL failure */
+        int n=world_bind_textures(&w,&key,&id,&mode,1);
+        assert(n==(attempt?1:-1));
+        if(attempt)assert(id && glIsTexture(id) && mode==N2_DRAW_BLEND);
+        free(r->tpk.blk);
+    }
+    world_texture_cache_clear();
 }
 
 int main(void) {
@@ -185,7 +214,18 @@ int main(void) {
     write_tpk(common,N2_TEX_SFX_FLARE_GLOWA,0);run_case(tracks,NULL,1,0,2,0);
     write_tpk(common,KEY,0);
     /* Existing region and master matches must win over the common red image. */
-    write_tpk(region,KEY,1);test_resident_resource_build(region);
+    write_tpk(region,KEY,1);
+    test_failed_upload_retry(region);
+    /* A district swap rebuilds the same keys: the second build must reuse the
+       first build's GL name (no re-decode, no re-upload, no second copy in
+       VRAM), and the name must outlive the resident that first requested it
+       until the cache itself is cleared. */
+    GLuint first=test_resident_resource_build(region);
+    assert(glIsTexture(first)); /* verify ownership BEFORE a new name can be reused */
+    GLuint again=test_resident_resource_build(region);
+    assert(first && first==again && glIsTexture(first));
+    world_texture_cache_clear();
+    assert(!glIsTexture(first));
     run_case(tracks,NULL,1,1,0,0);
     write_tpk(region,KEY+1,1);write_tpk(master,KEY,1);run_case(tracks,master,1,1,0,0);
     /* Common in region A must not preempt the existing region-B vista copy. */

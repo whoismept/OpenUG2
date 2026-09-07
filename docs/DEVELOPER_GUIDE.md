@@ -889,8 +889,9 @@ sit outside the loaded neighborhood.
 The instance-driven world keeps one replaceable `WorldResident`. Persistent
 navigation, districts, events and race state stay in `WorldCity`; geometry,
 ground grid, regional texture sources, lights and bounds live in
-`WorldNeighborhood`. `WorldResidentResources` owns the matching GL textures,
-ordinary/sky/glow/vista batches, per-mesh material maps and solid-collision
+`WorldNeighborhood`. `WorldResidentResources` borrows world textures from the
+process-wide texture-key cache and owns its ordinary/sky/glow/vista batches,
+per-mesh material maps and solid-collision
 arrays. Do not cache a scene mesh or batch index outside that package.
 
 Resident replacement is transactional. Normal driving prepares CPU geometry
@@ -922,10 +923,25 @@ The worker owns copied request strings and a zero-initialised candidate.
 Completion is atomically published; the frame thread joins it before validating
 the **current** player pose and calling `world_resident_finish`. Stale results
 are discarded, and shutdown joins any outstanding job before freeing data.
-Texture decode/upload, batches and cleanup still block the frame thread.
+Previously resolved textures and final missing keys are reused across resident
+builds; repeated keys preserve their GL name and authored draw mode. Source
+precedence (region/LOC4/master before common) is unchanged. Residents must not
+delete borrowed textures. `world_texture_cache_clear` releases them on the GL
+thread after all residents are done, before destroying the context. Tests or
+other callers changing source archives in-process must clear the cache first;
+normal track changes re-exec. Allocation/upload failure rejects the candidate,
+not the active resident. The cache retains visited keys for one bundle's run;
+it is not a multi-bundle cache or an eviction system.
+
+New texture decode/upload, batch construction and cleanup still block the frame
+thread. Texture reuse reduces measured stalls but does not establish a bounded
+frame time; amortizing the remaining geometry/upload/free work is separate.
 `--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
 physics paced at approximately 60 Hz; race audits and unpaced captures use the sync
 control. A successful resident swap does not prove continuous ground contact.
+An explicit `--frames N` bounds a resident-drive sample and writes its final
+capture; without it the full route/control-run termination remains unchanged.
+A bounded sample does not claim the full RDA route passed.
 
 `WorldNeighborhood.master` records whether the master resource came from
 `mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only

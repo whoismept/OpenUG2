@@ -223,6 +223,16 @@ void world_ground_grid_free(WGroundGrid *grid);
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                         unsigned char *modes, int cap);
 
+/* The GL names world_bind_textures writes are owned by a process-wide
+ * key -> texture cache, not by the caller: a moving-residency swap re-requests
+ * essentially the same ~1100 keys, and re-decoding/re-uploading them was the
+ * bulk of the frame-thread stall at a district boundary. Callers borrow the
+ * names and must not delete them. Binding returns -1 on allocation/upload
+ * failure; callers must reject that candidate. Releases every cached texture; call it on a
+ * GL thread, and before pointing the loader at different archives in the same
+ * process (a track switch re-execs, so only tests need that). */
+void world_texture_cache_clear(void);
+
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
 /* Which kind of surface the ground query landed on. */
