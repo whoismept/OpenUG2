@@ -71,11 +71,10 @@ static void run_case(const char *tracks,const char *masterpath,
     /* Each case rewrites the fixture archives under the same key, so the
        process-wide texture cache must not survive into the next one. */
     world_texture_cache_clear();
-    /* Only fixture-owned allocations; no production cleanup API added. */
-    for(int i=0;i<w->neighborhood.nreg;i++)free(w->neighborhood.rgn[i].tpk.blk);
-    free(w->neighborhood.loc4);free(w->neighborhood.master);free(w->neighborhood.mastertpk.blk);free(w->neighborhood.vista.meshes);
-    free(w->neighborhood.scene.meshes);free(w->neighborhood.mbb);free(w->city.nav);free(w->city.navcomp);
-    free(w->city.navedge);free(w->city.adjstart);free(w->city.adjlist);free(w->city.navev);free(w->city.navopen);
+    /* The loader activates this owner's grid even for an empty scene. Use the
+     * ownership teardown so later ground queries cannot see a freed grid. */
+    world_neighborhood_free(&w->neighborhood);
+    world_city_free(&w->city);
     free(w);
 }
 
@@ -170,7 +169,20 @@ static GLuint test_resident_resource_build(const char *region_path) {
     assert(!neighborhood.rgn[0].data);
     GLuint bound = resources.textures[0];
     world_resident_resources_free(&resources);
-    world_neighborhood_free(&neighborhood);
+    assert(world_ground_grid_build(&neighborhood.grid,&neighborhood.scene,
+                                   (const float (*)[4])neighborhood.mbb));
+    WorldResident candidate={0};candidate.world=neighborhood;
+    candidate.radius=candidate.world.radius=1400;
+    for(int leave=0;leave<2;leave++) {
+        assert(!world_resident_finish_step(&candidate,1,1,0,1,NULL));
+        assert(candidate.resources.upload && !candidate.resources.ordinary);
+        /* A supported start is insufficient: the last step must reject a
+         * player who has since left this detached candidate's ground. */
+        int status=world_resident_finish_step(&candidate,leave?1e8f:1,1,0,1,NULL);
+        assert(status==(leave?-1:1));
+        world_resident_resources_free(&candidate.resources);
+    }
+    world_neighborhood_free(&candidate.world);
     return bound;
 }
 
@@ -190,6 +202,104 @@ static void test_failed_upload_retry(const char *region_path) {
         free(r->tpk.blk);
     }
     world_texture_cache_clear();
+}
+
+static void assert_same_buffer(GLenum target, GLuint a, GLuint b) {
+    GLint na=0,nb=0;
+    glBindBuffer(target,a);glGetBufferParameteriv(target,GL_BUFFER_SIZE,&na);
+    glBindBuffer(target,b);glGetBufferParameteriv(target,GL_BUFFER_SIZE,&nb);
+    assert(na>0 && na==nb);
+    void *pa=malloc((size_t)na),*pb=malloc((size_t)nb);assert(pa && pb);
+    glBindBuffer(target,a);glGetBufferSubData(target,0,na,pa);
+    glBindBuffer(target,b);glGetBufferSubData(target,0,nb,pb);
+    assert(!memcmp(pa,pb,(size_t)na));free(pa);free(pb);
+}
+
+static void test_sliced_batches(void) {
+    N2Mesh meshes[7]={{0}};N2Scene scene={meshes,7,7};
+    float verts[7][15],bounds[7][4];uint16_t indices[3]={0,1,2};
+    unsigned char colors[7][12],modes[7]={0};
+    GLuint textures[7]={3,3,3,2,3,3,3};int direct_map[7],sliced_map[7];
+    const float triangle[15]={0,0,0,0,0, 4,0,0,1,0, 0,4,0,0,1};
+    for(int i=0;i<7;i++) {
+        memcpy(verts[i],triangle,sizeof triangle);memset(colors[i],i+20,12);
+        for(int v=0;v<3;v++)verts[i][v*5+2]=(float)i;
+        bounds[i][0]=bounds[i][1]=0;bounds[i][2]=bounds[i][3]=4;
+        meshes[i].verts=verts[i];meshes[i].idx=indices;meshes[i].vcol=colors[i];
+        meshes[i].nverts=3;meshes[i].nidx=3;meshes[i].cat=N2_ROAD;
+        meshes[i].texkey=textures[i];meshes[i].mat_exact=i>=2;
+        sliced_map[i]=-99;
+    }
+    meshes[4].cat=N2_SKY;meshes[5].cat=N2_GLOW;modes[6]=N2_DRAW_CUTOUT;
+    N2Batch *direct=NULL,*sliced=NULL;int count=-99;
+    int nd=upload_world_batches(&scene,bounds,textures,0,&direct,NULL,direct_map,modes);
+    assert(nd==4 && direct_map[0]==direct_map[1] && direct_map[2]!=direct_map[0]);
+    assert(direct_map[6]!=direct_map[2] && direct_map[4]==-1 && direct_map[5]==-1);
+    WorldBatchUpload *job=upload_world_batches_begin(&scene,bounds,textures,0,NULL,modes);
+    assert(job && !upload_world_batches_step(&job,0,&sliced,&count,sliced_map));
+    for(int step=1;step<=nd;step++) {
+        assert(upload_world_batches_step(&job,1,&sliced,&count,sliced_map)==(step==nd));
+        if(step<nd) {
+            assert(job && !sliced && count==-99);
+            for(int i=0;i<7;i++)assert(sliced_map[i]==-99);
+        }
+    }
+    assert(!job && count==nd && !memcmp(direct_map,sliced_map,sizeof direct_map));
+    for(int i=0;i<nd;i++) {
+        assert_same_buffer(GL_ARRAY_BUFFER,direct[i].vbo,sliced[i].vbo);
+        assert_same_buffer(GL_ELEMENT_ARRAY_BUFFER,direct[i].ibo,sliced[i].ibo);
+        N2Batch a=direct[i],b=sliced[i];a.vbo=a.ibo=b.vbo=b.ibo=0;
+        assert(!memcmp(&a,&b,sizeof a));
+    }
+    render_batch_array_free(&direct,&nd);render_batch_array_free(&sliced,&count);
+    /* On each partial stage, cancel and prove the latest emitted GL pair died.
+     * Immediate GL failure must also cancel and leave complete outputs alone. */
+    for(int stop=0;stop<4;stop++) {
+        job=upload_world_batches_begin(&scene,bounds,textures,0,NULL,modes);assert(job);
+        GLint vbo=0,ibo=0;
+        for(int step=0;step<stop;step++)
+            assert(!upload_world_batches_step(&job,1,&sliced,&count,NULL));
+        if(stop) {
+            glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&vbo);
+            glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING,&ibo);
+            assert(glIsBuffer((GLuint)vbo) && glIsBuffer((GLuint)ibo));
+        }
+        if(stop==2) {
+            glEnable(0xdeadbeefu);
+            assert(upload_world_batches_step(&job,1,&sliced,&count,NULL)==-1);
+            assert(!job && !sliced && count==0);
+        } else upload_world_batches_cancel(&job);
+        assert(!job && !glIsBuffer((GLuint)vbo) && !glIsBuffer((GLuint)ibo));
+        upload_world_batches_cancel(&job);
+    }
+    assert(glGetError()==GL_NO_ERROR);
+}
+
+static void test_sliced_u16_limit(void) {
+    N2Mesh meshes[3]={{0}};N2Scene scene={meshes,3,3};
+    float bounds[3][4]={{0,0,4,4},{0,0,4,4},{0,0,4,4}};
+    GLuint textures[3]={1,1,1};int map[3],counts[3]={40000,25535,3};
+    uint16_t indices[3][3];
+    for(int i=0;i<3;i++) {
+        meshes[i].nverts=counts[i];meshes[i].nidx=3;meshes[i].cat=N2_ROAD;
+        meshes[i].verts=calloc((size_t)counts[i]*5,sizeof(float));assert(meshes[i].verts);
+        indices[i][0]=0;indices[i][1]=1;indices[i][2]=(uint16_t)(counts[i]-1);
+        meshes[i].idx=indices[i];
+    }
+    WorldBatchUpload *job=upload_world_batches_begin(&scene,bounds,textures,0,NULL,NULL);
+    N2Batch *out=NULL;int count=0;assert(job);
+    assert(!upload_world_batches_step(&job,1,&out,&count,map));
+    assert(upload_world_batches_step(&job,1,&out,&count,map)==1);
+    assert(count==2 && map[0]==map[1] && map[2]!=map[0]);
+    GLint bytes=0;uint16_t packed[6];
+    glBindBuffer(GL_ARRAY_BUFFER,out[map[0]].vbo);
+    glGetBufferParameteriv(GL_ARRAY_BUFFER,GL_BUFFER_SIZE,&bytes);
+    assert(bytes==65535*(int)sizeof(BatchedVertex));
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,out[map[0]].ibo);
+    glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER,0,sizeof packed,packed);
+    assert(packed[2]==39999 && packed[3]==40000 && packed[5]==65534);
+    render_batch_array_free(&out,&count);
+    for(int i=0;i<3;i++)free(meshes[i].verts);
 }
 
 static void test_incremental_retirement(void) {
@@ -240,6 +350,8 @@ int main(void) {
     SDL_Window *win=SDL_CreateWindow("world-texture-test",0,0,32,32,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
     assert(win);SDL_GLContext ctx=SDL_GL_CreateContext(win);assert(ctx);
     test_resident_resource_cleanup();
+    test_sliced_batches();
+    test_sliced_u16_limit();
     test_incremental_retirement();
     /* No regional match: common supplies exact key, RGBA and draw mode once. */
     write_tpk(region,KEY+1,1);write_tpk(common,KEY,0);

@@ -902,8 +902,10 @@ on one worker; `--resident-sync` selects the synchronous diagnostic control:
    candidate without activating its grid or making GL calls.
 3. CPU validation checks finite geometry/index/bounds, zero rejected instances
    and ROAD/TERRAIN support under the current player layer.
-4. `world_resident_resources_build` resolves textures and uploads every pass,
-   then builds collision from that same candidate scene.
+4. Background `world_resident_finish_step` resolves textures, uploads ordinary
+   batches over multiple frames, then builds the remaining passes and collision
+   from that same candidate. `world_resident_resources_build` drains the same
+   upload cursor synchronously for startup/countdown/diagnostics.
 5. At a frame boundary `world_resident_activate` swaps the complete owner and
    activates its ground grid; only then may the former resident be destroyed.
 
@@ -921,8 +923,15 @@ across swaps.
 
 The worker owns copied request strings and a zero-initialised candidate.
 Completion is atomically published; the frame thread joins it before validating
-the **current** player pose and calling `world_resident_finish`. Stale results
-are discarded, and shutdown joins any outstanding job before freeing data.
+the **current** player pose and starting GL-thread finishing. Ordinary uploads
+consume at most 128 complete batches per frame. The exact cell/material/u16
+partition, final texture order and mesh-to-batch mapping are shared with the
+synchronous wrapper. Partial output belongs to an upload cursor, never to the
+active renderer. Before activation, ground support is checked again at the
+player's latest position. Obsolete partial candidates are cancelled; errors
+retain the active owner, and shutdown joins any outstanding job before freeing
+partial uploads and their borrowed CPU scene. Temporary cursor arrays reserve
+up to one entry per source mesh; this is not a byte-level memory cap.
 Previously resolved textures and final missing keys are reused across resident
 builds; repeated keys preserve their GL name and authored draw mode. Source
 precedence (region/LOC4/master before common) is unchanged. Residents must not
@@ -933,9 +942,12 @@ normal track changes re-exec. Allocation/upload failure rejects the candidate,
 not the active resident. The cache retains visited keys for one bundle's run;
 it is not a multi-bundle cache or an eviction system.
 
-New texture decode/upload and batch construction still block the frame thread.
-Texture reuse reduces measured stalls but does not establish a bounded frame
-time; amortizing the remaining geometry/upload work is separate.
+The ordinary-batch quota spreads both CPU packing and GL submission. It is not
+a time deadline: a single large batch/driver call may still stall. Initial new
+texture decode/upload, partition sorting, sky/glow work and final vista/collision
+work remain synchronous. The old complete scene stays active throughout, but
+activation happens later; the route audit replans on activation, so its driving
+trajectory can change. A lower peak step is not proof of better route completion.
 Normal worker-driven swaps retire the old owner in 256 batch/mesh units per
 frame, on the GL thread. This is a work quota, not a hard time deadline. Only
 inactive arrays are consumed; the active render/collision scene is untouched.
@@ -943,13 +955,17 @@ There is one retired slot: a second swap arriving unusually early drains that
 slot synchronously to preserve ownership and activate the new neighborhood on
 time. Synchronous diagnostics/countdown retain immediate destruction. Shutdown
 joins the loader and safely frees any partially retired owner before clearing
-the texture cache/context. New batch construction/upload is still blocking.
+the texture cache/context. Cancellation/backlog draining can still block.
 `--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
 physics paced at approximately 60 Hz; race audits and unpaced captures use the sync
 control. A successful resident swap does not prove continuous ground contact.
 An explicit `--frames N` bounds a resident-drive sample and writes its final
 capture; without it the full route/control-run termination remains unchanged.
 A bounded sample does not claim the full RDA route passed.
+Sliced-drive timing reports distinguish `peak-step` (largest blocking finish
+step including activation) from `total-work` (aggregate finish work across
+frames, excluding inter-frame waiting). Phase totals must not be read as one
+frame's latency. The CPU-worker time is separate from both metrics.
 
 `WorldNeighborhood.master` records whether the master resource came from
 `mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only

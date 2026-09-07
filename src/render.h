@@ -135,6 +135,18 @@ int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                           const GLuint *mtex, GLuint texTerr, N2Batch **out,
                           const char *audit, int *meshbatch,
                           const unsigned char *mtexmode);
+/* Same partition, resumed on the GL thread. Scene and mode arrays are borrowed
+ * and must stay immutable until completion/cancellation. Step returns 0 while
+ * pending, 1 after transferring complete output, or -1 on failure. Pending and
+ * failed steps leave outputs untouched. A quota is not a hard time deadline. */
+typedef struct WorldBatchUpload WorldBatchUpload;
+WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
+                          const float (*mbb)[4], const GLuint *mtex,
+                          GLuint texTerr, const char *audit,
+                          const unsigned char *mtexmode);
+int upload_world_batches_step(WorldBatchUpload **job, int max_batches,
+                          N2Batch **out, int *count, int *meshbatch);
+void upload_world_batches_cancel(WorldBatchUpload **job);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
  * since there are only ever a handful of skybox/neon meshes per city. Sky,

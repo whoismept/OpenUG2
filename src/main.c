@@ -2297,6 +2297,8 @@ int main(int argc, char **argv) {
     WorldResident *active_resident = NULL, *candidate_resident = NULL;
     WorldResident *retired_resident = NULL;
     unsigned retire_frames = 0, retire_peak_ms = 0, retire_total_ms = 0;
+    WResidentBuildTiming candidate_timing = {0};
+    unsigned finish_frames = 0, finish_peak_ms = 0, finish_total_ms = 0;
     const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
     if (world2 && !world2_spawn_set) {
         const char *stem = !strncmp(trackname,"STREAM",6) ? trackname+6 : trackname;
@@ -5257,7 +5259,7 @@ int main(int argc, char **argv) {
         }
 
         /* M154: only CPU/file preparation runs on the single worker. Join before
-           validating/uploading/activating/freeing any resident. The active grid
+           consuming its candidate; GL finishing may span frames. The active grid
            stays immutable while the worker builds its detached grid. Unpaced
            capture/audit runs retain synchronous preparation: their simulated
            time can outrun wall-clock I/O by orders of magnitude. The paced
@@ -5272,6 +5274,15 @@ int main(int argc, char **argv) {
                 world_resident_target(&resident_policy, carpos[0], carpos[1],
                                       active_resident->center[0],
                                       active_resident->center[1], target);
+        int background = race_state != 0 && !raudit && !resident_sync && !resident_route_audit &&
+                         (!shot || (resident_drive_audit && resident_realtime));
+        if (candidate_resident && (!resident_wanted || !background ||
+            candidate_resident->center[0] != target[0] ||
+            candidate_resident->center[1] != target[1])) {
+            printf("resident partial upload discarded: obsolete target\n");
+            world_resident_free(candidate_resident);
+            candidate_resident = NULL;
+        }
         WorldResident *prepared = NULL;
         WResidentBuildTiming prepared_timing = {0};
         if (resident_job) resident_wait_frames++;
@@ -5286,8 +5297,7 @@ int main(int argc, char **argv) {
             prepared_status = 0;
         }
         if (resident_wanted) {
-            if (!candidate_resident &&
-                !(target[0] == failed_resident_cell[0] &&
+            if (!(target[0] == failed_resident_cell[0] &&
                   target[1] == failed_resident_cell[1])) {
                 float saved_pos[3] = {carpos[0], carpos[1], carpos[2]};
                 float saved_vel[2] = {vel[0], vel[1]};
@@ -5298,8 +5308,6 @@ int main(int argc, char **argv) {
                                              active_resident->center[1]};
                 uint32_t build_begin = SDL_GetTicks();
                 WResidentBuildTiming build_timing = {0};
-                int background = race_state != 0 && !raudit && !resident_sync && !resident_route_audit &&
-                                 (!shot || (resident_drive_audit && resident_realtime));
                 int build_status = 0; /* pending is not a failed build */
                 if (!background) {
                     candidate_resident = calloc(1, sizeof *candidate_resident);
@@ -5308,13 +5316,20 @@ int main(int argc, char **argv) {
                                           target[0], target[1],
                                           carpos[0], carpos[1], carpos[2],
                                           &build_timing) ? 1 : -1;
-                } else if (prepared_status) {
-                    candidate_resident = prepared;
-                    prepared = NULL;
-                    build_timing = prepared_timing;
-                    build_status = prepared_status > 0 &&
-                        world_resident_finish(candidate_resident,
-                            carpos[0], carpos[1], carpos[2], &build_timing) ? 1 : -1;
+                } else if (candidate_resident || prepared_status) {
+                    if (!candidate_resident) {
+                        candidate_resident = prepared;
+                        prepared = NULL;
+                        candidate_timing = prepared_timing;
+                        finish_frames = finish_peak_ms = finish_total_ms = 0;
+                    }
+                    build_status = prepared_status < 0 ? -1 :
+                        world_resident_finish_step(candidate_resident,
+                            carpos[0], carpos[1], carpos[2], 128, &candidate_timing);
+                    build_timing = candidate_timing;
+                    unsigned elapsed = SDL_GetTicks() - build_begin;
+                    finish_frames++; finish_total_ms += elapsed;
+                    if (elapsed > finish_peak_ms) finish_peak_ms = elapsed;
                 } else if (!resident_job) {
                     resident_wait_frames = 0;
                     if (!world_resident_job_start(&resident_job, &resident_args,
@@ -5331,6 +5346,7 @@ int main(int argc, char **argv) {
                             active_resident->generation);
                     if(race_state==0) { running=0; final_status=1; }
                 } else if (build_status > 0) {
+                    uint32_t activate_begin = SDL_GetTicks();
                     world_resident_activate(&active_resident,
                                             &candidate_resident);
                     world.neighborhood = active_resident->world;
@@ -5388,13 +5404,20 @@ int main(int argc, char **argv) {
                     assert(g_ride_ready == saved_ride_ready);
                     assert(!memcmp(&g_ride, &saved_ride, sizeof g_ride));
                     uint32_t build_end = SDL_GetTicks();
+                    uint32_t blocking_ms = build_end - build_begin;
+                    if (background) {
+                        finish_total_ms += build_end - activate_begin;
+                        if (finish_peak_ms > blocking_ms) blocking_ms = finish_peak_ms;
+                        printf("resident finish sliced steps=%u total=%u ms peak-step=%u ms\n",
+                               finish_frames, finish_total_ms, blocking_ms);
+                    }
                     printf("resident prepare=%s CPU=%u ms frames-running=%u "
                            "blocking-finish=%u ms "
                            "[validate=%u tex=%u batches=%u collision=%u]\n",
                            background ? "worker" : "sync",
                            build_timing.neighborhood_ms,
                            background ? resident_wait_frames : 0,
-                           build_end - build_begin,
+                           blocking_ms,
                            build_timing.validate_ms, build_timing.textures_ms,
                            build_timing.batches_ms, build_timing.collision_ms);
                     printf("resident activated gen=%lu center=(%.0f,%.0f) "
@@ -5403,12 +5426,12 @@ int main(int argc, char **argv) {
                            active_resident->generation,
                            active_resident->center[0], active_resident->center[1],
                            nm, nbatch, ntmap, world.neighborhood.nlights, nobst,
-                           build_end - build_begin);
+                           blocking_ms);
                     /* M151: record boundary crossing telemetry */
                     if (resident_drive_audit && rda_nswaps < RDA_MAX_SWAPS) {
                         RDASwapRecord *r = &rda_swaps[rda_nswaps];
                         r->frame = rda_frame;
-                        r->wall_ms = build_end - build_begin;
+                        r->wall_ms = blocking_ms; /* peak step for sliced finish */
                         r->old_center[0] = pre_swap_center[0];
                         r->old_center[1] = pre_swap_center[1];
                         r->new_center[0] = active_resident->center[0];
@@ -5435,17 +5458,14 @@ int main(int argc, char **argv) {
                             if (meshbatch[j] < -1 || meshbatch[j] >= nbatch) inv_batch++;
                         r->invalid_batch = inv_batch;
                         r->invalid_src = inv_src;
-                        r->t_total = build_end - build_begin;
+                        r->t_total = background ? finish_total_ms : build_end - build_begin;
                         r->t_neighborhood = build_timing.neighborhood_ms;
                         r->t_cpu_background = background ? build_timing.neighborhood_ms : 0;
                         r->t_validate = build_timing.validate_ms;
                         r->t_textures = build_timing.textures_ms;
                         r->t_batches = build_timing.batches_ms;
                         r->t_collision = build_timing.collision_ms;
-                        uint32_t measured_blocking = build_timing.total_ms -
-                            (background ? build_timing.neighborhood_ms : 0);
-                        r->t_activate = r->t_total > measured_blocking
-                                      ? r->t_total - measured_blocking : 0;
+                        r->t_activate = build_end - activate_begin;
                         r->max_pos_delta = 0; r->max_z_delta = 0; r->max_cam_delta = 0;
                         r->walls_near = 0; r->rails_near = 0;
                         /* track visited center */
@@ -5455,14 +5475,14 @@ int main(int argc, char **argv) {
                             rda_visited_n++;
                         }
                         rda_nswaps++;
-                        printf("RDA SWAP %d: frame=%ld build=%u ms "
+                        printf("RDA SWAP %d: frame=%ld peak-step=%u ms total-work=%u ms "
                                "[neigh=%u valid=%u tex=%u batch=%u coll=%u act=%u] "
                                "old=(%.0f,%.0f) new=(%.0f,%.0f) gen=%lu "
                                "player=(%.3f,%.3f,%.3f) speed=%.1f km/h "
                                "grounded=%d contact=0x%x "
                                "meshes=%d batches=%d textures=%d obstacles=%d "
                                "inv_batch=%d inv_src=%d\n",
-                               rda_nswaps, rda_frame, r->t_total,
+                               rda_nswaps, rda_frame, r->wall_ms, r->t_total,
                                r->t_neighborhood, r->t_validate, r->t_textures,
                                r->t_batches, r->t_collision, r->t_activate,
                                r->old_center[0], r->old_center[1],
@@ -8187,7 +8207,7 @@ int main(int argc, char **argv) {
             /* Track frame time for longest-frame detection */
             uint32_t rda_ft1 = SDL_GetTicks();
             uint32_t frame_ms = rda_ft1 - rda_ft0;
-            /* The real stall is in the build, which we already timed in t_total.
+            /* The build's peak step and aggregate work are timed separately.
                Also track the render frame for completeness. */
             if (rda_control_mode) {
                 if (frame_ms > rda_control_longest_ms)
@@ -8270,10 +8290,10 @@ int main(int argc, char **argv) {
                 printf("\nSTALL BREAKDOWN:\n");
                 for (int si = 0; si < rda_nswaps; si++) {
                     RDASwapRecord *rs = &rda_swaps[si];
-                    printf("  swap %d: blocking=%u ms  cpu-background=%u "
+                    printf("  swap %d: peak-step=%u ms total-work=%u ms cpu-background=%u "
                            "cpu-blocking=%u validate=%u "
                            "textures=%u batches=%u collision=%u activate=%u\n",
-                           si+1, rs->t_total, rs->t_cpu_background,
+                           si+1, rs->wall_ms, rs->t_total, rs->t_cpu_background,
                            rs->t_neighborhood - rs->t_cpu_background,
                            rs->t_validate, rs->t_textures, rs->t_batches,
                            rs->t_collision, rs->t_activate);

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 #include "physics.h"
 
@@ -103,6 +104,7 @@ int world_resident_route_point(const WResidentPolicy *policy,
 
 void world_resident_resources_free(WorldResidentResources *resources) {
     if (!resources) return;
+    upload_world_batches_cancel(&resources->upload);
     /* World textures belong to the process-wide key cache in world.c and are
        shared with every other resident: this array only borrows them. The
        grass upload is this build's own, so it is still released here. */
@@ -144,7 +146,8 @@ static int resident_vista_batches(WorldResidentResources *resources,
         N2Batch *part = NULL;
         int count = upload_cat_batches(&one, one.meshes[0].cat,
                                        &texture, &part, NULL);
-        if (count <= 0) { free(part); continue; }
+        if (count < 0) return 0;
+        if (!count) { free(part); continue; }
         int total = resources->vista_count + count;
         N2Batch *batches = (N2Batch *)realloc(
             resources->vista, (size_t)total * sizeof *batches);
@@ -173,74 +176,90 @@ static uint32_t wrb_ms(struct timespec *a, struct timespec *b) {
                       (b->tv_nsec - a->tv_nsec) / 1000000);
 }
 
-int world_resident_resources_build(WorldResidentResources *resources,
+static int resident_resources_step(WorldResidentResources *resources,
                                    WorldNeighborhood *neighborhood,
+                                   int max_batches,
                                    WResidentBuildTiming *timing) {
     if (!resources || !neighborhood || neighborhood->scene.count <= 0 ||
-        !neighborhood->scene.meshes || !neighborhood->mbb) return 0;
-    world_resident_resources_free(resources);
-    while (glGetError() != GL_NO_ERROR) {}
+        !neighborhood->scene.meshes || !neighborhood->mbb) return -1;
     struct timespec rt0, rt1;
-
     int mesh_count = neighborhood->scene.count;
-    int texture_cap = mesh_count + neighborhood->vista.count +
-                      (neighborhood->nlights > 0 ? 1 : 0);
-    if (texture_cap <= 0) texture_cap = 1;
-    resources->texture_keys = (uint32_t *)calloc(
-        (size_t)texture_cap, sizeof *resources->texture_keys);
-    resources->textures = (GLuint *)calloc(
-        (size_t)texture_cap, sizeof *resources->textures);
-    resources->texture_modes = (unsigned char *)calloc(
-        (size_t)texture_cap, sizeof *resources->texture_modes);
-    resources->mesh_textures = (GLuint *)calloc(
-        (size_t)mesh_count, sizeof *resources->mesh_textures);
-    resources->mesh_modes = (unsigned char *)calloc(
-        (size_t)mesh_count, sizeof *resources->mesh_modes);
-    resources->mesh_batch = (int *)malloc(
-        (size_t)mesh_count * sizeof *resources->mesh_batch);
-    if (!resources->texture_keys || !resources->textures ||
-        !resources->texture_modes || !resources->mesh_textures ||
-        !resources->mesh_modes || !resources->mesh_batch) goto fail;
-    resources->mesh_count = mesh_count;
 
-    if (timing) clock_gettime(CLOCK_MONOTONIC, &rt0);
-    World facade;
-    memset(&facade, 0, sizeof facade);
-    facade.neighborhood = *neighborhood;
-    resources->texture_count = world_bind_textures(
-        &facade, resources->texture_keys, resources->textures,
-        resources->texture_modes, texture_cap);
-    *neighborhood = facade.neighborhood;
-    if (resources->texture_count < 0) goto fail;
-    for (int i = 0; i < resources->texture_count; i++)
-        if (!resources->textures[i]) goto fail;
+    if (!resources->mesh_count) {
+        while (glGetError() != GL_NO_ERROR) {}
+        int texture_cap = mesh_count + neighborhood->vista.count +
+                          (neighborhood->nlights > 0 ? 1 : 0);
+        if (texture_cap <= 0) texture_cap = 1;
+        resources->texture_keys = (uint32_t *)calloc(
+            (size_t)texture_cap, sizeof *resources->texture_keys);
+        resources->textures = (GLuint *)calloc(
+            (size_t)texture_cap, sizeof *resources->textures);
+        resources->texture_modes = (unsigned char *)calloc(
+            (size_t)texture_cap, sizeof *resources->texture_modes);
+        resources->mesh_textures = (GLuint *)calloc(
+            (size_t)mesh_count, sizeof *resources->mesh_textures);
+        resources->mesh_modes = (unsigned char *)calloc(
+            (size_t)mesh_count, sizeof *resources->mesh_modes);
+        resources->mesh_batch = (int *)malloc(
+            (size_t)mesh_count * sizeof *resources->mesh_batch);
+        if (!resources->texture_keys || !resources->textures ||
+            !resources->texture_modes || !resources->mesh_textures ||
+            !resources->mesh_modes || !resources->mesh_batch) goto fail;
+        resources->mesh_count = mesh_count;
 
-    for (int i = 0; i < mesh_count; i++) {
-        resources->mesh_batch[i] = -1;
-        for (int j = 0; j < resources->texture_count; j++)
-            if (resources->texture_keys[j] == neighborhood->scene.meshes[i].texkey) {
-                resources->mesh_textures[i] = resources->textures[j];
-                resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
-                    &neighborhood->scene.meshes[i], resources->texture_modes[j]);
-                break;
-            }
+        if (timing) clock_gettime(CLOCK_MONOTONIC, &rt0);
+        World facade;
+        memset(&facade, 0, sizeof facade);
+        facade.neighborhood = *neighborhood;
+        resources->texture_count = world_bind_textures(
+            &facade, resources->texture_keys, resources->textures,
+            resources->texture_modes, texture_cap);
+        *neighborhood = facade.neighborhood;
+        if (resources->texture_count < 0) goto fail;
+        for (int i = 0; i < resources->texture_count; i++)
+            if (!resources->textures[i]) goto fail;
+
+        for (int i = 0; i < mesh_count; i++) {
+            resources->mesh_batch[i] = -1;
+            for (int j = 0; j < resources->texture_count; j++)
+                if (resources->texture_keys[j] == neighborhood->scene.meshes[i].texkey) {
+                    resources->mesh_textures[i] = resources->textures[j];
+                    resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
+                        &neighborhood->scene.meshes[i], resources->texture_modes[j]);
+                    break;
+                }
+        }
+        if (neighborhood->have_grass)
+            resources->terrain_texture = upload_tex(&neighborhood->grass);
+        if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
+                      timing->textures_ms = wrb_ms(&rt0, &rt1); rt0 = rt1; }
+
+        Uint64 batch_begin = SDL_GetPerformanceCounter();
+        resources->sky_count = upload_cat_batches(
+            &neighborhood->scene, N2_SKY, resources->mesh_textures,
+            &resources->sky, NULL);
+        resources->glow_count = upload_cat_batches(
+            &neighborhood->scene, N2_GLOW, resources->mesh_textures,
+            &resources->glow, NULL);
+        if (resources->sky_count < 0 || resources->glow_count < 0) goto fail;
+        resources->upload = upload_world_batches_begin(
+            &neighborhood->scene, (const float (*)[4])neighborhood->mbb,
+            resources->mesh_textures, resources->terrain_texture,
+            NULL, resources->mesh_modes);
+        if (!resources->upload) goto fail;
+        resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+        return 0; /* keep texture/partition work separate from ordinary uploads */
     }
-    if (neighborhood->have_grass)
-        resources->terrain_texture = upload_tex(&neighborhood->grass);
-    if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
-                  timing->textures_ms = wrb_ms(&rt0, &rt1); rt0 = rt1; }
 
-    resources->sky_count = upload_cat_batches(
-        &neighborhood->scene, N2_SKY, resources->mesh_textures,
-        &resources->sky, NULL);
-    resources->glow_count = upload_cat_batches(
-        &neighborhood->scene, N2_GLOW, resources->mesh_textures,
-        &resources->glow, NULL);
-    resources->ordinary_count = upload_world_batches(
-        &neighborhood->scene, (const float (*)[4])neighborhood->mbb,
-        resources->mesh_textures, resources->terrain_texture,
-        &resources->ordinary, NULL, resources->mesh_batch,
-        resources->mesh_modes);
+    Uint64 batch_begin = SDL_GetPerformanceCounter();
+    int uploaded = upload_world_batches_step(&resources->upload, max_batches,
+                        &resources->ordinary, &resources->ordinary_count,
+                        resources->mesh_batch);
+    if (uploaded < 0) goto fail;
+    if (!uploaded) {
+        resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+        return 0;
+    }
     if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
     if (!resident_vista_batches(resources, neighborhood)) goto fail;
 
@@ -254,8 +273,12 @@ int world_resident_resources_build(WorldResidentResources *resources,
             (uint32_t)resources->ordinary[i].index_count;
         resources->debug_batches[i].chunk_id = (uint32_t)i;
     }
-    if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
-                  timing->batches_ms = wrb_ms(&rt0, &rt1); rt0 = rt1; }
+    resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+    if (timing) {
+        timing->batches_ms = (uint32_t)(resources->batch_ticks * 1000 /
+                                       SDL_GetPerformanceFrequency());
+        clock_gettime(CLOCK_MONOTONIC, &rt0);
+    }
 
     int obstacle_cap = mesh_count;
     resources->obstacles = (float (*)[4])calloc(
@@ -276,7 +299,17 @@ int world_resident_resources_build(WorldResidentResources *resources,
 
 fail:
     world_resident_resources_free(resources);
-    return 0;
+    return -1;
+}
+
+int world_resident_resources_build(WorldResidentResources *resources,
+                                   WorldNeighborhood *neighborhood,
+                                   WResidentBuildTiming *timing) {
+    world_resident_resources_free(resources);
+    int status;
+    do { status = resident_resources_step(resources, neighborhood, INT_MAX, timing); }
+    while (!status);
+    return status > 0;
 }
 
 int world_resident_validate_cpu(const WorldResident *resident,
@@ -360,6 +393,28 @@ int world_resident_finish(WorldResident *candidate, float x, float y, float z,
                     timing->validate_ms + timing->textures_ms +
                     timing->batches_ms + timing->collision_ms;
     return 1;
+}
+
+int world_resident_finish_step(WorldResident *candidate, float x, float y, float z,
+                               int max_batches, WResidentBuildTiming *timing) {
+    if (!candidate || max_batches <= 0) return -1;
+    if (!candidate->resources.mesh_count) {
+        Uint64 begin = SDL_GetPerformanceCounter();
+        if (!world_resident_validate_cpu(candidate, x, y, z)) return -1;
+        if (timing) timing->validate_ms = (uint32_t)(
+            (SDL_GetPerformanceCounter() - begin) * 1000 / SDL_GetPerformanceFrequency());
+    }
+    int status = resident_resources_step(&candidate->resources, &candidate->world,
+                                         max_batches, timing);
+    if (status > 0) {
+        WGroundHit hit;
+        if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
+            world_ground_hit(&candidate->world.scene, x, y, z, &hit) == WSURF_NONE)
+            return -1;
+        if (timing) timing->total_ms = timing->neighborhood_ms + timing->validate_ms +
+                timing->textures_ms + timing->batches_ms + timing->collision_ms;
+    }
+    return status;
 }
 
 int world_resident_build(WorldResident *candidate,

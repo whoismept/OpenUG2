@@ -43,6 +43,8 @@ typedef struct {
     float (*obstacle_z)[2];
     int *obstacle_src;
     int obstacle_count;
+    WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
+    uint64_t batch_ticks;      /* aggregate across sliced GL-thread work */
 } WorldResidentResources;
 
 /* Optional build timing output (M151). Pass NULL to skip. */
@@ -92,6 +94,11 @@ int world_resident_prepare(WorldResident *candidate, const WResidentBuildArgs *a
                            WResidentBuildTiming *timing);
 int world_resident_finish(WorldResident *candidate, float x, float y, float z,
                           WResidentBuildTiming *timing);
+/* Background finish: 0 pending, 1 complete, -1 failed. Retains partial resources
+ * in candidate; free safely on cancellation. Check CURRENT support on the last
+ * step as well as validating the detached scene before the first upload. */
+int world_resident_finish_step(WorldResident *candidate, float x, float y, float z,
+                          int max_batches, WResidentBuildTiming *timing);
 
 /* Single-loader contract: while a job is outstanding, do not invoke another
  * neighborhood/instance load or activate/free the active ground grid. Rendering
