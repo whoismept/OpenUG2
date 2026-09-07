@@ -25,8 +25,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/frontend/frontend.c src/frontend/frontend_draw.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/frontend/frontend.h src/frontend/frontend_draw.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -62,7 +62,7 @@ build/debugui.o: src/debugui.cpp src/debug.h
 
 DBG_OBJ := $(SRC:src/%.c=build/%.dbg.o)
 build/%.dbg.o: src/%.c $(HDRS) $(GEN)
-	@mkdir -p build
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DDEBUG_UI -c $< -o $@
 
 debug: $(DBG_OBJ) $(IMGUI_OBJ)
@@ -88,6 +88,16 @@ world-resident-test: tools/world_resident_test.c src/world_resident.c src/world.
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DWORLD_RESIDENT_TESTING -Isrc tools/world_resident_test.c src/world_resident.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/world_resident_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/world_resident_test
 
+district-collision-test: tools/district_collision_test.c src/physics.c src/physics.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/district_collision_test.c src/physics.c -o build/district_collision_test -lm
+	./build/district_collision_test
+
+ground-motion-test: tools/ground_motion_test.c src/ground_motion.h src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ground_motion_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ground_motion_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/ground_motion_test
+
 world-group-test: tools/world_group_test.c src/world_group_reader.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_test.c -o build/world_group_test
@@ -96,6 +106,10 @@ world-group-test: tools/world_group_test.c src/world_group_reader.h
 world-group-audit: tools/world_group_audit.c src/world_group_reader.h src/world_scenery.h src/world_instance.c src/world_instance.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_audit.c -o build/world_group_audit -lm
+
+route-membership-audit: tools/m160_route_audit.c src/world_group_reader.h src/world_scenery.h src/world_instance.c src/world_instance.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) tools/m160_route_audit.c -o build/m160_route_audit -lm
 
 light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	@mkdir -p build
@@ -139,11 +153,11 @@ world-cli-test: nfsu2
 	if test $$spawn_missing -eq 2 && test $$heading_missing -eq 2 && \
 	   test $$spawn_bad -eq 2 && test $$heading_bad -eq 2 && \
 	   test $$scenery_missing -eq 2 && test $$scenery_bad -eq 2 && \
-	   test $$scenery_legacy -eq 2 && test $$scenery_live -eq 2 && \
+	   test $$scenery_legacy -eq 1 && test $$scenery_live -eq 2 && \
 	   test $$scenery_spawn -eq 2 && test $$scenery_stack -eq 2 && \
-	   test $$world2_load_fail -eq 1 && test $$resident_legacy -eq 2 && \
+	   test $$world2_load_fail -eq 1 && test $$resident_legacy -eq 1 && \
 	   test $$resident_all -eq 2 && test $$resident_race -eq 2 && \
-	   test $$resident_valid -eq 1 && test $$resident_route_legacy -eq 2 && \
+	   test $$resident_valid -eq 1 && test $$resident_route_legacy -eq 1 && \
 	   test $$resident_route_race -eq 2 && test $$resident_route_valid -eq 1; then \
 	  echo "world_cli_test: PASS"; \
 	else \
@@ -163,4 +177,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test light-state-test world-texture-test world-group-test world-group-audit
+.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test light-state-test world-texture-test world-group-test world-group-audit

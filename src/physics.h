@@ -144,11 +144,13 @@ typedef struct {
 
 /* One frame of support, gathered by the caller from the world. ax/ay are the
  * wheel offsets in body space (+x forward, +y left); the integrator re-centres
- * them on their own centroid so a car at rest generates exactly zero torque. */
+ * them on their own centroid so a car at rest generates exactly zero torque.
+ * Initialise vz for every wheel; zero means a stationary support height. */
 typedef struct {
     float z[4];      /* world support height under each wheel, m */
     int   valid[4];  /* 1 = reachable support this frame          */
     float ax[4], ay[4];
+    float vz[4];     /* support-height rate along wheel XY motion, m/s; 0 at rest */
 } PhysRideSupport;
 
 /* Static equilibrium on the given support. Solves heave, pitch and roll from
@@ -162,6 +164,11 @@ void phys_ride_init(PhysRideState *r, const PhysRideSupport *s);
 /* Downward contact reach for the NEXT gather: droop plus the distance the body
  * falls during one step, so a fast landing cannot tunnel past a floor. */
 float phys_ride_reach_down(const PhysRideState *r, float dt);
+/* Height rate on the selected static face. vel is resolved XY metres/tick;
+ * headings include accepted yaw only. Positional collision pushes are not
+ * velocity. No previous-face heights are differenced across seams/layers. */
+float phys_ride_support_vz(const float normal[3], const float vel[2],
+                          float old_heading, float heading, float ax, float ay, float dt);
 /* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
 /* World Z of wheel k's contact point under the current body pose. */
@@ -185,7 +192,9 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
  *
  * scene/src (optional, NULL to skip) turn the rect into a broad phase only: a
  * hit is confirmed against the SOURCE MESH's own geometry -- some near-vertical
- * face within r in XY whose height span overlaps the car. The stored rect is the
+ * face clipped to the car's Z interval and then within r in XY. Testing just
+ * the face's Z bounds is insufficient: an upper edge can project near the car
+ * even when the face at car height is metres away. The stored rect is the
  * mesh's full XY extent at every height, which is not the building's footprint
  * (measured: XB_HTECHTOWERQ_1B_00 occupies 37% of its 40x50 m rect, and its
  * nearest wall face to the pinned car was 5.6 m away and 42 m up). Same
@@ -199,9 +208,9 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
 typedef struct {
     int   mesh, tri;      /* source mesh and triangle that owns the feature   */
     float cx, cy;         /* closest point on that feature, XY                */
-    float nx, ny;         /* unit XY normal, closest point -> car centre      */
-    float dist;           /* XY distance from the car centre to it            */
-    float pen;            /* r - dist, the depth to resolve                   */
+    float nx, ny;         /* unit XY normal, feature -> circle/capsule axis   */
+    float dist;           /* closest XY distance to the shape's axis          */
+    float pen;            /* separating depth; r-dist unless axis straddles   */
     float span;           /* union vertical span of this mesh's contacting
                              faces: a 0.10 m seam is not a wall              */
 } PhysWallContact;
@@ -227,6 +236,19 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
                   PhysWallContact *log, int maxlog);
+/* Player wall footprint: an oriented capsule derived from body-local bounds
+ * [minX,minY,minZ,maxX,maxY,maxZ]. Same face clipping/normal response as the
+ * circle API; length and width are independent. No angular impulse or CCD.
+ * Missing body/scene data preserves the old 1.3m circle fallback. */
+int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog);
+/* Resolve one mesh's near-vertical faces against the same body capsule. The
+ * face-height range lets the road system admit low rails while rejecting both
+ * surface seams and tall terrain walls. */
+int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6],
+        float z0,float z1,const N2Scene *scene,int mesh,float face_min,
+        float face_max,PhysWallContact *contact);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 

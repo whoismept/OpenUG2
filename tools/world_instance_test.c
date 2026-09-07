@@ -15,6 +15,7 @@
  * normal translation unit is still linked by the Makefile; rename only its
  * public functions in this isolated copy and expose its private helpers here. */
 #define winst_parse_regions winst_parse_regions_test_copy
+#define winst_default_focus winst_default_focus_test_copy
 #define winst_free_regions winst_free_regions_test_copy
 #define winst_select_regions winst_select_regions_test_copy
 #define winst_decode_placement winst_decode_placement_test_copy
@@ -35,6 +36,7 @@
 #undef winst_select_regions
 #undef winst_free_regions
 #undef winst_parse_regions
+#undef winst_default_focus
 
 /* Test-only observation hook; it is deliberately not part of world_instance.h. */
 long winst_test_placement_live_allocations(void);
@@ -68,6 +70,12 @@ static int near(float a, float b) {
 static int close3(const float *v, float x, float y, float z) {
     return near(v[0], x) && near(v[1], y) && near(v[2], z);
 }
+
+static void make_instance_record(unsigned char record[64], int type,
+                                 float x0, float y0, float x1, float y1);
+static long add_section(unsigned char *buf, long pos, int region_id,
+                        const char *type_name,
+                        const unsigned char *placements, int placement_count);
 
 static void free_scene(N2Scene *scene) {
     for (int i = 0; i < scene->count; i++) {
@@ -135,6 +143,24 @@ static void test_regions(void) {
     nr = 0;
     assert(winst_parse_regions(buf, used - 1, &r, &nr) == 0);
     assert(r == NULL && nr == 0);
+}
+
+static void test_default_focus_uses_a_region_present_in_stream(void) {
+    unsigned char companion[256], stream[512], placement[64];
+    long companion_len = make_regions(companion, sizeof companion);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+
+    long stream_len = add_section(stream, 0, 17, "XO_HOME", placement, 1);
+    float focus[2] = {99.0f, 99.0f};
+    assert(winst_default_focus(companion, companion_len, stream, stream_len,
+                               focus) == 1);
+    assert(near(focus[0], 0.0f) && near(focus[1], 0.0f));
+
+    stream_len = add_section(stream, 0, 23, "XO_FOREIGN", placement, 1);
+    focus[0] = focus[1] = 99.0f;
+    assert(winst_default_focus(companion, companion_len, stream, stream_len,
+                               focus) == 0);
+    assert(near(focus[0], 99.0f) && near(focus[1], 99.0f));
 }
 
 static void test_placement(void) {
@@ -638,6 +664,66 @@ static long fixture_group(unsigned char *dst, const char *name,
     return size;
 }
 
+/* Selection may hide trackside dressing; it must never remove the ground.
+ * Road and terrain meshes reach the scene through winst_place_ground_prototypes,
+ * which runs over the model library before the section walk and takes no
+ * selection, and winst_build_visit then skips every ROAD/TERRAIN mesh. Delete
+ * either half and a raced event opens a hole in the world.
+ *
+ * This matters on real data (M161): 1292 authored placements across 17 L4RB and
+ * L4RC events carry road-named prototypes (TRN_ROADpiece*, TRN_ROADskid*) and
+ * are exclusive to one event's group, so a sibling event's selection does hide
+ * those placements. It stays safe only because of the two rules above. */
+static void test_selection_never_hides_ground(void) {
+    const char *root="build/world_instance_ground_fixture";
+    const char *cp="build/world_instance_ground_fixture/L4RA.BUN";
+    const char *sp="build/world_instance_ground_fixture/STREAML4RA.BUN";
+    assert(mkdir(root,0777)==0 || errno==EEXIST);
+    unsigned char companion[1024],stream[8192],roads[2*64],walls[2*64],ov[24]={0},groups[256];
+    long clen=make_regions(companion,sizeof companion), glen=0;
+    /* override 0: a ROAD-classified placement, exclusive to event 7
+       override 1: a wall placement, exclusive to event 7
+       override 2: a wall placement, exclusive to event 8 */
+    const unsigned g7[]={0,1}, g8[]={2};
+    glen+=fixture_group(groups+glen,"BARRIERS_7",g7,2);
+    glen+=fixture_group(groups+glen,"BARRIERS_8",g8,1);
+    const unsigned sec[]={17,23,23}, row[]={0,0,1};
+    for(int i=0;i<3;i++){put_u16(ov+8*i,sec[i]);put_u16(ov+8*i+2,row[i]);put_u16(ov+8*i+6,1);}
+    clen=add_leaf(companion,clen,0x34107,ov,sizeof ov);
+    clen=add_leaf(companion,clen,0x34108,groups,glen);
+    assert(write_fixture_file(cp,companion,clen));
+
+    /* "ROAD" in the authored name is what n2_mesh_category keys on. */
+    long slen=add_keyed_model(stream,0,"XB_ROADSLAB",0x11112222,4);
+    slen=add_keyed_model(stream,slen,"XB_WALLPANEL",0x33334444,4);
+    for(int i=0;i<2;i++){
+        make_instance_record(roads+64*i,0,(float)(i*4-8),-4,(float)(i*4-4),-2);
+        make_instance_record(walls+64*i,0,(float)(i*4+0),2,(float)(i*4+4),4);
+    }
+    slen=add_section(stream,slen,17,"XB_ROADSLAB",roads,2);
+    slen=add_section(stream,slen,23,"XB_WALLPANEL",walls,2);
+    assert(write_fixture_file(sp,stream,slen));
+
+    const char *bundles[]={"STREAML4RA"};
+    /* event, total meshes, placements the selection hides */
+    const struct {int event,count;long hidden;} cases[]={{0,3,0},{7,2,1},{8,2,2}};
+    for(int i=0;i<3;i++){
+        N2Scene scene={0},vista={0};WInstStats stats;
+        assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
+        assert(scene.count==cases[i].count && vista.count==0);
+        assert(stats.scenery_hidden==cases[i].hidden);
+        assert(stats.scenery_effective==cases[i].event);
+        int nroad=0;
+        for(int j=0;j<scene.count;j++)
+            if(scene.meshes[j].cat==N2_ROAD||scene.meshes[j].cat==N2_TERRAIN)nroad++;
+        /* The invariant. Event 8 hides the road-named placement itself, yet the
+           drivable mesh is still there, placed once from the library. */
+        assert(nroad==1);
+        free_scene(&scene);free_scene(&vista);
+    }
+    remove(cp);remove(sp);rmdir(root);
+}
+
 /* Missing event filtering used to emit every race's props; filtering by model
  * name instead would also remove the identically named ordinary neighbors. */
 static void test_scenery_event_assembly(void) {
@@ -675,6 +761,9 @@ static void test_scenery_event_assembly(void) {
         N2Scene scene={0},vista={0};WInstStats stats;
         assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
         assert(scene.count==cases[i].count && vista.count==0);
+        /* An authored request is reported back unchanged; only an unauthored
+         * one degrades, so a diagnostic can never claim a filter that did not run. */
+        assert(stats.scenery_effective==cases[i].event);
         unsigned seen=0;
         for(int j=0;j<scene.count;j++){
             int row=(int)lroundf(scene.meshes[j].verts[0]/10);
@@ -695,9 +784,28 @@ static void test_scenery_event_assembly(void) {
         free_scene(&scene);free_scene(&vista);
     }
     N2Scene scene={0},vista={0};WInstStats stats;
-    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,999));
-    assert(!scene.count&&!vista.count);
+    /* M160: a positive id this bundle does not author is an authoring fact,
+     * not a corrupt table. It degrades to the unfiltered scene so a raceable
+     * event with no group of its own still loads; nothing is hidden and the
+     * event-preview accounting stays at zero. Compare 999 with case {0,5,31}
+     * above: same mesh count, same rows, same wall set. */
+    assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,999));
+    assert(scene.count==5 && vista.count==0 && stats.scenery_hidden==0);
+    assert(stats.scenery_effective==0);   /* degraded, and reported as degraded */
+    {   unsigned seen=0;
+        for(int j=0;j<scene.count;j++){
+            int row=(int)lroundf(scene.meshes[j].verts[0]/10);
+            assert(row>=0&&row<5);seen|=1u<<row;
+        }
+        assert(seen==31u);
+    }
+    free_scene(&scene);free_scene(&vista);
+    memset(&scene,0,sizeof scene);memset(&vista,0,sizeof vista);
+    /* Out-of-contract ids and corrupt tables still fail closed. */
     assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,-2));
+    assert(!scene.count&&!vista.count);
+    assert(!world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,10,NULL,0,&stats,65536));
+    assert(!scene.count&&!vista.count);
     /* Every override is checked, including row 4 outside this local view.
      * Bad row, missing section, stale flags and duplicate targets fail atomically. */
     for(int badcase=0;badcase<4;badcase++) {
@@ -1006,11 +1114,148 @@ static void test_world2_capture_policy(void) {
     assert(!legacy_static.freeze_motion);
 }
 
+/* M150 regression: "start" means the selected STREAM bundle's authored
+   focus, not a hard-coded L4RA coordinate. Explicit X,Y remains an override. */
+static void test_world_spawn_policy(void) {
+    float xy[2] = {-99.0f, -99.0f};
+    assert(world_spawn_parse("start", xy) == WORLD_SPAWN_AUTHORED);
+    assert(xy[0] == -99.0f && xy[1] == -99.0f);
+    assert(world_spawn_parse("12.5,-7.25", xy) == WORLD_SPAWN_EXPLICIT);
+    assert(fabsf(xy[0] - 12.5f) < 0.001f);
+    assert(fabsf(xy[1] + 7.25f) < 0.001f);
+    assert(world_spawn_parse("12.5,-7.25junk", xy) == WORLD_SPAWN_INVALID);
+    assert(world_spawn_parse(NULL, xy) == WORLD_SPAWN_INVALID);
+}
+
+static long add_common_material_model_named(unsigned char *buf, long pos,
+                                            uint32_t model_key,
+                                            uint32_t slot0, uint32_t slot1,
+                                            const char *name) {
+    unsigned char header[8 + 192], slots[16], subs[120];
+    unsigned char verts[72], indices[12];
+    memset(header, 0, sizeof header); memset(header, 0x11, 8);
+    memset(slots, 0, sizeof slots); memset(subs, 0, sizeof subs);
+    memset(verts, 0, sizeof verts); memset(indices, 0, sizeof indices);
+    put_u32(header + 8 + 0x10, model_key);
+    for (int i = 0; i < 16; i++)
+        put_f32(header + 8 + 0x40 + i * 4, i % 5 == 0 ? 1.0f : 0.0f);
+    snprintf((char *)header + 8 + 0xa4,
+             sizeof header - (8 + 0xa4), "%s", name);
+    put_u32(slots, slot0); put_u32(slots + 8, slot1);
+    put_u32(subs + 12, 3); put_u32(subs + 28, 0); put_u32(subs + 52, 0);
+    put_u32(subs + 60 + 12, 3); put_u32(subs + 60 + 28, 1);
+    put_u32(subs + 60 + 52, 3);
+    put_f32(verts + 24, 1.0f); put_f32(verts + 48 + 4, 1.0f);
+    put_u16(indices, 0); put_u16(indices + 2, 1); put_u16(indices + 4, 2);
+    put_u16(indices + 6, 0); put_u16(indices + 8, 2); put_u16(indices + 10, 1);
+    long start = pos; pos += 8;
+    pos = add_leaf(buf, pos, 0x00134011ul, header, sizeof header);
+    pos = add_leaf(buf, pos, 0x00134012ul, slots, sizeof slots);
+    pos = add_leaf(buf, pos, 0x00134b02ul, subs, sizeof subs);
+    pos = add_leaf(buf, pos, 0x00134b01ul, verts, sizeof verts);
+    pos = add_leaf(buf, pos, 0x00134b03ul, indices, sizeof indices);
+    put_u32(buf + start, 0x80134010ul);
+    put_u32(buf + start + 4, (unsigned long)(pos - start - 8));
+    return pos;
+}
+
+static long add_common_material_model(unsigned char *buf, long pos,
+                                      uint32_t model_key,
+                                      uint32_t slot0, uint32_t slot1) {
+    return add_common_material_model_named(buf, pos, model_key, slot0, slot1,
+                                           "XO_COMMON_MATERIAL");
+}
+
+/* M149 regression: PAN_* prototypes are authored far-horizon geometry. The
+   legacy parser already routes them away from the physical scene, and the
+   instance builder must preserve that contract. Otherwise PAN_HILLRIDGE is
+   classified as TERRAIN and becomes a support plane hundreds of metres above
+   the city. */
+static void test_panorama_prototype_routes_to_vista(void) {
+    static const char *names[] = { "PAN_HILLRIDGE", "PAN_HILLRIDGEHILL" };
+    for (int i = 0; i < 2; i++) {
+        unsigned char object[4096];
+        uint32_t keys[2] = { 0xaabbccddu, 0x11223344u };
+        WInstLibrary library = {0};
+        long length = add_common_material_model_named(
+            object, 0, 0x55667788u, keys[0], keys[1], names[i]);
+        winst_collect_models(&library, object, 0, length, keys, 2);
+        assert(library.count == 1);
+        assert(library.items[0].is_vista == 1);
+        winst_library_free(&library);
+    }
+}
+
+static long make_common_tpk(unsigned char *buf, size_t cap,
+                            uint32_t slot0, uint32_t slot1) {
+    const long record_size = 0x7c, header_size = 2 * record_size;
+    const long pixel_chunk = 8 + header_size;
+    const long used = pixel_chunk + 9;
+    assert(cap >= (size_t)used);
+    memset(buf, 0, cap);
+    put_u32(buf, 0xb3310000ul); put_u32(buf + 4, (unsigned long)header_size);
+    memcpy(buf + 8, "COMMON_SLOT_ZERO", 17);
+    put_u32(buf + 8 + 0x18, slot0);
+    memcpy(buf + 8 + record_size, "COMMON_SLOT_ONE", 16);
+    put_u32(buf + 8 + record_size + 0x18, slot1);
+    put_u32(buf + pixel_chunk, 0x33320002ul);
+    return used;
+}
+
+/* M145 integration regression: exercise the public builder with slot keys
+   available only from GLOBAL/InGameCommon.bun. Removing common-key inventory
+   assembly must make the exact per-submesh assertions fail. */
+static void test_common_key_submesh_resolution(void) {
+    const char *base = "build/world_instance_common_fixture";
+    const char *tracks = "build/world_instance_common_fixture/TRACKS";
+    const char *global = "build/world_instance_common_fixture/GLOBAL";
+    const char *companion_path =
+        "build/world_instance_common_fixture/TRACKS/L4RA.BUN";
+    const char *stream_path =
+        "build/world_instance_common_fixture/TRACKS/STREAML4RA.BUN";
+    const char *common_path =
+        "build/world_instance_common_fixture/GLOBAL/InGameCommon.bun";
+    const uint32_t model_key = 0x55667788u;
+    const uint32_t slot0 = 0xaabbccddu, slot1 = 0x11223344u;
+    assert(mkdir(base, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(tracks, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(global, 0777) == 0 || errno == EEXIST);
+
+    unsigned char companion[256], stream[4096], common[512], placement[64];
+    long companion_len = make_regions(companion, sizeof companion);
+    long stream_len = add_common_material_model(stream, 0, model_key, slot0, slot1);
+    make_instance_record(placement, 0, -1.0f, -1.0f, 1.0f, 1.0f);
+    long section = stream_len;
+    stream_len = add_section(stream, stream_len, 17, "XO_COMMON_MATERIAL", placement, 1);
+    N2Leaf types[1]; int ntypes = 0;
+    n2_find_leaves(stream, section + 8, stream_len, 0x34102, types, &ntypes, 1);
+    assert(ntypes == 1);
+    put_u32(stream + types[0].off + 0x20, model_key);
+    long common_len = make_common_tpk(common, sizeof common, slot0, slot1);
+    assert(write_fixture_file(companion_path, companion, companion_len));
+    assert(write_fixture_file(stream_path, stream, stream_len));
+    assert(write_fixture_file(common_path, common, common_len));
+
+    const char *bundles[] = {"STREAML4RA"};
+    N2Scene scene = {0}, vista = {0}; WInstStats stats = {0};
+    assert(world_instance_build(&scene, &vista, tracks, bundles, 1,
+                                0, 0, 5, NULL, 0, &stats) == 1);
+    assert(scene.count == 2 && vista.count == 0);
+    assert(scene.meshes[0].mat_exact == 1 && scene.meshes[0].texkey == slot0);
+    assert(scene.meshes[1].mat_exact == 1 && scene.meshes[1].texkey == slot1);
+    free_scene(&scene); free_scene(&vista);
+
+    remove(common_path); remove(companion_path); remove(stream_path);
+    rmdir(global); rmdir(tracks); rmdir(base);
+}
+
 int main(void) {
     test_scenery_event_assembly();
+    test_selection_never_hides_ground();
     test_builder_authored_model_keys();
     test_positioned_model_name_boundaries();
     test_regions();
+    test_default_focus_uses_a_region_present_in_stream();
     test_placement();
     test_decoded_asymmetric_placement();
     test_direct_placement();
@@ -1021,6 +1266,9 @@ int main(void) {
     test_builder_uses_bounds_across_unmapped_sections();
     test_builder_home_atomicity_and_bundle_isolation();
     test_world2_capture_policy();
+    test_world_spawn_policy();
+    test_common_key_submesh_resolution();
+    test_panorama_prototype_routes_to_vista();
     puts("world_instance_test: PASS");
     return 0;
 }

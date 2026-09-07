@@ -294,7 +294,12 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
     int is_vista = 0;
-    if (n2_vista_family(name)) {
+    /* Match n2_walk_meshes' established PAN_* contract. These authored
+       horizon models render through the vista tier, but must never enter the
+       ordinary scene where TERRAIN members become ground/collision support. */
+    if (!strncmp(name, "PAN", 3)) {
+        is_vista = 1;
+    } else if (n2_vista_family(name)) {
         N2Geom geometry;
         is_vista = n2_obj_geom(data, begin, end, matrix, &geometry) &&
                    n2_is_vista_impostor(name, &geometry);
@@ -748,6 +753,80 @@ static int winst_walk_sections(const unsigned char *data, long begin, long end,
     return 1;
 }
 
+static int winst_mark_section_ids(const unsigned char *data, long begin, long end,
+                                  unsigned depth, unsigned char *present,
+                                  int present_cap) {
+    if (depth > 64) return 0;
+    for (long pos=begin; pos<end;) {
+        if (end-pos<8) return 0;
+        uint32_t magic=n2_u32(data+pos); long child_end=0;
+        if (!chunk_end(pos+8,n2_u32(data+pos+4),end,&child_end)) return 0;
+        if (magic==0x80034100u) {
+            WInstSection section;
+            if (!winst_parse_section(data,pos+8,child_end,&section) ||
+                section.region_id<0 || section.region_id>=present_cap) return 0;
+            present[section.region_id]=1;
+        } else if (magic && (magic>>28)==8 &&
+                   !winst_mark_section_ids(data,pos+8,child_end,depth+1,
+                                           present,present_cap)) return 0;
+        pos=child_end;
+    }
+    return 1;
+}
+
+int winst_default_focus(const unsigned char *companion, long companion_len,
+                        const unsigned char *stream, long stream_len,
+                        float out_xy[2]) {
+    if (!companion || companion_len < 0 || !stream || stream_len < 0 || !out_xy)
+        return 0;
+    WInstRegion *regions = NULL;
+    int count = 0;
+    if (!winst_parse_regions(companion, companion_len, &regions, &count)) return 0;
+    unsigned char *present=(unsigned char *)calloc(65536,1);
+    if (!present || !winst_mark_section_ids(stream,0,stream_len,0,present,65536)) {
+        free(present);
+        winst_free_regions(regions,count);
+        return 0;
+    }
+
+    int best = -1;
+    float best_x = 0.0f, best_y = 0.0f;
+    double best_d2 = 0.0;
+    for (int i = 0; i < count; i++) {
+        if (regions[i].id<0 || regions[i].id>=65536 || !present[regions[i].id]) continue;
+
+        double sx = 0.0, sy = 0.0;
+        for (int p = 0; p < regions[i].nxy; p++) {
+            sx += regions[i].xy[p * 2];
+            sy += regions[i].xy[p * 2 + 1];
+        }
+        float x = (float)(sx / regions[i].nxy);
+        float y = (float)(sy / regions[i].nxy);
+        if (!in_polygon(&regions[i], x, y)) {
+            x = 0.5f * (regions[i].bb[0] + regions[i].bb[2]);
+            y = 0.5f * (regions[i].bb[1] + regions[i].bb[3]);
+        }
+        if (!in_polygon(&regions[i], x, y)) {
+            x = regions[i].xy[0];
+            y = regions[i].xy[1];
+        }
+        double d2 = (double)x * x + (double)y * y;
+        if (best < 0 || d2 < best_d2 ||
+            (d2 == best_d2 && regions[i].id < regions[best].id)) {
+            best = i;
+            best_x = x;
+            best_y = y;
+            best_d2 = d2;
+        }
+    }
+    free(present);
+    winst_free_regions(regions, count);
+    if (best < 0) return 0;
+    out_xy[0] = best_x;
+    out_xy[1] = best_y;
+    return 1;
+}
+
 #ifdef WORLD_INSTANCE_TESTING
 int winst_test_collect_placements(const unsigned char *section_data,
                                   long section_len,
@@ -997,17 +1076,28 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
      * until a complete temporary assembly has been built and committed. */
     if (!bundle_data) goto cleanup;
 
+    /* A requested event id the bundle does not author is degraded to the
+     * unfiltered scene. That is an authoring fact, not a corrupt table, so it
+     * must not fail the build: L4RB 4201/4202/4203 and L4RC 4341 are raceable
+     * events with no group of their own. Everything else still fails closed. */
+    int effective_event = scenery_event;
     if (scenery_event) {
         const char *stem = !strncmp(local_stats.bundle,"STREAM",6)
                          ? local_stats.bundle+6 : local_stats.bundle;
         long len=0;unsigned char *data=winst_read_named(track_root,stem,&len);
         WGTable table;
-        int valid=data && wg_open_file(data,(size_t)len,&table) &&
-                  wg_selection_open(&table,scenery_event,&scenery);
+        int valid=data && wg_open_file(data,(size_t)len,&table);
+        if(valid && !wg_event_group_present(&table,scenery_event))effective_event=0;
+        valid=valid && (!effective_event ||
+                        wg_selection_open(&table,effective_event,&scenery));
         free(data); /* selection owns copied membership, not borrowed bytes */
-        if(!valid || !winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
-        for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+        if(!valid)goto cleanup;
+        if(effective_event) {
+            if(!winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
+            for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+        }
     }
+    local_stats.scenery_effective = effective_event;
 
     uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
     if (!keys) goto cleanup;
@@ -1015,6 +1105,26 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     int nkeys = n2_tpk_keys(bundle_data, tpk, keys, 16384);
     if (shared && nkeys < 16384)
         nkeys += n2_car_tex_keys(shared, shared_len, keys + nkeys, 16384 - nkeys);
+    /* Instance prototypes can reference shared gameplay textures that are
+     * authored only in GLOBAL/InGameCommon.bun. Those keys must participate
+     * in per-submesh resolution; otherwise the affected ranges lose exact
+     * material ownership and are conservatively rendered as opaque. */
+    if (nkeys < 16384) {
+        char path[1024];
+        int length = snprintf(path, sizeof path,
+                              "%s/../GLOBAL/InGameCommon.bun", track_root);
+        if (length >= 0 && (size_t)length < sizeof path) {
+            long common_len = 0;
+            unsigned char *common = n2_read_file(path, &common_len);
+            if (common) {
+                N2Tpk common_tpk = n2_tpk_open(common, common_len);
+                nkeys += n2_tpk_keys(common, common_tpk, keys + nkeys,
+                                     16384 - nkeys);
+                free(common_tpk.blk);
+                free(common);
+            }
+        }
+    }
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
     free(keys);
 
@@ -1034,7 +1144,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     collect.visit = winst_build_visit;
     collect.userdata = &visit;
     collect.stats = &local_stats;
-    collect.scenery = scenery_event ? &scenery : NULL;
+    collect.scenery = effective_event ? &scenery : NULL;
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;

@@ -115,6 +115,14 @@ float phys_ride_reach_down(const PhysRideState *r, float dt) {
     return PHYS_RIDE_DROOP + fall;
 }
 
+float phys_ride_support_vz(const float normal[3], const float vel[2],
+                          float old_heading, float heading, float ax, float ay, float dt) {
+    if (dt <= 0 || fabsf(normal[2]) < 1e-6f) return 0;
+    float dc=cosf(heading)-cosf(old_heading), ds=sinf(heading)-sinf(old_heading);
+    float dx=vel[0]+dc*ax-ds*ay, dy=vel[1]+ds*ax+dc*ay;
+    return -(normal[0]*dx+normal[1]*dy)/(normal[2]*dt);
+}
+
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     const float w    = 6.2831853f * PHYS_RIDE_FREQ;   /* rad/s */
     const float K    = w * w;                          /* 1/s^2 per metre       */
@@ -145,7 +153,8 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         mask |= 1u << k;
         if (c > PHYS_RIDE_BUMP) c = PHYS_RIDE_BUMP;
         r->compression[k] = c;
-        force[k] = K*c - C*wv + PHYS_RIDE_G;
+        /* The damper resists suspension travel, not motion along a slope. */
+        force[k] = K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G;
     }
     r->contact_mask = mask;
 
@@ -382,19 +391,75 @@ void phys_selftest(void) {
 
 }
 
+/* Clip a convex face against one horizontal half-space. A triangle clipped
+ * by the car's two parallel height planes has at most five vertices (eight
+ * slots also accommodate duplicate boundary vertices). Crossing endpoints
+ * have different Z, so the interpolation denominator cannot be zero. */
+static int cw_clip_z(const float in[][3], int count, float out[][3],
+                     float z, int keep_above) {
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        const float *a = in[i], *b = in[(i+1)%count];
+        int ai = keep_above ? a[2] >= z : a[2] <= z;
+        int bi = keep_above ? b[2] >= z : b[2] <= z;
+        if (ai) { memcpy(out[n], a, sizeof out[n]); n++; }
+        if (ai != bi) {
+            float u = (z - a[2]) / (b[2] - a[2]);
+            out[n][0] = a[0] + (b[0] - a[0]) * u;
+            out[n][1] = a[1] + (b[1] - a[1]) * u;
+            out[n][2] = z;
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Does this mesh present an actual wall to the car here, and WHICH feature?
- * Near-vertical face, height span overlapping the car, XY projection within r.
- * Two passes over the same faces: the first finds the closest edge feature and
- * the union vertical span of every contacting face, the second is not needed --
- * the span is accumulated as we go. The normal comes from the closest point to
+ * Near-vertical face, clipped to car height before measuring XY distance.
+ * The union span still uses authored faces, so a thin height overlap with a
+ * tall wall is not mistaken for a mesh seam. The normal comes from the closest point to
  * the car centre, never from triangle winding, so a wall pushes the car away
  * from itself rather than along whatever axis its bounding box prefers. */
-int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
-                    float r, float cz0, float cz1, PhysWallContact *out) {
+/* Closest points of two XY segments. An intersection must be tested first:
+ * endpoint projections alone miss the middle of a long vehicle side. */
+static float cw_segment_pair(float ax,float ay,float bx,float by,
+        const float *p,const float *q,float *carx,float *cary,float *wallx,float *wally) {
+    float ux=bx-ax,uy=by-ay,vx=q[0]-p[0],vy=q[1]-p[1];
+    float det=ux*vy-uy*vx;
+    if(fabsf(det)>1e-9f) {
+        float dx=p[0]-ax,dy=p[1]-ay;
+        float t=(dx*vy-dy*vx)/det,u=(dx*uy-dy*ux)/det;
+        if(t>=0 && t<=1 && u>=0 && u<=1) {
+            *carx=*wallx=ax+t*ux;*cary=*wally=ay+t*uy;return 0;
+        }
+    }
+    float best=1e30f;
+    for(int i=0;i<4;i++) {
+        float x,y,cx,cy,wx,wy;
+        if(i<2) {
+            cx=i?bx:ax;cy=i?by:ay;
+            float l2=vx*vx+vy*vy;
+            float t=l2>1e-9f?((cx-p[0])*vx+(cy-p[1])*vy)/l2:0;
+            t=pv_clamp(t,0,1);wx=p[0]+t*vx;wy=p[1]+t*vy;
+        } else {
+            wx=i==2?p[0]:q[0];wy=i==2?p[1]:q[1];
+            float l2=ux*ux+uy*uy;
+            float t=l2>1e-9f?((wx-ax)*ux+(wy-ay)*uy)/l2:0;
+            t=pv_clamp(t,0,1);cx=ax+t*ux;cy=ay+t*uy;
+        }
+        x=cx-wx;y=cy-wy;float d=x*x+y*y;
+        if(d<best){best=d;*carx=cx;*cary=cy;*wallx=wx;*wally=wy;}
+    }
+    return best;
+}
+
+static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
+                    float qx, float qy, float r, float cz0, float cz1,
+                    float face_min,float face_max,PhysWallContact *out) {
     if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
     float r2 = r*r;
-    float bestd2 = 1e30f, bcx = 0, bcy = 0; int btri = -1;
+    float bestd2 = 1e30f, bcx = 0, bcy = 0, bodyx=px, bodyy=py; int btri = -1;
     float ulo = 1e30f, uhi = -1e30f;                 /* union span of contacts */
     float fnx = 0, fny = 0;                          /* winding normal, fallback */
     for (int t = 0; t + 2 < m->nidx; t += 3) {
@@ -410,22 +475,36 @@ int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
         float zlo = A[2], zhi = A[2];
         if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
         if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
+        if (zhi-zlo < face_min || zhi-zlo > face_max) continue;
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
-        const float *P[3] = { A, B, C };
+        const float *P[8] = { A, B, C };
+        int np = 3;
+        float clipped[8][3], work[8][3];
+        if (zlo < cz0 || zhi > cz1) {
+            memcpy(clipped[0], A, sizeof clipped[0]);
+            memcpy(clipped[1], B, sizeof clipped[1]);
+            memcpy(clipped[2], C, sizeof clipped[2]);
+            np = cw_clip_z(clipped, 3, work, cz0, 1);
+            np = cw_clip_z(work, np, clipped, cz1, 0);
+            for (int j = 0; j < np; j++) P[j] = clipped[j];
+        }
         int touched = 0;
-        for (int e = 0; e < 3; e++) {
-            const float *p0 = P[e], *p1 = P[(e+1)%3];
+        for (int e = 0; e < np; e++) {
+            const float *p0 = P[e], *p1 = P[(e+1)%np];
             float dx = p1[0]-p0[0], dy = p1[1]-p0[1], l2 = dx*dx+dy*dy;
             float u = l2 > 1e-9f ? ((px-p0[0])*dx + (py-p0[1])*dy) / l2 : 0.0f;
             if (u < 0) u = 0; if (u > 1) u = 1;
             float sx = p0[0]+dx*u, sy = p0[1]+dy*u;
-            float qx = px - sx, qy = py - sy, d2 = qx*qx + qy*qy;
+            float ox = px - sx, oy = py - sy, d2 = ox*ox + oy*oy;
+            float hx=px,hy=py;
+            if(px!=qx || py!=qy)
+                d2=cw_segment_pair(px,py,qx,qy,p0,p1,&hx,&hy,&sx,&sy);
             if (d2 > r2) continue;
             touched = 1;
             /* closest feature wins; ties go to the lower triangle index, so the
                choice is the same on every run regardless of float noise */
             if (d2 < bestd2 || (d2 == bestd2 && btri >= 0 && t/3 < btri)) {
-                bestd2 = d2; bcx = sx; bcy = sy; btri = t/3;
+                bestd2 = d2; bcx = sx; bcy = sy; bodyx=hx;bodyy=hy;btri = t/3;
                 float nl = sqrtf(n[0]*n[0]+n[1]*n[1]);
                 if (nl > 1e-9f) { fnx = n[0]/nl; fny = n[1]/nl; }
             }
@@ -438,12 +517,25 @@ int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
     if (out) {
         out->mesh = mi; out->tri = btri; out->cx = bcx; out->cy = bcy;
         out->dist = sqrtf(bestd2); out->pen = r - out->dist; out->span = span;
-        float ox = px - bcx, oy = py - bcy;
+        float ox = bodyx - bcx, oy = bodyy - bcy;
         if (out->dist > 1e-6f) { out->nx = ox / out->dist; out->ny = oy / out->dist; }
-        else { out->nx = fnx; out->ny = fny; }   /* centre exactly on the face:
-                                                    winding normal is all there is */
+        else {
+            /* A segment can straddle a face. Choose the side of its midpoint
+             * and clear the whole segment, not just the intersection point. */
+            if((px!=qx || py!=qy) && ((px+qx)*.5f-bcx)*fnx+((py+qy)*.5f-bcy)*fny<0)
+                {fnx=-fnx;fny=-fny;}
+            out->nx=fnx;out->ny=fny;
+            if(px!=qx || py!=qy)
+                out->pen=r-fminf((px-bcx)*fnx+(py-bcy)*fny,
+                                 (qx-bcx)*fnx+(qy-bcy)*fny);
+        }
     }
     return 1;
+}
+
+int cw_mesh_feature(const N2Scene *s,int mi,float px,float py,
+                    float r,float z0,float z1,PhysWallContact *out) {
+    return cw_shape_feature(s,mi,px,py,px,py,r,z0,z1,0,INFINITY,out);
 }
 
 int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
@@ -451,24 +543,41 @@ int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
     return cw_mesh_feature(s, mi, px, py, r, cz0, cz1, NULL);
 }
 
+static int cw_body_shape(float heading,const float bb[6],float *r,
+                         float *ax,float *ay,float *bx,float *by) {
+    *r=1.3f;*ax=*ay=*bx=*by=0;
+    if(!bb || !isfinite(bb[0]) || !isfinite(bb[1]) || !isfinite(bb[3]) ||
+       !isfinite(bb[4]) || bb[3]<=bb[0] || bb[4]<=bb[1])return 0;
+    *r=(bb[4]-bb[1])*.5f;
+    float mid=(bb[0]+bb[3])*.5f,side=(bb[1]+bb[4])*.5f;
+    float rear=fminf(bb[0]+*r,mid),front=fmaxf(bb[3]-*r,mid);
+    float c=cosf(heading),s=sinf(heading);
+    *ax=c*rear-s*side;*ay=s*rear+c*side;
+    *bx=c*front-s*side;*by=s*front+c*side;
+    return 1;
+}
+
 /* Resolution order is the obstacle order phys_collect_walls produced (mesh
    index order, stable across runs). Each contact is resolved against the
    position the previous one left behind, so overlapping walls compose instead
    of fighting; within one mesh the closest feature wins. */
-int collide_walls(float *pos, float *vel, const float obst[][4],
+static int cw_resolve(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
-                  PhysWallContact *log, int maxlog) {
+                  PhysWallContact *log, int maxlog,
+                  float ax,float ay,float bx,float by) {
     int hits = 0;
     for (int o = 0; o < nobst; o++) {
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
-        if (pos[0]<=x0 || pos[0]>=x1 || pos[1]<=y0 || pos[1]>=y1) continue;
+        if (pos[0]+fmaxf(ax,bx)<=x0 || pos[0]+fminf(ax,bx)>=x1 ||
+            pos[1]+fmaxf(ay,by)<=y0 || pos[1]+fminf(ay,by)>=y1) continue;
         /* vertical volumes must actually overlap for this to be a collision */
         if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) continue;
         if (scene && src) {
             /* the rect was broad phase only: resolve against the FACE */
             PhysWallContact c;
-            if (!cw_mesh_feature(scene, src[o], pos[0], pos[1], r, cz0, cz1, &c))
+            if (!cw_shape_feature(scene, src[o], pos[0]+ax, pos[1]+ay,
+                                  pos[0]+bx,pos[1]+by,r,cz0,cz1,0,INFINITY,&c))
                 continue;
             float vn = vel[0]*c.nx + vel[1]*c.ny;
             if (c.pen <= 0.0f && vn >= 0.0f) continue;   /* touching, not colliding:
@@ -490,6 +599,36 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
         hits++;
     }
     return hits;
+}
+
+int collide_walls(float *pos,float *vel,const float obst[][4],
+        const float obz[][2],int nobst,float r,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,0,0,0,0);
+}
+
+int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
+    float r,ax,ay,bx,by;
+    if(!scene || !src || !cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by))
+        return collide_walls(pos,vel,obst,obz,nobst,1.3f,z0,z1,scene,src,log,maxlog);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,ax,ay,bx,by);
+}
+
+int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6],
+        float z0,float z1,const N2Scene *scene,int mesh,float face_min,
+        float face_max,PhysWallContact *contact) {
+    float r,ax,ay,bx,by;cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by);
+    PhysWallContact hit;
+    if(!cw_shape_feature(scene,mesh,pos[0]+ax,pos[1]+ay,pos[0]+bx,pos[1]+by,
+                         r,z0,z1,face_min,face_max,&hit)) return 0;
+    float vn=vel[0]*hit.nx+vel[1]*hit.ny;
+    if(hit.pen<=0 && vn>=0) return 0;
+    if(hit.pen>0){pos[0]+=hit.nx*hit.pen;pos[1]+=hit.ny*hit.pen;}
+    if(vn<0){vel[0]-=vn*hit.nx;vel[1]-=vn*hit.ny;}
+    if(contact)*contact=hit;
+    return 1;
 }
 void collide_walls_selftest(void) {
     float obst[1][4] = {{0,0,10,10}};
@@ -521,7 +660,7 @@ void collide_walls_selftest(void) {
     assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f, NULL, NULL, NULL, 0) == 1);
 }
 
-#define WALL_MIN_HEIGHT 2.5f    /* z-extent below this = flat prop, not a wall */
+#define WALL_MIN_HEIGHT 2.5f    /* heuristic mesh below this = flat, not a wall */
 #define WALL_MAX_SPAN   300.0f  /* skip oversized shells (sky domes etc.) */
 
 /* Which scenery stops a car (Phase 65). Each mesh now carries its asset-name
@@ -560,7 +699,12 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
             if(p[0]<ox0)ox0=p[0]; if(p[0]>ox1)ox1=p[0];
             if(p[1]<oy0)oy0=p[1]; if(p[1]>oy1)oy1=p[1];
             if(p[2]<oz0)oz0=p[2]; if(p[2]>oz1)oz1=p[2]; }
-        if (oz1-oz0 < WALL_MIN_HEIGHT) continue;             /* flat: not a wall */
+        /* BUILDING/WALL/STRUCT are authored solid semantics, so their height
+         * is not a classifier. In particular L4RA's XW_SANDSTONEBASE pieces
+         * are only 0.548 m tall but have real 0.539 m vertical faces. Let the
+         * geometric narrow phase distinguish those from a sub-0.30 m seam.
+         * Keep the 2.5 m heuristic for props/unclassified meshes only. */
+        if (!scen_is_wall(sc) && oz1-oz0 < WALL_MIN_HEIGHT) continue;
         if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
         if (prop_check) {   /* thin street furniture: leave it drivable-through */
             float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;

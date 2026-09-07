@@ -7,6 +7,7 @@
 #include <math.h>
 
 #include "world.h"
+#include "physics.h"
 #include "resource.h"
 
 static void grid_build(World *w);
@@ -315,10 +316,16 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                     options->focus_x, options->focus_y);
             return 0;
         }
-        if (options->scenery_event)
-            printf("SCENERY PREVIEW event=%d hidden-placements=%ld "
+        if (options->scenery_event) {
+            /* Report what was SELECTED. A race whose event authors no group of
+               its own degrades to the unfiltered scene; saying "event" there
+               would claim a filter that never ran. */
+            int eff = w->neighborhood.inst_stats.scenery_effective;
+            printf("SCENERY SELECTION mode=%s event=%d hidden-placements=%ld "
                    "[load-time only; shared/unknown groups and direction flags unchanged]\n",
+                   eff == -1 ? "free" : eff ? "event" : "unfiltered(no authored group)",
                    options->scenery_event, w->neighborhood.inst_stats.scenery_hidden);
+        }
         for (int r = 0; r < nreg; r++) {
             w->neighborhood.rgn[r].mesh0 = 0;
             w->neighborhood.rgn[r].mesh1 = !strcmp(w->neighborhood.rgn[r].name, w->neighborhood.inst_stats.bundle)
@@ -369,9 +376,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         w->neighborhood.mbb[i][0]=x0; w->neighborhood.mbb[i][1]=y0; w->neighborhood.mbb[i][2]=x1; w->neighborhood.mbb[i][3]=y1;
     }
     grid_build(w);
-    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Do not
-       add their keys to geometry/material selection: this is only the last
-       texture-resolution source, with existing regional precedence intact. */
+    /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Instance
+       prototype material matching already inventories this archive during
+       its build; retain the bytes here as the final texture-resolution source,
+       with existing regional precedence intact. */
     char commonp[1024];
     int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
     if (plen >= 0 && (size_t)plen < sizeof commonp) {
@@ -457,96 +465,165 @@ static int world_texture_decode(const World *w, const WRegion *g,
     return ok;
 }
 
+/* ---- process-wide key -> GL texture cache ----
+ * Neighboring residents request mostly the same textures. Keep the uploaded
+ * images (and final misses) instead of decoding/uploading them on every swap.
+ * The sources a key resolves against (region bundle, LOC4, master, common) are
+ * bundle-global and identical for every neighborhood of one process -- a track
+ * switch re-execs -- so a key's decoded result cannot change between builds.
+ * ponytail: retain one bundle's visited keys until shutdown; add eviction if
+ * multi-bundle in-process streaming makes this measured memory cost too large.
+ * The cache owns the GL names; residents only borrow them. Any caller that
+ * replaces the underlying archives in-process must call
+ * world_texture_cache_clear() first (see tools/world_texture_test.c).
+ * Frame-thread only, so it needs no locking: binding is part of the GL half of
+ * a resident build, and the worker thread only prepares CPU data. */
+typedef struct {
+    uint32_t key;
+    GLuint tex;
+    unsigned char mode;
+    unsigned char state;    /* 0 empty, 1 bound, 2 unresolvable */
+    uint32_t build, pass;   /* emitted-in-this-build / tried-against-this-source */
+} WTexCacheEntry;
+static WTexCacheEntry *g_texcache;
+static int g_texcache_cap, g_texcache_used;
+static uint32_t g_texbind_build, g_texbind_pass;
+
+/* Slot for `key`: an occupied entry, or the empty slot it belongs in.
+ * NULL only if the table cannot grow -- fail the candidate, never create an
+ * unowned GL name that its borrowing resident cannot release. */
+static WTexCacheEntry *world_texcache_slot(uint32_t key) {
+    if ((g_texcache_used + 1) * 4 >= g_texcache_cap * 3) {
+        int cap = g_texcache_cap ? g_texcache_cap * 2 : 2048;
+        WTexCacheEntry *t = (WTexCacheEntry *)calloc((size_t)cap, sizeof *t);
+        if (!t) return NULL;
+        for (int i = 0; i < g_texcache_cap; i++) {
+            if (!g_texcache[i].state) continue;
+            uint32_t h = g_texcache[i].key & (uint32_t)(cap - 1);
+            while (t[h].state) h = (h + 1) & (uint32_t)(cap - 1);
+            t[h] = g_texcache[i];
+        }
+        free(g_texcache);
+        g_texcache = t; g_texcache_cap = cap;
+    }
+    uint32_t h = key & (uint32_t)(g_texcache_cap - 1);
+    while (g_texcache[h].state && g_texcache[h].key != key)
+        h = (h + 1) & (uint32_t)(g_texcache_cap - 1);
+    return &g_texcache[h];
+}
+
+void world_texture_cache_clear(void) {
+    for (int i = 0; i < g_texcache_cap; i++)
+        if (g_texcache[i].state == 1 && g_texcache[i].tex)
+            glDeleteTextures(1, &g_texcache[i].tex);
+    free(g_texcache);
+    g_texcache = NULL; g_texcache_cap = g_texcache_used = 0;
+    g_texbind_build = g_texbind_pass = 0;
+}
+
+/* Bind one requested key from one source, honouring the cache. `last` marks
+ * the final source this key will ever be offered, so a failure there -- and
+ * only there -- is what gets remembered as unresolvable. `owner` supplies the
+ * mesh named by the TEXFAIL census, or NULL for the light key (never
+ * reported, same as before). */
+static void world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
+                           int last, uint32_t *keys, GLuint *texs,
+                           unsigned char *modes, int cap, int *n,
+                           const N2Mesh *owner) {
+    if (!tk || *n < 0 || *n >= cap) return;
+    WTexCacheEntry *e = world_texcache_slot(tk);
+    if (!e) { *n = -1; return; }
+    if (e && e->state == 1) {                   /* decoded by an earlier build */
+        if (e->build == g_texbind_build) return;             /* already emitted */
+        keys[*n] = tk; texs[*n] = e->tex;
+        if (modes) modes[*n] = e->mode;
+        (*n)++;
+        e->build = g_texbind_build;
+        return;
+    }
+    if (e && e->state == 2) return;             /* known unresolvable */
+    if (e && e->pass == g_texbind_pass && e->key == tk) return;  /* failed here */
+    if (e) { e->key = tk; e->pass = g_texbind_pass; }
+    N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
+    int ok = world_texture_decode(w, g, tk, &tt, pass);
+    if (ok && !n2_tex_noise(&tt)) {
+        GLuint id = upload_tex(&tt);
+        if (!id || glGetError() != GL_NO_ERROR) {
+            if (id) glDeleteTextures(1, &id);
+            free(tt.rgb); free(tt.alpha); free(tt.dxt);
+            *n = -1;
+            return; /* do not cache a failed upload */
+        }
+        /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
+           itself; a key that resolved via n2_load_car_tex_by_key (the
+           shared LOC4 car-texture library) keeps them at their zero
+           default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
+           world texture had before this field existed, not a new
+           misclassification. */
+        unsigned char mode = (unsigned char)n2_tex_mode(&tt);
+        keys[*n] = tk; texs[*n] = id;
+        if (modes) modes[*n] = mode;
+        (*n)++;
+        if (e) {
+            if (!e->state) g_texcache_used++;
+            e->state = 1; e->tex = id; e->mode = mode; e->build = g_texbind_build;
+        }
+    } else {
+        if (owner && g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
+            /* M133: separate "the archive has no such record" from "we
+               decoded it and then threw it away" -- they need different
+               fixes and the old counters merged them. */
+            printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
+                   ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
+                   pass ? "not in common TPK" : "not in region/LOC4/master",
+                   owner->sname, owner->cat);
+            if (ok) g_world_texnoise++; else g_world_texmiss++;
+        }
+        if (last && e) {
+            if (!e->state) g_texcache_used++;
+            e->state = 2;
+        }
+    }
+    if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+}
+
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                         unsigned char *modes, int cap) {
     int n = 0;
+    int npass = w->neighborhood.common ? 2 : 1;
+    g_texbind_build++;
     /* Finish the original binding order across ALL regions first. Only then
        retry still-unbound requests against common; never borrow from an
        unrelated region or preempt a later region's successful old lookup. */
-    for (int pass = 0; pass < (w->neighborhood.common ? 2 : 1); pass++)
+    for (int pass = 0; pass < npass; pass++)
     for (int r = 0; r < w->neighborhood.nreg; r++) {
         WRegion *g = &w->neighborhood.rgn[r];
         if (!g->data) continue;
-        for (int i = g->mesh0; i < g->mesh1; i++) {
-            uint32_t tk = w->neighborhood.scene.meshes[i].texkey; if (!tk) continue;
-            int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
-            if (seen || n >= cap) continue;
-            N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
-            int ok = world_texture_decode(w, g, tk, &tt, pass);
-            if (ok && !n2_tex_noise(&tt)) {
-                keys[n] = tk; texs[n] = upload_tex(&tt);
-                /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
-                   itself; a key that resolved via n2_load_car_tex_by_key (the
-                   shared LOC4 car-texture library) keeps them at their zero
-                   default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
-                   world texture had before this field existed, not a new
-                   misclassification. */
-                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
-                n++;
-            }
-            else if (g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
-                /* M133: separate "the archive has no such record" from "we
-                   decoded it and then threw it away" -- they need different
-                   fixes and the old counters merged them. */
-                printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
-                       pass ? "not in common TPK" : "not in region/LOC4/master",
-                       w->neighborhood.scene.meshes[i].sname, w->neighborhood.scene.meshes[i].cat);
-                if (ok) g_world_texnoise++; else g_world_texmiss++;
-            }
-            if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
-        }
+        int last = pass == npass - 1 && r == w->neighborhood.nreg - 1;
+        g_texbind_pass++;
+        for (int i = g->mesh0; i < g->mesh1; i++)
+            world_bind_key(w, g, w->neighborhood.scene.meshes[i].texkey, pass,
+                           last, keys, texs, modes, cap, &n,
+                           &w->neighborhood.scene.meshes[i]);
         /* District light records have no mesh-owned texture slot. Request
            their shipped flare through this same regional/shared resolver
            while the STREAM bytes are still alive. */
-        if (w->neighborhood.nlights > 0 && n < cap) {
-            uint32_t tk = N2_TEX_SFX_FLARE_GLOWA;
-            int seen = 0;
-            for (int j = 0; j < n; j++) if (keys[j] == tk) { seen = 1; break; }
-            if (!seen) {
-                N2Tex tt = {0};
-                int ok = world_texture_decode(w, g, tk, &tt, pass);
-                if (ok && !n2_tex_noise(&tt)) {
-                    keys[n] = tk; texs[n] = upload_tex(&tt);
-                    if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
-                    n++;
-                }
-                if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
-            }
-        }
+        if (w->neighborhood.nlights > 0)
+            world_bind_key(w, g, N2_TEX_SFX_FLARE_GLOWA, pass, last,
+                           keys, texs, modes, cap, &n, NULL);
         /* M132: vista impostors carry their own authored texture keys and are
            decoded from the same TPK, in the same pass, before the region bytes
            are released. They are not region-tagged, so every region gets a
            chance at every key; a miss is silent and harmless. */
-        for (int i = 0; i < w->neighborhood.vista.count; i++) {
-            uint32_t tk = w->neighborhood.vista.meshes[i].texkey; if (!tk) continue;
-            int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
-            if (seen || n >= cap) continue;
-            N2Tex tt = {0};
-            int ok = world_texture_decode(w, g, tk, &tt, pass);
-            if (ok && !n2_tex_noise(&tt)) {
-                keys[n] = tk; texs[n] = upload_tex(&tt);
-                /* vista batches don't consult drawmode (the tier has its own
-                   uVista alpha-blend path), but fill it anyway so the slot
-                   never carries stale/uninitialised data. */
-                if (modes) modes[n] = (unsigned char)n2_tex_mode(&tt);
-                n++;
-            }
-            else if (g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
-                /* M133: separate "the archive has no such record" from "we
-                   decoded it and then threw it away" -- they need different
-                   fixes and the old counters merged them. M133-R: `i` here
-                   indexes w->neighborhood.vista, not w->neighborhood.scene -- attribute to the vista
-                   mesh that actually owns this key, not whatever scene mesh
-                   happens to share the same index. */
-                printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
-                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
-                       pass ? "not in common TPK" : "not in region/LOC4/master",
-                       w->neighborhood.vista.meshes[i].sname, w->neighborhood.vista.meshes[i].cat);
-                if (ok) g_world_texnoise++; else g_world_texmiss++;
-            }
-            if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
-        }
+        /* M133-R: the census names the VISTA mesh that owns the key, not
+           whatever scene mesh happens to share the same index. Vista draws
+           don't consult drawmode (the tier has its own uVista alpha-blend
+           path); the mode slot is filled anyway so it never carries stale
+           data. */
+        for (int i = 0; i < w->neighborhood.vista.count; i++)
+            world_bind_key(w, g, w->neighborhood.vista.meshes[i].texkey, pass,
+                           last, keys, texs, modes, cap, &n,
+                           &w->neighborhood.vista.meshes[i]);
     }
     /* Keep every region alive until the last shared-fallback decision. */
     for (int r = 0; r < w->neighborhood.nreg; r++) {
@@ -1077,6 +1154,8 @@ int world_set_mode(World *w, int mode, int evidx) {
     return w->city.nbar;
 }
 
+static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float *ox,float *oy);
+
 int world_barrier_push(const World *w, float *pos, float r) {
     if (w->city.mode != MODE_RACE_EVENT) return 0;
     int hit = 0;
@@ -1084,12 +1163,16 @@ int world_barrier_push(const World *w, float *pos, float r) {
         const WBarrier *b = &w->city.bar[i];
         float rx = pos[0]-b->x, ry = pos[1]-b->y;
         if (rx*rx + ry*ry > BAR_REACH*BAR_REACH) continue;
-        float s = rx*b->dx + ry*b->dy;              /* along the closed road */
-        float t = -rx*b->dy + ry*b->dx;             /* across it */
-        if (s <= -r || s >= r + BAR_HALF) continue; /* behind, or already past */
-        if (t < -(BAR_HALF + r) || t > BAR_HALF + r) continue;
-        pos[0] -= b->dx * (s + r);                  /* back to the corridor side */
-        pos[1] -= b->dy * (s + r);
+        /* The rendered closure is one finite segment, not a deep volume on
+         * its far side. Resolve actual overlap to the nearest side/endpoint. */
+        float x,y;
+        float d2=seg_d2(pos[0],pos[1],b->x+b->dy*BAR_HALF,b->y-b->dx*BAR_HALF,
+                       b->x-b->dy*BAR_HALF,b->y+b->dx*BAR_HALF,&x,&y);
+        if(d2>=r*r)continue;
+        float d=sqrtf(d2),nx=d>1e-6f?(pos[0]-x)/d:-b->dx,
+                         ny=d>1e-6f?(pos[1]-y)/d:-b->dy;
+        pos[0]+=nx*(r-d);
+        pos[1]+=ny*(r-d);
         hit = 1;
     }
     return hit;
@@ -1620,6 +1703,66 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
     return WSURF_NONE;
 }
 
+static void wgs_mesh(const N2Mesh *m, int mi, const float p[3], const float q[3],
+                     float *best, WGroundHit *hit) {
+    if (m->cat != N2_ROAD && m->cat != N2_TERRAIN) return;
+    for (int t=0; t+2<m->nidx; t+=3) {
+        const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5,
+                    *c=m->verts+m->idx[t+2]*5;
+        /* Double intermediates keep centimetre-scale tests stable at city
+         * coordinates thousands of metres from the origin. */
+        double ex=b[0]-a[0], ey=b[1]-a[1], ez=b[2]-a[2];
+        double fx=c[0]-a[0], fy=c[1]-a[1], fz=c[2]-a[2];
+        double nx=ey*fz-ez*fy, ny=ez*fx-ex*fz, nz=ex*fy-ey*fx;
+        if (fabs(nz)<1e-9) continue;
+        if (nz<0) {nx=-nx;ny=-ny;nz=-nz;}
+        double d0=(nx*(p[0]-a[0])+ny*(p[1]-a[1])+nz*(p[2]-a[2]))/nz;
+        double d1=(nx*(q[0]-a[0])+ny*(q[1]-a[1])+nz*(q[2]-a[2]))/nz;
+        if (d0<0 || d1>=0) continue;
+        double f=d0/(d0-d1);
+        if (f>=*best) continue;
+        double x=p[0]+(q[0]-p[0])*f, y=p[1]+(q[1]-p[1])*f;
+        double det=ex*fy-ey*fx;
+        double u=((x-a[0])*fy-(y-a[1])*fx)/det;
+        double v=(ex*(y-a[1])-ey*(x-a[0]))/det;
+        if (u<0 || v<0 || u+v>1) continue;
+        *best=(float)f;
+        if (hit) {
+            double len=sqrt(nx*nx+ny*ny+nz*nz);
+            hit->mesh=mi;hit->tri=t/3;
+            hit->cat=m->cat==N2_ROAD?WSURF_ROAD:WSURF_TERRAIN;
+            hit->z=(float)(p[2]+(q[2]-p[2])*f);
+            hit->normal[0]=(float)(nx/len);hit->normal[1]=(float)(ny/len);
+            hit->normal[2]=(float)(nz/len);
+        }
+    }
+}
+
+float world_ground_sweep(const N2Scene *s, const float from[3],
+                         const float to[3], WGroundHit *hit) {
+    float best=1;
+    if (hit) { memset(hit,0,sizeof *hit);hit->mesh=hit->tri=-1; }
+    if (!s || !s->meshes) return best;
+    if (s->meshes!=g_grid.meshes) {
+        for(int i=0;i<s->count;i++)wgs_mesh(&s->meshes[i],i,from,to,&best,hit);
+    } else {
+        int x0=(int)floorf((fminf(from[0],to[0])-g_grid.x0)/GCELL);
+        int x1=(int)floorf((fmaxf(from[0],to[0])-g_grid.x0)/GCELL);
+        int y0=(int)floorf((fminf(from[1],to[1])-g_grid.y0)/GCELL);
+        int y1=(int)floorf((fmaxf(from[1],to[1])-g_grid.y0)/GCELL);
+        if(x0<0)x0=0;if(y0<0)y0=0;
+        if(x1>=g_grid.gw)x1=g_grid.gw-1;if(y1>=g_grid.gh)y1=g_grid.gh-1;
+        /* Traverse all source indices, without a capped scratch scene. */
+        for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++) {
+            int cell=y*g_grid.gw+x;
+            for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
+                int i=g_grid.list[k];wgs_mesh(&s->meshes[i],i,from,to,&best,hit);
+            }
+        }
+    }
+    return best;
+}
+
 int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {
     return wg_at(s, x, y, fallback, outz, NULL, NULL);
 }
@@ -1802,4 +1945,36 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
         }
     }
     return pushed;
+}
+
+int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
+                         const float bb[6],float z0,float z1,WRailHit *hit) {
+    if (s->meshes != g_grid.meshes) return 0;
+    int cx=(int)((pos[0]-g_grid.x0)/GCELL),cy=(int)((pos[1]-g_grid.y0)/GCELL);
+    if(cx<0||cy<0||cx>=g_grid.gw||cy>=g_grid.gh)return 0;
+    int cell=cy*g_grid.gw+cx,pushed=0;
+    for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
+        int mi=g_grid.list[k];PhysWallContact c;
+        if(!collide_body_mesh_wall(pos,vel,heading,bb,z0,z1,s,mi,
+                                   WALL_RAIL_MIN_H,WALL_RAIL_MAX_H,&c))continue;
+        if(hit&&!pushed) {
+            const N2Mesh *m=&s->meshes[mi];int q=c.tri*3;
+            const float *a=m->verts+m->idx[q]*5,*b=m->verts+m->idx[q+1]*5,
+                        *d=m->verts+m->idx[q+2]*5;
+            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2];
+            float e2x=d[0]-a[0],e2y=d[1]-a[1],e2z=d[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+            float len=sqrtf(nx*nx+ny*ny+nz*nz);
+            hit->mesh=mi;hit->tri=c.tri;hit->nz=len>1e-9f?nz/len:0;
+            hit->zlo=fminf(a[2],fminf(b[2],d[2]));
+            hit->zhi=fmaxf(a[2],fmaxf(b[2],d[2]));hit->edged=c.dist;
+        }
+        pushed=1;
+    }
+    return pushed;
+}
+
+int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r) {
+    float probe[3] = {x,y,z};
+    return !world_wall_push(s,probe,r,NULL);
 }

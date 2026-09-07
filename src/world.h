@@ -185,8 +185,9 @@ int world_race_update(World *w, float x, float y);
 
 void world_race_stop(World *w);
 
-/* Push the car circle (centre pos[3], radius r) back inside the corridor if it
- * has crossed an active race barrier. No-op in freeroam. Returns 1 if it pushed. */
+/* Resolve car-circle overlap with the finite active race-barrier segments.
+ * Either side is solid; no far-side recovery teleport. Z is untouched.
+ * No-op in freeroam. Returns 1 if it pushed. */
 int world_barrier_push(const World *w, float *pos, float r);
 
 /* Load trackname ("ALL" = every STREAM*.BUN under troot, else one region)
@@ -221,6 +222,16 @@ void world_ground_grid_free(WGroundGrid *grid);
  * M135. */
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                         unsigned char *modes, int cap);
+
+/* The GL names world_bind_textures writes are owned by a process-wide
+ * key -> texture cache, not by the caller: a moving-residency swap re-requests
+ * essentially the same ~1100 keys, and re-decoding/re-uploading them was the
+ * bulk of the frame-thread stall at a district boundary. Callers borrow the
+ * names and must not delete them. Binding returns -1 on allocation/upload
+ * failure; callers must reject that candidate. Releases every cached texture; call it on a
+ * GL thread, and before pointing the loader at different archives in the same
+ * process (a track switch re-execs, so only tests need that). */
+void world_texture_cache_clear(void);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
@@ -285,6 +296,14 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
                         WGroundHit *hit, WGroundHit *cand, int *verdict);
 
+/* Earliest above-to-below crossing of a ROAD/TERRAIN triangle by a segment.
+ * Returns a movement fraction [0,1], 1 for no crossing. Both endpoints below
+ * a sheet do not collide: this is not an overhead-layer recovery query.
+ * The caller supplies the wheel's upper contact envelope, not the body origin.
+ * Does not move the car, change the contact window, or mutate grid ownership. */
+float world_ground_sweep(const N2Scene *s, const float from[3],
+                         const float to[3], WGroundHit *hit);
+
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 void world_ground_selftest(void);
 
@@ -295,6 +314,14 @@ void world_ground_selftest(void);
  * the push itself is unchanged. */
 typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
+/* Gameplay rail response using the loaded car's oriented body footprint.
+ * Unlike the legacy circle helper above, this preserves velocity along the
+ * contacted face and clips the face to the body's actual height. */
+int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
+                         const float bb[6],float z0,float z1,WRailHit *hit);
+/* Non-mutating form used when validating a spawn candidate. Returns 1 only
+   when world_wall_push would leave the candidate untouched. */
+int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r);
 /* M133 texture-binding census: set before world_bind_textures to report every
  * key that produced no GPU texture, split by cause. Diagnostic only. */
 extern int g_world_texaudit, g_world_texnoise, g_world_texmiss;

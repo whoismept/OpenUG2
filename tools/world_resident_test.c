@@ -145,6 +145,32 @@ static void test_ground_grid_ownership(void) {
     assert(grid_a.gw == 0 && grid_a.gh == 0 && grid_b.gw == 0 && grid_b.gh == 0);
 }
 
+static void test_spawn_clearance_rejects_rail_face(void) {
+    float ground_v[15] = {
+        -4,-4,0,0,0, 4,-4,0,0,0, -4,4,0,0,0
+    };
+    float rail_v[15] = {
+        1,-4,0,0,0, 1,4,0,0,0, 1,-4,1.5f,0,0
+    };
+    uint16_t tri[3] = {0,1,2};
+    N2Mesh mesh[2] = {{0}};
+    N2Scene scene = {mesh,2,2};
+    float bounds[2][4] = {{-4,-4,4,4},{1,-4,1,4}};
+    WGroundGrid grid = {0};
+    for (int i=0;i<2;i++) {
+        mesh[i].verts = i ? rail_v : ground_v;
+        mesh[i].nverts = 3;
+        mesh[i].idx = tri;
+        mesh[i].nidx = 3;
+        mesh[i].cat = N2_ROAD;
+    }
+    assert(world_ground_grid_build(&grid,&scene,bounds));
+    world_ground_grid_activate(&grid);
+    assert(!world_wall_clear_at(&scene,0.5f,0.0f,0.0f,0.75f));
+    assert(world_wall_clear_at(&scene,-1.0f,0.0f,0.0f,0.75f));
+    world_ground_grid_free(&grid);
+}
+
 static void test_cpu_owner_cleanup(void) {
     WorldNeighborhood neighborhood = {0};
     WorldCity city = {0};
@@ -301,13 +327,103 @@ static void test_transactional_activation(void) {
     world_resident_free(active);
 }
 
-int main(void) {
+/* Breaks if a job borrows its caller's strings, replaces an outstanding job,
+ * publishes before completion, or frees/activates the current world's grid. */
+static void test_background_job(void) {
+    assert(SDL_GL_GetCurrentContext() == NULL);
+    WorldResident *active = fixture_resident(1, 0, 0, 2, 1);
+    world_ground_grid_activate(&active->world.grid);
+    char root[128] = "/nonexistent-openug-resident-test/TRACKS";
+    char track[64] = "STREAML4RA";
+    WResidentBuildArgs args = {0};
+    args.track_root = root; args.trackname = track;
+    args.policy = (WResidentPolicy){1400, 933, 67, 400};
+    WResidentJob *job = NULL;
+    assert(!world_resident_job_start(&job, &args, NAN, 0));
+    assert(job == NULL);
+    assert(world_resident_job_start(&job, &args, 400, 0));
+    WResidentJob *first = job;
+    assert(!world_resident_job_start(&job, &args, 800, 0));
+    assert(job == first);
+    WResidentJob *second = NULL;
+    assert(!world_resident_job_start(&second, &args, 800, 0));
+    assert(second == NULL); /* independent handles must not launch a second parser */
+    memset(root, 'x', sizeof root); memset(track, 'x', sizeof track);
+    WorldResident *prepared = NULL;
+    WResidentBuildTiming timing = {0};
+    int status = 0;
+    Uint32 deadline = SDL_GetTicks() + 10000;
+    do {
+        float z = -9;
+        assert(world_ground_at(&active->world.scene, 1, 1, -9, &z) == WSURF_ROAD);
+        assert(nearf(z, 2));
+        status = world_resident_job_take(&job, &prepared, &timing);
+        if (!status) { assert(prepared == NULL); SDL_Delay(1); }
+        assert(!SDL_TICKS_PASSED(SDL_GetTicks(), deadline));
+    } while (!status);
+    assert(status == -1 && job == NULL && prepared != NULL);
+    assert(prepared->center[0] == 400 && prepared->center[1] == 0);
+    world_resident_free(prepared);
+    assert(!world_resident_job_take(&job, &prepared, &timing));
+    args.track_root = "/nonexistent-openug-resident-test/TRACKS";
+    args.trackname = "STREAML4RB";
+    assert(world_resident_job_start(&job, &args, 800, 0));
+    world_resident_job_cancel(&job); /* joins even if the load is still running */
+    assert(job == NULL);
+    world_resident_job_cancel(&job);
+    assert(world_ground_z(&active->world.scene, 1, 1, -9) == 2);
+    world_resident_free(active);
+}
+
+/* Optional retail-data integration: no GL context, identical CPU geometry,
+ * active ground queries remain usable throughout preparation. */
+static void test_background_scene(const char *root, const char *track) {
+    WorldResident *active = fixture_resident(1, 0, 0, 2, 1);
+    world_ground_grid_activate(&active->world.grid);
+    WResidentBuildArgs args = {0};
+    args.track_root = root; args.trackname = track;
+    args.policy = (WResidentPolicy){1400, 933, 67, 400};
+    WorldResident *sync = calloc(1, sizeof *sync), *prepared = NULL;
+    assert(sync);
+    WResidentBuildTiming a = {0}, b = {0};
+    assert(world_resident_prepare(sync, &args, 0, 0, &a));
+    WResidentJob *job = NULL;
+    assert(world_resident_job_start(&job, &args, 0, 0));
+    int status, polls = 0;
+    Uint32 deadline = SDL_GetTicks() + 60000;
+    do {
+        assert(world_ground_z(&active->world.scene, 1, 1, -9) == 2);
+        status = world_resident_job_take(&job, &prepared, &b);
+        if (!status) { polls++; SDL_Delay(1); }
+        assert(!SDL_TICKS_PASSED(SDL_GetTicks(), deadline));
+    } while (!status);
+    assert(status == 1 && prepared && job == NULL);
+    assert(sync->world.scene.count == prepared->world.scene.count);
+    assert(sync->world.vista.count == prepared->world.vista.count);
+    for (int i = 0; i < sync->world.scene.count; i++)
+        assert(n2_mesh_same_content(&sync->world.scene.meshes[i],
+                                    &prepared->world.scene.meshes[i]));
+    assert(prepared->resources.texture_count == 0);
+    /* Fresh support validation rejects a player who has left the scene, before
+       any GL upload (this entire test runs without a GL context). */
+    assert(!world_resident_finish(prepared, 1e8f, 1e8f, 0, &b));
+    assert(world_ground_z(&active->world.scene, 1, 1, -9) == 2);
+    printf("background %s: %d meshes identical; %d main-thread polls; CPU %u ms\n",
+           track, prepared->world.scene.count, polls, b.neighborhood_ms);
+    world_resident_free(prepared); world_resident_free(sync);
+    world_resident_free(active);
+}
+
+int main(int argc, char **argv) {
     test_policy();
     test_route_points();
     test_ground_grid_ownership();
+    test_spawn_clearance_rejects_rail_face();
     test_cpu_owner_cleanup();
     test_mapped_master_cleanup();
     test_transactional_activation();
+    test_background_job();
+    if (argc == 3) test_background_scene(argv[1], argv[2]);
     puts("world_resident_test: PASS");
     return 0;
 }

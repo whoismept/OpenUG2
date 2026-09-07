@@ -103,15 +103,20 @@ data root
        -> race state -> camera -> render passes -> optional diagnostics
 ```
 
-### Opt-in instance-driven district flow
+### Default instance-driven district flow
 
-The legacy STREAM object walk remains the default. `--world2` is a diagnostic
-instance-world path and must be paired with one explicit `--track STREAM...`
-and `--spawn start` or `--spawn X,Y`; it refuses `--track ALL`. The named
-`start` pose is only a repeatable L4RA reference focus, not a new freeroam
-spawn policy.
+Normal free roam uses the instance-world path. With no track argument the
+engine opens `STREAML4RA`; selecting any single `--track STREAM...` keeps the
+same path. `--world2` remains a backward-compatible alias for old scripts and
+`--track ALL` remains a separate legacy research union, never a playable map.
 
-For this path, `main` resolves the requested XY before `world_load_ex`.
+Without a developer `--spawn` override, `main` intersects companion region
+polygons with section ids actually present in the selected STREAM bundle,
+chooses a deterministic authored focus, builds the resident, then selects the
+nearest ROAD triangle whose full car footprint has support, collision clearance
+and headroom. This removes the old hard-coded L4RA `--spawn start` requirement.
+
+For this path, `main` resolves the authored focus before `world_load_ex`.
 `world_instance_build` reads companion district polygons, selects the smallest
 containing home district and nearby district ids, then chooses one bundle that
 has the home section. It builds a local prototype library from that bundle,
@@ -132,25 +137,25 @@ Keyed records never fall back to a similarly named object. The bounded object
 name is used for diagnostics and scenery classification. Name-only compatibility
 is restricted to records with no keys. Multiple resident copies of the SAME
 key still use the first copy; district-specific copy selection and live streaming
-are separate, unimplemented work. This does not enable `--world2` by default.
+are separate, unimplemented work.
 
 ```text
---world2 focus
+single-STREAM authored focus
   -> companion polygon selection
   -> one home-section STREAM bundle
   -> local prototype library + instance placements
   -> world_dedup -> terrain bias -> bounds/ground grid -> nav -> textures/batches
 ```
 
-After the completed ground grid exists, the diagnostic spawn Z is resolved
-against the nearest authored ROAD/TERRAIN layer. This establishes load-time
-support evidence only; it does not establish vertical contact, collision,
-physics, alpha/glass, lighting, or vista behavior.
+After the completed ground grid exists, the provisional pose is resolved from
+an authored ROAD/TERRAIN triangle. Once the car dimensions and collision scene
+are available, the final free-roam pose is refined by the same patch, wall and
+headroom rules used by safe-spawn diagnostics.
 
 Use the GL-free audit for deterministic assembly evidence:
 
 ```sh
-./nfsu2 DATA_ROOT --track STREAML4RA --world2 --spawn start --heading -101 --instance-audit
+./nfsu2 DATA_ROOT --track STREAML4RA --instance-audit
 ```
 
 It reports selected bundle/home district, region and instance totals, placed
@@ -159,9 +164,9 @@ totals, keyed/explicit-LOD/name-only resolution counts, finite-coordinate failur
 and the ROAD/TERRAIN support result; it
 exits before SDL/OpenGL initialization. Run it twice and compare the outputs,
 normalizing only machine-specific absolute paths or elapsed time if present.
-For a fixed render check, retain the same arguments, replace the audit switch
-with `--shot OUTPUT.png`, and change only `--heading` (for example `-101`,
-`-11`, `79`, or `169`). In this explicit `--world2 --shot` mode, `--heading`
+For a fixed render check, add `--spawn X,Y --heading DEG`, replace the audit
+switch with `--shot OUTPUT.png`, and change only the heading (for example
+`-101`, `-11`, `79`, or `169`). In this explicit-pose `--shot` mode, `--heading`
 is the fixed camera direction (and seeds the parked car yaw); the requested
 supported spawn is preserved, with no legacy showcase selection, race-grid
 placement, or capture autopilot. `--instance-audit` remains GL-free and has no
@@ -553,18 +558,69 @@ spawn or layer transition.
 The horizontal model uses metres/tick; the ride integrator uses metres/second.
 Mixing those units creates violent launch or damping errors.
 
+The ride damper uses wheel velocity relative to the selected face's height rate,
+not absolute world-Z velocity. `phys_ride_support_vz` derives that rate from the
+face normal, resolved XY velocity and accepted wheel rotation, converting to
+metres/second. Positional wall pushes are not velocity; height differences across
+unrelated faces/layers are not differenced into an impulse. Reach, spring tuning
+and bump/droop limits are unchanged. `make ground-motion-test` also checks
+continuous uphill/downhill contact, rotation/winding, rest and genuine free fall.
+
+Before gathering support, `ground_motion_limit` (in `src/ground_motion.h`)
+checks the XY move proposed by `phys_car_step`. `world_ground_sweep` finds
+above-to-below crossings of actual ROAD/TERRAIN triangles by each wheel's
+upper contact envelope. The move stops before a crossing; only velocity into
+the face is removed. Z remains owned by the ride integrator, and overhead
+layers are not recovery targets. The query uses the active ground grid without
+a capped list of candidate meshes. Accepted yaw is reconstructed and rechecked
+because wheel endpoints do not interpolate linearly through a turn.
+
+Run `make ground-motion-test` for synthetic slope, overhead, winding, dense-grid
+and turning regressions. This is sampled wheel-envelope protection, not full
+rigid-body continuous collision detection. It does not cover subsequent wall
+pushes, vertical/angular suspension integration, or restore missing support.
+In particular, support loss can still leave the car at the ride tilt limit;
+passing these tests is not evidence of retail handling or a playable lap.
+
 ### Collision
 
 Building rectangles are broad phase only. `cw_mesh_feature` confirms a nearby
-source-mesh face overlapping the car's vertical envelope, rejects combined wall
+source-mesh face clipped to the car's vertical envelope, rejects combined wall
 spans below `WALL_MIN_FACE_SPAN`, and returns the closest feature normal and
 penetration. `collide_walls` pushes along that normal and removes only the
 into-wall velocity component.
+Clipping must happen **before** projecting the face into XY: overlapping Z
+bounds alone allow a distant upper edge to cause a false ground-level contact.
 
-`world_wall_push` handles near-vertical road/terrain guardrail faces using a
-measured height band. `world_barrier_push` is race-corridor closure. These are
-three separate predicates; a threshold proven for one is not automatically
-valid for another.
+The player uses `collide_body_walls`: an oriented capsule from the loaded body's
+longitudinal bounds and half-width, with asymmetric model offsets retained.
+The capsule axis is tested against the clipped face edges (including segment
+intersections), rather than testing only a 1.3 m circle at the car centre.
+This prevents the measured rear-axle excursion beyond the L4RB 4201 curb while
+the centre is still outside it. `collide_walls` remains the zero-axis circle
+wrapper; missing body measurements use its legacy fallback. Both share the
+face-local resolution and preserve tangential velocity. Race-audit attribution
+uses the returned production contacts, not a second circle-only query.
+
+This is an inscribed rounded approximation, not full rectangular body/corner
+coverage or swept rigid-body collision. It does not apply a yaw impulse, change
+the suspension, or change the corridor/AI collision shapes. Sequential
+contacts can still pin a vehicle against multiple faces; a supported wheel
+mask is not proof of a playable route or an unobstructed chase camera.
+
+`world_body_wall_push` handles near-vertical road/terrain guardrail faces using
+the same oriented body capsule and face-local velocity response. Its measured
+0.75–2.5 m face-height band rejects surface seams and tall terrain walls.
+`world_wall_push` remains the circle helper for spawn probes;
+`world_barrier_push` is race-corridor closure. These predicates still have
+separate ownership, so a threshold proven for one is not automatically valid
+for another.
+
+Race-corridor closures resolve circle overlap with the same finite 18 m segment
+that is drawn. Both sides and rounded endpoints are solid; the far side is not
+a nine-metre-deep recovery volume. A side approach must not teleport the car
+back across a slope and leave its wheels below the road. These closures still
+use a circle and have no vertical-layer test or swept collision.
 
 ## 10. Racing, navigation and AI
 
@@ -700,12 +756,15 @@ is proven; activation timing, race direction and career-stage state are not.
 Some venue graphics (six in RB) have no override membership. Do not convert
 this audit into a blanket name-prefix filter or section-level suppression.
 
-### Scenery preview (M140, opt-in; not live activation)
+### Scenery selection (M140/M147, conservative; not live activation)
 
-The checked reader is shared from `src/world_group_reader.h`. The separate
-selection policy in `src/world_scenery.h` hides only exclusively numeric-event
+The checked reader is shared from `src/world_group_reader.h`. The selection
+policy in `src/world_scenery.h` hides only exclusively numeric-event
 memberships; ordinary/shared/unknown placements remain. Both rendering and
-collision are built from that same filtered scene. Default loading is unchanged.
+collision are built from that same filtered scene. Normal instance-driven free
+roam selects `free` by default; a live `--event` race selects that event's own
+authored group (M160, below). Retail direction/career activation timing is
+still undecoded, so nothing is filtered *within* the selected event.
 
 For a bounded city comparison, run these as three independent loads:
 
@@ -722,8 +781,9 @@ For a bounded city comparison, run these as three independent loads:
 `--instance-audit` can replace the capture flags for a GL-free assembly check.
 The preview cannot be used interactively, with `--event`, race/drive audits,
 or alternate-spawn captures/audits. Event selection here does not arm a race.
-An unrecognized numeric event or inconsistent group data fails loading; it
-does not silently fall back to an unfiltered scene.
+Inconsistent group data fails loading. A numeric event the bundle authors no
+group for degrades to the unfiltered scene instead (M160, below); that is the
+only fallback, and it is reported.
 
 At this RA pose with the current 1000 m chunk, free suppresses 258 placements;
 event 4144 suppresses 226, restoring 32 placements / 92 emitted meshes / 604
@@ -739,31 +799,173 @@ wall-contact responses, shared memberships, unknown events and corrupt targets.
 Runtime direction/career selection is still unimplemented. Do not present this
 preview as retail free-roam fidelity or automatic Enter/finish activation.
 
-### Moving world neighborhood (M144, `--world2` free-roam)
+### Per-event race selection (M160)
+
+`wg_runtime_selection` in `src/world_scenery.h` is the whole policy:
+
+| caller state | selection |
+|---|---|
+| explicit `--scenery-preview` | the requested value (the CLI still forbids pairing it with `--event`, so this beats a race id only at the function level) |
+| live race (`--event N`) | `N` — the event's own authored group |
+| everything else | `-1`, conservative free roam |
+
+Why it matters, measured on STREAML4RG event 4701: the bundle authors 4827
+group placements and only 77 belong to `BARRIERS_4701`. 143 sit within 40 m of
+the event's own `0x34148` racing line and 15 foreign-exclusive ones sit at
+0.00 m from it, including event 4707's start/finish gantry pair 17.6 m from
+4701's own start grid. Before M160 a race loaded all of them.
+
+**A positive id here is a request, not a guarantee.** Four shipped events
+author no group at all (L4RB 4201/4202/4203, L4RC 4341), and
+`wg_selection_open` rejects an absent group exactly as it rejects a corrupt
+table. `wg_event_group_present` separates the two:
+
+- group absent -> `world_instance_build_for_event` degrades `effective_event`
+  to 0 and builds the unfiltered scene. `collect.scenery` follows
+  `effective_event`, never the request, so nothing is half-filtered.
+- table malformed, duplicate or out-of-contract id -> still fails closed.
+
+`WInstStats.scenery_effective` carries what was actually selected back to the
+caller. The `SCENERY SELECTION` line prints that, not the request, so a
+degraded load reads `mode=unfiltered(no authored group)` and can never claim a
+filter that did not run. Check it when a race looks unfiltered:
+
+```sh
+./nfsu2 /path/to/NFSU2 --car MIATA --track STREAML4RG --event 4701 \
+  --race-audit /tmp/rg | grep 'SCENERY SELECTION'
+```
+
+Ownership of a specific contact is a separate question from selection. Barrier
+geometry also ships **ungrouped**, and those placements are outside this system
+entirely — no event selection can hide them. Attribute before assuming a
+contact is filterable: match the collision AABB to its two authored end posts,
+then look the posts up with `build/world_group_audit`.
+
+`make world-group-test` covers the policy table, `wg_event_group_present`
+against a real `BARRIERS_4701` group, and the sibling-id rejection that makes
+the predicate necessary. `make world-instance-test` covers the degrade path:
+an unauthored id must produce the same meshes, rows and wall set as the
+unfiltered build, with `scenery_hidden == 0` and `scenery_effective == 0`.
+
+### Selection can never remove ground (M161)
+
+Event selection filters the section walk only. Drivable surface is not in that
+path at all:
+
+- `winst_place_ground_prototypes` walks the model library, places every ROAD
+  and TERRAIN mesh of every prototype, runs before the section walk, and takes
+  no selection argument.
+- `winst_build_visit`, the visitor the selection filters, skips every ROAD and
+  TERRAIN mesh outright.
+
+So hiding a placement removes only its non-ground meshes. This is load-bearing
+on real data: 1292 authored placements across 17 L4RB and L4RC events carry
+road-named prototypes (`TRN_ROADpiece*`, `TRN_ROADskid*`,
+`TRN_traintracks_lighting_*`) that ARE hidden when a sibling event is raced.
+`test_selection_never_hides_ground` pins both halves; it was verified to fail
+when either is removed. Do not add a selection argument to the ground path, and
+do not drop the ROAD/TERRAIN skip in the visitor.
+
+Validate the whole selection path against shipped data with:
+
+```sh
+make route-membership-audit
+./build/m160_route_audit /path/to/NFSU2/TRACKS --sweep 40   # all 105 events
+./build/m160_route_audit /path/to/NFSU2/TRACKS --assets     # what groups can hide
+```
+
+The sweep reports per-event own/foreign counts, how many foreign placements sit
+within the corridor of that event's own racing line, and any road-named
+placement a selection hides. Expect 0 failures and exactly 4 degrades. It
+exercises the selection path only and builds no scene, so a clean sweep is not
+a claim that every event loads and drives.
+
+Catalog exposure and runtime exposure are different numbers: L4RB/4211 has
+road-named placements in the catalog but hides nothing at runtime, because they
+sit outside the loaded neighborhood.
+
+### Moving world neighborhood
 
 The instance-driven world keeps one replaceable `WorldResident`. Persistent
 navigation, districts, events and race state stay in `WorldCity`; geometry,
 ground grid, regional texture sources, lights and bounds live in
-`WorldNeighborhood`. `WorldResidentResources` owns the matching GL textures,
-ordinary/sky/glow/vista batches, per-mesh material maps and solid-collision
+`WorldNeighborhood`. `WorldResidentResources` borrows world textures from the
+process-wide texture-key cache and owns its ordinary/sky/glow/vista batches,
+per-mesh material maps and solid-collision
 arrays. Do not cache a scene mesh or batch index outside that package.
 
-Resident replacement is transactional and synchronous:
+Resident replacement is transactional. Normal driving prepares CPU geometry
+on one worker; `--resident-sync` selects the synchronous diagnostic control:
 
 1. `world_resident_target` snaps the player to a deterministic 400 m cell.
-2. `world_neighborhood_load` builds a candidate without activating its grid.
+2. `world_resident_prepare` / `world_neighborhood_load` builds a detached CPU
+   candidate without activating its grid or making GL calls.
 3. CPU validation checks finite geometry/index/bounds, zero rejected instances
    and ROAD/TERRAIN support under the current player layer.
-4. `world_resident_resources_build` resolves textures and uploads every pass,
-   then builds collision from that same candidate scene.
+4. Background `world_resident_finish_step` resolves textures, uploads ordinary
+   batches over multiple frames, then builds the remaining passes and collision
+   from that same candidate. `world_resident_resources_build` drains the same
+   upload cursor synchronously for startup/countdown/diagnostics.
 5. At a frame boundary `world_resident_activate` swaps the complete owner and
-   activates its ground grid; only then is the former resident destroyed.
+   activates its ground grid; only then may the former resident be destroyed.
 
 Build failure leaves the old resident active and the failed snapped cell is not
 retried until the player targets another cell. Player position, velocity,
 heading, sprung ride/contact state, camera and input are deliberately outside
-the resident and must remain byte-identical across activation. This path is
-free-roam-only, requires one explicit STREAM bundle and never uses `--track ALL`.
+the resident and must remain byte-identical across activation. Free-roam and
+races use this path with one STREAM bundle, never `--track ALL`. Race countdown
+prepares synchronously after grid placement, before the player can drive with
+a neighborhood still centred kilometres away at the menu focus. A countdown
+load failure exits with an error instead of starting with missing collision.
+Scenery-group selection is unchanged. Race-audit source attribution snapshots
+labels and includes the resident generation; mesh indices alone are not stable
+across swaps.
+
+The worker owns copied request strings and a zero-initialised candidate.
+Completion is atomically published; the frame thread joins it before validating
+the **current** player pose and starting GL-thread finishing. Ordinary uploads
+consume at most 128 complete batches per frame. The exact cell/material/u16
+partition, final texture order and mesh-to-batch mapping are shared with the
+synchronous wrapper. Partial output belongs to an upload cursor, never to the
+active renderer. Before activation, ground support is checked again at the
+player's latest position. Obsolete partial candidates are cancelled; errors
+retain the active owner, and shutdown joins any outstanding job before freeing
+partial uploads and their borrowed CPU scene. Temporary cursor arrays reserve
+up to one entry per source mesh; this is not a byte-level memory cap.
+Previously resolved textures and final missing keys are reused across resident
+builds; repeated keys preserve their GL name and authored draw mode. Source
+precedence (region/LOC4/master before common) is unchanged. Residents must not
+delete borrowed textures. `world_texture_cache_clear` releases them on the GL
+thread after all residents are done, before destroying the context. Tests or
+other callers changing source archives in-process must clear the cache first;
+normal track changes re-exec. Allocation/upload failure rejects the candidate,
+not the active resident. The cache retains visited keys for one bundle's run;
+it is not a multi-bundle cache or an eviction system.
+
+The ordinary-batch quota spreads both CPU packing and GL submission. It is not
+a time deadline: a single large batch/driver call may still stall. Initial new
+texture decode/upload, partition sorting, sky/glow work and final vista/collision
+work remain synchronous. The old complete scene stays active throughout, but
+activation happens later; the route audit replans on activation, so its driving
+trajectory can change. A lower peak step is not proof of better route completion.
+Normal worker-driven swaps retire the old owner in 256 batch/mesh units per
+frame, on the GL thread. This is a work quota, not a hard time deadline. Only
+inactive arrays are consumed; the active render/collision scene is untouched.
+There is one retired slot: a second swap arriving unusually early drains that
+slot synchronously to preserve ownership and activate the new neighborhood on
+time. Synchronous diagnostics/countdown retain immediate destruction. Shutdown
+joins the loader and safely frees any partially retired owner before clearing
+the texture cache/context. Cancellation/backlog draining can still block.
+`--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
+physics paced at approximately 60 Hz; race audits and unpaced captures use the sync
+control. A successful resident swap does not prove continuous ground contact.
+An explicit `--frames N` bounds a resident-drive sample and writes its final
+capture; without it the full route/control-run termination remains unchanged.
+A bounded sample does not claim the full RDA route passed.
+Sliced-drive timing reports distinguish `peak-step` (largest blocking finish
+step including activation) from `total-work` (aggregate finish work across
+frames, excluding inter-frame waiting). Phase totals must not be read as one
+frame's latency. The CPU-worker time is separate from both metrics.
 
 `WorldNeighborhood.master` records whether the master resource came from
 `mmap`. Destruction must use `res_unmap_file` for mapped data and `free` only
@@ -782,11 +984,10 @@ the supported L4RA start / L4RB sprint-grid pose:
 | **1400** | **23768 / 4528 / 694 / 1077** | **4142 / 1059 / 277 / 101** |
 | 1600 | 31557 / 5397 / 777 / 1546 | 6916 / 1449 / 371 / 135 |
 
-Use `--resident-audit RADIUS X Y` with `--world2`, one explicit `--track` and
-`--spawn` to measure the real loader/uploader. The audit is rejected for legacy,
+Use `--resident-audit RADIUS X Y` with one explicit `--track` to measure the
+real loader/uploader. `--spawn` is optional. The audit is rejected for legacy,
 `ALL` and `--event` modes. Times are synchronous development measurements, not
-frame-budget promises; asynchronous/background loading is intentionally not in
-M144.
+frame-budget promises. They predate the background CPU preparation above.
 
 Use `--resident-route-audit PREFIX` with the same mode guards to exercise the
 production transaction across two supported navigation points. The audit takes

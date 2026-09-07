@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <zlib.h>   /* screenshot PNG (dev only) */
 
 #include "render.h"
@@ -559,7 +560,7 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
 }
 
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
-static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
+static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                        GLuint tex, N2Batch *b, int bidx, const char *audit,
                        const unsigned char *mtexmode) {
     int nv = 0, ni = 0;
@@ -568,11 +569,13 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     }
     BatchedVertex *bv = (BatchedVertex *)malloc((size_t)nv * sizeof *bv);
     uint16_t *bi = (uint16_t *)malloc((size_t)ni * sizeof *bi);
+    if (!bv || !bi) { free(bv); free(bi); return 0; }
     float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
     int vo = 0, io = 0;
     for (int k = i0; k < i1; k++) {
         const N2Mesh *m = &s->meshes[ent[k].idx];
         float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
+        if (!nor) { free(bv); free(bi); return 0; }
         mesh_normals(m, nor);          /* per source mesh: no cross-mesh smoothing */
         for (int v = 0; v < m->nverts; v++) {
             BatchedVertex *o = &bv[vo + v]; const float *p = m->verts + v*5;
@@ -597,6 +600,10 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof *bv, bv, GL_STATIC_DRAW);
     glGenBuffers(1, &b->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
+        memset(b, 0, sizeof *b); free(bv); free(bi); return 0;
+    }
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
     b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
@@ -606,14 +613,48 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     }
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
     free(bv); free(bi);
+    return 1;
 }
 
-int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
-                         const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                         const char *audit, int *meshbatch,
-                         const unsigned char *mtexmode) {
+struct WorldBatchUpload {
+    const N2Scene *scene;
+    const unsigned char *modes;
+    const char *audit;
+    BSortEnt *ent;
+    N2Batch *batches;
+    int *run0, *run1;
+    int meshes, next, count;
+};
+
+void upload_world_batches_cancel(WorldBatchUpload **slot) {
+    if (!slot || !*slot) return;
+    WorldBatchUpload *j = *slot;
+    render_batch_array_free(&j->batches, &j->count);
+    free(j->ent); free(j->run0); free(j->run1); free(j);
+    *slot = NULL;
+}
+
+WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
+                          const float (*mbb)[4], const GLuint *mtex,
+                          GLuint texTerr, const char *audit,
+                          const unsigned char *mtexmode) {
+    if (!s || s->count < 0 || (s->count && (!s->meshes || !mbb || !mtex)))
+        return NULL;
+    WorldBatchUpload *j = calloc(1, sizeof *j);
+    if (!j) return NULL;
     int n = s->count;
-    if (meshbatch) for (int i = 0; i < n; i++) meshbatch[i] = -1;
+    size_t cap = (size_t)(n ? n : 1);
+    /* ponytail: at most one batch per source mesh; temporary upper-bound
+     * arrays avoid reallocating partial GL owners. Compact if memory dominates. */
+    j->ent = malloc(cap * sizeof *j->ent);
+    j->batches = malloc(cap * sizeof *j->batches);
+    j->run0 = malloc(cap * sizeof *j->run0);
+    j->run1 = malloc(cap * sizeof *j->run1);
+    if (!j->ent || !j->batches || !j->run0 || !j->run1) {
+        upload_world_batches_cancel(&j); return NULL;
+    }
+    j->scene = s; j->modes = mtexmode; j->audit = audit;
+    BSortEnt *ent = j->ent;
     /* world extent -> grid coords */
     float x0 = 1e30f, y0 = 1e30f;
     for (int i = 0; i < n; i++) {
@@ -624,7 +665,6 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
        upload_cat_batches instead: batching them in here would let an ordinary
        cell+texture run silently absorb a skybox shell or a neon sign, so
        they'd draw with the wrong depth/blend state at the wrong time. */
-    BSortEnt *ent = (BSortEnt *)malloc((size_t)n * sizeof *ent);
     int m = 0;
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
@@ -641,31 +681,40 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
         m++;
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
-    /* walk key runs, splitting a run at the u16 vertex ceiling */
-    int cap = 256, nb = 0;
-    N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
-    /* run boundaries per emission index, so a post-sort audit can replay the
-       SAME partition rather than re-deriving one (M79) */
-    int *run0 = (int *)malloc((size_t)cap * sizeof *run0);
-    int *run1 = (int *)malloc((size_t)cap * sizeof *run1);
-    int i0 = 0, verts = 0;
-    for (int i = 0; i <= m; i++) {
-        int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
-                                            ent[i].group != ent[i0].group)) ||
-                    (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
-        if (flush && i > i0) {
-            if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat);
-                run0 = (int *)realloc(run0, (size_t)cap * sizeof *run0);
-                run1 = (int *)realloc(run1, (size_t)cap * sizeof *run1); }
-            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit, mtexmode);
-            run0[nb] = i0; run1[nb] = i; nb++;
-            i0 = i; verts = 0;
+    j->meshes = m;
+    return j;
+}
+
+int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
+                             N2Batch **out, int *count, int *meshbatch) {
+    if (!slot || !*slot || !out || !count) return -1;
+    if (max_batches <= 0) return 0;
+    WorldBatchUpload *j = *slot;
+    const N2Scene *s = j->scene;
+    BSortEnt *ent = j->ent;
+    N2Batch *bat = j->batches;
+    int *run0 = j->run0, *run1 = j->run1;
+    const char *audit = j->audit;
+    while (j->next < j->meshes && max_batches-- > 0) {
+        int i0 = j->next, i = i0 + 1;
+        int verts = s->meshes[ent[i0].idx].nverts;
+        while (i < j->meshes && ent[i].key == ent[i0].key &&
+               ent[i].group == ent[i0].group &&
+               verts + s->meshes[ent[i].idx].nverts <= BATCH_MAXVERTS)
+            verts += s->meshes[ent[i++].idx].nverts;
+        if (!batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
+                        &bat[j->count], j->count, audit, j->modes)) {
+            upload_world_batches_cancel(slot); return -1;
         }
-        if (i < m) verts += s->meshes[ent[i].idx].nverts;
+        run0[j->count] = i0; run1[j->count] = i;
+        j->count++; j->next = i;
     }
+    if (j->next < j->meshes) return 0;
+    int nb = j->count;
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
     /* mesh -> final batch, replayed from each batch's own emission run so it is
        the production partition rather than a second derivation (M133) */
+    if (meshbatch) for (int k = 0; k < s->count; k++) meshbatch[k] = -1;
     if (meshbatch)
         for (int b = 0; b < nb; b++) {
             int e = bat[b].emit_idx;
@@ -681,9 +730,23 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
             batch_members_report(s, ent, run0[e], run1[e], want, bat[want].tex, &bat[want]);
         } else fprintf(stderr, "batch audit: #%d out of range (0..%d)\n", want, nb-1);
     }
-    free(ent); free(run0); free(run1);
-    *out = bat;
-    return nb;
+    *out = bat; *count = nb;
+    j->batches = NULL; j->count = 0;
+    upload_world_batches_cancel(slot);
+    return 1;
+}
+
+int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
+                         const GLuint *mtex, GLuint texTerr, N2Batch **out,
+                         const char *audit, int *meshbatch,
+                         const unsigned char *mtexmode) {
+    WorldBatchUpload *j = upload_world_batches_begin(s, mbb, mtex, texTerr,
+                                                    audit, mtexmode);
+    int count = 0;
+    if (!j || upload_world_batches_step(&j, INT_MAX, out, &count, meshbatch) < 0) {
+        upload_world_batches_cancel(&j); return -1;
+    }
+    return count;
 }
 
 /* Same merge as above but for exactly one category, grouped by texture only
@@ -693,6 +756,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                        const unsigned char *mtexmode) {
     int n = s->count;
     BSortEnt *ent = (BSortEnt *)malloc((size_t)(n ? n : 1) * sizeof *ent);
+    if (!ent) return -1;
     int m = 0;
     for (int i = 0; i < n; i++)
         if (s->meshes[i].cat == cat) {
@@ -705,14 +769,21 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     int cap = 8, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
+    if (!bat) { free(ent); return -1; }
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
         int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
                                             ent[i].group != ent[i0].group)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
-            if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }
-            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL, mtexmode);
+            if (nb == cap) {
+                cap *= 2;
+                N2Batch *grown = realloc(bat, (size_t)cap * sizeof *bat);
+                if (!grown) goto fail;
+                bat = grown;
+            }
+            if (!batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
+                            &bat[nb], nb, NULL, mtexmode)) goto fail;
             nb++;
             i0 = i; verts = 0;
         }
@@ -721,6 +792,8 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     free(ent);
     *out = bat;
     return nb;
+fail:
+    free(ent); render_batch_array_free(&bat, &nb); return -1;
 }
 
 void render_batch_array_free(N2Batch **batches, int *count) {

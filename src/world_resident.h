@@ -43,10 +43,23 @@ typedef struct {
     float (*obstacle_z)[2];
     int *obstacle_src;
     int obstacle_count;
+    WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
+    uint64_t batch_ticks;      /* aggregate across sliced GL-thread work */
 } WorldResidentResources;
 
+/* Optional build timing output (M151). Pass NULL to skip. */
+typedef struct {
+    uint32_t neighborhood_ms;  /* world_neighborhood_load */
+    uint32_t validate_ms;      /* world_resident_validate_cpu */
+    uint32_t textures_ms;      /* world_bind_textures + mesh tex lookup */
+    uint32_t batches_ms;       /* upload_*_batches + debug_batches */
+    uint32_t collision_ms;     /* phys_collect_walls */
+    uint32_t total_ms;
+} WResidentBuildTiming;
+
 int world_resident_resources_build(WorldResidentResources *resources,
-                                   WorldNeighborhood *neighborhood);
+                                   WorldNeighborhood *neighborhood,
+                                   WResidentBuildTiming *timing);
 void world_resident_resources_free(WorldResidentResources *resources);
 
 struct WorldResident {
@@ -70,9 +83,43 @@ int world_resident_validate_cpu(const WorldResident *resident,
 int world_resident_build(WorldResident *candidate,
                          const WResidentBuildArgs *args,
                          float center_x, float center_y,
-                         float player_x, float player_y, float player_z);
+                         float player_x, float player_y, float player_z,
+                         WResidentBuildTiming *timing);
+
+/* Prepare owns CPU/file data only; candidate must be zero-initialized. Partial
+ * failure is still owned by candidate. Finish runs on the GL thread and checks
+ * the CURRENT player position, not a pose captured when preparation started. */
+int world_resident_prepare(WorldResident *candidate, const WResidentBuildArgs *args,
+                           float center_x, float center_y,
+                           WResidentBuildTiming *timing);
+int world_resident_finish(WorldResident *candidate, float x, float y, float z,
+                          WResidentBuildTiming *timing);
+/* Background finish: 0 pending, 1 complete, -1 failed. Retains partial resources
+ * in candidate; free safely on cancellation. Check CURRENT support on the last
+ * step as well as validating the detached scene before the first upload. */
+int world_resident_finish_step(WorldResident *candidate, float x, float y, float z,
+                          int max_batches, WResidentBuildTiming *timing);
+
+/* Single-loader contract: while a job is outstanding, do not invoke another
+ * neighborhood/instance load or activate/free the active ground grid. Rendering
+ * and ground queries on the immutable active scene may continue. All job APIs
+ * are called on the frame thread. Arguments are copied; no active-world pointers
+ * are borrowed. Take joins only after completion, then transfers the CPU owner
+ * (including partial failed output). Cancel joins and disposes on the caller. */
+typedef struct WResidentJob WResidentJob;
+int world_resident_job_start(WResidentJob **job, const WResidentBuildArgs *args,
+                             float center_x, float center_y);
+/* 0 = not ready/no job (outputs untouched), 1 = prepared, -1 = load failed. */
+int world_resident_job_take(WResidentJob **job, WorldResident **candidate,
+                            WResidentBuildTiming *timing);
+void world_resident_job_cancel(WResidentJob **job);
 void world_resident_activate(WorldResident **active,
                              WorldResident **candidate);
 void world_resident_free(WorldResident *resident);
+/* GL-thread cleanup of an INACTIVE resident, at most max_items batches/meshes
+ * per call. Returns 1 and clears the slot when done; 0 leaves a partial owner.
+ * The partial owner must not be queried/rendered. world_resident_free remains
+ * safe for immediate shutdown/cancellation at any step. */
+int world_resident_retire_step(WorldResident **resident, int max_items);
 
 #endif

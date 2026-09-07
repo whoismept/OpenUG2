@@ -2,7 +2,7 @@
 CARS/
 TRACKS/
 GLOBAL/
-FRONTEND/
+/FRONTEND/
 SOUND/
 SUBTITLES/
 NIS/
@@ -26,6 +26,7 @@ scratchpad/
 *.o
 *.obj
 *.exe
+*.dSYM
 
 # --- Screenshots / generated ---
 *.png
@@ -57,3 +58,4 @@ AGENTS.md
 CLAUDE.md
 docs/PROJECT_STATE.md
 docs/OPUS_TASK_TEMPLATE.md
+docs/superpowers/

@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "../src/world_group_reader.h"
+#include "../src/world_scenery.h"
 
 static void u16(unsigned char *p, unsigned n) {p[0]=(unsigned char)n;p[1]=(unsigned char)(n>>8);}
 static void u32(unsigned char *p, unsigned n) {u16(p,n);u16(p+2,n>>16);}
@@ -29,13 +30,54 @@ static int check_member(const WGMember *m, void *ctx) {
 }
 static int cancel(const WGMember *m, void *ctx) {(void)m;(*(int*)ctx)++;return 0;}
 int main(void) {
-    unsigned char ov[16], g[112];WGTable t;
+    /* Normal open-world free roam must use the conservative selection that
+     * removes event-exclusive placements. Explicit previews retain their
+     * requested mode. A live race now REQUESTS its own authored group, so
+     * another event's road closures cannot stand on the raced route; the
+     * builder degrades a request the bundle does not author (M160). */
+    assert(wg_runtime_selection(0, 0, 0) == -1);
+    assert(wg_runtime_selection(1, -1, 0) == -1);
+    assert(wg_runtime_selection(1, 4144, 0) == 4144);
+    assert(wg_runtime_selection(0, 0, 4201) == 4201);
+    assert(wg_runtime_selection(0, 0, 4701) == 4701);
+    /* An explicit preview still wins over the active race id. */
+    assert(wg_runtime_selection(1, -1, 4701) == -1);
+    unsigned char ov[16], g[112];WGTable t;WGSelection sel_probe={0};
     fixture(ov,g);
     /* Catches missing decoder, wrong field offsets and a global/local index mixup. */
     assert(wg_open(ov,sizeof ov,g,sizeof g,&t));
     assert(t.override_count==2 && t.group_count==2);
     assert(wg_visit(&t,check_member,NULL) && visits==3);
     int calls=0;assert(!wg_visit(&t,cancel,&calls) && calls==1);
+    /* Group presence is answered from the authored names only. The fixture
+     * groups are "A" and "B", so no numeric event id is present, while
+     * free roam and "unchanged" stay answerable without a lookup. */
+    assert(wg_event_group_present(&t,-1) && wg_event_group_present(&t,0));
+    assert(!wg_event_group_present(&t,4701));
+    assert(!wg_event_group_present(NULL,4701));
+    {   /* One real BARRIERS_<id> group: present for its own id only. Absence
+         * of a sibling id is what the builder degrades on, and it must never
+         * be confused with the table being rejected. */
+        unsigned char bov[8], bg[56];
+        WGTable bt;
+        memset(bov,0,sizeof bov);memset(bg,0,sizeof bg);
+        u16(bov+6,1);                       /* one reference to override 0 */
+        memcpy(bg+8,"BARRIERS_4701",13);
+        uint32_t h=0xffffffffu;
+        for(const char *c="BARRIERS_4701";*c;c++)h=h*33u+(unsigned char)*c;
+        u32(bg+40,h);u32(bg+48,1);u16(bg+52,0);
+        assert(wg_open(bov,sizeof bov,bg,sizeof bg,&bt));
+        assert(wg_event_group_present(&bt,4701));
+        assert(!wg_event_group_present(&bt,4702));
+        assert(wg_selection_open(&bt,4701,&sel_probe) && sel_probe.count==1);
+        assert(sel_probe.items[0].membership==(WG_EVENT|WG_ACTIVE));
+        assert(wg_selection_visible(&sel_probe,0,0));
+        free(sel_probe.items);memset(&sel_probe,0,sizeof sel_probe);
+        /* A sibling id the bundle does not author is rejected by the selection
+         * helper; only wg_event_group_present separates that from corruption. */
+        assert(!wg_selection_open(&bt,4702,&sel_probe));
+    }
+
     assert(!wg_visit(&t,NULL,NULL));
     /* Every truncation must fail before any consumer can use a partial table. */
     for(size_t n=0;n<sizeof g;n++)assert(!wg_open(ov,sizeof ov,g,n,&t));

@@ -30,7 +30,7 @@ pipeline works, but only selected content has been verified end to end.
 
 ### Current development screenshots
 
-These are unedited captures from the current single-region `--world2` path,
+These are unedited captures from the current single-region open-world path,
 rendered from user-supplied retail data. They show the engine's present state,
 not a finished release or a claim of pixel-perfect retail fidelity.
 
@@ -126,28 +126,36 @@ Point it at your NFS: Underground 2 data directory (the folder containing
 make run DATA=/path/to/nfsu2/data
 ```
 
-Run one of the currently verified single-region paths explicitly:
-
-> The executable still selects `ALL` when no track is supplied for legacy
-> diagnostic compatibility. Choose an individual region for supported gameplay.
+The normal command opens the current L4RA open-world reference. The engine
+derives a start district from the selected STREAM bundle and places the car on
+the nearest safe authored road; no internal world-mode or spawn flag is needed.
 
 ```sh
-# Closed circuit reference
+# Open-world reference (STREAML4RA is the default)
+./nfsu2 DATA
+
+# Another single-region world / sprint reference
+./nfsu2 DATA --car ECLIPSE --track STREAML4RB --event 4201
+
+# Closed-circuit reference (uses the currently verified circuit loader)
 ./nfsu2 DATA --car HUMMER --track STREAML4RA \
   --circuit ROUTESL4RA/Paths4175.bin
-
-# Sprint reference
-./nfsu2 DATA --car HUMMER --track STREAML4RB --event 4201
 ```
 
 - `--car NAME` — a folder under `CARS/` (needs a `GEOMETRY.BIN`).
 - `--track NAME` — a single `STREAM*.BUN` under `TRACKS/`, such as
-  `STREAML4RA` or `STREAML4RB`. `ALL` still exists for diagnostics but is not a
-  supported gameplay composition.
+  `STREAML4RA` or `STREAML4RB`. Selecting one automatically enables the
+  instance-driven moving neighborhood. `ALL` still exists for diagnostics but
+  is not a supported gameplay composition.
 - `--circuit PATH` — a closed-loop `Paths*.bin` under `TRACKS/`.
 - `--event ID` — start a shipped race event such as L4RB sprint `4201`.
 - `--tier ordinary` — production renderer and the default. `--tier full` is an
   experimental panorama path with known visual defects.
+
+The old `--world2` option remains accepted for scripts, but it is now only a
+backward-compatible alias. `--spawn start|X,Y` and `--heading DEG` are developer
+overrides for reproducible audits; ordinary players and new contributors do not
+need them.
 
 It opens on a **pre-race menu**: the car orbits amid the city while you pick a
 **car** (Left/Right — every drivable folder under `CARS/`), a **track** (Up/Down
