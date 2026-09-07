@@ -2295,6 +2295,8 @@ int main(int argc, char **argv) {
 
     static World world;
     WorldResident *active_resident = NULL, *candidate_resident = NULL;
+    WorldResident *retired_resident = NULL;
+    unsigned retire_frames = 0, retire_peak_ms = 0, retire_total_ms = 0;
     const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
     if (world2 && !world2_spawn_set) {
         const char *stem = !strncmp(trackname,"STREAM",6) ? trackname+6 : trackname;
@@ -4975,6 +4977,17 @@ int main(int argc, char **argv) {
     while (running) {
         uint32_t resident_frame_begin = SDL_GetTicks();
         Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
+        if (retired_resident) {
+            uint32_t begin = SDL_GetTicks();
+            /* ponytail: work quota, not a hard millisecond deadline. Keep GL
+             * cleanup on this thread; only the inactive owner is consumed. */
+            int done = world_resident_retire_step(&retired_resident, 256);
+            uint32_t elapsed = SDL_GetTicks() - begin;
+            retire_frames++; retire_total_ms += elapsed;
+            if (elapsed > retire_peak_ms) retire_peak_ms = elapsed;
+            if (done) printf("resident retired frames=%u total=%u ms peak-step=%u ms\n",
+                             retire_frames, retire_total_ms, retire_peak_ms);
+        }
         /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
            the production race_state==3 Enter branch runs exactly as written. */
         static long ra_f = 0; static int ra_sent = 0, ra_start = -1;
@@ -5357,7 +5370,16 @@ int main(int argc, char **argv) {
                             if (b2 > vista_far) vista_far = b2;
                         }
                     if (nvista) vista_far *= 2.5f;
-                    world_resident_free(candidate_resident); /* previous */
+                    if (background) {
+                        /* One retired owner. An unusually rapid second swap
+                         * drains it rather than dropping ownership or delaying
+                         * the new collision neighborhood. */
+                        if (retired_resident)
+                            printf("resident retirement backlog: draining before next swap\n");
+                        world_resident_free(retired_resident);
+                        retired_resident = candidate_resident;
+                        retire_frames = retire_peak_ms = retire_total_ms = 0;
+                    } else world_resident_free(candidate_resident);
                     candidate_resident = NULL;
                     failed_resident_cell[0] = failed_resident_cell[1] = NAN;
                     assert(!memcmp(carpos, saved_pos, sizeof saved_pos));
@@ -8424,6 +8446,7 @@ int main(int argc, char **argv) {
     dbgui_shutdown();
 #endif
     world_resident_job_cancel(&resident_job); /* join before active-grid/GL teardown */
+    world_resident_free(retired_resident);
     if (world2) {
         world_resident_free(candidate_resident);
         world_resident_free(active_resident);

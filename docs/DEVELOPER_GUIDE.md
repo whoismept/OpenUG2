@@ -905,7 +905,7 @@ on one worker; `--resident-sync` selects the synchronous diagnostic control:
 4. `world_resident_resources_build` resolves textures and uploads every pass,
    then builds collision from that same candidate scene.
 5. At a frame boundary `world_resident_activate` swaps the complete owner and
-   activates its ground grid; only then is the former resident destroyed.
+   activates its ground grid; only then may the former resident be destroyed.
 
 Build failure leaves the old resident active and the failed snapped cell is not
 retried until the player targets another cell. Player position, velocity,
@@ -933,9 +933,17 @@ normal track changes re-exec. Allocation/upload failure rejects the candidate,
 not the active resident. The cache retains visited keys for one bundle's run;
 it is not a multi-bundle cache or an eviction system.
 
-New texture decode/upload, batch construction and cleanup still block the frame
-thread. Texture reuse reduces measured stalls but does not establish a bounded
-frame time; amortizing the remaining geometry/upload/free work is separate.
+New texture decode/upload and batch construction still block the frame thread.
+Texture reuse reduces measured stalls but does not establish a bounded frame
+time; amortizing the remaining geometry/upload work is separate.
+Normal worker-driven swaps retire the old owner in 256 batch/mesh units per
+frame, on the GL thread. This is a work quota, not a hard time deadline. Only
+inactive arrays are consumed; the active render/collision scene is untouched.
+There is one retired slot: a second swap arriving unusually early drains that
+slot synchronously to preserve ownership and activate the new neighborhood on
+time. Synchronous diagnostics/countdown retain immediate destruction. Shutdown
+joins the loader and safely frees any partially retired owner before clearing
+the texture cache/context. New batch construction/upload is still blocking.
 `--resident-drive-audit PREFIX --resident-realtime` exercises this worker with
 physics paced at approximately 60 Hz; race audits and unpaced captures use the sync
 control. A successful resident swap does not prove continuous ground contact.

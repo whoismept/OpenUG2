@@ -481,3 +481,37 @@ void world_resident_free(WorldResident *resident) {
     world_neighborhood_free(&resident->world);
     free(resident);
 }
+
+int world_resident_retire_step(WorldResident **slot, int max_items) {
+    if (!slot || !*slot) return 1;
+    if (max_items <= 0) return 0;
+    WorldResident *r = *slot;
+    WorldResidentResources *v = &r->resources;
+    N2Batch *batches[] = {v->ordinary, v->sky, v->glow, v->vista};
+    int *counts[] = {&v->ordinary_count, &v->sky_count,
+                    &v->glow_count, &v->vista_count};
+    for (int g = 0; g < 4; g++) {
+        if (!batches[g]) continue;
+        while (*counts[g] > 0) {
+            if (!max_items) return 0;
+            N2Batch *b = &batches[g][--*counts[g]];
+            GLuint ids[] = {b->vbo, b->ibo};
+            glDeleteBuffers(2, ids);
+            max_items--;
+        }
+    }
+    N2Scene *scenes[] = {&r->world.scene, &r->world.vista};
+    for (int g = 0; g < 2; g++) {
+        N2Scene *s = scenes[g];
+        if (!s->meshes) continue;
+        while (s->count > 0) {
+            if (!max_items) return 0;
+            N2Mesh *m = &s->meshes[--s->count];
+            free(m->verts); free(m->idx); free(m->vcol);
+            max_items--;
+        }
+    }
+    world_resident_free(r); /* emptied arrays and remaining small owners */
+    *slot = NULL;
+    return 1;
+}

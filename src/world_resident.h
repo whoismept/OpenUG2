@@ -109,5 +109,10 @@ void world_resident_job_cancel(WResidentJob **job);
 void world_resident_activate(WorldResident **active,
                              WorldResident **candidate);
 void world_resident_free(WorldResident *resident);
+/* GL-thread cleanup of an INACTIVE resident, at most max_items batches/meshes
+ * per call. Returns 1 and clears the slot when done; 0 leaves a partial owner.
+ * The partial owner must not be queried/rendered. world_resident_free remains
+ * safe for immediate shutdown/cancellation at any step. */
+int world_resident_retire_step(WorldResident **resident, int max_items);
 
 #endif

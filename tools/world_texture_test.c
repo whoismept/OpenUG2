@@ -192,6 +192,39 @@ static void test_failed_upload_retry(const char *region_path) {
     world_texture_cache_clear();
 }
 
+static void test_incremental_retirement(void) {
+    for(int steps=1;steps<=5;steps++) {
+        WorldResident *r=calloc(1,sizeof *r);assert(r);
+        r->resources.ordinary_count=2;
+        r->resources.ordinary=calloc(2,sizeof *r->resources.ordinary);
+        r->world.scene.count=2;r->world.vista.count=1;
+        r->world.scene.meshes=calloc(2,sizeof *r->world.scene.meshes);
+        r->world.vista.meshes=calloc(1,sizeof *r->world.vista.meshes);
+        assert(r->resources.ordinary && r->world.scene.meshes && r->world.vista.meshes);
+        GLuint ids[2];glGenBuffers(2,ids);
+        for(int i=0;i<2;i++) {
+            glBindBuffer(GL_ARRAY_BUFFER,ids[i]);glBufferData(GL_ARRAY_BUFFER,4,ids,GL_STATIC_DRAW);
+            r->resources.ordinary[i].vbo=ids[i];
+            r->world.scene.meshes[i].verts=malloc(4);
+            r->world.scene.meshes[i].idx=malloc(2);
+            r->world.scene.meshes[i].vcol=malloc(4);
+        }
+        r->world.vista.meshes[0].verts=malloc(4);
+        assert(!world_resident_retire_step(&r,0));
+        assert(!world_resident_retire_step(&r,1));
+        assert(r->resources.ordinary_count==1 && r->world.scene.count==2);
+        assert(glIsBuffer(ids[0]) && !glIsBuffer(ids[1]));
+        /* Cancel after every partial stage, including partially freed CPU
+         * meshes, or finish all two batches and three meshes in five calls. */
+        for(int call=2;call<=steps;call++)
+            assert(world_resident_retire_step(&r,1)==(call==5));
+        if(steps<5) {assert(r);world_resident_free(r);r=NULL;}
+        else assert(!r);
+        assert(!glIsBuffer(ids[0]) && !glIsBuffer(ids[1]));
+        assert(world_resident_retire_step(&r,1));
+    }
+}
+
 int main(void) {
     char root[]="build/world-texture-XXXXXX";assert(mkdtemp(root));
     char tracks[160],global[160],region[192],common[192],master[192];
@@ -207,6 +240,7 @@ int main(void) {
     SDL_Window *win=SDL_CreateWindow("world-texture-test",0,0,32,32,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
     assert(win);SDL_GLContext ctx=SDL_GL_CreateContext(win);assert(ctx);
     test_resident_resource_cleanup();
+    test_incremental_retirement();
     /* No regional match: common supplies exact key, RGBA and draw mode once. */
     write_tpk(region,KEY+1,1);write_tpk(common,KEY,0);
     run_case(tracks,NULL,1,0,0,0);
