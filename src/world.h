@@ -223,6 +223,20 @@ void world_ground_grid_free(WGroundGrid *grid);
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
                         unsigned char *modes, int cap);
 
+/* Zero-initialize for one binding; keep its world and output arrays alive.
+ * 0 pending, 1 complete, -1 failed. At most max_decodes uncached resolution
+ * attempts per step (misses count too); cached requests do not consume quota.
+ * count/map are partial until complete. Only one binding may be in flight,
+ * on the GL thread. Cancel via normal neighborhood/resource teardown: this
+ * cursor owns no allocations, and the cache retains successful GL uploads. */
+typedef struct {
+    int pass, region, request, count;
+    uint32_t build, source;
+} WTextureBind;
+int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
+                             unsigned char *modes, int cap,
+                             WTextureBind *binding, int max_decodes);
+
 /* The GL names world_bind_textures writes are owned by a process-wide
  * key -> texture cache, not by the caller: a moving-residency swap re-requests
  * essentially the same ~1100 keys, and re-decoding/re-uploading them was the

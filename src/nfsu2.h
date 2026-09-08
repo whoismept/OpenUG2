@@ -15,7 +15,8 @@
 enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        /* car mesh classes, from material name */
        N2_CAR_BODY = 10, N2_CAR_GLASS = 11, N2_CAR_LIGHT = 12,
-       N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
+       N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16,
+       N2_CAR_INTERIOR = 17 };
 
 enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
 #define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
@@ -1314,7 +1315,13 @@ static int n2_car_category(const unsigned char *d, long beg, long end) {
                        contains "LIGHT" too. */
                     if (n2_contains(n,L,"BRAKE") && n2_contains(n,L,"LIGHT"))  return N2_CAR_BRAKELIGHT;
                     if (n2_contains(n,L,"LIGHT") || n2_contains(n,L,"LAMP"))   return N2_CAR_LIGHT;
-                    if (n2_contains(n,L,"TIRE") || n2_contains(n,L,"WHEEL"))   return N2_CAR_TIRE;
+                    /* Two shipped cars (IMPREZAWRX/LANCEREVO8) store the
+                       28-byte name as FRONT_WHEE, with the final L truncated.
+                       Keep that authored wheel family out of BODY so the
+                       production renderer can bind/instance the real tire. */
+                    if (n2_contains(n,L,"TIRE") || n2_contains(n,L,"WHEEL") ||
+                        n2_contains(n,L,"FRONT_WHEE") || n2_contains(n,L,"REAR_WHEE"))
+                        return N2_CAR_TIRE;
                     /* mechanical compartment detail (engine bay, exhaust pipe):
                        unpainted metal/plastic, not glossy body shell — checked
                        before the generic KIT/BODY catch-all below, since these
@@ -1353,6 +1360,36 @@ static int n2_name_variant(const unsigned char *n, long L, int *num,
             *tok_at = q; *tok_len = 7; return 2;
         }
     return 0;
+}
+
+/* Enumerate the actual KITnn/STYLEnn variants authored by this car.  The
+ * geometry archive is the source of truth: hard-coding KIT01/02 made the
+ * debug/customisation path silently hide the other shipped kits (MIATA has
+ * KIT01..KIT29).  This is deliberately a byte scan rather than a second tree
+ * walk; the tokens only occur in the material-name leaves and the final list
+ * is de-duplicated/sorted before it reaches the UI. */
+static int n2_car_variant_numbers(const unsigned char *d, long len, int kind,
+                                  int *out, int cap) {
+    if (!d || len <= 0 || !out || cap <= 0) return 0;
+    int n = 0;
+    for (long i = 0; i + (kind == 1 ? 5 : 7) < len; i++) {
+        int match = kind == 1
+                  ? d[i]=='K' && d[i+1]=='I' && d[i+2]=='T'
+                  : d[i]=='S' && d[i+1]=='T' && d[i+2]=='Y' && d[i+3]=='L' && d[i+4]=='E';
+        long p = i + (kind == 1 ? 3 : 5);
+        if (!match || d[p] < '0' || d[p] > '9' ||
+            d[p+1] < '0' || d[p+1] > '9') continue;
+        int v = (d[p]-'0')*10 + d[p+1]-'0', seen = 0;
+        for (int q = 0; q < n; q++) if (out[q] == v) { seen = 1; break; }
+        if (seen || n >= cap) continue;
+        out[n++] = v;
+    }
+    for (int i = 1; i < n; i++) {
+        int v = out[i], j = i;
+        while (j > 0 && out[j-1] > v) { out[j] = out[j-1]; j--; }
+        out[j] = v;
+    }
+    return n;
 }
 
 /* Classify a car mesh against the active profile.
@@ -1785,6 +1822,24 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_WINDSHIELD 0x471a1dcau
 #define N2_MAT_CARSKIN    0xd6d6080au
 
+/* Third material, identified by MEASUREMENT rather than by cracking its name
+ * (the hash is one-way; "DULLPLASTIC" == 0x0fedee40 and "MOLDINGS" ==
+ * 0x12c9453c do fall out of the same hash and confirm the convention, but this
+ * one does not match any candidate tried). What the geometry says, per-submesh
+ * vertex bbox, MIATA / GOLF / 350Z:
+ *   BASE_A     sub2  480 idx  x[-1.34,+0.51] y[-0.72,+0.72] z[+0.16,+1.02]
+ *                    -- full cabin width, floor to roofline: the interior tub
+ *   BASE_A     sub0   12 idx  x[-0.63,-0.32] y[+0.09,+0.58] z[+0.53,+0.96]
+ *                    -- a small off-centre panel at wheel height
+ *   FRONT_WHEEL sub2  48 idx  x/z +-0.29     y[+0.04,+0.19]  -- rim inner face
+ *   TRUNK       sub1  30 idx  x[-1.88,-1.29] z[+0.56,+0.69]  -- lid inner face
+ * and, decisively, it appears on NO outward panel on any car checked: not the
+ * hood, front bumper, door, trunk outer, headlight or skirt, all of which carry
+ * CARSKIN there instead. Every occurrence is a surface only visible through an
+ * opening. Treating it as unpainted interior is what the placement supports;
+ * the actual authored name remains unknown. */
+#define N2_MAT_INTERIOR   0x010cb64au
+
 /* Classify one submesh's material hash. `fallback` is the object-level
  * category from n2_car_category, used whenever the hash is 0 (absent/out of
  * bounds -- n2_mesh_submeshes and the matid bounds check both fail safe to
@@ -1794,6 +1849,7 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 static int n2_mat_class(uint32_t hash, int fallback) {
     if (hash == N2_MAT_WINDSHIELD) return N2_CAR_GLASS;
     if (hash == N2_MAT_CARSKIN)    return N2_CAR_BODY;
+    if (hash == N2_MAT_INTERIOR)   return N2_CAR_INTERIOR;
     return fallback;
 }
 

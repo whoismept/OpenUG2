@@ -17,7 +17,7 @@ static void u32(unsigned char *p, uint32_t n) {
 }
 /* One 4x4 DXT3 fixture. Even texels transparent, odd texels opaque.
  * RGB endpoint is red for common, green for the overriding source. */
-static void write_tpk(const char *path, uint32_t key, int green) {
+static void write_tpk_record(FILE *f, uint32_t key, int green) {
     unsigned char d[8+124+8+16]={0};
     u32(d,0xb3310000u);u32(d+4,124);
     unsigned char *r=d+8;
@@ -26,8 +26,11 @@ static void write_tpk(const char *path, uint32_t key, int green) {
     r[0x45]=5;r[0x49]=2;r[0x4a]=1;r[0x4b]=0;
     u32(d+132,0x33320002u);u32(d+136,16);
     memset(d+140,0xf0,8);d[148]=green?0xe0:0;d[149]=green?0x07:0xf8;
+    assert(fwrite(d,1,sizeof d,f)==sizeof d);
+}
+static void write_tpk(const char *path, uint32_t key, int green) {
     FILE *f=fopen(path,"wb");assert(f);
-    assert(fwrite(d,1,sizeof d,f)==sizeof d);assert(!fclose(f));
+    write_tpk_record(f,key,green);assert(!fclose(f));
 }
 
 static void run_case(const char *tracks,const char *masterpath,
@@ -55,7 +58,18 @@ static void run_case(const char *tracks,const char *masterpath,
         w->neighborhood.vista.count=1;w->neighborhood.vista.meshes[0].texkey=KEY;
     } else if(consumer==2) {w->neighborhood.nlights=1;requested=N2_TEX_SFX_FLARE_GLOWA;}
     uint32_t keys[4]={0};GLuint ids[4]={0};unsigned char modes[4]={0};
-    int n=world_bind_textures(w,keys,ids,modes,4);
+    WTextureBind binding={0};
+    assert(!world_bind_textures_step(w,keys,ids,modes,4,&binding,0));
+    assert(!binding.build && !binding.count && w->neighborhood.rgn[0].data);
+    int status=0;
+    for(int calls=0;!status && calls<32;calls++) {
+        status=world_bind_textures_step(w,keys,ids,modes,4,&binding,1);
+        if(!status)assert(w->neighborhood.rgn[0].data);
+    }
+    assert(status==1);
+    int n=binding.count;
+    assert(world_bind_textures_step(w,keys,ids,modes,4,&binding,1)==1);
+    assert(binding.count==n); /* completed cursor neither repeats nor re-emits */
     assert(n==want_count); /* RED before common-library support: 0 instead of 1. */
     assert(!w->neighborhood.common && !w->neighborhood.commontpk.blk && !w->neighborhood.commonlen && !w->neighborhood.commontpk.nblk);
     if(n) {
@@ -202,6 +216,65 @@ static void test_failed_upload_retry(const char *region_path) {
         free(r->tpk.blk);
     }
     world_texture_cache_clear();
+}
+
+/* Nine cold keys exceed one background texture slice. Geometry must not start
+ * until binding completes; cancellation must keep cache-owned uploads alive. */
+static void test_sliced_resident_textures(const char *path) {
+    FILE *f=fopen(path,"wb");assert(f);
+    for(int i=0;i<9;i++)write_tpk_record(f,KEY+(uint32_t)i,1);
+    assert(!fclose(f));
+    GLuint first=0;
+    for(int attempt=0;attempt<4;attempt++) {
+        if(attempt==1) {
+            world_texture_cache_clear();assert(!glIsTexture(first));first=0;
+        }
+        WorldResident *r=calloc(1,sizeof *r);assert(r);
+        WorldNeighborhood *w=&r->world;
+        r->radius=w->radius=1400;w->nreg=1;
+        w->rgn[0].data=n2_read_file(path,&w->rgn[0].len);assert(w->rgn[0].data);
+        w->rgn[0].tpk=n2_tpk_open(w->rgn[0].data,w->rgn[0].len);
+        w->rgn[0].mesh1=w->scene.count=w->scene.cap=9;
+        w->scene.meshes=calloc(9,sizeof *w->scene.meshes);
+        w->mbb=calloc(9,sizeof *w->mbb);assert(w->scene.meshes && w->mbb);
+        for(int i=0;i<9;i++) {
+            N2Mesh *m=&w->scene.meshes[i];
+            const float verts[15]={0,0,0,0,0, 4,0,0,1,0, 0,4,0,0,1};
+            m->verts=malloc(sizeof verts);m->idx=malloc(3*sizeof *m->idx);
+            assert(m->verts && m->idx);memcpy(m->verts,verts,sizeof verts);
+            m->idx[0]=0;m->idx[1]=1;m->idx[2]=2;
+            m->nverts=m->nidx=3;m->cat=N2_ROAD;m->mat_exact=i&1;
+            m->texkey=KEY+(uint32_t)i;w->mbb[i][2]=w->mbb[i][3]=4;
+        }
+        assert(world_ground_grid_build(&w->grid,&w->scene,(const float (*)[4])w->mbb));
+        int status=world_resident_finish_step(r,1,1,0,1,NULL);
+        assert(!status);
+        if(attempt<2) {
+            /* RED at M164: all nine keys upload and geometry starts at once. */
+            assert(!r->resources.upload && w->rgn[0].data);
+            assert(r->resources.texture_binding.count==8);
+            first=r->resources.textures[0];assert(first && glIsTexture(first));
+            if(attempt==1) {
+                glEnable(0xdeadbeef); /* fail the next slice, after eight uploads */
+                assert(world_resident_finish_step(r,1,1,0,1,NULL)==-1);
+                assert(!r->resources.mesh_count && !w->rgn[0].data);
+            }
+        } else {
+            for(int calls=1;!status && calls<32;calls++)
+                status=world_resident_finish_step(r,1,1,0,1,NULL);
+            assert(status==1 && !w->rgn[0].data && r->resources.texture_count==9);
+            assert(r->resources.textures[0]==first);
+            for(int i=0;i<9;i++) {
+                assert(r->resources.texture_keys[i]==KEY+(uint32_t)i);
+                assert(r->resources.mesh_textures[i]==r->resources.textures[i]);
+                assert(r->resources.mesh_modes[i]==n2_world_draw_mode(
+                    &w->scene.meshes[i],N2_DRAW_BLEND));
+                assert(r->resources.mesh_batch[i]>=0);
+            }
+        }
+        world_resident_free(r);assert(glIsTexture(first));
+    }
+    world_texture_cache_clear();assert(!glIsTexture(first));
 }
 
 static void assert_same_buffer(GLenum target, GLuint a, GLuint b) {
@@ -353,6 +426,7 @@ int main(void) {
     test_sliced_batches();
     test_sliced_u16_limit();
     test_incremental_retirement();
+    test_sliced_resident_textures(master);
     /* No regional match: common supplies exact key, RGBA and draw mode once. */
     write_tpk(region,KEY+1,1);write_tpk(common,KEY,0);
     run_case(tracks,NULL,1,0,0,0);

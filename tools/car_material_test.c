@@ -146,6 +146,11 @@ static int category_for_name(const char *name) {
     leaf_name(&p, name);
     return n2_mesh_category(p.b, 0, p.n);
 }
+static int car_category_for_name(const char *name) {
+    Buf p; p.n = 0;
+    leaf_name(&p, name);
+    return n2_car_category(p.b, 0, p.n);
+}
 
 /* M136 RED/GREEN regression: SKY is a narrow authored family and the shipped
  * dome is a two-material object (dome + alpha cap), not one last-slot mesh. */
@@ -788,6 +793,18 @@ int main(void) {
         free(sc.meshes);
     }
 
+    printf("  F4 authored KIT/STYLE enumeration is sorted and unique\n");
+    {
+        const unsigned char names[] = "MIATA_KIT29_BODY_A MIATA_KIT01_BUMPER_A "
+                                      "MIATA_KIT29_SKIRT_A MIATA_STYLE28_HOOD_A";
+        int kits[8], styles[8];
+        int nk = n2_car_variant_numbers(names, (long)sizeof names - 1, 1, kits, 8);
+        int ns = n2_car_variant_numbers(names, (long)sizeof names - 1, 2, styles, 8);
+        chk("KIT list contains unique sorted options",
+            nk == 2 && kits[0] == 1 && kits[1] == 29);
+        chk("STYLE list contains the authored style", ns == 1 && styles[0] == 28);
+    }
+
     /* -------------------------------------------------------------------
      * Fixture H (M143): a structurally complete two-triangle material
      * partition followed by one orphan u16 index. The renderer cannot form a
@@ -1010,6 +1027,8 @@ int main(void) {
      * undamaged, whatever the split outcome.
      * ------------------------------------------------------------------- */
     printf("  E tire/rim object with several unrelated material hashes\n");
+    chk("truncated FRONT_WHEE wheel token stays TIRE",
+        car_category_for_name("IMPREZAWRX_KIT00_FRONT_WHEE") == N2_CAR_TIRE);
     {
         Buf f; f.n = 0;
         float pos[9][3] = {{0,0,0},{1,0,0},{0,1,0}, {1,0,0},{1,1,0},{0,1,0},
@@ -1058,6 +1077,53 @@ int main(void) {
         chk("not split (single submesh, nothing to split from)", n == 1);
         chk("classified GLASS from the proven material hash, not BODY from the name",
             n == 1 && sc.meshes[0].cat == N2_CAR_GLASS);
+        for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
+        free(sc.meshes);
+    }
+
+    /* -------------------------------------------------------------------
+     * Fixture F2: N2_MAT_INTERIOR. The real shape is every car's
+     * <CAR>_BASE_A: one object whose name matches the BODY name-heuristic
+     * ("BASE"), carrying an outer CARSKIN slice AND an interior slice. Before
+     * this material was classified, the interior slice inherited BODY and was
+     * drawn in metallic body paint with gloss, clear coat and environment
+     * reflection, filling the whole cabin behind the glass.
+     * ------------------------------------------------------------------- */
+    printf("  F2 CARSKIN + INTERIOR object splits into BODY and INTERIOR\n");
+    {
+        Buf f; f.n = 0;
+        float pos[6][3] = {{0,0,0},{1,0,0},{0,1,0}, {1,0,0},{1,1,0},{0,1,0}};
+        uint16_t idx[6] = {0,1,2, 3,4,5};
+        uint32_t tex[1] = {0xAAAAAAAAu};
+        uint32_t mat[2] = {N2_MAT_CARSKIN, N2_MAT_INTERIOR};
+        SubSpec sub[2] = { {3, 0, 0, 0}, {3, 0, 1, 3} };
+        object(&f, "TESTCAR_BASE_A", tex, 1, mat, 2, sub, 2, pos, 6, idx, 6);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, NULL, 0, NULL);
+        printf("    emitted meshes: %d, total nidx: %ld (raw: 6)\n", n, total_nidx(&sc));
+        chk("split into two slices", n == 2);
+        chk("no coverage lost", total_nidx(&sc) == 6);
+        chk("one BODY slice and one INTERIOR slice",
+            count_by_cat(&sc, N2_CAR_BODY) == 1 &&
+            count_by_cat(&sc, N2_CAR_INTERIOR) == 1);
+        for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
+        free(sc.meshes);
+    }
+    /* Single-submesh case: nothing to split, so the whole object's category
+       must still come from the material hash, not from its "KIT" name. */
+    printf("  F3 single-submesh INTERIOR object with a BODY-heuristic name\n");
+    {
+        Buf f; f.n = 0;
+        float pos[3][3] = {{0,0,0},{1,0,0},{0,1,0}};
+        uint16_t idx[3] = {0,1,2};
+        uint32_t tex[1] = {0xAAAAAAAAu};
+        uint32_t mat[1] = { N2_MAT_INTERIOR };
+        SubSpec sub[1] = { {3, 0, 0, 0} };
+        object(&f, "TESTCAR_KIT00_TRUNK_A", tex, 1, mat, 1, sub, 1, pos, 3, idx, 3);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, NULL, 0, NULL);
+        chk("classified INTERIOR from the material hash, not BODY from the name",
+            n == 1 && sc.meshes[0].cat == N2_CAR_INTERIOR);
         for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
         free(sc.meshes);
     }

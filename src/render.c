@@ -122,6 +122,8 @@ static const char *FS =
         HUD/debug uUnlit pass, leaves this at its default 0.0 and keeps its
         existing uAlpha-only alpha output unchanged) */
     "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
+    "uniform float uFresnel;\n"   /* >0.5: glass -- fresnel drives alpha + reflection */
+    "uniform float uClearcoat;\n" /* >0: second tight specular lobe over the base coat */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -175,7 +177,12 @@ static const char *FS =
        sharper diffuse swing right here instead, gated the same way as the
        cavity term above — world batches always set uSpec=0, so they never
        take this branch. */
-    "  if(uSpec>0.001) d=uAmbient*0.55+uDiffuse*1.2*nl;\n"
+    /* Paint was clipping to white: at 0.55/1.2 the diffuse term alone reached
+       ~0.95, which the shared *1.35 exposure below pushed past 1.0 before the
+       specular, rim and environment terms were even added -- so every panel
+       saturated and the highlights had no headroom left to show against.
+       Pulling the body's own diffuse back leaves that headroom for them. */
+    "  if(uSpec>0.001) d=uAmbient*0.35+uDiffuse*0.80*nl;\n"
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
@@ -196,16 +203,25 @@ static const char *FS =
        to show them (verified: body meshes carry no diffuse map at all), so
        this fakes the early-2000s baked-AO look by darkening paint where the
        surface turns away from the camera, instead of claiming detail that
-       isn't in the asset. */
+       isn't in the asset. Narrowed from pow4/0.6 to pow6/0.78: at pow4 the
+       falloff reached far onto flat panels and fought the fresnel edge
+       brightening below, which is what flattened the paint into matte clay.
+       It now only bites in the last few degrees, i.e. actual creases. */
     "  if(uSpec>0.001){\n"
-    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 4.0);\n"
-    "    base *= mix(1.0, 0.6, edge);\n"
+    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 6.0);\n"
+    "    base *= mix(1.0, 0.78, edge);\n"
     "  }\n"
     /* Phong: reflect the light about the normal and test it against the VIEW
        vector. The old form used dot(N,L) with no V term at all, so it was a
        sharpened diffuse -- the highlight could not travel across a panel as
        the camera moved, which is what made the paint read flat/matte. */
-    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec;\n"
+    "  float rl = max(dot(reflect(-L,N), V), 0.0);\n"
+    "  float sp = pow(rl, uGloss)*uSpec;\n"
+    /* clear coat: automotive paint is a coloured base coat under a clear
+       lacquer, so it carries TWO highlights -- the broad soft one from the
+       pigment (sp above) and a small hard one from the lacquer surface. One
+       lobe alone is what makes painted metal read as moulded plastic. */
+    "  sp += pow(rl, 160.0)*uClearcoat;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
     /* per-vertex prelight (world geometry): the source stores baked AO/lighting
@@ -218,6 +234,7 @@ static const char *FS =
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
        uCamPos is the camera in the SAME space as vPos/vN. */
+    "  float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "  if(uEnv>0.001){\n"
     "    vec3 R = reflect(-V, N);\n"
     "    float up = clamp(R.z*0.5+0.5, 0.0, 1.0);\n"
@@ -228,7 +245,6 @@ static const char *FS =
        actually mirror. */
     "    vec3 env = mix(vec3(0.03,0.03,0.05), vec3(0.10,0.14,0.24), up)\n"
     "             + vec3(0.85,0.66,0.42)*pow(1.0-abs(R.z), 4.0);\n"
-    "    float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "    lit += env * (uEnv * fres);\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
@@ -239,6 +255,12 @@ static const char *FS =
        fully opaque/full-strength through those gaps, since uAlpha alone
        carries no per-texel information. */
     "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
+    /* Glass (uFresnel, the car glass pass only). A flat per-pass alpha is what
+       made the cabin read as a still pool: every window sat at one constant
+       opacity regardless of angle, so it looked like a filled surface rather
+       than a pane. Real glass is nearly clear head-on and a mirror at grazing
+       incidence, so alpha rides the same fresnel term the reflection does. */
+    "  if(uFresnel>0.5) outA = clamp(mix(uAlpha, 1.0, fres), 0.0, 1.0);\n"
     "  gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);\n"
     "}\n";
 
@@ -361,6 +383,8 @@ RProg render_program(void) {
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
+    r.uFresnel = glGetUniformLocation(r.prog, "uFresnel");
+    r.uClearcoat = glGetUniformLocation(r.prog, "uClearcoat");
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
     glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);

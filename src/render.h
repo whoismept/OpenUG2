@@ -82,6 +82,9 @@ typedef struct {
           uFlipN,   /* 1 = negate the vertex normal (inspector diagnostic) */
           uGloss,   /* specular pow() exponent: high = tight metallic-paint
                        highlight, low = broad plastic/trim sheen (cars only) */
+          uFresnel, /* >0.5: alpha rides the fresnel term (car glass pass only) */
+          uClearcoat, /* >0: second tight specular lobe -- the lacquer over the
+                         coloured base coat (car body/trim only) */
           uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
 } RProg;
 

@@ -210,6 +210,9 @@ typedef struct {
     int   rim_paint;        /* 1 = tint toward rim_color, 0 = raw OEM texture */
     float rim_color[3];     /* rim paint colour */
 
+    int   car_cull;         /* 1 = back-face cull the car shell */
+    float body_clearcoat;   /* tight lacquer highlight over the base coat */
+
     /* --- neon underglow (a real customization, not a diagnostic) --- */
     int   neon_on;          /* 1 = project the underglow pool */
     float neon_col[3];      /* emission colour */

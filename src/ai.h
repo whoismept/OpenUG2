@@ -24,4 +24,16 @@ int load_circuit(const char *dataroot, const char *circuit, N2Scene *scene,
 void ai_step(AiCar *ai, int k, const N2Path *aipath, N2Scene *scene,
              int start_idx, int player_prog);
 
+/* Input-only test driver. Borrows a validated, open XY polyline; never writes
+ * the car pose/velocity or queries/snaps its ground height. Speeds: m/tick. */
+typedef struct {
+    const N2Path *path;
+    int segment, direction, stalled, finished, failed;
+    float start, progress, length, checkpoint, error, target[2], target_kmh;
+} AiDrive;
+typedef struct { float throttle, steer; int handbrake; } AiDriveInput;
+int ai_drive_route_valid(const N2Path *path);
+int ai_drive_init(AiDrive *drive, const N2Path *path, const float pos[3], float heading);
+AiDriveInput ai_drive_step(AiDrive *drive, const float pos[3], float heading, float speed);
+
 #endif
