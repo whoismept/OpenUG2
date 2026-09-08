@@ -18,6 +18,9 @@ enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16,
        N2_CAR_INTERIOR = 17 };
 
+/* Placement belongs to the source part, independently of each slice's material. */
+enum { N2_MOUNT_BODY = 0, N2_MOUNT_WHEEL, N2_MOUNT_FRONT_BRAKE, N2_MOUNT_REAR_BRAKE };
+
 enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
 #define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
 
@@ -81,6 +84,7 @@ typedef struct {
        keep/drop one whole tier's slice set atomically instead of resolving
        each split slice independently. 0 = not a car mesh / not tier-tracked. */
     uint32_t tierid;
+    unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
 } N2Mesh;
 
 /* Active customization profile.
@@ -1893,6 +1897,15 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             int vkind = 0, vnum = 0; uint32_t vfam = 0;
             if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
             int cat = n2_car_category(d, ds, ds + s);
+            char part[64]; n2_mesh_name(d, ds, ds + s, part, sizeof part);
+            int mount = cat == N2_CAR_TIRE ? N2_MOUNT_WHEEL : N2_MOUNT_BODY;
+            if (cat != N2_CAR_BRAKELIGHT) {
+                /* FRONT_BRAKE is truncated to FRONT_BRAK on long car names. */
+                if (strstr(part, "_FRONT_BRAK")) mount = N2_MOUNT_FRONT_BRAKE;
+                else if (strstr(part, "_REAR_BRAKE")) mount = N2_MOUNT_REAR_BRAKE;
+            }
+            if (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE)
+                cat = N2_CAR_MECH;
             int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
                         uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
             uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
@@ -1987,6 +2000,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
                         scene->meshes[before].tierid = tierid;
+                        scene->meshes[before].car_mount = (unsigned char)mount;
                     }
                 }
             } else {
@@ -2000,6 +2014,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
                         scene->meshes[before].tierid = tierid;
+                        scene->meshes[before].car_mount = (unsigned char)mount;
                     }
                 }
             }
@@ -2018,6 +2033,26 @@ static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
     n2_car_apply_config(scene, cfg);   /* aftermarket parts shadow stock ones */
     n2_car_dedupe_lod(scene);          /* collapse each LOD family to its best tier */
     return scene->count;
+}
+
+/* Orient every material slice of a stock wheel together. Source vertices/UVs
+ * and triangle coverage are retained; edge length is not a visibility rule.
+ * Returns a representative of the stock tier (all its slices must be drawn).
+ * Call once per fresh car load, including a kit reload. */
+static int n2_car_prepare_wheels(N2Scene *s) {
+    int stock = -1;
+    for (int i=0;i<s->count;i++) {
+        N2Mesh *m=&s->meshes[i];
+        if (m->car_mount != N2_MOUNT_WHEEL || m->nverts <= 0) continue;
+        float bb[6]; n2_mesh_bbox(m,bb);
+        float ymid=0.5f*(bb[2]+bb[3]);
+        for (int v=0;v<m->nverts;v++) {
+            m->verts[v*5] = -m->verts[v*5];
+            m->verts[v*5+1] = ymid-m->verts[v*5+1];
+        }
+        if (stock<0 || m->nidx>s->meshes[stock].nidx) stock=i;
+    }
+    return stock;
 }
 
 static void n2_free_scene(N2Scene *s) {

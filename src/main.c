@@ -3480,9 +3480,10 @@ int main(int argc, char **argv) {
     uint32_t ckeys[512]; int nck = ctdata ? n2_car_tex_keys(ctdata, ctlen, ckeys, 512) : 0;
     uint32_t mapkey[128]; GLuint maptex[128]; char mapalpha[128]; int nmap = 0;
     N2Scene car; int ncar = 0; GpuMesh *cgm = NULL;
-    int stock_wheel = -1;   /* cgm[] index of the car's own highest-LOD stock wheel mesh */
+    int stock_wheel = -1;   /* representative of the complete stock wheel tier */
     float wheelT[4][16];                         /* 4 wheel placements (car-local) */
     float wheelTAI[4][16];                       /* same, minus the player's steer (AI cars) */
+    float brakeT[4][16], brakeTAI[4][16];          /* hub travel/steer, no tyre spin */
     GpuMesh wheelmesh; int have_wheel = 0;       /* procedural tyre, built after GL init */
     for (int k=0;k<4;k++){ float I[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(wheelT[k],I,sizeof(I)); }
     float carbb[6] = {0,0,0,0,0,0};              /* body AABB min/max, for wheel placement */
@@ -3530,22 +3531,7 @@ int main(int argc, char **argv) {
         }
         carbb[0]=bb0[0];carbb[1]=bb0[1];carbb[2]=bb0[2];
         carbb[3]=bb1[0];carbb[4]=bb1[1];carbb[5]=bb1[2];  /* wheelT built per-frame from g_dbg */
-        /* Prep each stock wheel mesh: (1) the tyre is modelled with its solid
-           spoke/cap face inboard (low Y) and the hollow barrel mouth outboard,
-           so rotate it 180 deg about the vertical (Z) through its own Y-centre
-           -- (x,y)->(-x,-y) -- which flips the cap outward and centres the tyre
-           on the AttribSys track line; a rotation (not a mirror) keeps winding
-           and normals valid. (2) drop the flat backing/hub-plane quad so the
-           rim renders as clean spokes. Then remember the highest-LOD tier. */
-        for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
-            N2Mesh *m=&car.meshes[i];
-            float ty0=1e30f,ty1=-1e30f;
-            for(int v=0;v<m->nverts;v++){ float y=m->verts[v*5+1]; if(y<ty0)ty0=y; if(y>ty1)ty1=y; }
-            float ymid=0.5f*(ty0+ty1);
-            for(int v=0;v<m->nverts;v++){ m->verts[v*5]=-m->verts[v*5]; m->verts[v*5+1]=ymid-m->verts[v*5+1]; }
-            rim_drop_welded_mesh(m);
-            if (stock_wheel<0 || m->nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
-        }
+        stock_wheel = n2_car_prepare_wheels(&car);
         /* Light-bloom clusters: average the lens vertices in each of the 4
            quadrants (front/rear x sign, left/right y sign) to get a halo anchor
            per headlight/taillight group. A vertex threshold keeps a stray single
@@ -5235,16 +5221,7 @@ int main(int argc, char **argv) {
                     free(cgm); cgm = NULL;
                     n2_free_scene(&car);
                     ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
-                    stock_wheel = -1;   /* re-orient + re-cull wheels, re-find stock index */
-                    for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
-                        N2Mesh *m=&car.meshes[i];
-                        float ty0=1e30f,ty1=-1e30f;
-                        for(int v=0;v<m->nverts;v++){ float y=m->verts[v*5+1]; if(y<ty0)ty0=y; if(y>ty1)ty1=y; }
-                        float ymid=0.5f*(ty0+ty1);
-                        for(int v=0;v<m->nverts;v++){ m->verts[v*5]=-m->verts[v*5]; m->verts[v*5+1]=ymid-m->verts[v*5+1]; }
-                        rim_drop_welded_mesh(m);
-                        if (stock_wheel<0 || m->nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
-                    }
+                    stock_wheel = n2_car_prepare_wheels(&car);
                     cgm = upload_scene(&car);
                     printf("body kit -> KIT%02d (%d meshes)\n", carcfg.body_kit, ncar);
                 }
@@ -7177,6 +7154,13 @@ int main(int argc, char **argv) {
                      heaves, pitches and rolls above it. A single shared height
                      would float or sink tyres on every bump. */
                   float wzk = wz + (g_ride_ready && !sstatic && !capture_policy.freeze_motion ? g_ride.compression[k] : 0.0f);
+                  /* Disc + caliper are one authored part. Keep the assembly at
+                     its axle, steering with the front hub without spinning the
+                     caliper. Independent disc rotation needs a material/part split. */
+                  float B[16]={s,0,0,0, 0,sy,0,0, 0,0,s,0, wp[k][0],wp[k][1],wzk,1};
+                  memcpy(brakeTAI[k],B,sizeof B); brakeTAI[k][14]=wz;
+                  if (k<2) { B[0]=s*sc; B[1]=s*ss; B[4]=-sy*ss; B[5]=sy*sc; }
+                  memcpy(brakeT[k],B,sizeof B);
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
                                wp[k][0],wp[k][1],wzk,1};
@@ -7206,6 +7190,8 @@ int main(int argc, char **argv) {
                parts with no in-TPK texture get a sensible flat colour by class. */
             for (int i = 0; i < ncar; i++) {
                 int c = cgm[i].cat;
+                int mount = car.meshes[i].car_mount;
+                if (mount == N2_MOUNT_WHEEL) continue; /* complete tier drawn below */
                 int is_light = (c==N2_CAR_LIGHT || c==N2_CAR_BRAKELIGHT);
                 if ((c==N2_CAR_BODY && !g_dbg.show_body) ||
                     (is_light       && !g_dbg.show_lights)|| (c==N2_CAR_TIRE && !g_dbg.show_tires) ||
@@ -7327,7 +7313,17 @@ int main(int argc, char **argv) {
                     glCullFace(g_dbg.insp_cull == 1 ? GL_BACK : GL_FRONT);
                 }
 #endif
-                if (c != N2_CAR_TIRE) { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }   /* tyres = procedural, below */
+                if (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE) {
+                    int first = mount == N2_MOUNT_FRONT_BRAKE ? 0 : 2;
+                    glDisable(GL_CULL_FACE); /* the opposite side mirrors Y */
+                    for (int k=first;k<first+2;k++) {
+                        float MB[16]; mat_mul(MVPwheel,brakeT[k],MB);
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
+                        draw_gpumesh(&cgm[i]); g_dbg.drawn++;
+                    }
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                    if (g_dbg.car_cull) glEnable(GL_CULL_FACE);
+                } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
 #ifdef DEBUG_UI
                 if (insp_on && g_dbg.insp_wire) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
                 if (insp_on && g_dbg.insp_highlight) glUniform1f(uUnlit, 0.0f);
@@ -7371,7 +7367,7 @@ int main(int argc, char **argv) {
                 glUniform1f(rp.uEnv, 0.95f);   /* glass reflects hardest */
                 glUniform3f(uColor, 0.020f, 0.024f, 0.032f);
                 for (int i = 0; i < ncar; i++)
-                    if (cgm[i].cat == N2_CAR_GLASS) {
+                    if (cgm[i].cat == N2_CAR_GLASS && car.meshes[i].car_mount == N2_MOUNT_BODY) {
 #ifdef DEBUG_UI
                         /* the opaque loop skips glass, so the inspector overlay
                            has to be applied here too or selecting a window did
@@ -7437,12 +7433,8 @@ int main(int argc, char **argv) {
                the radial rim texture gives them a hub + spokes instead of a void */
             if (have_wheel && g_dbg.show_tires) {
                 glUniform1f(rp.uDecal, 0.0f);
-                /* Authentic stock wheel: the car's OWN FRONT_WHEEL mesh (rim +
-                   tyre) from its GEOMETRY.BIN, with the flat backing-plane quad
-                   culled at load, instanced at all four AttribSys corners. This
-                   is the real factory wheel, so it wins over the shared rim
-                   library below whenever the car ships one (all but the 2 tyre-
-                   less cars). At blur speed the procedural disc still takes over. */
+                /* Draw every material slice of the selected source wheel tier,
+                   including slices whose material is INTERIOR rather than TIRE. */
                 /* STYLE01 of the NFSU library is the car's factory wheel. Keep
                    that authored mesh (and its real tire texture) as the stock
                    view; any other brand/style is an explicit modification and
@@ -7450,13 +7442,22 @@ int main(int argc, char **argv) {
                    ran for every style, so W/ImGui changes were invisible. */
                 if (stock_wheel >= 0 && wheel_brand == 0 && wheel_style == 1 &&
                     PHYS_KMH(speed) <= WHEEL_BLUR_KMH) {
-                    GLuint stex=0; for(int j=0;j<nmap;j++) if(mapkey[j]==cgm[stock_wheel].texkey){stex=maptex[j];break;}
-                    glUniform1f(uUseTex, stex?1.0f:0.0f); glUniform1f(rp.uEnv, 0.25f);
-                    glUniform1f(uSpec, 0.5f); glUniform3f(uColor,0.6f,0.6f,0.62f);
-                    if (stex) glBindTexture(GL_TEXTURE_2D, stex);
-                    for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPwheel, wheelT[k], MVPw);
-                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&cgm[stock_wheel]); }
-                    g_dbg.drawn+=4; glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                    for (int i=0;i<ncar;i++) {
+                        if (car.meshes[i].car_mount != N2_MOUNT_WHEEL ||
+                            car.meshes[i].tierid != car.meshes[stock_wheel].tierid) continue;
+                        GLuint stex=0;
+                        for(int j=0;j<nmap;j++) if(mapkey[j]==cgm[i].texkey){stex=maptex[j];break;}
+                        int inner = cgm[i].cat == N2_CAR_INTERIOR;
+                        glUniform1f(uUseTex,stex?1.0f:0.0f);
+                        glUniform1f(rp.uEnv,inner?0.0f:0.25f);
+                        glUniform1f(uSpec,inner?0.04f:0.5f);
+                        glUniform3f(uColor,0.05f,0.05f,0.06f);
+                        if(stex) glBindTexture(GL_TEXTURE_2D,stex);
+                        for(int k=0;k<4;k++){float MW[16];mat_mul(MVPwheel,wheelT[k],MW);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);draw_gpumesh(&cgm[i]);}
+                        g_dbg.drawn+=4;
+                    }
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                     goto wheels_drawn;
                 }
                 /* Geometric rim below the blur threshold, else the procedural
@@ -7513,8 +7514,16 @@ int main(int argc, char **argv) {
                                      -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
                   glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
                 glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
-                for (int i = 0; i < ncar; i++)
-                    if (cgm[i].cat != N2_CAR_TIRE) { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
+                for (int i = 0; i < ncar; i++) {
+                    int mount=car.meshes[i].car_mount;
+                    if (mount==N2_MOUNT_WHEEL) continue;
+                    if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
+                        int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
+                        for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,brakeTAI[w],MB);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&cgm[i]);g_dbg.drawn++;}
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                    } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
+                }
                 if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
                     for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(AIWheelMVP, wheelTAI[w], MVPw);

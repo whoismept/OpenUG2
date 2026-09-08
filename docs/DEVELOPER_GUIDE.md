@@ -608,19 +608,36 @@ split slice, so a heavily-split tier would win merely for having more
 slices, independent of how much triangle detail it contributes. Ties keep
 the earlier-encountered tier, matching the pre-M135 tie-break exactly.
 
-The stock wheel visual is currently partly procedural. Wheel position and ride
-height are separate concerns: axle/track data place contact points, while the
-selected tyre radius/body profile determines presentation. Spoilers and wheel
-libraries require separate asset loads.
+Stock wheel placement now follows the source part, not its material category.
+`N2Mesh.car_mount` survives material splitting and LOD/config selection: even an
+INTERIOR-material slice of `FRONT_WHEEL` belongs at the wheel hubs. The stock
+draw consumes every slice of the selected `tierid`, preserving source indices
+and texture slots. Startup and kit reload share `n2_car_prepare_wheels`;
+the stock path no longer deletes triangles by edge length. MIATA previously
+drew only 120 of its wheel's 497 triangles at each hub, while a 16-triangle
+wheel slice and both brake assemblies remained at the body origin.
+
+`FRONT_BRAKE` / `REAR_BRAKE` assemblies now follow their respective axle's
+hub travel and front steering, including on opponent cars. The caliper and
+disc remain one non-spinning assembly; independent disc rotation is not yet
+implemented. Stock coverage/attachments were checked across 29 player cars,
+with left/right/underside captures for five. This does not establish complete
+vehicle fidelity: aftermarket rim selection still uses its older single-mesh
+path, high-speed wheel blur and opponent tyres are procedural, and the
+MIATA `KIT00_EXHAUST_A` part still needs its own attachment attribution.
+
+Wheel position and ride height remain separate concerns: axle/track data place
+contact points, while the selected tyre radius/body profile determines
+presentation. Spoilers and wheel libraries require separate asset loads.
 
 ### Next vehicle-presentation and modification milestone
 
 The next vehicle pass is visual/asset attribution, not another physics
 tuning pass. The current checklist is:
 
-1. Restore complete tyre and rim rendering: authored tyre meshes, wheel-library
-   mesh selection, diffuse/material binding and transform alignment must all be
-   visible on every audited car.
+1. Finish tyre and rim rendering beyond the repaired stock slice path:
+   wheel-library mesh selection, diffuse/material binding, high-speed transition
+   and transform alignment must all be visible on every audited car.
 2. Attribute the unexplained object rendered under the car centre to its exact
    source object, material slot, transform and category. Do not hide it with a
    global cull or renderer exception; fix the source classification or

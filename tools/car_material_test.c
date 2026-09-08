@@ -152,6 +152,49 @@ static int car_category_for_name(const char *name) {
     return n2_car_category(p.b, 0, p.n);
 }
 
+static void car_mount_test(void) {
+    printf("\n  Source-part mounts survive material splitting\n");
+    const char *names[] = {"TESTCAR_KIT00_FRONT_WHEEL_A", "TESTCAR_KIT00_FRONT_BRAKE_A",
+                          "TESTCAR_KIT00_REAR_BRAKE_A", "TESTCAR_KIT00_BRAKELIGHT_A",
+                          "IMPREZAWRX_KIT00_FRONT_WHEE", "TESTCAR_BASE_A",
+                          "IMPREZAWRX_KIT00_FRONT_BRAK", "TESTCAR_KIT00_FRONT_BRAKELIGHT_A"};
+    int mounts[] = {N2_MOUNT_WHEEL, N2_MOUNT_FRONT_BRAKE, N2_MOUNT_REAR_BRAKE,
+                    N2_MOUNT_BODY, N2_MOUNT_WHEEL, N2_MOUNT_BODY,
+                    N2_MOUNT_FRONT_BRAKE, N2_MOUNT_BODY};
+    for (unsigned k=0;k<sizeof mounts/sizeof mounts[0];k++) {
+        Buf f; f.n=0;
+        float pos[6][3]={{-.3f,0,-.3f},{.3f,0,-.3f},{0,.2f,.3f},
+                         {-.2f,0,-.2f},{.2f,0,-.2f},{0,.2f,.2f}};
+        uint16_t idx[]={0,1,2,3,4,5};
+        uint32_t tex[]={0xabcdef01u,0xabcdef02u};
+        uint32_t mat[]={0x11223344u,N2_MAT_INTERIOR};
+        SubSpec sub[]={{3,0,0,0},{3,1,1,3}};
+        object(&f,names[k],tex,2,mat,2,sub,2,pos,6,idx,6);
+        N2Scene sc; n2_load_car(f.b,f.n,&sc,tex,2,NULL);
+        chk("both material slices and their triangles survive",sc.count==2 && total_nidx(&sc)==6);
+        chk(names[k],sc.count==2 && sc.meshes[0].car_mount==mounts[k] &&
+                     sc.meshes[1].car_mount==mounts[k]);
+        chk("interior material does not change attachment",count_by_cat(&sc,N2_CAR_INTERIOR)==1);
+        int wheel = n2_car_prepare_wheels(&sc);
+        chk("preparation preserves all source triangles",total_nidx(&sc)==6);
+        if (mounts[k]==N2_MOUNT_WHEEL && sc.count==2) {
+            chk("stock tier includes both materials",wheel>=0 &&
+                sc.meshes[0].tierid==sc.meshes[wheel].tierid &&
+                sc.meshes[1].tierid==sc.meshes[wheel].tierid);
+            chk("all slices receive the same wheel transform",
+                !memcmp(sc.meshes[0].verts,sc.meshes[1].verts,6*5*sizeof(float)) &&
+                fabsf(sc.meshes[0].verts[0]-.3f)<1e-6f &&
+                fabsf(sc.meshes[0].verts[1]-.1f)<1e-6f);
+            chk("rotation preserves winding indices and distinct texture slots",
+                !memcmp(sc.meshes[0].idx,idx,3*sizeof(uint16_t)) &&
+                !memcmp(sc.meshes[1].idx,idx+3,3*sizeof(uint16_t)) &&
+                sc.meshes[0].texkey==tex[0] && sc.meshes[1].texkey==tex[1]);
+        } else chk("body and brake geometry is not wheel-oriented",wheel==-1 &&
+            sc.meshes[0].verts[0]==pos[0][0] && sc.meshes[0].verts[1]==pos[0][1]);
+        n2_free_scene(&sc);
+    }
+}
+
 /* M136 RED/GREEN regression: SKY is a narrow authored family and the shipped
  * dome is a two-material object (dome + alpha cap), not one last-slot mesh. */
 static void sky_material_routing_test(void) {
@@ -759,6 +802,7 @@ static int sort_tests(void) {
 }
 
 int main(void) {
+    car_mount_test();
     printf("MILESTONE 135  car material routing / complete-tier LOD regression\n\n");
 
     /* -------------------------------------------------------------------
