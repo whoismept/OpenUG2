@@ -2035,6 +2035,40 @@ static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
     return scene->count;
 }
 
+/* A WHEELS library contains several size variants per STYLE. Keep the first
+ * complete source tier, not just its first material slice, and never stack
+ * the other sizes. n2_load_car has already selected LODs. No index filtering.
+ * ponytail: preserves the existing first-size choice; explicit rim sizing
+ * belongs to the later modification UI, not this coverage fix. */
+static int n2_rim_select_tier(N2Scene *s) {
+    if (!s || s->count<=0 || !s->meshes || !s->meshes[0].tierid) return 0;
+    uint32_t tier=s->meshes[0].tierid;
+    int w=0;
+    for (int i=0;i<s->count;i++) {
+        if (s->meshes[i].tierid!=tier) {
+            free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol);
+        } else {
+            if (w!=i) s->meshes[w]=s->meshes[i];
+            w++;
+        }
+    }
+    s->count=w;
+    return s->count;
+}
+
+/* Stock and library wheels share this source-to-hub transform: turn the
+ * source's +Y backing inward and centre its width. Split slices retain the
+ * same full vertex pool, so each gets the same transform. Call once per load. */
+static void n2_prepare_wheel_mesh(N2Mesh *m) {
+    if (!m || !m->verts || m->nverts<=0) return;
+    float bb[6]; n2_mesh_bbox(m,bb);
+    float ymid=0.5f*(bb[2]+bb[3]);
+    for (int v=0;v<m->nverts;v++) {
+        m->verts[v*5] = -m->verts[v*5];
+        m->verts[v*5+1] = ymid-m->verts[v*5+1];
+    }
+}
+
 /* Orient every material slice of a stock wheel together. Source vertices/UVs
  * and triangle coverage are retained; edge length is not a visibility rule.
  * Returns a representative of the stock tier (all its slices must be drawn).
@@ -2044,12 +2078,7 @@ static int n2_car_prepare_wheels(N2Scene *s) {
     for (int i=0;i<s->count;i++) {
         N2Mesh *m=&s->meshes[i];
         if (m->car_mount != N2_MOUNT_WHEEL || m->nverts <= 0) continue;
-        float bb[6]; n2_mesh_bbox(m,bb);
-        float ymid=0.5f*(bb[2]+bb[3]);
-        for (int v=0;v<m->nverts;v++) {
-            m->verts[v*5] = -m->verts[v*5];
-            m->verts[v*5+1] = ymid-m->verts[v*5+1];
-        }
+        n2_prepare_wheel_mesh(m);
         if (stock<0 || m->nidx>s->meshes[stock].nidx) stock=i;
     }
     return stock;
@@ -2573,9 +2602,21 @@ static int n2_mipbytes2(int w, int h, int bpb) {
 }
 static int n2_mipbytes(int s, int bpb) { return n2_mipbytes2(s, s, bpb); }
 
-/* Decode ONE car texture by its TPK key: find the slot, JDLZ-decompress, then
- * recover square dims + DXT1/DXT3 by matching the mip-chain size to DecodedSize
- * (car textures are square; format isn't stored, so it's inferred). Returns 1. */
+/* Both car payload wrappers must retain DXT1's authored one-bit alpha, just
+ * like the compressed GPU upload. Opaque images retain the RGB fallback. */
+static int n2_car_dxt1(const unsigned char *src, N2Tex *t) {
+    long n=(long)t->w*t->h;
+    t->rgb=(unsigned char *)malloc(n*3);
+    t->alpha=(unsigned char *)malloc(n);
+    if (!t->rgb || !t->alpha) {
+        free(t->rgb);free(t->alpha);t->rgb=t->alpha=NULL;return 0;
+    }
+    n2_dxt1(src,t->w,t->h,t->rgb,t->alpha);t->afmt=1;
+    for(long i=0;i<n;i++)if(t->alpha[i]!=255)return 1;
+    free(t->alpha);t->alpha=NULL;return 1;
+}
+
+/* Decode ONE car texture through its offset-slot table and embedded header. */
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
@@ -2590,6 +2631,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         }
     if (dec <= 0 || absoff < 0 || (long)absoff + enc > len) return 0;
     unsigned char *raw = (unsigned char *)malloc(dec);
+    if (!raw) return 0;
     if (enc >= 20 && memcmp(d + absoff, "HUFF", 4) == 0) {
         /* "HUFF"-wrapped blob (16-byte wrapper + EAC Huffman stream) — used
            by every VINYLS.BIN slot and by some TEXTURES.BIN slots. If the
@@ -2608,11 +2650,12 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
             if (w >= 8 && h >= 8 && w <= 2048 && h <= 2048 &&
                 n2_u32(rec + 0x18) == key && rec[0] >= 'A' && rec[0] <= 'Z') {
                 long n = (long)w * h;
-                if (fmt == 0x31545844 && n/2 + 144 <= dec) {        /* "DXT1" */
-                    t->w = w; t->h = h; t->alpha = NULL;
-                    t->rgb = (unsigned char *)malloc(n * 3);
-                    n2_dxt1(raw, w, h, t->rgb, NULL);
-                    t->dxtlen = (int)(n/2); t->dxtfmt = 1;          /* base-level blocks */
+                if (fmt == 0x31545844) {                         /* "DXT1" */
+                    long blocks=(long)((w+3)/4)*((h+3)/4)*8;
+                    if (blocks + 144 > dec) { free(raw); return 0; }
+                    t->w = w; t->h = h;
+                    if (!n2_car_dxt1(raw,t)) { free(raw); return 0; }
+                    t->dxtlen = (int)blocks; t->dxtfmt = 1;        /* base-level blocks */
                     t->dxt = (unsigned char *)malloc(t->dxtlen);
                     memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
@@ -2665,6 +2708,14 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     if (tw < 1 || th < 1 || tw > 4096 || th > 4096) { free(raw); return 0; }
     long n = (long)tw * th;
     t->w = tw; t->h = th;
+    /* Same texture-info fields as world TPKs, relative to BinKey here
+       (world records include a 24-byte name before it). MIATA_TIRE and
+       PLAYERWIRE_STYLE02_WHEEL both store usage=1, blend=0, writeZ=1;
+       their wheel-sized backing quad uses the atlas's transparent corners. */
+    if (P + 0x34 <= dec) {
+        t->order=raw[P+0x2d];t->usage=raw[P+0x31];
+        t->blend=raw[P+0x32];t->wz=raw[P+0x33];
+    }
     if (fmt == 0x20) {                    /* uncompressed BGRA: no compressed upload */
         if (n*4 > P) { free(raw); return 0; }
         t->rgb = (unsigned char *)malloc(n*3);
@@ -2676,8 +2727,9 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         free(raw); return 1;              /* dxtfmt stays 0 -> RGBA upload path */
     }
     if (fmt == 0x22) {                    /* DXT1 */
-        t->alpha = NULL; t->rgb = (unsigned char *)malloc(n*3);
-        n2_dxt1(raw, tw, th, t->rgb, NULL); t->dxtfmt = 1;
+        if ((long)((tw+3)/4)*((th+3)/4)*8 > P || !n2_car_dxt1(raw,t))
+            { free(raw); return 0; }
+        t->dxtfmt = 1;
     } else if (fmt == 0x24) {             /* DXT3 */
         t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
         n2_dxt3(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 3;

@@ -129,6 +129,11 @@ route-membership-audit: tools/m160_route_audit.c src/world_group_reader.h src/wo
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/m160_route_audit.c -o build/m160_route_audit -lm
 
+wheel-render-test: tools/wheel_render_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/wheel_render_test.c src/render.c -o build/wheel_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/wheel_render_test
+
 light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/light_state_test.c src/render.c -o build/light_state_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
@@ -183,6 +188,39 @@ world-cli-test: nfsu2
 	  exit 1; \
 	fi
 
+# Real GL/readback check; output is retained for visual inspection on failure.
+render-resolution-test: nfsu2
+	@set -e; capture_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/openug2-resolution.XXXXXX"); \
+	echo "render_resolution_test: captures in $$capture_dir"; \
+	for size in 1920x1080 3840x2160 1919x1079 960x600; do \
+	  set --; test "$$size" = 1920x1080 || set -- --resolution "$$size"; \
+	  ./nfsu2 "$(DATA)" --car MIATA --track STREAML4RA --heading 0 \
+	    --shot-empty --shot-yaw 90 --shot-pitch -25 --frames 1 "$$@" \
+	    --shot "$$capture_dir/$$size.png" >"$$capture_dir/$$size.log" 2>&1 \
+	    || { cat "$$capture_dir/$$size.log"; exit 1; }; \
+	  set -- $$(od -An -tu1 -j16 -N8 "$$capture_dir/$$size.png"); \
+	  test $$# -eq 8; \
+	  width=$$(( $$1*16777216 + $$2*65536 + $$3*256 + $$4 )); \
+	  height=$$(( $$5*16777216 + $$6*65536 + $$7*256 + $$8 )); \
+	  test "$$width" = "$${size%x*}" && test "$$height" = "$${size#*x}" \
+	    || { echo "render_resolution_test: FAIL $$size got $${width}x$${height}"; exit 1; }; \
+	done; echo 'render_resolution_test: PASS'
+
+resolution-cli-test: nfsu2
+	@set +e; \
+	./nfsu2 --resolution >/dev/null 2>&1; \
+	test $$? -eq 2 || { echo 'resolution_cli_test: FAIL missing size'; exit 1; }; \
+	for size in '' 0x1080 1920x0 63x1080 1920x63 7681x1080 1920x4321 \
+	  -1920x1080 1920 1920X1080 1920x1080junk 1920x1080x1 \
+	  999999999999999999999x1080; do \
+	  ./nfsu2 --resolution "$$size" >/dev/null 2>&1; \
+	  test $$? -eq 2 || { echo "resolution_cli_test: FAIL invalid $$size"; exit 1; }; \
+	done; \
+	for size in 64x64 960x600 1920x1080 3840x2160 7680x4320 1919x1079; do \
+	  ./nfsu2 build/no-such-data-root --resolution "$$size" --instance-audit >/dev/null 2>&1; \
+	  test $$? -eq 1 || { echo "resolution_cli_test: FAIL valid $$size"; exit 1; }; \
+	done; echo 'resolution_cli_test: PASS'
+
 ai-drive-cli-test: nfsu2
 	@set +e; \
 	for args in '--ai-drive-audit' '--ai-drive-audit /tmp/ai' \
@@ -209,4 +247,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test
+.PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test

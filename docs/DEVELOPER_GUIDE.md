@@ -515,6 +515,10 @@ presence in free roam still needs an independently proven activation rule.
 
 ## 8. Car loading and presentation
 
+See [Vehicle rendering status and audit notes](VEHICLE_RENDERING.md) for the
+consolidated wheel fixes, capture operations, evidence coverage and unresolved
+exhaust attachment.
+
 The car path is:
 
 ```text
@@ -622,15 +626,73 @@ hub travel and front steering, including on opponent cars. The caliper and
 disc remain one non-spinning assembly; independent disc rotation is not yet
 implemented. Stock coverage/attachments were checked across 29 player cars,
 with left/right/underside captures for five. This does not establish complete
-vehicle fidelity: aftermarket rim selection still uses its older single-mesh
-path, high-speed wheel blur and opponent tyres are procedural, and the
-MIATA `KIT00_EXHAUST_A` part still needs its own attachment attribution.
+vehicle fidelity: high-speed wheel blur and opponent tyres are procedural, and
+the MIATA `KIT00_EXHAUST_A` part still needs its attachment orientation resolved.
+
+Aftermarket rims now retain all material slices of the first selected source
+`tierid`, through `n2_rim_select_tier`, and draw them at each hub. Different
+size variants in the same STYLE remain alternatives, not stacked geometry.
+The existing first-size choice and radius fitting are unchanged. An 80-style
+library census confirmed one shared diffuse key within each selected tier;
+the NFSU STYLE02 production draw changed from 120 to 433 triangles per hub in
+the first coverage fix, and now retains all 435 source triangles. The geometric
+edge-length filter is removed. Tier selection preserves source indices, UVs
+and material slices.
+
+The backing quad is now attributed: NFSU STYLE02 source triangles 433/434 use
+material hash `0x010cb64a` and the transparent-corner region of its own wheel
+atlas, not malformed index joins. MIATA and HUMMER stock wheels use the same
+atlas layout. The car texture decoder now retains DXT1's one-bit alpha in the
+CPU fallback and reads the embedded texture-info draw fields (relative to
+BinKey: order `+0x2d`, usage `+0x31`, blend `+0x32`, writeZ `+0x33`). The
+compressed GPU blocks remain unchanged. The existing body/vinyl decal policy
+and LOC4 world fallback's opaque policy are explicitly preserved.
+
+Source census: all 29 selected stock wheels are cutout; of 80 selected library
+styles, 73 are cutout and seven are blended (ADVAN 01/02, AVUS 02, KONIG 07/08,
+RACINGHART 06, ROTA 02). This is source-data validation, not a visual fleet
+sign-off. Wheel draws now consume these modes through `render_wheel_mesh`:
+cutout discards alpha below 0.5 with depth writes; blend uses texture alpha,
+back-to-front indexed-range/hub ordering and no depth writes. The helper
+restores the caller's texture/alpha/blend/depth state. Opaque opponents finish
+before player glass and wheels. The existing body/vinyl/world policies are
+unchanged; blended styles are not forced into binary cutout.
+
+Alpha alone was insufficient: the first unfiltered aftermarket capture still
+put a solid disc over the spokes. Unlike stock wheels, the library loader had
+skipped the source-to-hub transform. Both paths now reuse
+`n2_prepare_wheel_mesh` (`x=-x`, `y=width_midpoint-y`), once per fresh load,
+before library radius fitting. NFSU STYLE02's backing moves from source
+Y=+0.183822 to hub-local Y=-0.091438 m, behind the spokes on both mirrored
+sides. An 80-style check preserves common slice pivots, indices, UVs and radius.
+MIATA/HUMMER stock, NFSU02 cutout and ADVAN02 blend captures were inspected at
+1920x1080, including opposite-side MIATA controls. Spokes remain visible with
+all source triangles (ADVAN02: 457 -> 461 per hub). This does not establish
+finished wheel materials: rim tint still affects tyre/backing slices, ADVAN
+has visible angular surfaces, and range-centre sorting is not per-triangle or
+whole-scene transparency ordering. Evidence: `scratchpad/vehicle_wheel_draw/`;
+decoder fixtures and source metadata: `scratchpad/vehicle_materials/`.
+
+Exhaust attribution has identified an object-owned `0x13401A` RIGHT_EXHAUST
+record on MIATA's KIT00 rear bumper, but the marker basis cannot yet be applied
+directly to the stock exhaust's local axes. No inferred translation/rotation
+or mesh-hiding workaround is applied. Detailed measurements and same-pose
+1080p evidence are kept locally under `scratchpad/vehicle_exhaust/`.
+The user's follow-up also identifies the body-centre object as a likely
+misplaced exhaust. For MIATA the source trace already identifies
+`KIT00_EXHAUST_A` near the origin: resolve its attachment, do not remove it as
+unwanted geometry. The correct assembly orientation remains unverified.
 
 Wheel position and ride height remain separate concerns: axle/track data place
 contact points, while the selected tyre radius/body profile determines
 presentation. Spoilers and wheel libraries require separate asset loads.
 
 ### Next vehicle-presentation and modification milestone
+
+The agreed shop-tab structure and vehicle-only reload contract are in
+[Vehicle customization and in-place switching](VEHICLE_CUSTOMIZATION.md).
+Car selection must preserve world/session resources; it is not a mesh-only
+replacement that leaves the old car's profile or audio active.
 
 The next vehicle pass is visual/asset attribution, not another physics
 tuning pass. The current checklist is:

@@ -186,8 +186,7 @@ static const char *FS =
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
-    /* N2_DRAW_CUTOUT world batches only (M135): uAlphaTest is 0.0 for every
-       other draw call, so this changes nothing anywhere else. Threshold 0.5
+    /* N2_DRAW_CUTOUT world batches and authored wheel textures. Threshold 0.5
        matches the authored railing/fence texture's own 1-bit DXT1 alpha
        (fully 0 or 255, no partial value to tune against). */
     "  if(uAlphaTest>0.5 && t.a<0.5) discard;\n"
@@ -249,7 +248,7 @@ static const char *FS =
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight. M135-R: authored
-       BLEND/ADD world batches instead multiply in the TEXTURE's own alpha
+       BLEND/ADD world batches and blended wheels multiply in the TEXTURE's own alpha
        (uTextureAlpha>0.5) -- otherwise a cutout-shaped blend/additive
        texture (e.g. a lit-window sheet with transparent gaps) would draw
        fully opaque/full-strength through those gaps, since uAlpha alone
@@ -950,6 +949,54 @@ void draw_gpumesh(GpuMesh *g) {
     glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
     glDrawElements(GL_TRIANGLES, g->nidx, GL_UNSIGNED_SHORT, 0);
+}
+
+void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
+    const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal};
+    float saved[5];for(int i=0;i<5;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    GLint oldtex,src,dst,srca,dsta;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&oldtex);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&src);glGetIntegerv(GL_BLEND_DST_RGB,&dst);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&srca);glGetIntegerv(GL_BLEND_DST_ALPHA,&dsta);
+    GLboolean blend=glIsEnabled(GL_BLEND),depth=glIsEnabled(GL_DEPTH_TEST),mask;
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
+    int cut=texture && mode==N2_DRAW_CUTOUT, translucent=texture && mode==N2_DRAW_BLEND;
+    glBindTexture(GL_TEXTURE_2D,texture);
+    glUniform1f(r->uUseTex,texture?1.0f:0.0f);
+    glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);
+    glUniform1f(r->uTextureAlpha,translucent?1.0f:0.0f);
+    glUniform1f(r->uAlpha,1.0f);glUniform1f(r->uDecal,0.0f);
+    glEnable(GL_DEPTH_TEST);glDepthMask(translucent?GL_FALSE:GL_TRUE);
+    if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
+    else glDisable(GL_BLEND);
+    draw_gpumesh(mesh);
+    for(int i=0;i<5;i++)glUniform1f(loc[i],saved[i]);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
+    glBlendFuncSeparate((GLenum)src,(GLenum)dst,(GLenum)srca,(GLenum)dsta);
+    if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);
+    if(depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    glDepthMask(mask);
+}
+
+void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order) {
+    if(!scene || scene->count<=0 || !order)return;
+    int n=scene->count;float depth[4*n];
+    for(int i=0;i<n;i++) {
+        const N2Mesh *m=scene->meshes+i;
+        float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
+        /* Split slices share the entire vertex pool: use their own indices. */
+        for(int j=0;j<m->nidx;j++)for(int a=0;a<3;a++) {
+            float v=m->verts[m->idx[j]*5+a];
+            if(v<lo[a])lo[a]=v;if(v>hi[a])hi[a]=v;
+        }
+        for(int k=0;k<4;k++) {
+            int at=k*n+i;order[at]=at;depth[at]=mvp[k][15];
+            for(int a=0;a<3;a++)depth[at]+=mvp[k][a*4+3]*(lo[a]+hi[a])*.5f;
+        }
+    }
+    /* ponytail: source-slice centres give painter order, not per-triangle
+       transparency. Intersecting translucent surfaces still need finer sorting. */
+    n2_sort_back_to_front(order,4*n,depth);
 }
 
 /* S3TC format enums + capability flag. glext.h / SDL_opengl.h define these on

@@ -174,63 +174,13 @@ static void wheel_contact_residuals(const N2Scene *scene, const float pos[3],
  * to leak or get left dangling, which an untested from-scratch teardown/
  * reload path could easily do quietly. */
 /* Load one aftermarket rim style out of a wheel-brand archive and upload it.
- * The archive holds several size/width variants per style; the first mesh is
- * used. Frees any previously uploaded rim. Returns 1 on success. */
-/* Drop triangles that weld two submesh runs together.
- *
- * What these triangles ACTUALLY are (Phase 49, re-measured -- two earlier
- * versions of this comment were wrong). They are NOT a grouping artifact:
- *   - The 0x134B02 index runs are clean. Every run's index count is a
- *     multiple of 3 and the runs are chained (start = prev start + count),
- *     so grouping the whole buffer in 3s from offset 0 never crosses a run
- *     boundary. There is no "tail bridges into the next run" bug.
- *   - The long triangles are genuine source geometry: a flat, axis-aligned
- *     quad (2 tris, 4 dedicated verts) at CONSTANT Y = 0.18, spanning the
- *     full rim diameter in X and Z. Verified identical across BBS/ENKEI/VOLK/
- *     OZ/ADVAN/LEXANI/WORK/RACINGHART/GIOVANNA/NFSU. It is the rim's flat
- *     backing/hub plane, hidden behind the spokes and occluded by the tyre
- *     and brake when mounted -- so dropping it is invisible, and keeping it
- *     would z-fight against the brake disc the engine draws separately.
- *     Measured: exactly 2 of 487 tris on BBS style 1 (LEXANI has 4 = two
- *     quads); the rest are clean spoke surface (mean edge 0.065 vs 0.85 diam).
- *
- * So the fix is a genuine-geometry cull, not a parser change: a run-boundary
- * splitter would keep these tris (they sit correctly inside one run), which
- * is why that approach was NOT taken. Dropping them here, before upload_scene,
- * means they never reach a VBO -- the VRAM is already optimal.
- *
- * Kept out of n2_add_pair on purpose: that path is shared by all 57 cars, and
- * this archive is the only place the condition arises. Purely local, and
- * geometric (edge > 0.25*diag) rather than name-based, so it is self-limiting
- * and cannot misfire on a legitimately large triangle in a small mesh. */
-static void rim_drop_welded_mesh(N2Mesh *m) {
-    float bb[6]; n2_mesh_bbox(m, bb);
-    float dx = bb[1]-bb[0], dy = bb[3]-bb[2], dz = bb[5]-bb[4];
-    float diag = sqrtf(dx*dx + dy*dy + dz*dz);
-    if (diag <= 0.0f) return;
-    float lim = 0.25f * diag, lim2 = lim * lim;
-    int w = 0;
-    for (int t = 0; t + 2 < m->nidx; t += 3) {
-        int ok = 1;
-        for (int k = 0; k < 3 && ok; k++) {
-            const float *p = m->verts + m->idx[t+k]*5;
-            const float *q = m->verts + m->idx[t+(k+1)%3]*5;
-            float ex=p[0]-q[0], ey=p[1]-q[1], ez=p[2]-q[2];
-            if (ex*ex+ey*ey+ez*ez > lim2) ok = 0;
-        }
-        if (ok) { m->idx[w]=m->idx[t]; m->idx[w+1]=m->idx[t+1]; m->idx[w+2]=m->idx[t+2]; w += 3; }
-    }
-    m->nidx = w;
-}
-static void rim_drop_welded_tris(N2Scene *s) {
-    for (int i = 0; i < s->count; i++) rim_drop_welded_mesh(&s->meshes[i]);
-}
-
+ * The archive holds several size/width variants; use all slices of the first
+ * complete tier. Frees any previously uploaded rim. Returns 1 on success. */
 static int load_rim_style(const unsigned char *wldata, long wllen,
                           const uint32_t *wkeys, int nwkeys, int style,
                           N2Scene *lib, GpuMesh **gm, int *ngm,
                           const unsigned char *wtdata, long wtlen,
-                          GLuint *rimtex, float fitR) {
+                          GLuint *rimtex, int *rimmode, float fitR) {
     if (!wldata) { (void)wllen; return 0; }
     for (int i = 0; i < *ngm; i++) {
         glDeleteBuffers(1, &(*gm)[i].vbo);
@@ -242,11 +192,16 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     N2CarConfig wcfg = { 0, style, 0, style };   /* STYLEnn selects the rim */
     int n = n2_load_car(wldata, wllen, lib, wkeys, nwkeys, &wcfg);
     if (n <= 0) return 0;
-    rim_drop_welded_tris(lib);
-    /* Fit the aftermarket rim to THIS car's wheel. The library rims are one
-       fixed tuner size (~0.42 radius); a Hummer's arch is far bigger, so the
-       rim floated tiny inside it. Scale every rim submesh (they share the
-       origin) to the car's own stock-wheel radius fitR, which is measured from
+    n = n2_rim_select_tier(lib);
+    if (n <= 0) return 0;
+    for (int i=0;i<n;i++) n2_prepare_wheel_mesh(&lib->meshes[i]);
+    int triangles=0;
+    for (int i=0;i<n;i++) triangles+=lib->meshes[i].nidx/3;
+    printf("  rim tier: %u, %d slices, %d source triangles per hub\n",
+           lib->meshes[0].tierid,n,triangles);
+    /* Fit the selected library size to THIS car's wheel. Scale every rim
+       submesh (they share the origin) to the car's stock-wheel radius fitR,
+       which is measured from
        the car's N2_CAR_TIRE mesh -- the same size the procedural tyre uses, so
        the two stay consistent when the draw swaps between them at speed. */
     if (fitR > 0.0f && lib->count) {
@@ -269,11 +224,13 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
        LEXANI/WORK/ADVAN), so one texture covers the whole rim -- hence a
        single GLuint rather than a per-mesh map like the car body uses. */
     if (*rimtex) { glDeleteTextures(1, rimtex); *rimtex = 0; }
+    *rimmode=N2_DRAW_OPAQUE;
     uint32_t tk = lib->count ? lib->meshes[0].texkey : 0;
     N2Tex rt; memset(&rt, 0, sizeof rt);
     long ar=0, ag=0, ab=0, bmn=255, bmx=0;
     if (tk && wtdata && n2_load_car_tex_by_key(wtdata, wtlen, tk, &rt)) {
         *rimtex = upload_tpk_texture_to_gpu(&rt);
+        *rimmode=n2_tex_mode(&rt);
         /* rim sheets are atlases with UVs in [0,1]: clamp so REPEAT wrap +
            mip filtering cannot bleed the opposite border in (same reason as
            the car body atlases above). */
@@ -289,17 +246,20 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     /* channel telemetry: B min/max spanning 0..255 confirms the decode is NOT
        truncating blue -- the low average is an authentic gold/bronze rim. */
     printf("  rim diffuse: texkey %08x -> %s (%dx%d) avg RGB %ld,%ld,%ld  B[min %ld..max %ld]\n",
-           tk, *rimtex ? "bound" : "UNRESOLVED, procedural fallback",
+           tk, *rimtex ? "bound" : "UNRESOLVED, untextured geometry",
            *rimtex ? rt.w : 0, *rimtex ? rt.h : 0, ar, ag, ab, bmn, bmx);
+    printf("  rim material: draw mode %d\n",*rimmode);
     return 1;
 }
 
 static void relaunch(const char *selfexe, const char *dataroot,
-                     const char *car, const char *track) {
-    char *na[8]; int a = 0;
+                     const char *car, const char *track, int width, int height) {
+    char resolution[32]; snprintf(resolution,sizeof resolution,"%dx%d",width,height);
+    char *na[10]; int a = 0;
     na[a++] = (char *)selfexe; na[a++] = (char *)dataroot;
     na[a++] = "--car";   na[a++] = (char *)car;
-    na[a++] = "--track"; na[a++] = (char *)track; na[a] = NULL;
+    na[a++] = "--track"; na[a++] = (char *)track;
+    na[a++] = "--resolution"; na[a++] = resolution; na[a] = NULL;
     SDL_Quit(); execvp(selfexe, na);
     _exit(1);   /* only reached if execvp itself failed */
 }
@@ -437,8 +397,9 @@ static int dump_car_info(const char *dataroot, const char *car) {
     for (int i = 0; i < nk; i++) {
         N2Tex tex;
         if (n2_load_car_tex_by_key(t, tn, keys[i], &tex)) {
-            printf("  key=0x%08X  %4dx%-4d  %s\n", keys[i], tex.w, tex.h,
-                   tex.alpha ? "DXT3 (alpha)" : "DXT1");
+            printf("  key=0x%08X  %4dx%-4d  %s%s\n", keys[i], tex.w, tex.h,
+                   tex.dxtfmt==1?"DXT1":tex.dxtfmt==3?"DXT3":tex.dxtfmt==5?"DXT5":"decoded RGB",
+                   tex.alpha?" (alpha)":"");
             free(tex.rgb); free(tex.alpha); free(tex.dxt);
         } else printf("  key=0x%08X  (decode failed)\n", keys[i]);
     }
@@ -1370,6 +1331,7 @@ int main(int argc, char **argv) {
                           not a supported playable open-world composition.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit
+         --resolution WxH window/render size (default 1920x1080; also used by audits)
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free)
          --world2         legacy alias; instance world is automatic for one STREAM
          --scenery-preview free|EVENT  load-time event-only scenery test (world2 capture/audit only)
@@ -1385,6 +1347,7 @@ int main(int argc, char **argv) {
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
+    int render_width = 1920, render_height = 1080;
     const char *xaudit = NULL;   /* --transform-audit REGION: GL-free placement forensics */
     float shotyaw = 1e9f;        /* --shot-yaw DEG: fixed capture heading (M132) */
     float shotpitch = 0.0f;      /* --shot-pitch DEG: camera elevation */
@@ -1470,6 +1433,18 @@ int main(int argc, char **argv) {
     int want_laps = 2;       /* --laps N: race distance for --event */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
+        else if (!strcmp(argv[i], "--resolution")) {
+            char extra;
+            if (i+1 >= argc ||
+                strspn(argv[i+1],"0123456789x") != strlen(argv[i+1]) ||
+                sscanf(argv[i+1],"%4dx%4d%c",&render_width,&render_height,&extra) != 2 ||
+                render_width < 64 || render_width > 7680 ||
+                render_height < 64 || render_height > 4320) {
+                fprintf(stderr,"--resolution requires WIDTHxHEIGHT (64..7680 x 64..4320)\n");
+                return 2;
+            }
+            i++;
+        }
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
         else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames")  && i+1 < argc) { shotframes = atoi(argv[++i]); shotframes_set = 1; }
@@ -2711,11 +2686,29 @@ int main(int argc, char **argv) {
 #endif
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    /* Hidden, fixed-size capture windows avoid the desktop's visible-window
+       size clamp (notably macOS), using the same production GL draw path. */
+    const int capture_window = shot || raudit || resident_route_audit;
     SDL_Window *win = SDL_CreateWindow("OpenUG2",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 600,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, render_width, render_height,
+        SDL_WINDOW_OPENGL | (capture_window ? SDL_WINDOW_HIDDEN : SDL_WINDOW_RESIZABLE));
+    if (!win) { fprintf(stderr,"window: %s\n",SDL_GetError()); return 1; }
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { fprintf(stderr, "GL ctx: %s\n", SDL_GetError()); return 1; }
+    /* Every capture reads tightly packed RGB, including odd-width windows. */
+    glPixelStorei(GL_PACK_ALIGNMENT,1);
+    { int dw,dh; GLint limit[2];
+      SDL_GL_GetDrawableSize(win,&dw,&dh);
+      glGetIntegerv(GL_MAX_VIEWPORT_DIMS,limit);
+      printf("render size: requested %dx%d, drawable %dx%d (%s)\n",
+             render_width,render_height,dw,dh,capture_window ? "capture" : "interactive");
+      if (capture_window && (dw!=render_width || dh!=render_height ||
+                             dw>limit[0] || dh>limit[1])) {
+          fprintf(stderr,"Cannot capture the requested resolution on this display/GL backend\n");
+          SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
+          return 1;
+      }
+    }
     SDL_GameController *controller = NULL;
     for (int i = 0; i < SDL_NumJoysticks() && !controller; i++)
         if (SDL_IsGameController(i)) controller = SDL_GameControllerOpen(i);
@@ -3478,7 +3471,7 @@ int main(int argc, char **argv) {
     /* per-mesh car textures: get the TPK keys, then decode each key referenced
        by a mesh into its own GL texture (body, wheel, brake, ... bound by UVs). */
     uint32_t ckeys[512]; int nck = ctdata ? n2_car_tex_keys(ctdata, ctlen, ckeys, 512) : 0;
-    uint32_t mapkey[128]; GLuint maptex[128]; char mapalpha[128]; int nmap = 0;
+    uint32_t mapkey[128]; GLuint maptex[128]; char mapalpha[128], mapmode[128]; int nmap = 0;
     N2Scene car; int ncar = 0; GpuMesh *cgm = NULL;
     int stock_wheel = -1;   /* representative of the complete stock wheel tier */
     float wheelT[4][16];                         /* 4 wheel placements (car-local) */
@@ -3622,7 +3615,10 @@ int main(int argc, char **argv) {
             N2Tex ct;
             if (n2_load_car_tex_by_key(ctdata, ctlen, tk, &ct)) {
                 mapkey[nmap] = tk; maptex[nmap] = upload_tpk_texture_to_gpu(&ct);
-                mapalpha[nmap] = ct.alpha != NULL;   /* DXT3 = decal mask */
+                /* Preserve the existing decal policy: newly retained DXT1
+                   cutout alpha is not a paint/vinyl compositing mask. */
+                mapalpha[nmap] = ct.alpha != NULL && ct.dxtfmt != 1;
+                mapmode[nmap] = (char)n2_tex_mode(&ct);
                 nmap++;
                 /* car textures are atlases (UVs in [0,1]): clamp so REPEAT
                    wrap + mip filtering can't bleed the opposite border in. */
@@ -3654,7 +3650,7 @@ int main(int argc, char **argv) {
             N2Tex vt; int got = 0; uint32_t gotkey = 0;
             for (int k = 0; k < nvk && !got; k++) {
                 if (!n2_load_car_tex_by_key(vdata, vlen, vkeys[k], &vt)) continue;
-                if (vt.alpha) {
+                if (vt.alpha && vt.dxtfmt != 1) { /* unchanged vinyl candidate policy */
                     long n = (long)vt.w * vt.h, op = 0;
                     for (long p = 0; p < n; p++) if (vt.alpha[p] > 128) op++;
                     float f = (float)op / (float)n;
@@ -4740,10 +4736,10 @@ int main(int argc, char **argv) {
         if (wtdata) nwkeys = n2_car_tex_keys(wtdata, wtlen, wkeys,
                                              (int)(sizeof wkeys / sizeof wkeys[0]));
     }
-    GLuint rimtex = 0;    /* real rim diffuse; 0 => fall back to procedural */
+    GLuint rimtex = 0; int rimmode=N2_DRAW_OPAQUE;
     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                        &wheellib, &wheelgm, &nwheelgm,
-                       wtdata, wtlen, &rimtex, carWheelR))
+                       wtdata, wtlen, &rimtex, &rimmode, carWheelR))
         printf("rims: %s style %d, %d mesh(es)\n", wheel_brands[wheel_brand], wheel_style, nwheelgm);
     else
         printf("rims: library unavailable, using procedural wheels\n");
@@ -5200,7 +5196,7 @@ int main(int argc, char **argv) {
                     wheel_style = wheel_style % 8 + 1;   /* 1..8 */
                     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                                        &wheellib, &wheelgm, &nwheelgm,
-                                       wtdata, wtlen, &rimtex, carWheelR))
+                                       wtdata, wtlen, &rimtex, &rimmode, carWheelR))
                         printf("rims -> %s style %d (%d mesh(es))\n",
                                wheel_brands[wheel_brand], wheel_style, nwheelgm);
                 }
@@ -5241,10 +5237,10 @@ int main(int argc, char **argv) {
                                trackname, carpos[0], carpos[1], carpos[2]);
                     } else if ((k==SDLK_LEFT || k==SDLK_RIGHT) && ncars > 1) {
                         selcar = (selcar + (k==SDLK_RIGHT?1:ncars-1)) % ncars;
-                        relaunch(selfexe, dataroot, carlist[selcar], trackname);
+                        relaunch(selfexe, dataroot, carlist[selcar], trackname, render_width, render_height);
                     } else if ((k==SDLK_UP || k==SDLK_DOWN) && ntrack > 1) {
                         seltrack = (seltrack + (k==SDLK_DOWN?1:ntrack-1)) % ntrack;
-                        relaunch(selfexe, dataroot, carname, tracklist[seltrack]);
+                        relaunch(selfexe, dataroot, carname, tracklist[seltrack], render_width, render_height);
                     } else if ((k==SDLK_LEFTBRACKET || k==SDLK_RIGHTBRACKET) &&
                                !ncirc && nsprint > 1) {
                         selsprint = (selsprint + (k==SDLK_RIGHTBRACKET?1:nsprint-1)) % nsprint;
@@ -7332,6 +7328,60 @@ int main(int argc, char **argv) {
 #endif
             }
             glUniform1f(uUnlit, 0.0f);   /* emissive lenses left it on; glass/wheels below are lit */
+            /* Finish opaque opponents before player glass/blended wheels: the
+               latter do not write depth and cannot occlude a later opaque draw. */
+            glDisable(GL_CULL_FACE);   /* opponents were already two-sided */
+            glUniform1f(uUseTex, 0.0f);
+            glUniform1f(rp.uDecal, 0.0f); /* no player badge/vinyl state on AI tyres */
+            glUniform1f(uSpec, 0.3f);     /* AIs: flat colour but glossy paint */
+            glUniform1f(rp.uEnv, 0.35f);
+            glUniform1f(rp.uClearcoat, 0.0f);
+            /* Preserve the gloss previously inherited after the glass pass. */
+            if (g_dbg.show_glass) glUniform1f(uGloss, 90.0f);
+            /* AI opponents — same body, each in its own colour */
+            for (int k = 0; k < nai; k++) {
+                float aup[3], aiz=ais[k].pos[2];
+                float AIModel[16], AIMVPc[16], AIWheelModel[16], AIWheelMVP[16];
+                world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
+                mat_car(ais[k].pos, ais[k].head, aup, ride, AIModel);   /* AI: same per-car ride */
+                mat_mul(MVP, AIModel, AIMVPc);
+                mat_car(ais[k].pos, ais[k].head, aup, car_ride, AIWheelModel);
+                mat_mul(MVP, AIWheelModel, AIWheelMVP);
+                glUniformMatrix4fv(uMVP, 1, GL_FALSE, AIMVPc);
+                { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
+                  float dx=cam[0]-ais[k].pos[0], dy=cam[1]-ais[k].pos[1];
+                  float dz=cam[2]-(ais[k].pos[2]+ride);
+                  glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
+                                     -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
+                  glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
+                glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
+                for (int i = 0; i < ncar; i++) {
+                    int mount=car.meshes[i].car_mount;
+                    if (mount==N2_MOUNT_WHEEL) continue;
+                    if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
+                        int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
+                        for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,brakeTAI[w],MB);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&cgm[i]);g_dbg.drawn++;}
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
+                    } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
+                }
+                if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
+                    glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
+                    for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(AIWheelMVP, wheelTAI[w], MVPw);
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&wheelmesh); }
+                    g_dbg.drawn += 4;
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
+                    glUniform1f(uUseTex, 0.0f);
+                    glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
+                }
+            }
+            /* Opponents use their own matrices; restore player shader space. */
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
+            { float ch=cosf(heading), sh=sinf(heading);
+              float dx=cam[0]-bodypos[0], dy=cam[1]-bodypos[1], dz=cam[2]-(bodypos[2]+ride);
+              glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
+                                 -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
+              glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
             /* glass pass: translucent tint, blended over the finished body,
                depth-write off (no self-occlusion), spec kept by the shader's
                uAlpha output. State restored before anything else draws. */
@@ -7429,8 +7479,8 @@ int main(int argc, char **argv) {
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                 glDepthMask(GL_TRUE); glDisable(GL_BLEND);
             }
-            /* procedural tyres at the 4 arches (the game rims render as urchins);
-               the radial rim texture gives them a hub + spokes instead of a void */
+            /* Authored stock/library wheels below the blur threshold, with
+               the existing procedural wheel as the high-speed fallback. */
             if (have_wheel && g_dbg.show_tires) {
                 glUniform1f(rp.uDecal, 0.0f);
                 /* Draw every material slice of the selected source wheel tier,
@@ -7445,8 +7495,8 @@ int main(int argc, char **argv) {
                     for (int i=0;i<ncar;i++) {
                         if (car.meshes[i].car_mount != N2_MOUNT_WHEEL ||
                             car.meshes[i].tierid != car.meshes[stock_wheel].tierid) continue;
-                        GLuint stex=0;
-                        for(int j=0;j<nmap;j++) if(mapkey[j]==cgm[i].texkey){stex=maptex[j];break;}
+                        GLuint stex=0;int smode=N2_DRAW_OPAQUE;
+                        for(int j=0;j<nmap;j++) if(mapkey[j]==cgm[i].texkey){stex=maptex[j];smode=mapmode[j];break;}
                         int inner = cgm[i].cat == N2_CAR_INTERIOR;
                         glUniform1f(uUseTex,stex?1.0f:0.0f);
                         glUniform1f(rp.uEnv,inner?0.0f:0.25f);
@@ -7454,7 +7504,7 @@ int main(int argc, char **argv) {
                         glUniform3f(uColor,0.05f,0.05f,0.06f);
                         if(stex) glBindTexture(GL_TEXTURE_2D,stex);
                         for(int k=0;k<4;k++){float MW[16];mat_mul(MVPwheel,wheelT[k],MW);
-                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);draw_gpumesh(&cgm[i]);}
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);render_wheel_mesh(&rp,&cgm[i],stex,smode);}
                         g_dbg.drawn+=4;
                     }
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
@@ -7486,54 +7536,26 @@ int main(int argc, char **argv) {
                     glBindTexture(GL_TEXTURE_2D,
                         PHYS_KMH(speed) > WHEEL_BLUR_KMH ? texWheelBlur : texWheel);
                 }
-                for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPwheel, wheelT[k], MVPw);
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw);
-                    draw_gpumesh(geo ? &wheelgm[0] : &wheelmesh); }
-                g_dbg.drawn += 4;
+                float wmvp[4][16];for(int k=0;k<4;k++)mat_mul(MVPwheel,wheelT[k],wmvp[k]);
+                if(geo) {
+                    int order[4*nwheelgm];
+                    for(int i=0;i<4*nwheelgm;i++)order[i]=i;
+                    if(rimtex && rimmode==N2_DRAW_BLEND)render_wheel_order(&wheellib,wmvp,order);
+                    for(int j=0;j<4*nwheelgm;j++) {
+                        int k=order[j]/nwheelgm,i=order[j]%nwheelgm;
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[k]);
+                        render_wheel_mesh(&rp,&wheelgm[i],rimtex,rimmode);
+                    }
+                } else for(int k=0;k<4;k++) {
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[k]);draw_gpumesh(&wheelmesh);
+                }
+                g_dbg.drawn += 4 * (geo ? nwheelgm : 1);
                 glUniform1f(rp.uRimTint, 0.0f);   /* rim paint is rim-only */
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                 wheels_drawn: ;
             }
             glUniform1f(uUseTex, 0.0f);
-            glUniform1f(uSpec, 0.3f);     /* AIs: flat colour but glossy paint */
-            glUniform1f(rp.uEnv, 0.35f);
-            /* AI opponents — same body, each in its own colour */
-            for (int k = 0; k < nai; k++) {
-                float aup[3], aiz=ais[k].pos[2];
-                float AIWheelModel[16], AIWheelMVP[16];
-                world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
-                mat_car(ais[k].pos, ais[k].head, aup, ride, Model);   /* AI: same per-car ride */
-                mat_mul(MVP, Model, MVPc);
-                mat_car(ais[k].pos, ais[k].head, aup, car_ride, AIWheelModel);
-                mat_mul(MVP, AIWheelModel, AIWheelMVP);
-                glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
-                { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
-                  float dx=cam[0]-ais[k].pos[0], dy=cam[1]-ais[k].pos[1];
-                  float dz=cam[2]-(ais[k].pos[2]+ride);
-                  glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
-                                     -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
-                  glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
-                glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
-                for (int i = 0; i < ncar; i++) {
-                    int mount=car.meshes[i].car_mount;
-                    if (mount==N2_MOUNT_WHEEL) continue;
-                    if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
-                        int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
-                        for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,brakeTAI[w],MB);
-                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&cgm[i]);g_dbg.drawn++;}
-                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
-                    } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
-                }
-                if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
-                    glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
-                    for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(AIWheelMVP, wheelTAI[w], MVPw);
-                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&wheelmesh); }
-                    g_dbg.drawn += 4;
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
-                    glUniform1f(uUseTex, 0.0f);
-                    glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
-                }
-            }
+            glUniform1f(uSpec, 0.3f);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
@@ -7978,14 +8000,14 @@ int main(int argc, char **argv) {
             wheel_style = g_dbg.wheel_style < 1 ? 1 : g_dbg.wheel_style;
             if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                                &wheellib, &wheelgm, &nwheelgm,
-                               wtdata, wtlen, &rimtex, carWheelR))
+                               wtdata, wtlen, &rimtex, &rimmode, carWheelR))
                 printf("rims -> %s style %d (%d mesh(es))\n",
                        wheel_brands[wheel_brand], wheel_style, nwheelgm);
         }
         if (g_dbg.want_car >= 0 && g_dbg.want_car < ncars)
-            relaunch(selfexe, dataroot, carlist[g_dbg.want_car], trackname);
+            relaunch(selfexe, dataroot, carlist[g_dbg.want_car], trackname, render_width, render_height);
         if (g_dbg.want_track >= 0 && g_dbg.want_track < ntrack)
-            relaunch(selfexe, dataroot, carname, tracklist[g_dbg.want_track]);
+            relaunch(selfexe, dataroot, carname, tracklist[g_dbg.want_track], render_width, render_height);
 #endif
         if (smaudit) {
             /* Four sampler variants on the TARGET TEXTURE ONLY, all captured

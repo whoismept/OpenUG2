@@ -459,8 +459,12 @@ static int world_texture_decode(const World *w, const WRegion *g,
         return ok;
     }
     int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
-    if (!ok && w->neighborhood.loc4)
+    if (!ok && w->neighborhood.loc4) {
         ok = n2_load_car_tex_by_key(w->neighborhood.loc4, w->neighborhood.loc4len, key, tex);
+        /* The car decoder now exposes draw metadata. Preserve LOC4's existing
+           opaque world policy until its materials receive their own GL audit. */
+        if (ok) tex->order=tex->usage=tex->blend=tex->wz=0;
+    }
     if (!ok && w->neighborhood.master)
         ok = n2_tpk_decode(w->neighborhood.master, w->neighborhood.masterlen, w->neighborhood.mastertpk, key, tex);
     return ok;
@@ -556,12 +560,8 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
             *n = -1;
             return 1; /* do not cache a failed upload */
         }
-        /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
-           itself; a key that resolved via n2_load_car_tex_by_key (the
-           shared LOC4 car-texture library) keeps them at their zero
-           default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
-           world texture had before this field existed, not a new
-           misclassification. */
+        /* Exact STREAM material modes; world_texture_decode preserves the
+           separate, still-conservative LOC4 fallback policy. */
         unsigned char mode = (unsigned char)n2_tex_mode(&tt);
         keys[*n] = tk; texs[*n] = id;
         if (modes) modes[*n] = mode;

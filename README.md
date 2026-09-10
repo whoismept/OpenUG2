@@ -199,6 +199,15 @@ grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look �
 collide and building contact is confirmed against source mesh faces before the
 car is pushed. `--shot out.png` renders one frame to a PNG and exits.
 
+The default resolution is **1920×1080**. Screenshots and visual race/drive audits
+render in a hidden, fixed-size GL window, so desktop window limits do not shrink
+the PNG. Use `--resolution 3840x2160` for 4K captures, or `--resolution 960x600`
+for older reference dimensions. An unsupported capture size fails explicitly.
+Interactive windows remain resizable and may be constrained by the display;
+the log reports the actual drawable size. Existing capture scripts inherit the
+1080p default. `make render-resolution-test DATA=..` checks real PNG dimensions
+(requires game data and a working GL display).
+
 ## Layout
 
 ```
@@ -227,9 +236,11 @@ then moves outward to world correctness and race systems:
 1. **Vehicle foundation and presentation** — complete tyre/rim rendering,
    identify the unexplained under-car object, and verify body transforms,
    wheel/contact placement and measured handling behaviour.
-2. **Vehicle operations and modification flow** — connect the ImGui tabs and
-   proven asset libraries to bumpers, spoilers, rims, full body kits, headlights
-   and stickers/vinyls, with reversible stock fallbacks.
+2. **Vehicle operations and modification flow** — add a Modification tab with
+   Body, Performance, Graphics/Color and Car Specialties shop subtabs; keep
+   per-car selections and switch vehicle assets without restarting the world.
+   Connect proven part libraries with reversible stock fallbacks. See the
+   [customization and in-place switching design](docs/VEHICLE_CUSTOMIZATION.md).
 3. **Vehicle/world lighting fidelity** — fix headlight transforms and grounded
    neon first, then attribute district/fixture lights, road-closure guidance
    lights and the measured wet/rainy asphalt path.
