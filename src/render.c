@@ -122,6 +122,8 @@ static const char *FS =
         HUD/debug uUnlit pass, leaves this at its default 0.0 and keeps its
         existing uAlpha-only alpha output unchanged) */
     "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
+    "uniform float uFresnel;\n"   /* >0.5: glass -- fresnel drives alpha + reflection */
+    "uniform float uClearcoat;\n" /* >0: second tight specular lobe over the base coat */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -175,12 +177,16 @@ static const char *FS =
        sharper diffuse swing right here instead, gated the same way as the
        cavity term above — world batches always set uSpec=0, so they never
        take this branch. */
-    "  if(uSpec>0.001) d=uAmbient*0.55+uDiffuse*1.2*nl;\n"
+    /* Paint was clipping to white: at 0.55/1.2 the diffuse term alone reached
+       ~0.95, which the shared *1.35 exposure below pushed past 1.0 before the
+       specular, rim and environment terms were even added -- so every panel
+       saturated and the highlights had no headroom left to show against.
+       Pulling the body's own diffuse back leaves that headroom for them. */
+    "  if(uSpec>0.001) d=uAmbient*0.35+uDiffuse*0.80*nl;\n"
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
-    /* N2_DRAW_CUTOUT world batches only (M135): uAlphaTest is 0.0 for every
-       other draw call, so this changes nothing anywhere else. Threshold 0.5
+    /* N2_DRAW_CUTOUT world batches and authored wheel textures. Threshold 0.5
        matches the authored railing/fence texture's own 1-bit DXT1 alpha
        (fully 0 or 255, no partial value to tune against). */
     "  if(uAlphaTest>0.5 && t.a<0.5) discard;\n"
@@ -196,16 +202,25 @@ static const char *FS =
        to show them (verified: body meshes carry no diffuse map at all), so
        this fakes the early-2000s baked-AO look by darkening paint where the
        surface turns away from the camera, instead of claiming detail that
-       isn't in the asset. */
+       isn't in the asset. Narrowed from pow4/0.6 to pow6/0.78: at pow4 the
+       falloff reached far onto flat panels and fought the fresnel edge
+       brightening below, which is what flattened the paint into matte clay.
+       It now only bites in the last few degrees, i.e. actual creases. */
     "  if(uSpec>0.001){\n"
-    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 4.0);\n"
-    "    base *= mix(1.0, 0.6, edge);\n"
+    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 6.0);\n"
+    "    base *= mix(1.0, 0.78, edge);\n"
     "  }\n"
     /* Phong: reflect the light about the normal and test it against the VIEW
        vector. The old form used dot(N,L) with no V term at all, so it was a
        sharpened diffuse -- the highlight could not travel across a panel as
        the camera moved, which is what made the paint read flat/matte. */
-    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec;\n"
+    "  float rl = max(dot(reflect(-L,N), V), 0.0);\n"
+    "  float sp = pow(rl, uGloss)*uSpec;\n"
+    /* clear coat: automotive paint is a coloured base coat under a clear
+       lacquer, so it carries TWO highlights -- the broad soft one from the
+       pigment (sp above) and a small hard one from the lacquer surface. One
+       lobe alone is what makes painted metal read as moulded plastic. */
+    "  sp += pow(rl, 160.0)*uClearcoat;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
     /* per-vertex prelight (world geometry): the source stores baked AO/lighting
@@ -218,6 +233,7 @@ static const char *FS =
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
        uCamPos is the camera in the SAME space as vPos/vN. */
+    "  float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "  if(uEnv>0.001){\n"
     "    vec3 R = reflect(-V, N);\n"
     "    float up = clamp(R.z*0.5+0.5, 0.0, 1.0);\n"
@@ -228,17 +244,22 @@ static const char *FS =
        actually mirror. */
     "    vec3 env = mix(vec3(0.03,0.03,0.05), vec3(0.10,0.14,0.24), up)\n"
     "             + vec3(0.85,0.66,0.42)*pow(1.0-abs(R.z), 4.0);\n"
-    "    float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "    lit += env * (uEnv * fres);\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight. M135-R: authored
-       BLEND/ADD world batches instead multiply in the TEXTURE's own alpha
+       BLEND/ADD world batches and blended wheels multiply in the TEXTURE's own alpha
        (uTextureAlpha>0.5) -- otherwise a cutout-shaped blend/additive
        texture (e.g. a lit-window sheet with transparent gaps) would draw
        fully opaque/full-strength through those gaps, since uAlpha alone
        carries no per-texel information. */
     "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
+    /* Glass (uFresnel, the car glass pass only). A flat per-pass alpha is what
+       made the cabin read as a still pool: every window sat at one constant
+       opacity regardless of angle, so it looked like a filled surface rather
+       than a pane. Real glass is nearly clear head-on and a mirror at grazing
+       incidence, so alpha rides the same fresnel term the reflection does. */
+    "  if(uFresnel>0.5) outA = clamp(mix(uAlpha, 1.0, fres), 0.0, 1.0);\n"
     "  gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);\n"
     "}\n";
 
@@ -361,6 +382,8 @@ RProg render_program(void) {
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
+    r.uFresnel = glGetUniformLocation(r.prog, "uFresnel");
+    r.uClearcoat = glGetUniformLocation(r.prog, "uClearcoat");
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
     glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);
@@ -926,6 +949,54 @@ void draw_gpumesh(GpuMesh *g) {
     glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
     glDrawElements(GL_TRIANGLES, g->nidx, GL_UNSIGNED_SHORT, 0);
+}
+
+void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
+    const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal};
+    float saved[5];for(int i=0;i<5;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    GLint oldtex,src,dst,srca,dsta;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&oldtex);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&src);glGetIntegerv(GL_BLEND_DST_RGB,&dst);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&srca);glGetIntegerv(GL_BLEND_DST_ALPHA,&dsta);
+    GLboolean blend=glIsEnabled(GL_BLEND),depth=glIsEnabled(GL_DEPTH_TEST),mask;
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
+    int cut=texture && mode==N2_DRAW_CUTOUT, translucent=texture && mode==N2_DRAW_BLEND;
+    glBindTexture(GL_TEXTURE_2D,texture);
+    glUniform1f(r->uUseTex,texture?1.0f:0.0f);
+    glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);
+    glUniform1f(r->uTextureAlpha,translucent?1.0f:0.0f);
+    glUniform1f(r->uAlpha,1.0f);glUniform1f(r->uDecal,0.0f);
+    glEnable(GL_DEPTH_TEST);glDepthMask(translucent?GL_FALSE:GL_TRUE);
+    if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
+    else glDisable(GL_BLEND);
+    draw_gpumesh(mesh);
+    for(int i=0;i<5;i++)glUniform1f(loc[i],saved[i]);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
+    glBlendFuncSeparate((GLenum)src,(GLenum)dst,(GLenum)srca,(GLenum)dsta);
+    if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);
+    if(depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    glDepthMask(mask);
+}
+
+void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order) {
+    if(!scene || scene->count<=0 || !order)return;
+    int n=scene->count;float depth[4*n];
+    for(int i=0;i<n;i++) {
+        const N2Mesh *m=scene->meshes+i;
+        float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
+        /* Split slices share the entire vertex pool: use their own indices. */
+        for(int j=0;j<m->nidx;j++)for(int a=0;a<3;a++) {
+            float v=m->verts[m->idx[j]*5+a];
+            if(v<lo[a])lo[a]=v;if(v>hi[a])hi[a]=v;
+        }
+        for(int k=0;k<4;k++) {
+            int at=k*n+i;order[at]=at;depth[at]=mvp[k][15];
+            for(int a=0;a<3;a++)depth[at]+=mvp[k][a*4+3]*(lo[a]+hi[a])*.5f;
+        }
+    }
+    /* ponytail: source-slice centres give painter order, not per-triangle
+       transparency. Intersecting translucent surfaces still need finer sorting. */
+    n2_sort_back_to_front(order,4*n,depth);
 }
 
 /* S3TC format enums + capability flag. glext.h / SDL_opengl.h define these on

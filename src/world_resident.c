@@ -184,12 +184,11 @@ static int resident_resources_step(WorldResidentResources *resources,
         !neighborhood->scene.meshes || !neighborhood->mbb) return -1;
     struct timespec rt0, rt1;
     int mesh_count = neighborhood->scene.count;
+    int texture_cap = mesh_count + neighborhood->vista.count +
+                      (neighborhood->nlights > 0 ? 1 : 0);
 
     if (!resources->mesh_count) {
         while (glGetError() != GL_NO_ERROR) {}
-        int texture_cap = mesh_count + neighborhood->vista.count +
-                          (neighborhood->nlights > 0 ? 1 : 0);
-        if (texture_cap <= 0) texture_cap = 1;
         resources->texture_keys = (uint32_t *)calloc(
             (size_t)texture_cap, sizeof *resources->texture_keys);
         resources->textures = (GLuint *)calloc(
@@ -206,16 +205,26 @@ static int resident_resources_step(WorldResidentResources *resources,
             !resources->texture_modes || !resources->mesh_textures ||
             !resources->mesh_modes || !resources->mesh_batch) goto fail;
         resources->mesh_count = mesh_count;
+    }
 
-        if (timing) clock_gettime(CLOCK_MONOTONIC, &rt0);
+    if (resources->texture_binding.pass < 2) {
+        Uint64 texture_begin = SDL_GetPerformanceCounter();
         World facade;
         memset(&facade, 0, sizeof facade);
         facade.neighborhood = *neighborhood;
-        resources->texture_count = world_bind_textures(
+        /* ponytail: eight uncached attempts, not a time deadline; split an
+         * individual decode/upload only if one texture is a measured stall. */
+        int bound = world_bind_textures_step(
             &facade, resources->texture_keys, resources->textures,
-            resources->texture_modes, texture_cap);
+            resources->texture_modes, texture_cap, &resources->texture_binding,
+            max_batches == INT_MAX ? INT_MAX : 8);
         *neighborhood = facade.neighborhood;
-        if (resources->texture_count < 0) goto fail;
+        if (bound < 0) goto fail;
+        if (!bound) {
+            resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
+            return 0;
+        }
+        resources->texture_count = resources->texture_binding.count;
         for (int i = 0; i < resources->texture_count; i++)
             if (!resources->textures[i]) goto fail;
 
@@ -231,8 +240,9 @@ static int resident_resources_step(WorldResidentResources *resources,
         }
         if (neighborhood->have_grass)
             resources->terrain_texture = upload_tex(&neighborhood->grass);
-        if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
-                      timing->textures_ms = wrb_ms(&rt0, &rt1); rt0 = rt1; }
+        resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
+        if (timing) timing->textures_ms = (uint32_t)(
+            resources->texture_ticks * 1000 / SDL_GetPerformanceFrequency());
 
         Uint64 batch_begin = SDL_GetPerformanceCounter();
         resources->sky_count = upload_cat_batches(

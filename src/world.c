@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
+#include <limits.h>
 
 #include "world.h"
 #include "physics.h"
@@ -458,8 +459,12 @@ static int world_texture_decode(const World *w, const WRegion *g,
         return ok;
     }
     int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
-    if (!ok && w->neighborhood.loc4)
+    if (!ok && w->neighborhood.loc4) {
         ok = n2_load_car_tex_by_key(w->neighborhood.loc4, w->neighborhood.loc4len, key, tex);
+        /* The car decoder now exposes draw metadata. Preserve LOC4's existing
+           opaque world policy until its materials receive their own GL audit. */
+        if (ok) tex->order=tex->usage=tex->blend=tex->wz=0;
+    }
     if (!ok && w->neighborhood.master)
         ok = n2_tpk_decode(w->neighborhood.master, w->neighborhood.masterlen, w->neighborhood.mastertpk, key, tex);
     return ok;
@@ -526,24 +531,25 @@ void world_texture_cache_clear(void) {
  * only there -- is what gets remembered as unresolvable. `owner` supplies the
  * mesh named by the TEXFAIL census, or NULL for the light key (never
  * reported, same as before). */
-static void world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
+static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
                            int last, uint32_t *keys, GLuint *texs,
-                           unsigned char *modes, int cap, int *n,
+                           unsigned char *modes, int cap, WTextureBind *binding,
                            const N2Mesh *owner) {
-    if (!tk || *n < 0 || *n >= cap) return;
+    int *n = &binding->count;
+    if (!tk || *n < 0 || *n >= cap) return 0;
     WTexCacheEntry *e = world_texcache_slot(tk);
-    if (!e) { *n = -1; return; }
+    if (!e) { *n = -1; return 0; }
     if (e && e->state == 1) {                   /* decoded by an earlier build */
-        if (e->build == g_texbind_build) return;             /* already emitted */
+        if (e->build == binding->build) return 0;            /* already emitted */
         keys[*n] = tk; texs[*n] = e->tex;
         if (modes) modes[*n] = e->mode;
         (*n)++;
-        e->build = g_texbind_build;
-        return;
+        e->build = binding->build;
+        return 0;
     }
-    if (e && e->state == 2) return;             /* known unresolvable */
-    if (e && e->pass == g_texbind_pass && e->key == tk) return;  /* failed here */
-    if (e) { e->key = tk; e->pass = g_texbind_pass; }
+    if (e && e->state == 2) return 0;           /* known unresolvable */
+    if (e && e->pass == binding->source && e->key == tk) return 0; /* failed here */
+    if (e) { e->key = tk; e->pass = binding->source; }
     N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
     int ok = world_texture_decode(w, g, tk, &tt, pass);
     if (ok && !n2_tex_noise(&tt)) {
@@ -552,21 +558,17 @@ static void world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
             if (id) glDeleteTextures(1, &id);
             free(tt.rgb); free(tt.alpha); free(tt.dxt);
             *n = -1;
-            return; /* do not cache a failed upload */
+            return 1; /* do not cache a failed upload */
         }
-        /* M135: order/usage/blend/wz are only decoded by n2_tpk_decode
-           itself; a key that resolved via n2_load_car_tex_by_key (the
-           shared LOC4 car-texture library) keeps them at their zero
-           default, i.e. N2_DRAW_OPAQUE -- the same behaviour every
-           world texture had before this field existed, not a new
-           misclassification. */
+        /* Exact STREAM material modes; world_texture_decode preserves the
+           separate, still-conservative LOC4 fallback policy. */
         unsigned char mode = (unsigned char)n2_tex_mode(&tt);
         keys[*n] = tk; texs[*n] = id;
         if (modes) modes[*n] = mode;
         (*n)++;
         if (e) {
             if (!e->state) g_texcache_used++;
-            e->state = 1; e->tex = id; e->mode = mode; e->build = g_texbind_build;
+            e->state = 1; e->tex = id; e->mode = mode; e->build = binding->build;
         }
     } else {
         if (owner && g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
@@ -585,53 +587,68 @@ static void world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
         }
     }
     if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+    return 1; /* one uncached decode/upload attempt, including a miss */
 }
 
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
-                        unsigned char *modes, int cap) {
-    int n = 0;
+int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
+                             unsigned char *modes, int cap,
+                             WTextureBind *binding, int max_decodes) {
+    if (binding->pass == 2) return binding->count < 0 ? -1 : 1;
+    if (max_decodes <= 0) return 0;
+    if (!binding->build) binding->build = ++g_texbind_build;
     int npass = w->neighborhood.common ? 2 : 1;
-    g_texbind_build++;
     /* Finish the original binding order across ALL regions first. Only then
        retry still-unbound requests against common; never borrow from an
        unrelated region or preempt a later region's successful old lookup. */
-    for (int pass = 0; pass < npass; pass++)
-    for (int r = 0; r < w->neighborhood.nreg; r++) {
-        WRegion *g = &w->neighborhood.rgn[r];
-        if (!g->data) continue;
-        int last = pass == npass - 1 && r == w->neighborhood.nreg - 1;
-        g_texbind_pass++;
-        for (int i = g->mesh0; i < g->mesh1; i++)
-            world_bind_key(w, g, w->neighborhood.scene.meshes[i].texkey, pass,
-                           last, keys, texs, modes, cap, &n,
-                           &w->neighborhood.scene.meshes[i]);
-        /* District light records have no mesh-owned texture slot. Request
-           their shipped flare through this same regional/shared resolver
-           while the STREAM bytes are still alive. */
-        if (w->neighborhood.nlights > 0)
-            world_bind_key(w, g, N2_TEX_SFX_FLARE_GLOWA, pass, last,
-                           keys, texs, modes, cap, &n, NULL);
-        /* M132: vista impostors carry their own authored texture keys and are
-           decoded from the same TPK, in the same pass, before the region bytes
-           are released. They are not region-tagged, so every region gets a
-           chance at every key; a miss is silent and harmless. */
-        /* M133-R: the census names the VISTA mesh that owns the key, not
-           whatever scene mesh happens to share the same index. Vista draws
-           don't consult drawmode (the tier has its own uVista alpha-blend
-           path); the mode slot is filled anyway so it never carries stale
-           data. */
-        for (int i = 0; i < w->neighborhood.vista.count; i++)
-            world_bind_key(w, g, w->neighborhood.vista.meshes[i].texkey, pass,
-                           last, keys, texs, modes, cap, &n,
-                           &w->neighborhood.vista.meshes[i]);
+    while (binding->pass < npass) {
+        if (binding->region == w->neighborhood.nreg) {
+            binding->region = 0;
+            binding->pass++;
+            continue;
+        }
+        WRegion *g = &w->neighborhood.rgn[binding->region];
+        if (g->data) {
+            if (!binding->source) binding->source = ++g_texbind_pass;
+            int last = binding->pass == npass - 1 &&
+                       binding->region == w->neighborhood.nreg - 1;
+            int meshes = g->mesh1 - g->mesh0;
+            int light = w->neighborhood.nlights > 0;
+            /* Preserve mesh -> light -> vista order within each region/pass.
+             * Vistas are not region-tagged: each region gets a chance, and the
+             * owning vista (not an ordinary mesh) supplies the audit label. */
+            while (binding->request < meshes + light + w->neighborhood.vista.count) {
+                int i = binding->request++;
+                const N2Mesh *owner = i < meshes
+                    ? &w->neighborhood.scene.meshes[g->mesh0 + i]
+                    : i < meshes + light ? NULL
+                    : &w->neighborhood.vista.meshes[i - meshes - light];
+                uint32_t key = owner ? owner->texkey : N2_TEX_SFX_FLARE_GLOWA;
+                int decoded = world_bind_key(w, g, key, binding->pass, last,
+                    keys, texs, modes, cap, binding, owner);
+                if (binding->count < 0) goto done;
+                if (decoded && --max_decodes == 0) return 0;
+            }
+        }
+        binding->request = 0;
+        binding->source = 0;
+        binding->region++;
     }
+done:
     /* Keep every region alive until the last shared-fallback decision. */
     for (int r = 0; r < w->neighborhood.nreg; r++) {
         free(w->neighborhood.rgn[r].data); w->neighborhood.rgn[r].data = NULL;
     }
     free(w->neighborhood.commontpk.blk); memset(&w->neighborhood.commontpk, 0, sizeof w->neighborhood.commontpk);
     free(w->neighborhood.common); w->neighborhood.common = NULL; w->neighborhood.commonlen = 0;
-    return n;
+    binding->pass = 2;
+    return binding->count < 0 ? -1 : 1;
+}
+
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *modes, int cap) {
+    WTextureBind binding = {0};
+    while (!world_bind_textures_step(w, keys, texs, modes, cap, &binding, INT_MAX)) {}
+    return binding.count;
 }
 
 /* ---- ground grid ----

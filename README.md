@@ -42,6 +42,24 @@ not a finished release or a claim of pixel-perfect retail fidelity.
 | --- | --- |
 | ![OpenUG2 350Z on the L4RB suspension bridge](docs/images/openug2-350z-suspension-bridge.png) | ![OpenUG2 Eclipse on a wooded L4RB road](docs/images/openug2-eclipse-wooded-road.png) |
 
+### Latest verified runtime frames
+
+The gallery below focuses on the current work: route start lines, open-world
+city scale, vehicle presentation and the two-car road test. More captures and
+their provenance are collected in [`docs/screenshots`](docs/screenshots/).
+
+| MIATA — L4RA route | HUMMER — L4RB sprint |
+| --- | --- |
+| ![MIATA on the L4RA start line](docs/screenshots/miata-l4ra-startline.png) | ![HUMMER on the L4RB start line](docs/screenshots/hummer-l4rb-startline.png) |
+
+| MIATA — city run | Night open-world road |
+| --- | --- |
+| ![MIATA city run](docs/screenshots/miata-city-run.png) | ![Night open-world road](docs/screenshots/night-openworld.png) |
+
+| Two-car road test | Vehicle material showcase |
+| --- | --- |
+| ![Two-car road test](docs/screenshots/ai-two-car-road-test.png) | ![Vehicle material showcase](docs/screenshots/vehicle-material-showcase.png) |
+
 Known defects are tracked alongside the progress. For example,
 [#6](https://github.com/whoismept/OpenUG2/issues/6) documents a reproducible
 world-surface artifact with its own capture and acceptance criteria.
@@ -69,7 +87,7 @@ world-surface artifact with its own capture and acceptance criteria.
   driver.
 - **World visibility** — production uses the `ordinary` tier, whose view range
   follows the active fog (about 933 m with the current settings). Developer UI
-  and provisional HUD elements are hidden by default and toggled with `F1`.
+  and provisional HUD elements are hidden by default and toggled with `1`.
 
 ### Major gaps
 
@@ -78,12 +96,24 @@ world-surface artifact with its own capture and acceptance criteria.
   transfer or independent per-wheel suspension simulation.
 - Only selected L4RA/L4RB content is gameplay-tested. Other region bundles and
   eight remaining L4RB sprint events still need systematic coverage.
-- Sprint AI opponents, complete sprint HUD semantics and a production-quality
-  front end are missing.
+- Sprint AI opponents, the in-game driving/race HUD semantics and a
+  production-quality front end are missing.
 - Some race-specific `ZCV_`/`ZCS_` set-dressing definitions are decoded without
   a proven world-placement or mesh-linkage rule.
 - The experimental `--tier full` panorama pass still exposes opaque authored
   backdrop sheets as hard-edged bands at some headings. It is not the default.
+- Vehicle presentation still needs a complete tyre/rim render pass, attribution
+  of the unexplained object below the car, and an asset-backed ImGui modification
+  flow for bumpers, spoilers, rims, full body kits, headlights and stickers.
+- Lighting fidelity is incomplete: headlights need source-verified placement,
+  district and road-closure lights need material/group attribution, neon needs a
+  grounded road response, and the NFSU2-style wet/rainy asphalt path is not yet
+  implemented.
+- Open-world collision attribution still needs to classify overlapping or
+  duplicate instance meshes before any collision threshold is changed.
+- The northern mountain-road route needs a source-level visibility audit; after
+  that, the selected-route direction arrow must be recovered from authored
+  route/HUD data rather than guessed from the diagnostic map.
 - `--track ALL` currently unions incompatible city/event bundles that overlap
   in the same coordinates. It is useful for research, but is **not a valid
   playable open-world composition**.
@@ -157,20 +187,26 @@ backward-compatible alias. `--spawn start|X,Y` and `--heading DEG` are developer
 overrides for reproducible audits; ordinary players and new contributors do not
 need them.
 
-It opens on a **pre-race menu**: the car orbits amid the city while you pick a
-**car** (Left/Right — every drivable folder under `CARS/`), a **track** (Up/Down
-— `STREAM*.BUN` under `TRACKS/`) and a **circuit** (`[` / `]` — closed loops
-found on that track). `Enter` starts the 3-2-1. `--car`/`--track`/`--circuit`
-above just preselect the menu. (Car and track changes re-launch the engine to
-load fresh; circuit is an in-place reload.)
+It boots directly into the selected authored free-roam pose. The temporary
+three-entry menu was removed because it was not the retail Underground 2
+frontend; the asset-backed menu is documented in
+[`docs/FRONTEND_ASSETS.md`](docs/FRONTEND_ASSETS.md) and is the next frontend
+milestone.
 
-**Controls:** menu — `←`/`→` car, `↑`/`↓` track, `[`/`]` circuit or sprint,
-`Enter` race;
-driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
+**Controls:** driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
 grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look ·
-`E`/`Q` up/down · `Shift` faster), `F1` developer overlay, `Esc` quit. Cars
+`E`/`Q` up/down · `Shift` faster), `1` developer overlay, `Esc` quit. Cars
 collide and building contact is confirmed against source mesh faces before the
 car is pushed. `--shot out.png` renders one frame to a PNG and exits.
+
+The default resolution is **1920×1080**. Screenshots and visual race/drive audits
+render in a hidden, fixed-size GL window, so desktop window limits do not shrink
+the PNG. Use `--resolution 3840x2160` for 4K captures, or `--resolution 960x600`
+for older reference dimensions. An unsupported capture size fails explicitly.
+Interactive windows remain resizable and may be constrained by the display;
+the log reports the actual drawable size. Existing capture scripts inherit the
+1080p default. `make render-resolution-test DATA=..` checks real PNG dimensions
+(requires game data and a working GL display).
 
 ## Layout
 
@@ -194,20 +230,39 @@ docs/    engine/developer guide and evidence-labelled format reference
 
 ## Project direction
 
-To keep the project from expanding into disconnected experiments, work is
-ordered around a small number of outcomes:
+Current execution order starts with the vehicle and its player-facing systems,
+then moves outward to world correctness and race systems:
 
-1. Make individual source regions visually coherent and safely driveable.
-2. Complete one circuit and one sprint path with stable player, collision, AI
-   and race-state behaviour.
-3. Replace measured physics stand-ins only when the original data field or a
-   clear behavioural requirement is understood.
-4. Decode missing race-specific placement and set dressing.
-5. Revisit open-world bundle composition only after the individual bundles are
-   correct. `ALL` is not the reference map.
+1. **Vehicle foundation and presentation** — complete tyre/rim rendering,
+   identify the unexplained under-car object, and verify body transforms,
+   wheel/contact placement and measured handling behaviour.
+2. **Vehicle operations and modification flow** — add a Modification tab with
+   Body, Performance, Graphics/Color and Car Specialties shop subtabs; keep
+   per-car selections and switch vehicle assets without restarting the world.
+   Connect proven part libraries with reversible stock fallbacks. See the
+   [customization and in-place switching design](docs/VEHICLE_CUSTOMIZATION.md).
+3. **Vehicle/world lighting fidelity** — fix headlight transforms and grounded
+   neon first, then attribute district/fixture lights, road-closure guidance
+   lights and the measured wet/rainy asphalt path.
+4. **Open-world collision attribution** — classify overlapping/duplicate
+   instance meshes and false barriers before changing collision thresholds.
+5. **Northern mountain-road visibility** — recover the missing ROAD/TERRAIN
+   coverage and verify route continuity without hiding the gap with draw range.
+6. **Route guidance** — recover the selected-route direction arrow from the
+   authored route/HUD data after the underlying road coverage is trustworthy.
+7. **Production race opponents** — add and validate AI opponents on L4RA first,
+   then L4RB sprint events, with race-state and HUD evidence.
+8. **In-game driving frontend** — add the production HUD for speed/RPM/gear
+   gauges, mini-map/route state, race position and open-world money visibility;
+   money must be hidden while an active race HUD is shown.
+9. **Retail front end** — integrate the decoded menu assets and flow after the
+   vehicle, world-render, gameplay and in-game HUD foundations above are stable.
 
-Changes outside this order should begin with a focused issue explaining the
-evidence, scope and acceptance test.
+Each item needs a focused issue, evidence and an acceptance test. The existing
+physics discipline still applies: replace a stand-in only when the source field
+or a clear behavioural requirement is understood. `ALL` is not the reference
+playable map; revisit its bundle composition only after individual regions are
+correct.
 
 ## Help wanted
 
@@ -223,14 +278,16 @@ High-value contribution areas:
   data, race set-dressing placement, texture/material records and safe parser
   fixtures.
 - **World and rendering** — verify individual bundles, restore missing authored
-  scenery, improve visibility/culling, and identify the structural rule behind
-  panorama and detail-tier selection.
+  scenery including the northern mountain roads, improve visibility/culling,
+  and identify the structural rule behind panorama, detail-tier and lighting
+  selection.
 - **Vehicle dynamics** — tyre/contact behaviour, weight transfer, drivetrain
   and powertrain data, suspension presentation and NFSU2-style camera feedback.
-- **Racing and AI** — sprint opponents, route following, event coverage,
-  respawn/recovery, race HUD semantics and start/finish flow.
-- **Front end, audio and usability** — a real menu flow, settings, controls,
-  sound design and accessible diagnostics.
+- **Racing and AI** — production race opponents on the verified circuit and
+  sprint paths, route following, event coverage, respawn/recovery, race HUD
+  semantics and start/finish flow.
+- **Front end, audio and usability** — in-game driving/race HUD, a real menu
+  flow, settings, controls, sound design and accessible diagnostics.
 - **Portability and quality** — OpenGL ES, Windows/Linux/ARM coverage,
   deterministic parser/physics tests, profiling, documentation and reproducible
   bug reports.

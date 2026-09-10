@@ -15,7 +15,11 @@
 enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        /* car mesh classes, from material name */
        N2_CAR_BODY = 10, N2_CAR_GLASS = 11, N2_CAR_LIGHT = 12,
-       N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
+       N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16,
+       N2_CAR_INTERIOR = 17 };
+
+/* Placement belongs to the source part, independently of each slice's material. */
+enum { N2_MOUNT_BODY = 0, N2_MOUNT_WHEEL, N2_MOUNT_FRONT_BRAKE, N2_MOUNT_REAR_BRAKE };
 
 enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
 #define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
@@ -80,6 +84,7 @@ typedef struct {
        keep/drop one whole tier's slice set atomically instead of resolving
        each split slice independently. 0 = not a car mesh / not tier-tracked. */
     uint32_t tierid;
+    unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
 } N2Mesh;
 
 /* Active customization profile.
@@ -1314,7 +1319,13 @@ static int n2_car_category(const unsigned char *d, long beg, long end) {
                        contains "LIGHT" too. */
                     if (n2_contains(n,L,"BRAKE") && n2_contains(n,L,"LIGHT"))  return N2_CAR_BRAKELIGHT;
                     if (n2_contains(n,L,"LIGHT") || n2_contains(n,L,"LAMP"))   return N2_CAR_LIGHT;
-                    if (n2_contains(n,L,"TIRE") || n2_contains(n,L,"WHEEL"))   return N2_CAR_TIRE;
+                    /* Two shipped cars (IMPREZAWRX/LANCEREVO8) store the
+                       28-byte name as FRONT_WHEE, with the final L truncated.
+                       Keep that authored wheel family out of BODY so the
+                       production renderer can bind/instance the real tire. */
+                    if (n2_contains(n,L,"TIRE") || n2_contains(n,L,"WHEEL") ||
+                        n2_contains(n,L,"FRONT_WHEE") || n2_contains(n,L,"REAR_WHEE"))
+                        return N2_CAR_TIRE;
                     /* mechanical compartment detail (engine bay, exhaust pipe):
                        unpainted metal/plastic, not glossy body shell — checked
                        before the generic KIT/BODY catch-all below, since these
@@ -1353,6 +1364,36 @@ static int n2_name_variant(const unsigned char *n, long L, int *num,
             *tok_at = q; *tok_len = 7; return 2;
         }
     return 0;
+}
+
+/* Enumerate the actual KITnn/STYLEnn variants authored by this car.  The
+ * geometry archive is the source of truth: hard-coding KIT01/02 made the
+ * debug/customisation path silently hide the other shipped kits (MIATA has
+ * KIT01..KIT29).  This is deliberately a byte scan rather than a second tree
+ * walk; the tokens only occur in the material-name leaves and the final list
+ * is de-duplicated/sorted before it reaches the UI. */
+static int n2_car_variant_numbers(const unsigned char *d, long len, int kind,
+                                  int *out, int cap) {
+    if (!d || len <= 0 || !out || cap <= 0) return 0;
+    int n = 0;
+    for (long i = 0; i + (kind == 1 ? 5 : 7) < len; i++) {
+        int match = kind == 1
+                  ? d[i]=='K' && d[i+1]=='I' && d[i+2]=='T'
+                  : d[i]=='S' && d[i+1]=='T' && d[i+2]=='Y' && d[i+3]=='L' && d[i+4]=='E';
+        long p = i + (kind == 1 ? 3 : 5);
+        if (!match || d[p] < '0' || d[p] > '9' ||
+            d[p+1] < '0' || d[p+1] > '9') continue;
+        int v = (d[p]-'0')*10 + d[p+1]-'0', seen = 0;
+        for (int q = 0; q < n; q++) if (out[q] == v) { seen = 1; break; }
+        if (seen || n >= cap) continue;
+        out[n++] = v;
+    }
+    for (int i = 1; i < n; i++) {
+        int v = out[i], j = i;
+        while (j > 0 && out[j-1] > v) { out[j] = out[j-1]; j--; }
+        out[j] = v;
+    }
+    return n;
 }
 
 /* Classify a car mesh against the active profile.
@@ -1785,6 +1826,24 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_WINDSHIELD 0x471a1dcau
 #define N2_MAT_CARSKIN    0xd6d6080au
 
+/* Third material, identified by MEASUREMENT rather than by cracking its name
+ * (the hash is one-way; "DULLPLASTIC" == 0x0fedee40 and "MOLDINGS" ==
+ * 0x12c9453c do fall out of the same hash and confirm the convention, but this
+ * one does not match any candidate tried). What the geometry says, per-submesh
+ * vertex bbox, MIATA / GOLF / 350Z:
+ *   BASE_A     sub2  480 idx  x[-1.34,+0.51] y[-0.72,+0.72] z[+0.16,+1.02]
+ *                    -- full cabin width, floor to roofline: the interior tub
+ *   BASE_A     sub0   12 idx  x[-0.63,-0.32] y[+0.09,+0.58] z[+0.53,+0.96]
+ *                    -- a small off-centre panel at wheel height
+ *   FRONT_WHEEL sub2  48 idx  x/z +-0.29     y[+0.04,+0.19]  -- rim inner face
+ *   TRUNK       sub1  30 idx  x[-1.88,-1.29] z[+0.56,+0.69]  -- lid inner face
+ * and, decisively, it appears on NO outward panel on any car checked: not the
+ * hood, front bumper, door, trunk outer, headlight or skirt, all of which carry
+ * CARSKIN there instead. Every occurrence is a surface only visible through an
+ * opening. Treating it as unpainted interior is what the placement supports;
+ * the actual authored name remains unknown. */
+#define N2_MAT_INTERIOR   0x010cb64au
+
 /* Classify one submesh's material hash. `fallback` is the object-level
  * category from n2_car_category, used whenever the hash is 0 (absent/out of
  * bounds -- n2_mesh_submeshes and the matid bounds check both fail safe to
@@ -1794,6 +1853,7 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 static int n2_mat_class(uint32_t hash, int fallback) {
     if (hash == N2_MAT_WINDSHIELD) return N2_CAR_GLASS;
     if (hash == N2_MAT_CARSKIN)    return N2_CAR_BODY;
+    if (hash == N2_MAT_INTERIOR)   return N2_CAR_INTERIOR;
     return fallback;
 }
 
@@ -1837,6 +1897,15 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             int vkind = 0, vnum = 0; uint32_t vfam = 0;
             if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
             int cat = n2_car_category(d, ds, ds + s);
+            char part[64]; n2_mesh_name(d, ds, ds + s, part, sizeof part);
+            int mount = cat == N2_CAR_TIRE ? N2_MOUNT_WHEEL : N2_MOUNT_BODY;
+            if (cat != N2_CAR_BRAKELIGHT) {
+                /* FRONT_BRAKE is truncated to FRONT_BRAK on long car names. */
+                if (strstr(part, "_FRONT_BRAK")) mount = N2_MOUNT_FRONT_BRAKE;
+                else if (strstr(part, "_REAR_BRAKE")) mount = N2_MOUNT_REAR_BRAKE;
+            }
+            if (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE)
+                cat = N2_CAR_MECH;
             int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
                         uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
             uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
@@ -1931,6 +2000,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
                         scene->meshes[before].tierid = tierid;
+                        scene->meshes[before].car_mount = (unsigned char)mount;
                     }
                 }
             } else {
@@ -1944,6 +2014,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;
                         scene->meshes[before].tierid = tierid;
+                        scene->meshes[before].car_mount = (unsigned char)mount;
                     }
                 }
             }
@@ -1962,6 +2033,55 @@ static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
     n2_car_apply_config(scene, cfg);   /* aftermarket parts shadow stock ones */
     n2_car_dedupe_lod(scene);          /* collapse each LOD family to its best tier */
     return scene->count;
+}
+
+/* A WHEELS library contains several size variants per STYLE. Keep the first
+ * complete source tier, not just its first material slice, and never stack
+ * the other sizes. n2_load_car has already selected LODs. No index filtering.
+ * ponytail: preserves the existing first-size choice; explicit rim sizing
+ * belongs to the later modification UI, not this coverage fix. */
+static int n2_rim_select_tier(N2Scene *s) {
+    if (!s || s->count<=0 || !s->meshes || !s->meshes[0].tierid) return 0;
+    uint32_t tier=s->meshes[0].tierid;
+    int w=0;
+    for (int i=0;i<s->count;i++) {
+        if (s->meshes[i].tierid!=tier) {
+            free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol);
+        } else {
+            if (w!=i) s->meshes[w]=s->meshes[i];
+            w++;
+        }
+    }
+    s->count=w;
+    return s->count;
+}
+
+/* Stock and library wheels share this source-to-hub transform: turn the
+ * source's +Y backing inward and centre its width. Split slices retain the
+ * same full vertex pool, so each gets the same transform. Call once per load. */
+static void n2_prepare_wheel_mesh(N2Mesh *m) {
+    if (!m || !m->verts || m->nverts<=0) return;
+    float bb[6]; n2_mesh_bbox(m,bb);
+    float ymid=0.5f*(bb[2]+bb[3]);
+    for (int v=0;v<m->nverts;v++) {
+        m->verts[v*5] = -m->verts[v*5];
+        m->verts[v*5+1] = ymid-m->verts[v*5+1];
+    }
+}
+
+/* Orient every material slice of a stock wheel together. Source vertices/UVs
+ * and triangle coverage are retained; edge length is not a visibility rule.
+ * Returns a representative of the stock tier (all its slices must be drawn).
+ * Call once per fresh car load, including a kit reload. */
+static int n2_car_prepare_wheels(N2Scene *s) {
+    int stock = -1;
+    for (int i=0;i<s->count;i++) {
+        N2Mesh *m=&s->meshes[i];
+        if (m->car_mount != N2_MOUNT_WHEEL || m->nverts <= 0) continue;
+        n2_prepare_wheel_mesh(m);
+        if (stock<0 || m->nidx>s->meshes[stock].nidx) stock=i;
+    }
+    return stock;
 }
 
 static void n2_free_scene(N2Scene *s) {
@@ -2482,9 +2602,21 @@ static int n2_mipbytes2(int w, int h, int bpb) {
 }
 static int n2_mipbytes(int s, int bpb) { return n2_mipbytes2(s, s, bpb); }
 
-/* Decode ONE car texture by its TPK key: find the slot, JDLZ-decompress, then
- * recover square dims + DXT1/DXT3 by matching the mip-chain size to DecodedSize
- * (car textures are square; format isn't stored, so it's inferred). Returns 1. */
+/* Both car payload wrappers must retain DXT1's authored one-bit alpha, just
+ * like the compressed GPU upload. Opaque images retain the RGB fallback. */
+static int n2_car_dxt1(const unsigned char *src, N2Tex *t) {
+    long n=(long)t->w*t->h;
+    t->rgb=(unsigned char *)malloc(n*3);
+    t->alpha=(unsigned char *)malloc(n);
+    if (!t->rgb || !t->alpha) {
+        free(t->rgb);free(t->alpha);t->rgb=t->alpha=NULL;return 0;
+    }
+    n2_dxt1(src,t->w,t->h,t->rgb,t->alpha);t->afmt=1;
+    for(long i=0;i<n;i++)if(t->alpha[i]!=255)return 1;
+    free(t->alpha);t->alpha=NULL;return 1;
+}
+
+/* Decode ONE car texture through its offset-slot table and embedded header. */
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
@@ -2499,6 +2631,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         }
     if (dec <= 0 || absoff < 0 || (long)absoff + enc > len) return 0;
     unsigned char *raw = (unsigned char *)malloc(dec);
+    if (!raw) return 0;
     if (enc >= 20 && memcmp(d + absoff, "HUFF", 4) == 0) {
         /* "HUFF"-wrapped blob (16-byte wrapper + EAC Huffman stream) — used
            by every VINYLS.BIN slot and by some TEXTURES.BIN slots. If the
@@ -2517,11 +2650,12 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
             if (w >= 8 && h >= 8 && w <= 2048 && h <= 2048 &&
                 n2_u32(rec + 0x18) == key && rec[0] >= 'A' && rec[0] <= 'Z') {
                 long n = (long)w * h;
-                if (fmt == 0x31545844 && n/2 + 144 <= dec) {        /* "DXT1" */
-                    t->w = w; t->h = h; t->alpha = NULL;
-                    t->rgb = (unsigned char *)malloc(n * 3);
-                    n2_dxt1(raw, w, h, t->rgb, NULL);
-                    t->dxtlen = (int)(n/2); t->dxtfmt = 1;          /* base-level blocks */
+                if (fmt == 0x31545844) {                         /* "DXT1" */
+                    long blocks=(long)((w+3)/4)*((h+3)/4)*8;
+                    if (blocks + 144 > dec) { free(raw); return 0; }
+                    t->w = w; t->h = h;
+                    if (!n2_car_dxt1(raw,t)) { free(raw); return 0; }
+                    t->dxtlen = (int)blocks; t->dxtfmt = 1;        /* base-level blocks */
                     t->dxt = (unsigned char *)malloc(t->dxtlen);
                     memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
@@ -2574,6 +2708,14 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     if (tw < 1 || th < 1 || tw > 4096 || th > 4096) { free(raw); return 0; }
     long n = (long)tw * th;
     t->w = tw; t->h = th;
+    /* Same texture-info fields as world TPKs, relative to BinKey here
+       (world records include a 24-byte name before it). MIATA_TIRE and
+       PLAYERWIRE_STYLE02_WHEEL both store usage=1, blend=0, writeZ=1;
+       their wheel-sized backing quad uses the atlas's transparent corners. */
+    if (P + 0x34 <= dec) {
+        t->order=raw[P+0x2d];t->usage=raw[P+0x31];
+        t->blend=raw[P+0x32];t->wz=raw[P+0x33];
+    }
     if (fmt == 0x20) {                    /* uncompressed BGRA: no compressed upload */
         if (n*4 > P) { free(raw); return 0; }
         t->rgb = (unsigned char *)malloc(n*3);
@@ -2585,8 +2727,9 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         free(raw); return 1;              /* dxtfmt stays 0 -> RGBA upload path */
     }
     if (fmt == 0x22) {                    /* DXT1 */
-        t->alpha = NULL; t->rgb = (unsigned char *)malloc(n*3);
-        n2_dxt1(raw, tw, th, t->rgb, NULL); t->dxtfmt = 1;
+        if ((long)((tw+3)/4)*((th+3)/4)*8 > P || !n2_car_dxt1(raw,t))
+            { free(raw); return 0; }
+        t->dxtfmt = 1;
     } else if (fmt == 0x24) {             /* DXT3 */
         t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
         n2_dxt3(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 3;

@@ -82,6 +82,9 @@ typedef struct {
           uFlipN,   /* 1 = negate the vertex normal (inspector diagnostic) */
           uGloss,   /* specular pow() exponent: high = tight metallic-paint
                        highlight, low = broad plastic/trim sheen (cars only) */
+          uFresnel, /* >0.5: alpha rides the fresnel term (car glass pass only) */
+          uClearcoat, /* >0: second tight specular lobe -- the lacquer over the
+                         coloured base coat (car body/trim only) */
           uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
 } RProg;
 
@@ -106,6 +109,12 @@ GLuint   make_wheel_tex(void);          /* radial alloy-rim texture for it */
 GLuint   make_wheel_blur_tex(void);     /* same rim, angular-averaged (spinning) */
 GpuMesh  make_quad(void);               /* unit quad for HUD / billboards */
 void     draw_gpumesh(GpuMesh *g);
+/* Wheel material draw: caller owns lighting/MVP; texture, alpha, blend and
+ * depth state are restored. Missing textures use the opaque colour fallback. */
+void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode);
+/* Sort the four instances of a library's material slices by view depth.
+ * order has space for 4 * scene->count entries (hub * count + slice). */
+void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order);
 
 /* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
  * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */

@@ -17,7 +17,10 @@
 extern "C" void dbgui_init(struct SDL_Window *win, void *glctx) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;          /* don't litter imgui.ini */
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;                      /* don't litter imgui.ini */
+    io.ConfigWindowsMoveFromTitleBarOnly = false;  /* keep panels draggable */
+    io.ConfigWindowsResizeFromEdges = true;
     ImGui::StyleColorsDark();
     ImGui_ImplSDL2_InitForOpenGL((SDL_Window *)win, glctx);
     ImGui_ImplOpenGL2_Init();
@@ -34,8 +37,8 @@ extern "C" void dbgui_frame(void) {
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::SetNextWindowSize(ImVec2(440, 0), ImGuiCond_FirstUseEver);
-    ImGui::Begin("NFSU2 Master Inspector");
+    ImGui::SetNextWindowSize(ImVec2(620, 720), ImGuiCond_FirstUseEver);
+    ImGui::Begin("NFSU2 Master Inspector", nullptr, ImGuiWindowFlags_None);
     g_dbg.fps = (int)ImGui::GetIO().Framerate;
     /* Momentary car/track switch requests: reset EVERY frame (not inside a tab,
        or an inactive tab would leave want_car at 0 = a valid index and main.c
@@ -56,7 +59,7 @@ extern "C" void dbgui_frame(void) {
             if (ImGui::Button("Blue"))   { g_dbg.paint_override=1; g_dbg.paint[0]=0.05f; g_dbg.paint[1]=0.10f; g_dbg.paint[2]=0.60f; } ImGui::SameLine();
             if (ImGui::Button("Black"))  { g_dbg.paint_override=1; g_dbg.paint[0]=0.02f; g_dbg.paint[1]=0.02f; g_dbg.paint[2]=0.03f; } ImGui::SameLine();
             if (ImGui::Button("Silver")) { g_dbg.paint_override=1; g_dbg.paint[0]=0.60f; g_dbg.paint[1]=0.62f; g_dbg.paint[2]=0.66f; }
-            ImGui::TextDisabled("body kit: K cycles KIT00/01/02 (see console)");
+            ImGui::TextDisabled("body kit: K cycles authored KIT00..KITnn (see console)");
         }
         if (ImGui::CollapsingHeader("Wheel Stance (per-car, metres)", ImGuiTreeNodeFlags_DefaultOpen)) {
             /* Absolute stance for the active car -- edits apply next frame, since
@@ -111,14 +114,14 @@ extern "C" void dbgui_frame(void) {
         }
         if (ImGui::CollapsingHeader("Mesh Inspector")) {
             static const char *catn[] = {"ROAD","TERRAIN","OTHER","SKY","GLOW","?","?","?","?","?",
-                                         "BODY","GLASS","LIGHT","TIRE","MISC","BRAKELIGHT","MECH"};
+                                         "BODY","GLASS","LIGHT","TIRE","MISC","BRAKELIGHT","MECH","INTERIOR"};
             ImGui::Checkbox("highlight", (bool *)&g_dbg.insp_highlight); ImGui::SameLine();
             ImGui::Checkbox("wireframe", (bool *)&g_dbg.insp_wire);
             if (ImGui::Button("Dump Selected Mesh Telemetry")) g_dbg.insp_dump = 1;
             ImGui::BeginChild("meshlist", ImVec2(0, 160), true);
             for (int i = 0; i < g_dbg.insp_count; i++) {
                 int c = (g_dbg.insp_cat && i < g_dbg.insp_count) ? g_dbg.insp_cat[i] : 0;
-                const char *cn = (c >= 0 && c <= 16) ? catn[c] : "?";
+                const char *cn = (c >= 0 && c <= 17) ? catn[c] : "?";
                 char lbl[96];
                 snprintf(lbl, sizeof lbl, "%3d  %-10s %5d v", i, cn,
                          g_dbg.insp_verts ? g_dbg.insp_verts[i] : 0);
@@ -248,15 +251,11 @@ extern "C" void dbgui_frame(void) {
         ImGui::EndTabItem();
     }
 
-    ImGui::EndTabBar();
-    }
-    ImGui::End();
-
-    /* ---- Minimap / Navigation Graph: the real drivable road network parsed
+    /* ---- Tab 5: Navigation & Races ---- */
+    if (ImGui::BeginTabItem("Navigation & Races")) {
+    /* The real drivable road network parsed
        from the per-region ROUTES path files (chunk 0x34148), drawn top-down
        in world XY. Independent of the 3D geometry viewer. ---- */
-    ImGui::SetNextWindowSize(ImVec2(430, 588), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Minimap / Navigation Graph");
     ImGui::Text("%d nodes, %d edges, %d districts", g_dbg.nnav, g_dbg.nnavedge, g_dbg.ndist);
     ImGui::SameLine();
     ImGui::TextDisabled("district %s", g_dbg.zone_name[0] ? g_dbg.zone_name : "-");
@@ -441,6 +440,11 @@ extern "C" void dbgui_frame(void) {
             }
             ImGui::EndListBox();
         }
+    }
+    ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
     }
     ImGui::End();
 }

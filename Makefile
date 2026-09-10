@@ -1,6 +1,8 @@
 # OpenUG2 — build
 #
-#   make               desktop build (x86/ARM · Linux/macOS/Windows): SDL2 + OpenGL
+#   make               desktop build without the temporary frontend menu
+#   make normal        explicit alias for the normal build
+#   make menu          desktop build with the temporary standalone menu
 #   make gles          OpenGL ES 2.0 build (embedded/mobile ARM)
 #   make debug         desktop build + Dear ImGui debug overlay
 #   make run DATA=DIR  build + run against your NFSU2 data directory
@@ -25,8 +27,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/frontend/frontend.c src/frontend/frontend_draw.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/frontend/frontend.h src/frontend/frontend_draw.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -42,6 +44,17 @@ $(GEN): src/world_debug_120.vert src/world_debug_120.frag
 
 nfsu2: $(SRC) $(HDRS) $(GEN)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
+
+# Explicit build variants. Both write the same `nfsu2` executable; the last
+# target built is the one that is currently on disk.
+normal: $(SRC) $(HDRS) $(GEN)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
+
+menu: $(SRC) $(HDRS) src/frontend/frontend.c src/frontend/frontend_draw.c \
+	      src/frontend/frontend.h src/frontend/frontend_draw.h $(GEN)
+	$(CC) $(CFLAGS) -DOPENUG2_MENU $(SDL_CFLAGS) $(SRC) \
+		src/frontend/frontend.c src/frontend/frontend_draw.c -o nfsu2 \
+		$(SDL_LIBS) $(GL_LIBS) -lz -lm
 
 # Dev build with the Dear ImGui debug overlay + freecam controls (`make debug`).
 # The engine stays C; ImGui + the wrapper compile as C++ and link together.
@@ -98,6 +111,11 @@ ground-motion-test: tools/ground_motion_test.c src/ground_motion.h src/world.c s
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ground_motion_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ground_motion_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/ground_motion_test
 
+ai-drive-test: tools/ai_drive_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ai_drive_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ai_drive_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/ai_drive_test
+
 world-group-test: tools/world_group_test.c src/world_group_reader.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/world_group_test.c -o build/world_group_test
@@ -110,6 +128,11 @@ world-group-audit: tools/world_group_audit.c src/world_group_reader.h src/world_
 route-membership-audit: tools/m160_route_audit.c src/world_group_reader.h src/world_scenery.h src/world_instance.c src/world_instance.h src/nfsu2.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) tools/m160_route_audit.c -o build/m160_route_audit -lm
+
+wheel-render-test: tools/wheel_render_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/wheel_render_test.c src/render.c -o build/wheel_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/wheel_render_test
 
 light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	@mkdir -p build
@@ -165,6 +188,53 @@ world-cli-test: nfsu2
 	  exit 1; \
 	fi
 
+# Real GL/readback check; output is retained for visual inspection on failure.
+render-resolution-test: nfsu2
+	@set -e; capture_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/openug2-resolution.XXXXXX"); \
+	echo "render_resolution_test: captures in $$capture_dir"; \
+	for size in 1920x1080 3840x2160 1919x1079 960x600; do \
+	  set --; test "$$size" = 1920x1080 || set -- --resolution "$$size"; \
+	  ./nfsu2 "$(DATA)" --car MIATA --track STREAML4RA --heading 0 \
+	    --shot-empty --shot-yaw 90 --shot-pitch -25 --frames 1 "$$@" \
+	    --shot "$$capture_dir/$$size.png" >"$$capture_dir/$$size.log" 2>&1 \
+	    || { cat "$$capture_dir/$$size.log"; exit 1; }; \
+	  set -- $$(od -An -tu1 -j16 -N8 "$$capture_dir/$$size.png"); \
+	  test $$# -eq 8; \
+	  width=$$(( $$1*16777216 + $$2*65536 + $$3*256 + $$4 )); \
+	  height=$$(( $$5*16777216 + $$6*65536 + $$7*256 + $$8 )); \
+	  test "$$width" = "$${size%x*}" && test "$$height" = "$${size#*x}" \
+	    || { echo "render_resolution_test: FAIL $$size got $${width}x$${height}"; exit 1; }; \
+	done; echo 'render_resolution_test: PASS'
+
+resolution-cli-test: nfsu2
+	@set +e; \
+	./nfsu2 --resolution >/dev/null 2>&1; \
+	test $$? -eq 2 || { echo 'resolution_cli_test: FAIL missing size'; exit 1; }; \
+	for size in '' 0x1080 1920x0 63x1080 1920x63 7681x1080 1920x4321 \
+	  -1920x1080 1920 1920X1080 1920x1080junk 1920x1080x1 \
+	  999999999999999999999x1080; do \
+	  ./nfsu2 --resolution "$$size" >/dev/null 2>&1; \
+	  test $$? -eq 2 || { echo "resolution_cli_test: FAIL invalid $$size"; exit 1; }; \
+	done; \
+	for size in 64x64 960x600 1920x1080 3840x2160 7680x4320 1919x1079; do \
+	  ./nfsu2 build/no-such-data-root --resolution "$$size" --instance-audit >/dev/null 2>&1; \
+	  test $$? -eq 1 || { echo "resolution_cli_test: FAIL valid $$size"; exit 1; }; \
+	done; echo 'resolution_cli_test: PASS'
+
+ai-drive-cli-test: nfsu2
+	@set +e; \
+	for args in '--ai-drive-audit' '--ai-drive-audit /tmp/ai' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --frames 0' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --shot /tmp/ai.png' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --spawn 0,0' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --race-audit /tmp/ra' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --resident-drive-audit /tmp/rda' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --track ALL' \
+	  '--ai-drive-audit /tmp/ai --event 4201 --track STREAML4RB'; do \
+	  ./nfsu2 build/no-such-data-root $$args >/dev/null 2>&1; \
+	  test $$? -eq 2 || { echo "ai_drive_cli_test: FAIL $$args"; exit 1; }; \
+	done; echo 'ai_drive_cli_test: PASS'
+
 # OpenGL ES 2.0 (embedded/mobile). Cross-compile e.g.:
 #   CC=aarch64-linux-gnu-gcc make gles
 gles: $(SRC) $(HDRS) $(GEN)
@@ -177,4 +247,4 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test light-state-test world-texture-test world-group-test world-group-audit
+.PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test

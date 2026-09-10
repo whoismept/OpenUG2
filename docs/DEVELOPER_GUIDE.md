@@ -51,9 +51,13 @@ For a new human or LLM developer:
 2. `docs/PROJECT_STATE.md`, when present locally — short live milestone index;
    it is intentionally gitignored and may not exist in a fresh clone.
 3. This guide — subsystem boundaries and invariants.
-4. `docs/FORMATS.md` — only the format family relevant to the task.
-5. The public header for the subsystem.
-6. The smallest set of implementation functions named by the header/docs.
+4. `docs/GRAPHIFY_FINDINGS.md` — current architecture map and measurement
+   roadmap; treat inferred edges as hypotheses.
+5. `docs/FRONTEND_ASSETS.md` — when working on the retail menu/frontend asset
+   graph; it records measured data-root evidence without copying retail bytes.
+6. `docs/FORMATS.md` — only the format family relevant to the task.
+7. The public header for the subsystem.
+8. The smallest set of implementation functions named by the header/docs.
 
 Do not begin by reading all 6,000+ lines of `main.c`. Find the call site, then
 follow ownership into `world.c`, `physics.c`, `render.c`, `audio.c` or
@@ -331,6 +335,45 @@ draws zero authored light quads. Fixed M136 reference poses draw 197 of 2,228
 L4RA sources and 64 of 193 L4RB sources; these numbers prove distance culling,
 not a universal visibility count for every camera.
 
+### Next lighting-fidelity milestone
+
+The current lighting pass is intentionally small and several visible effects
+are still approximations. Investigate them in this order, using fixed-pose
+captures and source attribution rather than global brightness or draw-distance
+changes:
+
+1. **Headlight placement and road glow.** Compare the car-local light meshes,
+   bloom anchors and transformed world positions for several cars. Verify the
+   front/rear quadrant classification and the ground-glow contact point against
+   the road plane. A per-car offset is only acceptable when the source mesh or
+   transform proves it; do not hand-tune the symptom.
+2. **District and fixture lights.** Separate authored `0x135003` point-light
+   records from ordinary mesh fixtures and emissive/glow materials. The
+   current `SFX_FLARE_GLOWA` camera-facing quad can read as a flat texture;
+   record source position, radius, colour, occlusion and material before
+   deciding whether a sprite, mesh, or beam representation is correct.
+3. **Road-closure and directional lights.** Audit the event-specific barrier
+   groups (for example `BARRIERS_<id>` and `PLAYER_BARRIERS_*`) together with
+   candidate light materials such as `SFX_LIGHT_BEAMB`. Prove whether missing
+   lights come from group filtering, unresolved texture/material binding,
+   render-pass classification, or an absent placement record. The material is
+   a candidate only; its directional role is not yet established.
+4. **Neon ground response.** Keep world glow meshes separate from the car's
+   procedural underglow. The current underglow is an additive coloured pool;
+   validate its footprint against the road surface normal, material and
+   distance so the light is visibly grounded without hiding geometry or
+   globally increasing emissive intensity.
+5. **Wet/rainy asphalt.** First identify the road material inputs and the
+   weather/state signal. Then add a measured wetness path for specular,
+   clear-coat/reflection and rain-surface response while retaining the current
+   dry default. Do not add a global reflective shader effect until a shipped
+   texture/material or runtime state supports it.
+
+Acceptance is a same-pose day/night and dry/wet capture set, with no
+regression in `light-state-test`, ordinary-tier visibility, or existing
+vehicle/world material tests. Lighting work must not bundle collision or
+texture-decoder changes without their own evidence.
+
 ### Visibility tiers
 
 - `baseline`: historical fixed 700 m gate, diagnostic only;
@@ -342,6 +385,32 @@ Ordinary does not build or draw vista batches. The current common
 key map before the later tier gate; treating that avoidable load-time work as
 absent would be inaccurate. A change to full must be verified separately and
 must not alter ordinary same-pose output unless that is the explicit task.
+
+### Next map-visibility milestone: northern mountain roads
+
+The northern mountain-road area is a reported gameplay/render gap: the route
+network can lead into the area while the corresponding road geometry is not
+visible. Treat this as an attribution problem, not a request to increase the
+global draw distance. The investigation order is:
+
+1. Pick one reproducible northern route pose and capture the same pose with
+   `--tier baseline`, `ordinary` and `full`.
+2. Compare route nodes from `TRACKS/ROUTES<REGION>/Paths*.bin` (`0x34148`)
+   with ROAD/TERRAIN meshes emitted by the selected `STREAM*.BUN` resident.
+3. Record selected district, bundle, resident generation, placement/model key
+   and source object for every route segment with no visible road.
+4. Classify the gap as missing resident coverage, wrong STREAM bundle/section,
+   vista-only routing, ordinary-tier culling, scenery-group filtering,
+   prototype/LOD resolution, or a material/transform/render failure.
+5. Fix the owning stage and rerun the same-pose comparison; keep `ALL`, an
+   oversized resident radius and `--tier full` out of the acceptance test.
+
+The current policy is deliberately finite (`resident=1400 m`, `draw=933 m`)
+and STREAM bundles are overlapping route/event working sets, not adjacent map
+tiles. A mountain-road fix must prove which authored source is missing before
+changing residency or visibility limits. Acceptance requires continuous ROAD
+support and visible road geometry across the chosen route, with no change to
+unrelated L4RA/L4RB reference poses.
 
 ### Alpha
 
@@ -446,6 +515,10 @@ presence in free roam still needs an independently proven activation rule.
 
 ## 8. Car loading and presentation
 
+See [Vehicle rendering status and audit notes](VEHICLE_RENDERING.md) for the
+consolidated wheel fixes, capture operations, evidence coverage and unresolved
+exhaust attachment.
+
 The car path is:
 
 ```text
@@ -469,6 +542,26 @@ GLOBALB.BUN
   -> exact axle X and track Y fields
   -> conservative geometry fallback if absent/implausible
 ```
+
+Vehicle presentation notes (M167): the car texture index is sized for the full
+retail slot table (not just the first 64 entries), so late wheel/brake textures
+are not silently dropped. The default `NFSU`/`STYLE01` wheel keeps the car's
+authored stock mesh and diffuse; selecting another rim brand/style takes the
+separate `CARS/WHEELS` library path, so the debug `W` control now has a visible
+effect. Window panes are rendered two-sided with a lower Fresnel-driven alpha,
+and the measured `0x010cb64a` inner-cabin material stays matte/dark instead of
+being treated as painted bodywork. `K` cycles the KITnn variants actually found
+in the selected GEOMETRY.BIN, rather than stopping at KIT02.
+
+The fleet census also found a retail naming edge case: IMPREZAWRX and
+LANCEREVO8 store the 28-byte `FRONT_WHEEL` part name as `FRONT_WHEE`. The car
+classifier accepts that truncated token, so their authored wheels remain TIRE
+meshes instead of being painted as BODY.
+
+The retail car archives do not contain a chosen showroom paint colour; the
+default silver and the debug paint override are therefore presentation choices,
+not recovered Underground 2 career state. Standalone spoiler libraries
+(`CARS/SPOILER*`) and their car-specific placement are still separate work.
 
 `KIT00` remains the base car. Higher kit/style records override only matching
 families. Roof, body, badge and light appearance must come from the same
@@ -519,10 +612,107 @@ split slice, so a heavily-split tier would win merely for having more
 slices, independent of how much triangle detail it contributes. Ties keep
 the earlier-encountered tier, matching the pre-M135 tie-break exactly.
 
-The stock wheel visual is currently partly procedural. Wheel position and ride
-height are separate concerns: axle/track data place contact points, while the
-selected tyre radius/body profile determines presentation. Spoilers and wheel
-libraries require separate asset loads.
+Stock wheel placement now follows the source part, not its material category.
+`N2Mesh.car_mount` survives material splitting and LOD/config selection: even an
+INTERIOR-material slice of `FRONT_WHEEL` belongs at the wheel hubs. The stock
+draw consumes every slice of the selected `tierid`, preserving source indices
+and texture slots. Startup and kit reload share `n2_car_prepare_wheels`;
+the stock path no longer deletes triangles by edge length. MIATA previously
+drew only 120 of its wheel's 497 triangles at each hub, while a 16-triangle
+wheel slice and both brake assemblies remained at the body origin.
+
+`FRONT_BRAKE` / `REAR_BRAKE` assemblies now follow their respective axle's
+hub travel and front steering, including on opponent cars. The caliper and
+disc remain one non-spinning assembly; independent disc rotation is not yet
+implemented. Stock coverage/attachments were checked across 29 player cars,
+with left/right/underside captures for five. This does not establish complete
+vehicle fidelity: high-speed wheel blur and opponent tyres are procedural, and
+the MIATA `KIT00_EXHAUST_A` part still needs its attachment orientation resolved.
+
+Aftermarket rims now retain all material slices of the first selected source
+`tierid`, through `n2_rim_select_tier`, and draw them at each hub. Different
+size variants in the same STYLE remain alternatives, not stacked geometry.
+The existing first-size choice and radius fitting are unchanged. An 80-style
+library census confirmed one shared diffuse key within each selected tier;
+the NFSU STYLE02 production draw changed from 120 to 433 triangles per hub in
+the first coverage fix, and now retains all 435 source triangles. The geometric
+edge-length filter is removed. Tier selection preserves source indices, UVs
+and material slices.
+
+The backing quad is now attributed: NFSU STYLE02 source triangles 433/434 use
+material hash `0x010cb64a` and the transparent-corner region of its own wheel
+atlas, not malformed index joins. MIATA and HUMMER stock wheels use the same
+atlas layout. The car texture decoder now retains DXT1's one-bit alpha in the
+CPU fallback and reads the embedded texture-info draw fields (relative to
+BinKey: order `+0x2d`, usage `+0x31`, blend `+0x32`, writeZ `+0x33`). The
+compressed GPU blocks remain unchanged. The existing body/vinyl decal policy
+and LOC4 world fallback's opaque policy are explicitly preserved.
+
+Source census: all 29 selected stock wheels are cutout; of 80 selected library
+styles, 73 are cutout and seven are blended (ADVAN 01/02, AVUS 02, KONIG 07/08,
+RACINGHART 06, ROTA 02). This is source-data validation, not a visual fleet
+sign-off. Wheel draws now consume these modes through `render_wheel_mesh`:
+cutout discards alpha below 0.5 with depth writes; blend uses texture alpha,
+back-to-front indexed-range/hub ordering and no depth writes. The helper
+restores the caller's texture/alpha/blend/depth state. Opaque opponents finish
+before player glass and wheels. The existing body/vinyl/world policies are
+unchanged; blended styles are not forced into binary cutout.
+
+Alpha alone was insufficient: the first unfiltered aftermarket capture still
+put a solid disc over the spokes. Unlike stock wheels, the library loader had
+skipped the source-to-hub transform. Both paths now reuse
+`n2_prepare_wheel_mesh` (`x=-x`, `y=width_midpoint-y`), once per fresh load,
+before library radius fitting. NFSU STYLE02's backing moves from source
+Y=+0.183822 to hub-local Y=-0.091438 m, behind the spokes on both mirrored
+sides. An 80-style check preserves common slice pivots, indices, UVs and radius.
+MIATA/HUMMER stock, NFSU02 cutout and ADVAN02 blend captures were inspected at
+1920x1080, including opposite-side MIATA controls. Spokes remain visible with
+all source triangles (ADVAN02: 457 -> 461 per hub). This does not establish
+finished wheel materials: rim tint still affects tyre/backing slices, ADVAN
+has visible angular surfaces, and range-centre sorting is not per-triangle or
+whole-scene transparency ordering. Evidence: `scratchpad/vehicle_wheel_draw/`;
+decoder fixtures and source metadata: `scratchpad/vehicle_materials/`.
+
+Exhaust attribution has identified an object-owned `0x13401A` RIGHT_EXHAUST
+record on MIATA's KIT00 rear bumper, but the marker basis cannot yet be applied
+directly to the stock exhaust's local axes. No inferred translation/rotation
+or mesh-hiding workaround is applied. Detailed measurements and same-pose
+1080p evidence are kept locally under `scratchpad/vehicle_exhaust/`.
+The user's follow-up also identifies the body-centre object as a likely
+misplaced exhaust. For MIATA the source trace already identifies
+`KIT00_EXHAUST_A` near the origin: resolve its attachment, do not remove it as
+unwanted geometry. The correct assembly orientation remains unverified.
+
+Wheel position and ride height remain separate concerns: axle/track data place
+contact points, while the selected tyre radius/body profile determines
+presentation. Spoilers and wheel libraries require separate asset loads.
+
+### Next vehicle-presentation and modification milestone
+
+The agreed shop-tab structure and vehicle-only reload contract are in
+[Vehicle customization and in-place switching](VEHICLE_CUSTOMIZATION.md).
+Car selection must preserve world/session resources; it is not a mesh-only
+replacement that leaves the old car's profile or audio active.
+
+The next vehicle pass is visual/asset attribution, not another physics
+tuning pass. The current checklist is:
+
+1. Finish tyre and rim rendering beyond the repaired stock slice path:
+   wheel-library mesh selection, diffuse/material binding, high-speed transition
+   and transform alignment must all be visible on every audited car.
+2. Attribute the unexplained object rendered under the car centre to its exact
+   source object, material slot, transform and category. Do not hide it with a
+   global cull or renderer exception; fix the source classification or
+   placement once proven.
+3. Expose the proven asset families through the ImGui inspector as separate,
+   reversible selections: bumpers, spoilers, rims, full body kits, headlights
+   and roof/body stickers or vinyls.
+
+Each part must keep its authored mesh/material relationship, preserve the
+stock fallback when an optional library is absent, and include one screenshot
+or parser/runtime trace per car family before being called complete. The
+existing `W` rim and `K` kit controls are diagnostic entry points only; they
+are not yet the final modification system.
 
 ## 9. Vehicle dynamics and contact
 
@@ -616,6 +806,25 @@ the same oriented body capsule and face-local velocity response. Its measured
 separate ownership, so a threshold proven for one is not automatically valid
 for another.
 
+### Next open-world collision investigation: overlapping instances
+
+Some open-world contacts may come from authored meshes whose transformed
+footprints overlap, from duplicate LOD/prototype copies, or from a placement
+that is present in the scene but not visible in the render pass. Before
+changing collision thresholds, audit each suspect contact against:
+
+- collision mesh index and triangle;
+- source type name and model key;
+- `0x34103` placement row, translation, bounds and rotation/scale;
+- scenery-group membership and resident generation;
+- render visibility/material classification.
+
+Classify the result as authored overlap, duplicate instance, wrong prototype/
+LOD resolution, transform decode error or collision-only classification. The
+fix must remove the incorrect source or classification; hiding all props or
+loosening the wall predicate is not an acceptable workaround. Free-roam
+static contacts and race-generated closure barriers must be logged separately.
+
 Race-corridor closures resolve circle overlap with the same finite 18 m segment
 that is drawn. Both sides and rounded endpoints are solid; the far side is not
 a nine-metre-deep recovery volume. A side approach must not teleport the car
@@ -647,6 +856,108 @@ Current opponent AI in `ai_step` is kinematic:
 
 That asymmetry is a known limitation, not evidence that player contact should
 be simplified to match AI. Sprint opponents are not implemented.
+
+`--ai-drive-audit PREFIX --track STREAML4RB --event 4201` runs an input-only
+test driver through the normal player's steering response, physics, body/rail
+collision and four-wheel ride. It reuses race-audit contact/source logging and
+captures; it is **not** the `--shot` kinematic autopilot. Example from the repo:
+
+```sh
+./nfsu2 .. --car HUMMER --track STREAML4RB --event 4201 \
+  --ai-drive-audit scratchpad/rb_ai --resident-realtime --frames 6000
+```
+
+The driver borrows the production XY path reader, rejects missing/non-finite,
+closed or discontinuous chains (adjacent gaps over 120 m), and checks the actual
+grid's proximity/direction before moving. It follows a fixed local polyline
+with a short arc-length preview and a conservative 50 km/h test cap. It sends
+only throttle/brake, steering and handbrake; it never corrects position, height,
+heading, velocity or support. Resident activation does not replan the route.
+`--resident-realtime` uses the normal background loader at paced 60 Hz; without
+it, loading is synchronous for repeatable contact comparisons. `--frames` is
+the race-frame budget (default 18000); startup/countdown are separate.
+
+This first driver has no obstacle avoidance/reverse recovery and no decoded
+traffic, segmented-route or elevation topology. It stops and reports failure
+after five seconds without useful progress (including scraping below 3 km/h),
+over 12 m cross-track error, prolonged loss of all support, or invalid state.
+Timeout and interruption are not passes. `ROUTE_END` only means reaching/stopping
+near the route endpoint; `race_finished` is the separate production gate result.
+RB4201's current grid lies downstream of gate 0, so forward route coverage does
+not establish race completion. Use `make ai-drive-test ai-drive-cli-test` for
+the synthetic player-physics, validation and command-line checks.
+
+### Next race-AI milestone: real opponents
+
+After the open-world collision/source audit, extend the existing kinematic
+opponent path into the production race loop. Start with the verified L4RA
+circuit, then L4RB sprint events:
+
+1. reuse authored grid slots, route nodes and ordered gates;
+2. give each opponent a supported ground pose and bounded steering/throttle,
+   without teleporting position or Z;
+3. attribute opponent wall/rail/ground contacts separately from the player;
+4. validate lap order, finish placement, recovery and deterministic replay.
+
+The current `ai_step` remains a diagnostic baseline until these checks pass;
+player physics and collision must not be weakened to match it.
+
+### Route-selection direction arrow
+
+The current ImGui map can draw a diagnostic GPS polyline, but it is not the
+retail route-guidance arrow. The next route-guidance task must first separate
+the data and presentation layers:
+
+- **Route state:** ordered route nodes from `0x34148`, event outline/gates from
+  `0x3414c`, and start/grid markers from `TrackPosMarkersAll.bin`.
+- **Direction:** the tangent from the nearest valid route edge or next gate,
+  transformed into camera/screen space; junction changes must select the next
+  ordered edge rather than the nearest node alone.
+- **Asset provenance:** search the in-game/global texture and HUD resources for
+  the directional icon and its animation/colour states. The documented
+  `U2_Menu_Arrow_White.tga` is a frontend selection arrow, not evidence of the
+  race HUD arrow, so it must not be reused without a match.
+- **Fallback behaviour:** if no retail arrow asset or state table is found,
+  use a clearly marked geometric diagnostic arrow only; do not present it as
+  recovered retail UI.
+
+Acceptance requires the arrow to appear only after a route is selected, point
+through the next gate/turn, update at junctions and resident swaps, remain
+correct under camera rotation, and disappear when the route is cleared or the
+player is off-route. Record the source resource, route-state input and a
+same-route screenshot before integrating it into the eventual retail menu/HUD.
+
+### Next in-game frontend milestone: driving and race HUD
+
+The retail menu/frontend and the in-game driving frontend are separate
+surfaces. The next HUD pass must render from production gameplay state in both
+free-roam/open-world driving and active races; the ImGui inspector remains a
+debug tool and is not the final HUD. Keep state, layout and asset provenance
+separate so a missing retail texture cannot silently change gameplay state.
+
+Required state contracts:
+
+1. **Driving gauges:** speed, engine RPM and gear must follow the same vehicle
+   state used by physics. Any additional gauge (for example nitrous or damage)
+   needs a measured source/state before it is exposed.
+2. **Map and route:** open-world driving shows the player/map context and the
+   selected route when one exists. Race mode shows the active course/gates and
+   keeps the direction arrow tied to the ordered route state described above.
+3. **Race position:** show grid/countdown state before the start, live position
+   while the race is active, and the finish/result state after the final gate.
+   Position must come from ordered race progress, not nearest-world distance.
+4. **Money/economy:** show the career cash value in open-world/free-roam and
+   the appropriate career/result screens; hide it while an active race HUD is
+   displayed. Race entry fees, winnings and unlock/spend timing are gameplay
+   rules that must be supplied or measured before wiring the economy.
+
+Acceptance requires deterministic captures for open-world driving, pre-race
+countdown, active race, finish/results and race exit. The captures must prove
+that gauges remain tied to the vehicle, route/map state survives resident
+swaps, race position changes with ordered progress, and money is absent during
+the race but returns at the correct surrounding state. Do not use a permanent
+HUD overlay, debug labels or a global money draw call as a substitute for these
+state transitions.
 
 ## 11. Diagnostics and evidence
 
@@ -902,7 +1213,7 @@ on one worker; `--resident-sync` selects the synchronous diagnostic control:
    candidate without activating its grid or making GL calls.
 3. CPU validation checks finite geometry/index/bounds, zero rejected instances
    and ROAD/TERRAIN support under the current player layer.
-4. Background `world_resident_finish_step` resolves textures, uploads ordinary
+4. Background `world_resident_finish_step` resolves textures and uploads ordinary
    batches over multiple frames, then builds the remaining passes and collision
    from that same candidate. `world_resident_resources_build` drains the same
    upload cursor synchronously for startup/countdown/diagnostics.
@@ -923,8 +1234,14 @@ across swaps.
 
 The worker owns copied request strings and a zero-initialised candidate.
 Completion is atomically published; the frame thread joins it before validating
-the **current** player pose and starting GL-thread finishing. Ordinary uploads
-consume at most 128 complete batches per frame. The exact cell/material/u16
+the **current** player pose and starting GL-thread finishing. Texture binding
+consumes at most eight uncached resolution attempts per frame, including misses;
+already cached keys do not consume that quota. A small cursor retains the exact
+region/pass/request order, with source bytes alive until binding completes or
+the candidate is cancelled. There is only one in-flight binding, on the GL thread;
+partial maps never reach the active renderer. The synchronous binding wrapper
+drains the same cursor. Ordinary uploads then consume at most 128 complete
+batches per frame. The exact cell/material/u16
 partition, final texture order and mesh-to-batch mapping are shared with the
 synchronous wrapper. Partial output belongs to an upload cursor, never to the
 active renderer. Before activation, ground support is checked again at the
@@ -942,10 +1259,11 @@ normal track changes re-exec. Allocation/upload failure rejects the candidate,
 not the active resident. The cache retains visited keys for one bundle's run;
 it is not a multi-bundle cache or an eviction system.
 
-The ordinary-batch quota spreads both CPU packing and GL submission. It is not
-a time deadline: a single large batch/driver call may still stall. Initial new
-texture decode/upload, partition sorting, sky/glow work and final vista/collision
-work remain synchronous. The old complete scene stays active throughout, but
+The texture and ordinary-batch quotas spread CPU work and GL submission. They
+are not time deadlines: a single large texture, batch or driver call may still
+stall. CPU validation, mesh texture mapping, partition sorting, sky/glow work
+and final vista/collision work remain synchronous. Cold startup/countdown also
+remain synchronous. The old complete scene stays active throughout, but
 activation happens later; the route audit replans on activation, so its driving
 trajectory can change. A lower peak step is not proof of better route completion.
 Normal worker-driven swaps retire the old owner in 256 batch/mesh units per

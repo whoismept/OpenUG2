@@ -89,3 +89,106 @@ void ai_step(AiCar *ai, int k, const N2Path *aipath, N2Scene *scene,
     if (ai->prevrel > aipath->n*3/4 && rel < aipath->n/4) ai->lap++;
     ai->prevrel = rel;
 }
+
+static float ai_segment(const N2Path *p, int i) {
+    return hypotf(p->xy[2*i+2]-p->xy[2*i], p->xy[2*i+3]-p->xy[2*i+1]);
+}
+
+int ai_drive_route_valid(const N2Path *p) {
+    if (!p || !p->xy || p->n < 2 || p->n > 4096) return 0;
+    for (int i=0; i<p->n*2; i++)
+        if (!isfinite(p->xy[i]) || fabsf(p->xy[i]) >= 1e6f) return 0;
+    for (int i=0; i<p->n-1; i++) {
+        float len=ai_segment(p,i);
+        if (len < 0.01f || len > 120.0f) return 0;
+    }
+    /* ponytail: only open, unsegmented XY chains. Decode topology/elevation
+     * before accepting circuits, raw-list jumps or general city routing. */
+    return hypotf(p->xy[0]-p->xy[2*p->n-2],p->xy[1]-p->xy[2*p->n-1]) > 12.0f;
+}
+
+static float ai_projection(const N2Path *p, int i, const float pos[3], float *error) {
+    float dx=p->xy[2*i+2]-p->xy[2*i], dy=p->xy[2*i+3]-p->xy[2*i+1];
+    float t=((pos[0]-p->xy[2*i])*dx+(pos[1]-p->xy[2*i+1])*dy)/(dx*dx+dy*dy);
+    t=fmaxf(0,fminf(1,t));
+    *error=hypotf(pos[0]-p->xy[2*i]-t*dx,pos[1]-p->xy[2*i+1]-t*dy);
+    return t;
+}
+
+int ai_drive_init(AiDrive *d, const N2Path *p, const float pos[3], float heading) {
+    if (!d) return 0;
+    memset(d,0,sizeof *d); d->failed=1;
+    if (!ai_drive_route_valid(p) || !pos || !isfinite(pos[0]) ||
+        !isfinite(pos[1]) || !isfinite(heading)) return 0;
+    float best=1e30f, along=0, at=0;
+    for (int i=0; i<p->n-1; i++) {
+        float err, t=ai_projection(p,i,pos,&err), len=ai_segment(p,i);
+        if (err < best) { best=err; d->segment=i; at=along+t*len; }
+        along+=len;
+    }
+    int i=d->segment;
+    float dot=((p->xy[2*i+2]-p->xy[2*i])*cosf(heading)+
+               (p->xy[2*i+3]-p->xy[2*i+1])*sinf(heading))/ai_segment(p,i);
+    if (best > 8.0f || fabsf(dot) < 0.5f) return 0;
+    d->path=p; d->direction=dot>0 ? 1 : -1; d->length=along;
+    d->start=d->progress=d->checkpoint=dot>0 ? at : along-at;
+    d->error=best; d->failed=0;
+    return 1;
+}
+
+AiDriveInput ai_drive_step(AiDrive *d, const float pos[3], float heading, float speed) {
+    AiDriveInput out={0,0,1};
+    if (!d || d->failed || d->finished) return out;
+    if (!d->path || !pos || !isfinite(pos[0]) || !isfinite(pos[1]) ||
+        !isfinite(heading) || !isfinite(speed)) { d->failed=1; return out; }
+    const N2Path *p=d->path;
+    int i=d->segment;
+    float err, t=ai_projection(p,i,pos,&err);
+    int next=i+d->direction;
+    if (next>=0 && next<p->n-1) {
+        float ne, nt=ai_projection(p,next,pos,&ne);
+        if (ne < err) { i=next; t=nt; err=ne; }
+    }
+    d->segment=i; d->error=err;
+    if (err>12.0f) { d->failed=1; return out; }
+    float at=0;
+    for (int k=0; k<i; k++) at+=ai_segment(p,k);
+    at+=t*ai_segment(p,i);
+    if (d->direction<0) at=d->length-at;
+    if (at>d->progress) d->progress=at;
+    if (d->progress>d->checkpoint+0.5f && fabsf(PHYS_KMH(speed))>=3.0f) {
+        d->checkpoint=d->progress; d->stalled=0;
+    }
+    else if (++d->stalled>300) { d->failed=1; return out; }
+    float remaining=d->length-at;
+    if (remaining<2.0f && err<3.0f && fabsf(PHYS_KMH(speed))<2.0f) {
+        d->finished=1; return out;
+    }
+    /* Short arc-length preview, not a leap to a distant node across a bend. */
+    float look=fminf(10.0f,4.0f+fabsf(speed)*PHYS_TICKRATE*0.35f);
+    float len=ai_segment(p,i), part=d->direction>0 ? 1-t : t;
+    float advance=look;
+    while (advance>part*len) {
+        advance-=part*len;
+        next=i+d->direction;
+        if (next<0 || next>=p->n-1) { advance=part*len; break; }
+        i=next; len=ai_segment(p,i); part=1; t=d->direction>0 ? 0 : 1;
+    }
+    t+=d->direction*advance/len;
+    d->target[0]=p->xy[2*i]+t*(p->xy[2*i+2]-p->xy[2*i]);
+    d->target[1]=p->xy[2*i+1]+t*(p->xy[2*i+3]-p->xy[2*i+1]);
+    float angle=atan2f(d->target[1]-pos[1],d->target[0]-pos[0])-heading;
+    angle=atan2f(sinf(angle),cosf(angle));
+    out.steer=fmaxf(-1,fminf(1,angle/0.5f));
+    /* Conservative test pace; brake before the endpoint, never command reverse
+     * as a substitute for stopping. No handling/suspension parameters change. */
+    float target=50.0f/3.6f;
+    target=fminf(target,sqrtf(2*3.0f*fmaxf(0,remaining-1.0f)));
+    target=fminf(target,(14.0f+36.0f*fmaxf(0,
+                        cosf(fminf(fabsf(angle)*2,1.570796327f))))/3.6f);
+    d->target_kmh=target*3.6f;
+    float delta=target-speed*PHYS_TICKRATE;
+    out.throttle=delta < -0.5f && speed>0.01f ? -1.0f : fmaxf(0,fminf(1,delta*0.5f));
+    out.handbrake=target<0.1f;
+    return out;
+}

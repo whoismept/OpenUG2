@@ -44,6 +44,8 @@ typedef struct {
     int *obstacle_src;
     int obstacle_count;
     WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
+    WTextureBind texture_binding;
+    uint64_t texture_ticks;
     uint64_t batch_ticks;      /* aggregate across sliced GL-thread work */
 } WorldResidentResources;
 

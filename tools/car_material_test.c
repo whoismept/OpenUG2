@@ -146,6 +146,54 @@ static int category_for_name(const char *name) {
     leaf_name(&p, name);
     return n2_mesh_category(p.b, 0, p.n);
 }
+static int car_category_for_name(const char *name) {
+    Buf p; p.n = 0;
+    leaf_name(&p, name);
+    return n2_car_category(p.b, 0, p.n);
+}
+
+static void car_mount_test(void) {
+    printf("\n  Source-part mounts survive material splitting\n");
+    const char *names[] = {"TESTCAR_KIT00_FRONT_WHEEL_A", "TESTCAR_KIT00_FRONT_BRAKE_A",
+                          "TESTCAR_KIT00_REAR_BRAKE_A", "TESTCAR_KIT00_BRAKELIGHT_A",
+                          "IMPREZAWRX_KIT00_FRONT_WHEE", "TESTCAR_BASE_A",
+                          "IMPREZAWRX_KIT00_FRONT_BRAK", "TESTCAR_KIT00_FRONT_BRAKELIGHT_A"};
+    int mounts[] = {N2_MOUNT_WHEEL, N2_MOUNT_FRONT_BRAKE, N2_MOUNT_REAR_BRAKE,
+                    N2_MOUNT_BODY, N2_MOUNT_WHEEL, N2_MOUNT_BODY,
+                    N2_MOUNT_FRONT_BRAKE, N2_MOUNT_BODY};
+    for (unsigned k=0;k<sizeof mounts/sizeof mounts[0];k++) {
+        Buf f; f.n=0;
+        float pos[6][3]={{-.3f,0,-.3f},{.3f,0,-.3f},{0,.2f,.3f},
+                         {-.2f,0,-.2f},{.2f,0,-.2f},{0,.2f,.2f}};
+        uint16_t idx[]={0,1,2,3,4,5};
+        uint32_t tex[]={0xabcdef01u,0xabcdef02u};
+        uint32_t mat[]={0x11223344u,N2_MAT_INTERIOR};
+        SubSpec sub[]={{3,0,0,0},{3,1,1,3}};
+        object(&f,names[k],tex,2,mat,2,sub,2,pos,6,idx,6);
+        N2Scene sc; n2_load_car(f.b,f.n,&sc,tex,2,NULL);
+        chk("both material slices and their triangles survive",sc.count==2 && total_nidx(&sc)==6);
+        chk(names[k],sc.count==2 && sc.meshes[0].car_mount==mounts[k] &&
+                     sc.meshes[1].car_mount==mounts[k]);
+        chk("interior material does not change attachment",count_by_cat(&sc,N2_CAR_INTERIOR)==1);
+        int wheel = n2_car_prepare_wheels(&sc);
+        chk("preparation preserves all source triangles",total_nidx(&sc)==6);
+        if (mounts[k]==N2_MOUNT_WHEEL && sc.count==2) {
+            chk("stock tier includes both materials",wheel>=0 &&
+                sc.meshes[0].tierid==sc.meshes[wheel].tierid &&
+                sc.meshes[1].tierid==sc.meshes[wheel].tierid);
+            chk("all slices receive the same wheel transform",
+                !memcmp(sc.meshes[0].verts,sc.meshes[1].verts,6*5*sizeof(float)) &&
+                fabsf(sc.meshes[0].verts[0]-.3f)<1e-6f &&
+                fabsf(sc.meshes[0].verts[1]-.1f)<1e-6f);
+            chk("rotation preserves winding indices and distinct texture slots",
+                !memcmp(sc.meshes[0].idx,idx,3*sizeof(uint16_t)) &&
+                !memcmp(sc.meshes[1].idx,idx+3,3*sizeof(uint16_t)) &&
+                sc.meshes[0].texkey==tex[0] && sc.meshes[1].texkey==tex[1]);
+        } else chk("body and brake geometry is not wheel-oriented",wheel==-1 &&
+            sc.meshes[0].verts[0]==pos[0][0] && sc.meshes[0].verts[1]==pos[0][1]);
+        n2_free_scene(&sc);
+    }
+}
 
 /* M136 RED/GREEN regression: SKY is a narrow authored family and the shipped
  * dome is a two-material object (dome + alpha cap), not one last-slot mesh. */
@@ -753,7 +801,134 @@ static int sort_tests(void) {
     return FAIL;
 }
 
+static void rim_orientation_test(void) {
+    printf("\n  Aftermarket wheel source-to-hub orientation\n");
+    Buf f={.n=0};
+    const float p[7][3]={{-.2f,.03f,-.2f},{.2f,.03f,-.2f},{0,.03f,.2f},
+        {-.3f,.18f,-.3f},{.3f,.18f,-.3f},{.3f,.18f,.3f},{-.3f,.18f,.3f}};
+    const uint16_t idx[]={0,1,2,3,4,5,3,5,6};
+    const uint32_t tex[]={0x12345678},mat[]={0x22719fa9,N2_MAT_INTERIOR};
+    const SubSpec sub[]={{3,0,0,0},{6,0,1,3}};
+    object(&f,"TEST_STYLE02_15_23_A",tex,1,mat,2,sub,2,p,7,idx,9);
+    N2CarConfig cfg={0,2,0,2};N2Scene s;
+    n2_load_car(f.b,f.n,&s,tex,1,&cfg);
+    chk("library fixture retains spoke and backing slices",n2_rim_select_tier(&s)==2);
+    if(s.count!=2){n2_free_scene(&s);return;}
+    float before[2][35];
+    for(int i=0;i<2;i++) {
+        for(int v=0;v<7;v++) { /* Distinct nonzero UVs catch incidental edits. */
+            s.meshes[i].verts[v*5+3]=(float)v/8;
+            s.meshes[i].verts[v*5+4]=1.0f-(float)v/8;
+        }
+        memcpy(before[i],s.meshes[i].verts,sizeof before[i]);
+        n2_prepare_wheel_mesh(&s.meshes[i]);
+    }
+    for(int side=-1;side<=1;side+=2) {
+        float hub=side*.7f;
+        float spoke=hub+side*s.meshes[0].verts[1];
+        float backing=hub+side*s.meshes[1].verts[3*5+1];
+        chk(side<0?"right hub backing is inboard of spokes":"left hub backing is inboard of spokes",
+            side*(backing-spoke)<0);
+    }
+    int uv=1,radius=1;
+    for(int i=0;i<2;i++)for(int v=0;v<7;v++) {
+        const float *a=before[i]+v*5,*b=s.meshes[i].verts+v*5;
+        uv &= !memcmp(a+3,b+3,2*sizeof(float));
+        radius &= a[0]*a[0]+a[2]*a[2]==b[0]*b[0]+b[2]*b[2];
+    }
+    chk("wheel preparation preserves every UV",uv);
+    chk("wheel preparation preserves every radial distance",radius);
+    chk("wheel preparation preserves exact index ranges",total_nidx(&s)==9 &&
+        !memcmp(s.meshes[0].idx,idx,3*sizeof(uint16_t)) &&
+        !memcmp(s.meshes[1].idx,idx+3,6*sizeof(uint16_t)));
+    chk("all library slices receive the same transform",
+        !memcmp(s.meshes[0].verts,s.meshes[1].verts,sizeof before[0]));
+    n2_free_scene(&s);
+}
+
+static void rim_tier_test(void) {
+    printf("\n  Aftermarket rim complete model selection\n");
+    Buf f; f.n=0;
+    const float p[6][3]={{-1,0,-1},{1,0,-1},{1,0,1},{-1,0,1},{0,.2f,0},{0,-.2f,0}};
+    const uint16_t idx[]={0,1,2,0,2,3,1,4,2,1,5,2};
+    const uint32_t tex[]={0x12345678,0x87654321};
+    const SubSpec sub[]={{6,0,0,0},{6,1,0,6}};
+    object(&f,"BBS_STYLE01_15_23_A",tex,2,NULL,0,sub,2,p,6,idx,12);
+    object(&f,"BBS_STYLE01_15_23_B",tex,2,NULL,0,NULL,0,p,6,idx,3);
+    object(&f,"BBS_STYLE01_16_24_A",tex,2,NULL,0,sub,2,p,6,idx,12);
+    N2CarConfig cfg={0,1,0,1}; N2Scene s;
+    n2_load_car(f.b,f.n,&s,tex,2,&cfg);
+    chk("fixture has two complete models after LOD selection",s.count==4);
+    uint32_t tier=s.meshes[0].tierid;
+    chk("selected rim keeps both material slices",n2_rim_select_tier(&s)==2);
+    chk("selected rim retains all source triangles, including large faces",total_nidx(&s)==12);
+    if (s.count==2) {
+        chk("no second size or lower LOD is stacked",s.meshes[0].tierid==tier && s.meshes[1].tierid==tier);
+        chk("per-slice texture keys remain intact",s.meshes[0].texkey==tex[0] && s.meshes[1].texkey==tex[1]);
+        chk("selection leaves vertex and UV buffers untouched",!memcmp(s.meshes[0].verts,s.meshes[1].verts,6*5*sizeof(float)));
+        chk("selection leaves index ranges untouched",!memcmp(s.meshes[0].idx,idx,6*sizeof(uint16_t)) && !memcmp(s.meshes[1].idx,idx+6,6*sizeof(uint16_t)));
+        chk("selecting an already selected rim is idempotent",n2_rim_select_tier(&s)==2);
+    }
+    n2_free_scene(&s);
+    chk("missing library remains an empty fallback",n2_rim_select_tier(&s)==0 && n2_rim_select_tier(NULL)==0);
+}
+
+/* Car offset-slot TPK, literal-only JDLZ payload: exercise the same loader
+ * used by stock tyres and aftermarket rims, not the world TPK decoder. */
+static void car_texture_alpha_test(void) {
+    printf("\n  Car texture cutout metadata and portable alpha\n");
+    for (int mode=0;mode<6;mode++) {
+        int bgra=mode==2||mode==4, truncated=mode==3, short_blocks=mode==5;
+        unsigned char raw[256]={0};
+        const uint32_t key=0x12345678; const int p=0xc0;
+        int nraw=p+(truncated?0x28:0x34);
+        if (bgra) {
+            for (int i=0;i<16;i++) {raw[i*4]=32;raw[i*4+1]=64;raw[i*4+2]=128;raw[i*4+3]=i?255:0;}
+            if(mode==4)raw[7]=128;
+        } else { /* c0 <= c1, index 3 on the first pixel only when cutout */
+            raw[2]=255;raw[3]=255;raw[4]=mode==1?3:0;
+        }
+        memcpy(raw+p,&key,4);raw[p+0x20]=4;raw[p+0x22]=4;
+        if(short_blocks)raw[p+0x20]=raw[p+0x22]=32;
+        raw[p+0x26]=bgra?0x20:0x22;
+        if (!truncated) {raw[p+0x31]=mode?1:0;raw[p+0x33]=1;}
+        if(mode==4){raw[p+0x2d]=5;raw[p+0x31]=2;raw[p+0x32]=1;raw[p+0x33]=0;}
+        Buf z={.n=0};bstr(&z,"JDLZ");bu32(&z,0x1002);bu32(&z,nraw);bu32(&z,0);
+        for(int i=0;i<nraw;i++) {
+            if(i%8==0)z.b[z.n++]=0; /* eight literals */
+            if(i==0)z.b[z.n++]=0;   /* unused back-reference flags */
+            z.b[z.n++]=raw[i];
+        }
+        uint32_t enc=(uint32_t)z.n;memcpy(z.b+12,&enc,4);
+        Buf slots={.n=0},hdr={.n=0},file={.n=0};
+        bu32(&slots,key);bu32(&slots,40);bu32(&slots,enc);bu32(&slots,nraw);
+        bu32(&slots,nraw-p+0x88);bu32(&slots,0);
+        chunk(&hdr,0x33310003,&slots);chunk(&file,0xb3310000,&hdr);bbytes(&file,z.b,z.n);
+        N2Tex t;int ok=n2_load_car_tex_by_key(file.b,file.n,key,&t);
+        if(short_blocks) {
+            chk("undersized DXT1 base level is rejected",!ok);
+            chk("rejected base level leaves no allocated outputs",!t.rgb && !t.alpha && !t.dxt);
+            continue;
+        }
+        chk("car offset-slot texture decodes",ok);
+        if(!ok)continue;
+        chk("car record draw mode is preserved or safely defaults",
+            n2_tex_mode(&t)==(mode==4?N2_DRAW_BLEND:(mode==1||bgra)?N2_DRAW_CUTOUT:N2_DRAW_OPAQUE));
+        if(mode==1||bgra) {
+            chk("transparent and opaque source texels remain distinct",
+                t.alpha && t.alpha[0]==0 && t.alpha[1]==(mode==4?128:255));
+        } else chk("fully opaque DXT1 keeps the RGB fallback",!t.alpha);
+        if(!bgra)chk("GPU DXT1 blocks remain byte-identical",
+            t.dxtfmt==1 && t.dxt && !memcmp(t.dxt,raw,8));
+        free(t.rgb);free(t.alpha);free(t.dxt);
+    }
+}
+
 int main(void) {
+    car_texture_alpha_test();
+    rim_tier_test();
+    rim_orientation_test();
+    car_mount_test();
     printf("MILESTONE 135  car material routing / complete-tier LOD regression\n\n");
 
     /* -------------------------------------------------------------------
@@ -786,6 +961,18 @@ int main(void) {
         if (ig >= 0) chk("GLASS slice has 3 indices (one triangle)", sc.meshes[ig].nidx == 3);
         for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
         free(sc.meshes);
+    }
+
+    printf("  F4 authored KIT/STYLE enumeration is sorted and unique\n");
+    {
+        const unsigned char names[] = "MIATA_KIT29_BODY_A MIATA_KIT01_BUMPER_A "
+                                      "MIATA_KIT29_SKIRT_A MIATA_STYLE28_HOOD_A";
+        int kits[8], styles[8];
+        int nk = n2_car_variant_numbers(names, (long)sizeof names - 1, 1, kits, 8);
+        int ns = n2_car_variant_numbers(names, (long)sizeof names - 1, 2, styles, 8);
+        chk("KIT list contains unique sorted options",
+            nk == 2 && kits[0] == 1 && kits[1] == 29);
+        chk("STYLE list contains the authored style", ns == 1 && styles[0] == 28);
     }
 
     /* -------------------------------------------------------------------
@@ -1010,6 +1197,8 @@ int main(void) {
      * undamaged, whatever the split outcome.
      * ------------------------------------------------------------------- */
     printf("  E tire/rim object with several unrelated material hashes\n");
+    chk("truncated FRONT_WHEE wheel token stays TIRE",
+        car_category_for_name("IMPREZAWRX_KIT00_FRONT_WHEE") == N2_CAR_TIRE);
     {
         Buf f; f.n = 0;
         float pos[9][3] = {{0,0,0},{1,0,0},{0,1,0}, {1,0,0},{1,1,0},{0,1,0},
@@ -1058,6 +1247,53 @@ int main(void) {
         chk("not split (single submesh, nothing to split from)", n == 1);
         chk("classified GLASS from the proven material hash, not BODY from the name",
             n == 1 && sc.meshes[0].cat == N2_CAR_GLASS);
+        for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
+        free(sc.meshes);
+    }
+
+    /* -------------------------------------------------------------------
+     * Fixture F2: N2_MAT_INTERIOR. The real shape is every car's
+     * <CAR>_BASE_A: one object whose name matches the BODY name-heuristic
+     * ("BASE"), carrying an outer CARSKIN slice AND an interior slice. Before
+     * this material was classified, the interior slice inherited BODY and was
+     * drawn in metallic body paint with gloss, clear coat and environment
+     * reflection, filling the whole cabin behind the glass.
+     * ------------------------------------------------------------------- */
+    printf("  F2 CARSKIN + INTERIOR object splits into BODY and INTERIOR\n");
+    {
+        Buf f; f.n = 0;
+        float pos[6][3] = {{0,0,0},{1,0,0},{0,1,0}, {1,0,0},{1,1,0},{0,1,0}};
+        uint16_t idx[6] = {0,1,2, 3,4,5};
+        uint32_t tex[1] = {0xAAAAAAAAu};
+        uint32_t mat[2] = {N2_MAT_CARSKIN, N2_MAT_INTERIOR};
+        SubSpec sub[2] = { {3, 0, 0, 0}, {3, 0, 1, 3} };
+        object(&f, "TESTCAR_BASE_A", tex, 1, mat, 2, sub, 2, pos, 6, idx, 6);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, NULL, 0, NULL);
+        printf("    emitted meshes: %d, total nidx: %ld (raw: 6)\n", n, total_nidx(&sc));
+        chk("split into two slices", n == 2);
+        chk("no coverage lost", total_nidx(&sc) == 6);
+        chk("one BODY slice and one INTERIOR slice",
+            count_by_cat(&sc, N2_CAR_BODY) == 1 &&
+            count_by_cat(&sc, N2_CAR_INTERIOR) == 1);
+        for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
+        free(sc.meshes);
+    }
+    /* Single-submesh case: nothing to split, so the whole object's category
+       must still come from the material hash, not from its "KIT" name. */
+    printf("  F3 single-submesh INTERIOR object with a BODY-heuristic name\n");
+    {
+        Buf f; f.n = 0;
+        float pos[3][3] = {{0,0,0},{1,0,0},{0,1,0}};
+        uint16_t idx[3] = {0,1,2};
+        uint32_t tex[1] = {0xAAAAAAAAu};
+        uint32_t mat[1] = { N2_MAT_INTERIOR };
+        SubSpec sub[1] = { {3, 0, 0, 0} };
+        object(&f, "TESTCAR_KIT00_TRUNK_A", tex, 1, mat, 1, sub, 1, pos, 3, idx, 3);
+
+        N2Scene sc; int n = n2_load_car(f.b, f.n, &sc, NULL, 0, NULL);
+        chk("classified INTERIOR from the material hash, not BODY from the name",
+            n == 1 && sc.meshes[0].cat == N2_CAR_INTERIOR);
         for (int i = 0; i < sc.count; i++) { free(sc.meshes[i].verts); free(sc.meshes[i].idx); free(sc.meshes[i].vcol); }
         free(sc.meshes);
     }

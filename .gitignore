@@ -32,9 +32,14 @@ scratchpad/
 *.png
 !docs/images/
 !docs/images/*.png
+!docs/screenshots/
+!docs/screenshots/*.png
 mesh_out.*
 src/generated_world_debug_shaders.h
 *.log
+
+# --- Graphify output (reproducible local projection) ---
+/graphify-out*/
 
 # --- Reverse-engineering scratch (Ghidra projects, clones) ---
 ghidra/
@@ -59,3 +64,4 @@ CLAUDE.md
 docs/PROJECT_STATE.md
 docs/OPUS_TASK_TEMPLATE.md
 docs/superpowers/
+tools/capture_vehicle_shots.sh
