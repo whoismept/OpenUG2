@@ -202,8 +202,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     /* Fit the selected library size to THIS car's wheel. Scale every rim
        submesh (they share the origin) to the car's stock-wheel radius fitR,
        which is measured from
-       the car's N2_CAR_TIRE mesh -- the same size the procedural tyre uses, so
-       the two stay consistent when the draw swaps between them at speed. */
+       the car's N2_CAR_TIRE mesh. */
     if (fitR > 0.0f && lib->count) {
         float bb[6]; n2_mesh_bbox(&lib->meshes[0], bb);
         float rimR = 0.25f * ((bb[1]-bb[0]) + (bb[5]-bb[4]));   /* mean X-Z radius */
@@ -3573,7 +3572,6 @@ int main(int argc, char **argv) {
         }
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
-        free(globdata);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
@@ -3607,13 +3605,19 @@ int main(int argc, char **argv) {
                carprof.hub_z, carprof.ride, carprof.wheelbase, carprof.track_f,
                carprof.clearance);
         wheelmesh = make_wheel(wR, wHW); have_wheel = 1;
+        N2Tpk globaltpk = globdata ? n2_tpk_open(globdata, globlen) : (N2Tpk){0};
         /* decode + upload each distinct texture actually bound by a mesh */
         for (int i = 0; i < ncar; i++) {
             uint32_t tk = car.meshes[i].texkey; if (!tk) continue;
             int seen = 0; for (int j = 0; j < nmap; j++) if (mapkey[j]==tk) seen = 1;
             if (seen || nmap >= (int)(sizeof mapkey / sizeof mapkey[0])) continue;
             N2Tex ct;
-            if (n2_load_car_tex_by_key(ctdata, ctlen, tk, &ct)) {
+            int loaded = ctdata && n2_load_car_tex_by_key(ctdata, ctlen, tk, &ct);
+            int mount = car.meshes[i].car_mount;
+            if (!loaded && globdata &&
+                (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE))
+                loaded = n2_tpk_decode(globdata, globlen, globaltpk, tk, &ct);
+            if (loaded) {
                 mapkey[nmap] = tk; maptex[nmap] = upload_tpk_texture_to_gpu(&ct);
                 /* Preserve the existing decal policy: newly retained DXT1
                    cutout alpha is not a paint/vinyl compositing mask. */
@@ -3627,6 +3631,7 @@ int main(int argc, char **argv) {
                 free(ct.rgb); free(ct.alpha); free(ct.dxt);
             }
         }
+        free(globaltpk.blk); free(globdata);
         printf("car textures bound: %d distinct\n", nmap);
         /* Sponsor vinyl layer: VINYLS.BIN is a HUFF-compressed TPK and is
            decoded by the same key loader as car TEXTURES.BIN. Only composite
@@ -4688,13 +4693,6 @@ int main(int argc, char **argv) {
     GLuint texTerr = world2 ? active_resident->resources.terrain_texture
         : (world.neighborhood.have_grass ? upload_tex(&world.neighborhood.grass) : 0);
     GLuint texWheel = make_wheel_tex();   /* radial alloy-rim look for the tyres */
-    /* Above ~40 km/h the 5-spoke pattern is turning faster than the frame rate
-       can sample, so crisp spokes alias into a strobing mess. Swap to the
-       angular-averaged rim then — a stand-in for the pre-baked blur asset
-       retail used, which is NOT present in this data: no _BLUR key exists in
-       any per-car TEXTURES.BIN. */
-    GLuint texWheelBlur = make_wheel_blur_tex();
-    #define WHEEL_BLUR_KMH 40.0f
 
     /* Aftermarket rim library. NOT CARS/WHEELS/GEOMETRY.BIN -- that file is a
        64-byte stub; the real geometry is per brand (GEOMETRY_BBS.BIN,
@@ -5192,8 +5190,9 @@ int main(int argc, char **argv) {
                         printf("render mode %d: %s\n", g_debug_mode, dm[g_debug_mode]);
                     }
                 }
-                else if (k == SDLK_w && wldata) {
+                else if (k == SDLK_F6 && !e.key.repeat && wldata) {
                     wheel_style = wheel_style % 8 + 1;   /* 1..8 */
+                    g_dbg.wheel_style = wheel_style;
                     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                                        &wheellib, &wheelgm, &nwheelgm,
                                        wtdata, wtlen, &rimtex, &rimmode, carWheelR))
@@ -7232,9 +7231,9 @@ int main(int argc, char **argv) {
                                    : is_light?0.55f
                                    : (c==N2_CAR_MECH||c==N2_CAR_INTERIOR)?0.0f : 0.15f);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
-                GLuint tex = 0; int hasalpha = 0;
+                GLuint tex = 0; int hasalpha = 0, texmode = N2_DRAW_OPAQUE;
                 for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
-                    tex = maptex[j]; hasalpha = mapalpha[j]; break; }
+                    tex = maptex[j]; hasalpha = mapalpha[j]; texmode = mapmode[j]; break; }
                 if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
@@ -7315,7 +7314,7 @@ int main(int argc, char **argv) {
                     for (int k=first;k<first+2;k++) {
                         float MB[16]; mat_mul(MVPwheel,brakeT[k],MB);
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
-                        draw_gpumesh(&cgm[i]); g_dbg.drawn++;
+                        render_wheel_mesh(&rp, &cgm[i], tex, texmode); g_dbg.drawn++;
                     }
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                     if (g_dbg.car_cull) glEnable(GL_CULL_FACE);
@@ -7479,8 +7478,9 @@ int main(int argc, char **argv) {
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                 glDepthMask(GL_TRUE); glDisable(GL_BLEND);
             }
-            /* Authored stock/library wheels below the blur threshold, with
-               the existing procedural wheel as the high-speed fallback. */
+            /* Keep authored wheels and material routing at every speed.
+               ponytail: no motion blur until it preserves the selected wheel;
+               a generic disc loses its geometry, alpha and rubber materials. */
             if (have_wheel && g_dbg.show_tires) {
                 glUniform1f(rp.uDecal, 0.0f);
                 /* Draw every material slice of the selected source wheel tier,
@@ -7489,9 +7489,8 @@ int main(int argc, char **argv) {
                    that authored mesh (and its real tire texture) as the stock
                    view; any other brand/style is an explicit modification and
                    must reach the rim-library path below. Previously this branch
-                   ran for every style, so W/ImGui changes were invisible. */
-                if (stock_wheel >= 0 && wheel_brand == 0 && wheel_style == 1 &&
-                    PHYS_KMH(speed) <= WHEEL_BLUR_KMH) {
+                   ran for every style, so F6/ImGui changes were invisible. */
+                if (stock_wheel >= 0 && wheel_brand == 0 && wheel_style == 1) {
                     for (int i=0;i<ncar;i++) {
                         if (car.meshes[i].car_mount != N2_MOUNT_WHEEL ||
                             car.meshes[i].tierid != car.meshes[stock_wheel].tierid) continue;
@@ -7510,17 +7509,15 @@ int main(int argc, char **argv) {
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                     goto wheels_drawn;
                 }
-                /* Geometric rim below the blur threshold, else the procedural
-                   disc (its angular-averaged sheet sells the motion blur).
+                /* Use the selected library geometry whenever it is available.
                    The WHEELS/TEXTURES.BIN rim diffuse is AUTHENTIC (blue spans
                    the full 0..255; the low average is just a gold/bronze rim,
                    not a decode bug), so it is bound directly and shows the real
                    manufacturer colour. uEnv=0 keeps the warm env sphere off it
                    (that, not the texture, was the old green cast) and a strong
                    specular adds the chrome highlight over the diffuse.
-                   uColor is ignored on the textured path (base = t.rgb).
-                   PHYS_KMH(speed), not g_dbg.kmh, which lags a frame here. */
-                int geo = nwheelgm > 0 && PHYS_KMH(speed) <= WHEEL_BLUR_KMH;
+                   uColor is ignored on the textured path (base = t.rgb). */
+                int geo = nwheelgm > 0;
                 if (geo) {
                     /* Rim paint: bind the authentic OEM diffuse and recolor it
                        toward the chosen rim colour (silver default) via uRimTint,
@@ -7533,8 +7530,7 @@ int main(int argc, char **argv) {
                 } else {
                     glUniform1f(uUseTex, 1.0f); glUniform1f(rp.uEnv, 0.3f);
                     glUniform1f(uSpec, 0.4f);
-                    glBindTexture(GL_TEXTURE_2D,
-                        PHYS_KMH(speed) > WHEEL_BLUR_KMH ? texWheelBlur : texWheel);
+                    glBindTexture(GL_TEXTURE_2D, texWheel);
                 }
                 float wmvp[4][16];for(int k=0;k<4;k++)mat_mul(MVPwheel,wheelT[k],wmvp[k]);
                 if(geo) {

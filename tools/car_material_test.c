@@ -192,6 +192,22 @@ static void car_mount_test(void) {
         } else chk("body and brake geometry is not wheel-oriented",wheel==-1 &&
             sc.meshes[0].verts[0]==pos[0][0] && sc.meshes[0].verts[1]==pos[0][1]);
         n2_free_scene(&sc);
+        n2_load_car(f.b,f.n,&sc,tex+1,1,NULL);
+        int brake=mounts[k]==N2_MOUNT_FRONT_BRAKE || mounts[k]==N2_MOUNT_REAR_BRAKE;
+        chk("only brake mounts retain a shared texture absent from the car pack",
+            sc.count==2 && sc.meshes[0].texkey==(brake?tex[0]:0) &&
+            sc.meshes[1].texkey==tex[1]);
+        n2_free_scene(&sc);
+    }
+    for(int invalid=0;invalid<2;invalid++) {
+        Buf f;f.n=0;float pos[3][3]={{0,0,0},{1,0,0},{0,0,1}};
+        uint16_t idx[]={0,1,2};uint32_t tex[]={0xabcdef01u},mat[]={0x11223344u};
+        SubSpec sub[]={{3,invalid?9:0,0,0}};
+        object(&f,"TESTCAR_KIT00_FRONT_BRAKE_A",tex,1,mat,1,sub,1,pos,3,idx,3);
+        N2Scene sc;n2_load_car(f.b,f.n,&sc,NULL,0,NULL);
+        chk(invalid?"invalid brake slot remains unresolved":"single brake range retains its shared texture key",
+            sc.count==1 && sc.meshes[0].texkey==(invalid?0:tex[0]));
+        n2_free_scene(&sc);
     }
 }
 
@@ -924,7 +940,96 @@ static void car_texture_alpha_test(void) {
     }
 }
 
+static void wheel_material_identity_test(void) {
+    const char *names[]={"TEST_KIT00_FRONT_WHEEL_A","TEST_STYLE01_15_23_A"};
+    uint32_t tex[]={0xabcdef01u},mat[]={N2_MAT_RUBBER,N2_MAT_MAGSILVER};
+    float pos[3][3]={{0,0,0},{1,0,0},{0,1,0}};
+    uint16_t idx[]={0,1,2,2,1,0};
+    printf("\n  Wheel material identity through same-category ranges\n");
+    for(int name=0;name<2;name++)for(int bad=0;bad<3;bad++) {
+        Buf f={.n=0};SubSpec sub[]={{3,0,0,0},{3,0,1,3}};
+        if(bad==1)sub[1].start=4; /* invalid partition: no trusted material */
+        if(bad==2)sub[1].matid=99; /* preserve valid range, unknown identity */
+        object(&f,names[name],tex,1,mat,2,sub,2,pos,3,idx,6);
+        N2CarConfig cfg={0,1,0,1};N2Scene sc;
+        n2_load_car(f.b,f.n,&sc,tex,1,&cfg);
+        chk("source coverage is unchanged",total_nidx(&sc)==6);
+        if(bad==1)chk("malformed partition has no trusted material",
+            sc.count==1 && sc.meshes[0].car_material==0);
+        else {
+            chk("rubber and metal keep separate ranges with one texture/category",
+                sc.count==2 && sc.meshes[0].cat==sc.meshes[1].cat &&
+                sc.meshes[0].texkey==tex[0] && sc.meshes[1].texkey==tex[0]);
+            chk("material slots survive parsing; invalid slot remains unknown",
+                sc.count==2 && sc.meshes[0].car_material==mat[0] &&
+                sc.meshes[1].car_material==(bad==2?0:mat[1]));
+            chk("exact indices survive material splitting",sc.count==2 &&
+                !memcmp(sc.meshes[0].idx,idx,6) && !memcmp(sc.meshes[1].idx,idx+3,6));
+        }
+        n2_free_scene(&sc);
+    }
+}
+
+static void exhaust_attachment_test(void) {
+    printf("\n  Exhaust socket assembly after kit/LOD selection\n");
+    float pos[3][3]={{0,0,0},{.2f,0,0},{0,.1f,.1f}};
+    uint16_t idx[]={0,1,2,2,1,0};
+    uint32_t tex[]={0xabcdef01u},mat[]={N2_MAT_MAGCHROME,N2_MAT_INTERIOR};
+    SubSpec sub[]={{3,0,0,0},{3,0,1,3}};
+    for(int kit=0;kit<2;kit++)for(int mode=0;mode<7;mode++) {
+        Buf f={.n=0};
+        object(&f,"TEST_KIT00_EXHAUST_A",tex,1,mat,2,sub,2,pos,3,idx,6);
+        long source=8;
+        for(int k=0;k<2;k++) {
+            char name[64];snprintf(name,sizeof name,"TEST_KIT%02d_REAR_BUMPER_A",k);
+            long start=f.n;
+            object(&f,name,tex,1,NULL,0,NULL,0,pos,3,idx,3);
+            Buf marks={.n=0};
+            int count=mode==1 || mode==4?2:mode==3?0:1;
+            for(int side=0;side<count;side++) {
+                bu32(&marks,side && mode!=4?0xbd7cf15eu:0xbcf8a18bu);
+                bu32(&marks,0);bu32(&marks,0);bu32(&marks,0);
+                /* Socket +Z points rearward; reflected right socket mirrors Y. */
+                float m[]={0,0,1,0, 0,side?-1.f:1.f,0,0, -1,0,0,0,
+                           -2.f-k,side?-.5f:.5f,.1f,1};
+                if(mode==2)m[0]=NAN;
+                if(mode==4 && side)m[12]-=.2f; /* conflicting duplicate key */
+                if(mode==5)m[0]=.5f; /* shear */
+                for(int a=0;a<16;a++)bf32(&marks,m[a]);
+            }
+            if(mode==6)marks.n--; /* truncated marker record */
+            chunk(&f,0x0013401au,&marks);
+            uint32_t size=(uint32_t)(f.n-start-8);memcpy(f.b+start+4,&size,4);
+        }
+        N2CarConfig cfg={kit,0,0,0};N2Scene s;
+        n2_load_car(f.b,f.n,&s,tex,1,&cfg);
+        int n=0,ok=1;
+        for(int i=0;i<s.count;i++)if(s.meshes[i].car_source==source) {
+            N2Mesh *m=s.meshes+i;
+            int reflected=n>=2;
+            if(mode<2) {
+                ok &= fabsf(m->verts[0]-(-2.f-kit))<1e-6f;
+                ok &= fabsf(m->verts[1]-(reflected?-.5f:.5f))<1e-6f;
+                ok &= fabsf(m->verts[2]-.1f)<1e-6f;
+                ok &= fabsf(m->verts[5]-(-1.8f-kit))<1e-6f;
+                ok &= fabsf(m->verts[11]-(reflected?-.6f:.6f))<1e-6f;
+                ok &= m->idx[1]==idx[(n%2)*3+(reflected?2:1)];
+            } else ok &= !memcmp(m->verts,pos[0],3*sizeof(float)) &&
+                        !memcmp(m->idx,idx+(n%2)*3,3*sizeof(uint16_t));
+            ok &= m->texkey==tex[0] && m->car_material==mat[n%2];
+            for(int v=0;v<m->nverts;v++)ok &= m->verts[v*5+3]==0 && m->verts[v*5+4]==0;
+            n++;
+        }
+        chk(mode<2?"selected kit socket places all slices, preserves materials/UVs/winding":
+                   "invalid/missing/conflicting socket leaves source slices intact",ok);
+        chk("single/dual socket geometry count is exact",n==(mode==1?4:2));
+        n2_free_scene(&s);
+    }
+}
+
 int main(void) {
+    exhaust_attachment_test();
+    wheel_material_identity_test();
     car_texture_alpha_test();
     rim_tier_test();
     rim_orientation_test();

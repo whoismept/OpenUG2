@@ -1,9 +1,31 @@
 # Vehicle rendering status and audit notes
 
-Updated 2026-09-10. This consolidates the recent vehicle rendering work on
-`development`; the fixes remain local and uncommitted. The broader wheel audit
-now covers every selected wheel model found in the local archives. Its scope
-is observation only: runtime behaviour and assets are unchanged by the audit.
+Updated 2026-09-11. Covers wheel material isolation, stable wheel selection
+while driving, stock exhaust attachment and shared brake-disc textures.
+
+## Wheel material isolation (latest implementation)
+
+The loader retains each trusted source material hash through GPU upload.
+Wheel ranges also split when material identities differ despite sharing a
+texture and category; malformed partitions keep the conservative unknown
+material fallback. The shared stock/library draw helper limits rim paint to
+the identified MAGSILVER and MAGCHROME materials. RUBBER, DULLPLASTIC and the
+attributed backing material suppress metallic specular, environment and
+clearcoat contributions. Unknown materials keep their texture colour and
+existing lighting. These are renderer policies, not recovered retail shaders.
+
+The 159-model atlas rerender has an identical manifest: triangle counts,
+categories, texture bindings, alpha modes and radii are unchanged. Four sheets
+(005, 009, 010, 022) were visually reviewed in this pass; three mounted 1080p
+captures cover MIATA NFSU02 paint on/off and opposite-side HUMMER ADVAN02.
+Backings no longer receive the gray metallic sheen; rubber no longer receives
+rim tint. Source gray tyre detail, angular ADVAN/AVUS surfaces, unknown wheel
+materials and the unresolved traffic texture path remain separate limitations.
+
+Verification: 200 parser assertions (also ASan/UBSan), GL colour/alpha/state
+regression, debug and normal builds. GL requires display access; Apple's
+texture-zero sampler warning remains. Local evidence and reproduction:
+`scratchpad/vehicle_wheel_audit/MATERIALS.md`.
 
 ## Proven rendering fixes
 
@@ -140,27 +162,51 @@ the separate `CARS/WHEELS` library. Wheel-only views must record their selected
 car/style, view and dimensions. They isolate wheel surfaces but cannot approve
 body attachment, road contact or whole-scene transparency.
 
-## Unresolved appearance and exhaust attachment
+## Exhaust attachment and remaining presentation work
 
 The next UI/resource-ownership stage is specified in
 [Vehicle customization and in-place switching](VEHICLE_CUSTOMIZATION.md):
 one Modification surface with shop subtabs and car-only reloads that preserve
 the loaded world/session. This design is not yet implemented.
 
-Rim tint/specular still affects tyre and backing slices, and ADVAN retains
-visible angular surfaces. Range-centre sorting is neither triangle-level nor
-global scene transparency sorting. High-speed wheel blur and opponent tyres
-remain procedural. Separate diameter/width selection, independent brake-disc
+Unknown wheel materials still need attribution, and ADVAN retains visible
+angular surfaces. Range-centre sorting is neither triangle-level nor
+global scene transparency sorting. Player stock/library wheels now keep their
+authored geometry and material routing at every speed: the old 40 km/h switch
+to a shiny procedural disc is removed. Wheel rotation remains driven by road
+speed; motion blur is deferred until it preserves the selected wheel. Opponent
+tyres and the missing-geometry fallback remain procedural. Separate diameter/width selection, independent brake-disc
 rotation, tyre-road visual fidelity and the complete modification UI are open.
 
-The object near MIATA's body origin is attributed to `KIT00_EXHAUST_A`.
-Its source object transform is identity; the KIT00 rear bumper owns a
-`RIGHT_EXHAUST` position marker at approximately (-1.991, -0.516, +0.092) m.
-The marker basis does not directly match the stock pipe's axes, and KIT01 has
-a different attachment position. A 350Z comparison also has a nonidentity
-exhaust pivot and left/right markers. Correct assembly orientation is still
-unproven. This is an attachment issue; no guessed transform or mesh removal
-has been applied.
+Wheel-style cycling uses `F6` once per press. The former `W` binding collided
+with throttle and processed key repeats, replacing the wheels repeatedly while
+accelerating. `W` now leaves the selected wheels untouched; the ImGui selector
+remains available and follows changes made with `F6`.
+
+Player brake surfaces retain validated texture keys even when their textures
+live outside the car pack. Startup reuses the already loaded GLOBALB pack to
+resolve shared brake textures by exact key, then keeps them in the car texture
+map for kit reloads. Brake draws use the existing wheel material helper's
+cutout/depth handling, preserving the disc's transparent outline. Missing
+packs retain the mechanical fallback. Source disc size and placement are
+unchanged; opaque rim spokes can still obscure parts of the disc.
+
+Stock exhausts now attach through the retained rear bumper's left/right
+sockets after kit and LOD selection in `n2_load_car`. The loader preserves
+source-object ownership across material slices, converts the measured stock
+pipe axes to the socket basis, and places every slice at each socket. Reflected
+sockets reverse triangle winding. Startup and kit reload share this path.
+Missing, malformed or ambiguous attachments retain the original geometry.
+
+The source check covers 28 cars across KIT00–02: 84 resolved configurations,
+unchanged wheel radii, and one rear body-bound extension of about 1.1 mm.
+Parser fixtures cover single/dual sockets, reflection, kit selection and
+invalid records; ASan/UBSan pass. Inspected 1920x1080 captures cover MIATA stock
+and KIT01 reload, 350Z dual outlets and ESCALADE's angled outlet. The axis
+conversion is inferred from source geometry and socket measurements, not a
+recovered retail assembly implementation. Other kits and aftermarket exhaust
+libraries remain unverified; these isolated views do not establish road contact
+or finished exhaust lighting. Current evidence: `scratchpad/vehicle_exhaust/ASSEMBLY.md`.
 
 Local reproduction logs and captures remain under
 `scratchpad/vehicle_wheel_draw/`, `scratchpad/vehicle_materials/`,

@@ -579,14 +579,15 @@ window glass on the *same* texture slot while giving them different
 `matid` values — `n2_walk_car`'s old texture-only split could never see
 that difference and drew the whole thing as one opaque panel.
 
-`n2_mat_class` maps a material hash to a category. Only two mappings are
-proven and used: `WINDSHIELD -> N2_CAR_GLASS`, `CARSKIN -> N2_CAR_BODY`
-(both hash constants independently re-derived and verified against live
-`GOLF` data — see the `n2_mesh_submeshes` doc comment for the exact
-records). Chrome, aluminium, moldings, plastics, tire/rim materials and
-lens classes are measurable the same way but are deliberately NOT
-classified yet; an unmapped or out-of-range `matid` inherits the
-object-level category from `n2_car_category`, unchanged.
+`n2_mat_class` maps WINDSHIELD to GLASS, CARSKIN to BODY and the measured
+inner-surface material to INTERIOR. Other hashes inherit the object category.
+Separately, `N2Mesh.car_material` retains the trusted source hash through
+`GpuMesh`. Stock wheel objects and objects containing RUBBER also split on
+material identity, preserving metal/rubber boundaries even when their texture
+and category agree. Unsplit mixed or invalid data has material identity zero.
+The wheel draw permits tint only on MAGSILVER/MAGCHROME; RUBBER, DULLPLASTIC
+and backing ranges suppress metallic lighting. This does not change the body
+material shader or claim to reproduce retail material parameters.
 
 Before trusting a matid-driven (or texture-driven) split at all,
 `n2_car_submesh_partition_ok` requires the `0x134B02` ranges to start at
@@ -626,8 +627,30 @@ hub travel and front steering, including on opponent cars. The caliper and
 disc remain one non-spinning assembly; independent disc rotation is not yet
 implemented. Stock coverage/attachments were checked across 29 player cars,
 with left/right/underside captures for five. This does not establish complete
-vehicle fidelity: high-speed wheel blur and opponent tyres are procedural, and
-the MIATA `KIT00_EXHAUST_A` part still needs its attachment orientation resolved.
+vehicle fidelity: opponent tyres remain procedural, and independent brake-disc
+rotation is open. Stock exhaust attachment is covered below.
+
+Brake discs also reference a shared texture outside the per-car pack. The car
+parser now preserves exact texture keys on validated brake ranges, including
+single-range parts, without changing unresolved-key handling for body/wheel
+parts. Startup tries the car pack first, then the existing GLOBALB data for
+brake mounts only. Shared textures enter the same GPU map used by kit reloads;
+GLOBALB bytes and its temporary TPK index are released after upload. Brake
+draws reuse `render_wheel_mesh` to honor authored cutout alpha and restore GL
+state, eliminating the untextured dark disc and its opaque square corners.
+No geometry, rotor sizing or hub transforms change. Validation covers all
+29 stock cars' brake texture resolution, parser/sanitizer checks and mirrored
+stock/library captures; evidence remains in `scratchpad/vehicle_brakes/`.
+
+Player stock/library wheel draws no longer switch to a generic procedural
+disc above 40 km/h. That switch discarded source geometry, alpha routing and
+rubber material isolation, producing shiny filled wheels during motion.
+The selected geometry now stays active at all speeds with the existing hub
+rotation. The unused blur texture generator is removed; procedural geometry
+remains only for opponents and missing player wheel geometry. Motion blur
+needs a later solution that preserves the selected wheel. Controlled HUMMER
+stock/NFSU02 speed sweeps and matched captures are reproducible under
+`scratchpad/vehicle_wheel_motion/`.
 
 Aftermarket rims now retain all material slices of the first selected source
 `tierid`, through `n2_rim_select_tier`, and draw them at each hub. Different
@@ -668,20 +691,27 @@ sides. An 80-style check preserves common slice pivots, indices, UVs and radius.
 MIATA/HUMMER stock, NFSU02 cutout and ADVAN02 blend captures were inspected at
 1920x1080, including opposite-side MIATA controls. Spokes remain visible with
 all source triangles (ADVAN02: 457 -> 461 per hub). This does not establish
-finished wheel materials: rim tint still affects tyre/backing slices, ADVAN
-has visible angular surfaces, and range-centre sorting is not per-triangle or
+finished wheel materials: the later material-isolation fix protects tyre and
+backing ranges, but ADVAN still has angular surfaces and sorting is not per-triangle or
 whole-scene transparency ordering. Evidence: `scratchpad/vehicle_wheel_draw/`;
 decoder fixtures and source metadata: `scratchpad/vehicle_materials/`.
 
-Exhaust attribution has identified an object-owned `0x13401A` RIGHT_EXHAUST
-record on MIATA's KIT00 rear bumper, but the marker basis cannot yet be applied
-directly to the stock exhaust's local axes. No inferred translation/rotation
-or mesh-hiding workaround is applied. Detailed measurements and same-pose
-1080p evidence are kept locally under `scratchpad/vehicle_exhaust/`.
-The user's follow-up also identifies the body-centre object as a likely
-misplaced exhaust. For MIATA the source trace already identifies
-`KIT00_EXHAUST_A` near the origin: resolve its attachment, do not remove it as
-unwanted geometry. The correct assembly orientation remains unverified.
+`n2_load_car` now assembles stock exhaust slices after kit selection and LOD
+deduplication, using object-owned rear-bumper sockets. `car_source` retains the
+source object offset for every material slice. The shared attachment helper
+converts source axes to the measured socket convention once per fresh load,
+preserves UVs/materials, duplicates dual outlets and corrects reflected winding.
+It prepares all copies before replacing geometry; unsupported or invalid
+attachments keep the original source meshes. Startup and K kit reload use
+the same loader. This is a source-measured convention, not recovered retail code.
+
+Validation covers 84 configurations (28 cars, KIT00–02), parser fixtures and
+ASan/UBSan. Wheel radii remain unchanged; one rear body bound extends about
+1.1 mm. Four inspected 1080p views cover stock/kit reload, dual and angled
+outlets. Further kits and aftermarket exhaust libraries are not verified.
+Detailed source measurements, commands and captures remain local in
+`scratchpad/vehicle_exhaust/ASSEMBLY.md`, superseding the earlier unresolved
+orientation notes in that directory's historical report.
 
 Wheel position and ride height remain separate concerns: axle/track data place
 contact points, while the selected tyre radius/body profile determines
@@ -711,7 +741,7 @@ tuning pass. The current checklist is:
 Each part must keep its authored mesh/material relationship, preserve the
 stock fallback when an optional library is absent, and include one screenshot
 or parser/runtime trace per car family before being called complete. The
-existing `W` rim and `K` kit controls are diagnostic entry points only; they
+existing `F6` rim and `K` kit controls are diagnostic entry points only; they
 are not yet the final modification system.
 
 ## 9. Vehicle dynamics and contact
