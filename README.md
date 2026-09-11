@@ -195,7 +195,8 @@ milestone.
 
 **Controls:** driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
 grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look ·
-`E`/`Q` up/down · `Shift` faster), `1` developer overlay, `Esc` quit. Cars
+`E`/`Q` up/down · `Shift` faster), `1` developer overlay, `F6` cycle rim style
+(once per press), `K` cycle body kit, `Esc` quit. Cars
 collide and building contact is confirmed against source mesh faces before the
 car is pushed. `--shot out.png` renders one frame to a PNG and exits.
 

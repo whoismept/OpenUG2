@@ -430,6 +430,7 @@ GpuMesh *upload_scene(N2Scene *s) {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
         gm[i].trim = m->trim;
+        gm[i].car_material = m->car_material;
         free(nor);
     }
     return gm;
@@ -884,12 +885,7 @@ GpuMesh make_wheel(float R, float halfW) {
  * (centre 0.5,0.5, ring at uv-radius 0.5), so paint by relative radius —
  * bright hub disc, spoked metal mid, dark rubber edge. The tread quads
  * sample the outer ring = rubber. */
-/* spin_blur: 0 = crisp spokes, 1 = the same rim averaged around its own axis,
- * i.e. what the spokes smear into once the wheel turns faster than the eye can
- * follow. Generated, not loaded: there is no pre-baked blur asset anywhere in
- * CARS/ (checked every TEXTURES.BIN — the only "SPIN" hits are the SPINNER rim
- * accessory), and the rim itself is procedural here anyway. */
-static GLuint make_wheel_tex_var(int spin_blur) {
+GLuint make_wheel_tex(void) {
     enum { S = 64 };
     static unsigned char px[S*S*3];
     for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
@@ -898,12 +894,8 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char v;
         if (r > 0.78f)      v = 14;                                  /* rubber */
         else if (r > 0.30f) {                                        /* spokes */
-            /* the crisp term is (0.5+0.5cos)^2, whose mean over a full turn is
-               0.25 + 0.25*mean(cos^2) = 0.375 — so the blurred ring carries the
-               true angular average of the spokes: same mean brightness, no
-               spoke phase left to strobe. */
             float spoke = 0.5f + 0.5f*cosf(5.0f*atan2f(dy, dx));
-            v = (unsigned char)(38 + 70.0f*(spin_blur ? 0.375f : spoke*spoke));
+            v = (unsigned char)(38 + 70.0f*spoke*spoke);
         } else               v = r < 0.10f ? 150 : 105;              /* hub */
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
@@ -918,8 +910,6 @@ static GLuint make_wheel_tex_var(int spin_blur) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     return id;
 }
-GLuint make_wheel_tex(void)      { return make_wheel_tex_var(0); }
-GLuint make_wheel_blur_tex(void) { return make_wheel_tex_var(1); }
 
 /* unit-quad buffers for the 2D HUD / billboards (drawn in NDC via uMVP) */
 GpuMesh make_quad(void) {
@@ -952,8 +942,9 @@ void draw_gpumesh(GpuMesh *g) {
 }
 
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
-    const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal};
-    float saved[5];for(int i=0;i<5;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal,
+                       r->uRimTint,r->uSpec,r->uEnv,r->uClearcoat};
+    float saved[9];for(int i=0;i<9;i++)glGetUniformfv(r->prog,loc[i],saved+i);
     GLint oldtex,src,dst,srca,dsta;
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&oldtex);
     glGetIntegerv(GL_BLEND_SRC_RGB,&src);glGetIntegerv(GL_BLEND_DST_RGB,&dst);
@@ -966,11 +957,18 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);
     glUniform1f(r->uTextureAlpha,translucent?1.0f:0.0f);
     glUniform1f(r->uAlpha,1.0f);glUniform1f(r->uDecal,0.0f);
+    uint32_t material=mesh->car_material;
+    if (!texture || (material!=N2_MAT_MAGSILVER && material!=N2_MAT_MAGCHROME))
+        glUniform1f(r->uRimTint,0.0f);
+    if (material==N2_MAT_RUBBER || material==N2_MAT_INTERIOR || material==N2_MAT_DULLPLASTIC) {
+        glUniform1f(r->uSpec,0.0f);glUniform1f(r->uEnv,0.0f);
+        glUniform1f(r->uClearcoat,0.0f);
+    }
     glEnable(GL_DEPTH_TEST);glDepthMask(translucent?GL_FALSE:GL_TRUE);
     if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
     else glDisable(GL_BLEND);
     draw_gpumesh(mesh);
-    for(int i=0;i<5;i++)glUniform1f(loc[i],saved[i]);
+    for(int i=0;i<9;i++)glUniform1f(loc[i],saved[i]);
     glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
     glBlendFuncSeparate((GLenum)src,(GLenum)dst,(GLenum)srca,(GLenum)dsta);
     if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);

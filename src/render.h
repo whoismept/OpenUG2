@@ -24,7 +24,7 @@
 #include "nfsu2.h"
 
 /* per-mesh GPU buffers + computed normals */
-typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim; uint32_t texkey; } GpuMesh;
+typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim; uint32_t texkey, car_material; } GpuMesh;
 
 /* ---- static-world batching: meshes merged per (256m grid cell, texture) ----
  * One interleaved VBO per batch kills the per-mesh bind/attrib overhead;
@@ -106,11 +106,11 @@ RProg    render_program(void);          /* compile+link the shader, fetch unifor
 GpuMesh *upload_scene(N2Scene *s);      /* VBO/NBO/IBO per mesh, normals computed */
 GpuMesh  make_wheel(float R, float halfW);  /* procedural tyre (see render.c) */
 GLuint   make_wheel_tex(void);          /* radial alloy-rim texture for it */
-GLuint   make_wheel_blur_tex(void);     /* same rim, angular-averaged (spinning) */
 GpuMesh  make_quad(void);               /* unit quad for HUD / billboards */
 void     draw_gpumesh(GpuMesh *g);
-/* Wheel material draw: caller owns lighting/MVP; texture, alpha, blend and
- * depth state are restored. Missing textures use the opaque colour fallback. */
+/* Wheel material draw: paint is restricted to proven metal; rubber, backing
+ * and plastic suppress metallic lighting. All touched uniforms, texture,
+ * alpha, blend and depth state are restored. Missing textures stay opaque. */
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode);
 /* Sort the four instances of a library's material slices by view depth.
  * order has space for 4 * scene->count entries (hub * count + slice). */

@@ -92,8 +92,40 @@ int main(void) {
     assert(overlap[0]>120 && overlap[0]<136 && overlap[1]>120 && overlap[1]<136 && overlap[2]<5);
     glReadPixels(28,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,overlap);
     assert(overlap[0]>245 && overlap[1]<5 && overlap[2]<5);
+    /* Axial wheel face: rim paint and sheen must not brighten dark rubber,
+       plastic or backing texels. Exercise both authored alpha modes. */
+    const uint32_t materials[]={N2_MAT_RUBBER,N2_MAT_INTERIOR,N2_MAT_DULLPLASTIC,
+                                N2_MAT_MAGSILVER,N2_MAT_MAGCHROME,0,0x12049251u};
+    float axial[]={0,1,0, 0,1,0, 0,1,0, 0,1,0};
+    glBindBuffer(GL_ARRAY_BUFFER,q.nbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof axial,axial,GL_STATIC_DRAW);
+    for(int i=0;i<4;i++)pixels[i*4]=pixels[i*4+1]=pixels[i*4+2]=32;
+    glBindTexture(GL_TEXTURE_2D,tex);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,1,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    glUniform1f(r.uAmbient,.42f);glUniform3f(r.uLight,0,0,-1);
+    for(int mode=N2_DRAW_CUTOUT;mode<=N2_DRAW_BLEND;mode++)
+    for(int material=0;material<7;material++) {
+        unsigned char raw[4]={0};q.car_material=materials[material];
+        for(int paint=0;paint<2;paint++) {
+            glDepthMask(GL_TRUE);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+            glUniform1f(r.uRimTint,(float)paint);glUniform1f(r.uSpec,.85f);
+            glUniform1f(r.uEnv,.25f);glUniform1f(r.uClearcoat,.4f);
+            render_wheel_mesh(&r,&q,tex,mode);
+            unsigned char sample[4],corner[4];
+            glReadPixels(28,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,sample);
+            glReadPixels(4,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,corner);
+            assert(corner[0]<5 && corner[1]<5 && corner[2]>245);
+            if(!paint)memcpy(raw,sample,4);
+            else if(material==3 || material==4)assert(sample[1]>sample[0]+10);
+            else assert(!memcmp(raw,sample,3)); /* no tint, including unknowns */
+            if(material<3)assert(sample[0]<25 && sample[1]<25 && sample[2]<25);
+            const GLint loc[]={r.uRimTint,r.uSpec,r.uEnv,r.uClearcoat};
+            const float expected[]={(float)paint,.85f,.25f,.4f};
+            for(int i=0;i<4;i++){float value;glGetUniformfv(r.prog,loc[i],&value);assert(value==expected[i]);}
+        }
+    }
     assert(glGetError()==GL_NO_ERROR);
     glDeleteTextures(1,&tex);glDeleteBuffers(1,&q.vbo);glDeleteBuffers(1,&q.nbo);glDeleteBuffers(1,&q.ibo);
     glDeleteProgram(r.prog);SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(w);SDL_Quit();
-    puts("wheel_render_test: PASS (cutoff boundary, partial alpha, opaque/missing texture, occlusion, state, range/hub sorting, opaque overlap)");
+    puts("wheel_render_test: PASS (alpha, depth, state, sorting, overlap, wheel material paint/sheen isolation)");
 }
