@@ -9,6 +9,19 @@
 
 #include "render.h"
 
+#if defined(__APPLE__) && !defined(N2_GLES)
+#define glGenFramebuffers glGenFramebuffersEXT
+#define glBindFramebuffer glBindFramebufferEXT
+#define glFramebufferTexture2D glFramebufferTexture2DEXT
+#define glCheckFramebufferStatus glCheckFramebufferStatusEXT
+#define glDeleteFramebuffers glDeleteFramebuffersEXT
+#define glGenRenderbuffers glGenRenderbuffersEXT
+#define glBindRenderbuffer glBindRenderbufferEXT
+#define glRenderbufferStorage glRenderbufferStorageEXT
+#define glFramebufferRenderbuffer glFramebufferRenderbufferEXT
+#define glDeleteRenderbuffers glDeleteRenderbuffersEXT
+#endif
+
 #ifdef N2_GLES
 #  define GLSL_HEADER "precision mediump float;\n"
 #else
@@ -124,6 +137,28 @@ static const char *FS =
     "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
     "uniform float uFresnel;\n"   /* >0.5: glass -- fresnel drives alpha + reflection */
     "uniform float uClearcoat;\n" /* >0: second tight specular lobe over the base coat */
+    "uniform vec4 uHeadPos[2];\n"
+    "uniform vec3 uHeadForward, uHeadRight, uHeadUp;\n"
+    "uniform vec4 uHeadShape;\n" /* horizontal/vertical spread, downward slope, range */
+    "uniform float uHeadGain, uHeadLow;\n"
+    "uniform float uHeadShadow;\n"
+    "uniform sampler2D uHeadShadowMap0, uHeadShadowMap1;\n"
+    "uniform mat4 uHeadShadowMVP[2];\n"
+    "float headVisibility(int h,vec3 position,vec3 normal,float along){\n"
+    "  if(uHeadShadow<0.5)return 1.0;\n"
+    "  float offset=0.005+along*max(uHeadShape.x,uHeadShape.y)*2.0/512.0;\n"
+    "  vec4 clip=uHeadShadowMVP[h]*vec4(position+normal*offset,1.0);\n"
+    "  vec2 uv=clip.xy/clip.w*0.5+0.5;\n"
+    "  if(clip.w<=0.0 || uv.x<0.0 || uv.x>1.0 || uv.y<0.0 || uv.y>1.0)return 1.0;\n"
+    "  float depth=(clip.w-0.025-0.001*along)/uHeadShape.w;\n"
+    "  float visibility=0.0;\n"
+    "  for(int x=0;x<2;x++)for(int y=0;y<2;y++){\n"
+    "    vec2 at=uv+(vec2(float(x),float(y))-0.5)/512.0;\n"
+    "    vec2 depthRG=h==0?texture2D(uHeadShadowMap0,at).rg:texture2D(uHeadShadowMap1,at).rg;\n"
+    "    visibility+=step(depth,dot(depthRG,vec2(1.0,1.0/255.0)))*0.25;\n"
+    "  }\n"
+    "  return visibility;\n"
+    "}\n"
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -229,6 +264,21 @@ static const char *FS =
        grass/dirt variation back, and the flat "cardboard" look goes away. Gated
        by uVColor so cars/props (which don't carry it) are untouched. */
     "  if(uVColor>0.001) lit = mix(lit, lit*clamp(vColor.rgb*2.0, 0.0, 1.6), uVColor);\n"
+    /* Surface lighting and per-lamp world-geometry shadows. */
+    "  if(uHeadGain>0.0) for(int h=0;h<2;h++){\n"
+    "    vec3 ray=vPos-uHeadPos[h].xyz; float dist=length(ray);\n"
+    "    float along=dot(ray,uHeadForward);\n"
+    "    if(uHeadPos[h].w>0.5 && along>0.05 && dist<uHeadShape.w){\n"
+    "      float lateral=dot(ray,uHeadRight)/along;\n"
+    "      float elevation=dot(ray,uHeadUp)/along;\n"
+    "      vec2 cone=vec2(lateral/uHeadShape.x,(elevation+uHeadShape.z)/uHeadShape.y);\n"
+    "      float edge=1.0-smoothstep(0.55,1.0,length(cone));\n"
+    "      float cutoff=mix(1.0,1.0-smoothstep(-0.018,-0.008,elevation),uHeadLow);\n"
+    "      float reach=1.0-smoothstep(uHeadShape.w*0.65,uHeadShape.w,dist);\n"
+    "      float lambert=max(dot(N,-ray/max(dist,0.001)),0.0);\n"
+    "      if(edge*cutoff*lambert>0.0)lit+=base*vec3(1.0,0.94,0.82)*edge*cutoff*reach*lambert*uHeadGain*5.0*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);\n"
+    "    }\n"
+    "  }\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
@@ -348,6 +398,167 @@ static GLuint compile(GLenum type, const char *src) {
     return s;
 }
 
+/* Colour maps plus a depth renderbuffer work without depth-texture extensions.
+ * ponytail: fixed 512px world-only maps; add vehicle casters when their renderer
+ * supports receiving world-space lights. Alpha-blended surfaces do not cast. */
+void free_headlight_shadows(HeadlightShadows *s) {
+    glDeleteTextures(2,s->texture);glDeleteTextures(1,&s->white);
+    glDeleteRenderbuffers(1,&s->depth);glDeleteFramebuffers(1,&s->fbo);
+    if(s->program)glDeleteProgram(s->program);
+    memset(s,0,sizeof *s);
+}
+
+static int headlight_shadow_init(HeadlightShadows *s) {
+    const char *vs=GLSL_HEADER
+        "attribute vec3 aPos;attribute vec2 aUV;uniform mat4 uMVP;"
+        "varying vec2 uv;varying float distance;"
+        "void main(){uv=aUV;gl_Position=uMVP*vec4(aPos,1.0);distance=gl_Position.w;}";
+    const char *fs=GLSL_HEADER
+        "uniform sampler2D uTex;uniform float uCutout,uRange;"
+        "varying vec2 uv;varying float distance;"
+        "void main(){if(uCutout>0.5 && texture2D(uTex,uv).a<0.5)discard;"
+        "vec2 enc=fract(clamp(distance/uRange,0.0,0.99999)*vec2(1.0,255.0));"
+        "enc.x-=enc.y/255.0;gl_FragColor=vec4(enc,0.0,1.0);}";
+    GLuint v=compile(GL_VERTEX_SHADER,vs),f=compile(GL_FRAGMENT_SHADER,fs);
+    s->program=glCreateProgram();glAttachShader(s->program,v);glAttachShader(s->program,f);
+    glBindAttribLocation(s->program,0,"aPos");glBindAttribLocation(s->program,1,"aUV");
+    glLinkProgram(s->program);glDeleteShader(v);glDeleteShader(f);
+    GLint linked=0;glGetProgramiv(s->program,GL_LINK_STATUS,&linked);if(!linked)return 0;
+    s->mvp=glGetUniformLocation(s->program,"uMVP");
+    s->cutout=glGetUniformLocation(s->program,"uCutout");
+    s->range=glGetUniformLocation(s->program,"uRange");
+    glGenTextures(2,s->texture);
+    for(int h=0;h<2;h++) {
+        glBindTexture(GL_TEXTURE_2D,s->texture[h]);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,512,512,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    }
+    unsigned char white[]={255,255,255};N2Tex tex={.w=1,.h=1,.rgb=white};s->white=upload_tex(&tex);
+    glGenFramebuffers(1,&s->fbo);glBindFramebuffer(GL_FRAMEBUFFER,s->fbo);
+    glGenRenderbuffers(1,&s->depth);glBindRenderbuffer(GL_RENDERBUFFER,s->depth);
+    glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,512,512);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,s->depth);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s->texture[0],0);
+    return s->white && glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
+}
+
+static int headlight_caster_visible(const N2Batch *b,const float m[16]) {
+    for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2) {
+        float plane[4];for(int a=0;a<4;a++)plane[a]=m[a*4+3]+sign*m[a*4+axis];
+        float best=plane[3];
+        for(int a=0;a<3;a++)best+=plane[a]*(plane[a]>=0?b->bbox_max[a]:b->bbox_min[a]);
+        if(best<0)return 0;
+    }
+    return 1;
+}
+
+int render_headlight_shadows(const RProg *r,HeadlightShadows *s,const N2Batch *batches,int count) {
+    float gain;glGetUniformfv(r->prog,r->uHeadGain,&gain);
+    glUniform1f(r->uHeadShadow,0.0f);
+    if(gain<=0 || s->failed)return s->failed?-1:0;
+    float pos[2][4],forward[3],right[3],up[3],shape[4];
+    /* glGetUniformfv returns one array element, not the whole array. */
+    glGetUniformfv(r->prog,r->uHeadPos,pos[0]);
+    glGetUniformfv(r->prog,glGetUniformLocation(r->prog,"uHeadPos[1]"),pos[1]);
+    glGetUniformfv(r->prog,r->uHeadForward,forward);glGetUniformfv(r->prog,r->uHeadRight,right);
+    glGetUniformfv(r->prog,r->uHeadUp,up);glGetUniformfv(r->prog,r->uHeadShape,shape);
+    GLint program,fbo,rb,viewport[4],active,texture,depthfunc;
+    GLfloat clear[4],clear_depth;GLboolean mask[4],depthmask;
+    GLboolean depth=glIsEnabled(GL_DEPTH_TEST),blend=glIsEnabled(GL_BLEND),cull=glIsEnabled(GL_CULL_FACE);
+    GLboolean scissor=glIsEnabled(GL_SCISSOR_TEST),dither=glIsEnabled(GL_DITHER);
+    glGetIntegerv(GL_CURRENT_PROGRAM,&program);glGetIntegerv(GL_FRAMEBUFFER_BINDING,&fbo);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING,&rb);glGetIntegerv(GL_VIEWPORT,viewport);
+    glGetIntegerv(GL_ACTIVE_TEXTURE,&active);glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);glGetIntegerv(GL_DEPTH_FUNC,&depthfunc);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE,clear);glGetBooleanv(GL_COLOR_WRITEMASK,mask);
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&depthmask);glGetFloatv(GL_DEPTH_CLEAR_VALUE,&clear_depth);
+    int draws=0;float matrices[2][16];
+    if(!s->fbo && !headlight_shadow_init(s)) {
+        free_headlight_shadows(s);s->failed=1;
+        fprintf(stderr,"Headlight shadows unavailable; retaining unshadowed beams.\n");
+        draws=-1;goto restore;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER,s->fbo);glViewport(0,0,512,512);
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LESS);glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_SCISSOR_TEST);glDisable(GL_DITHER);
+#ifdef N2_GLES
+    glClearDepthf(1.0f);
+#else
+    glClearDepth(1.0);
+#endif
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glClearColor(1,1,1,1);
+    glUseProgram(s->program);glUniform1f(s->range,shape[3]);
+    for(int h=0;h<2;h++) {
+        float dir[3],vertical[3],view[16]={0},projection[16];
+        for(int a=0;a<3;a++){dir[a]=forward[a]-up[a]*shape[2];vertical[a]=up[a]+forward[a]*shape[2];}
+        vnorm(dir);vnorm(vertical);view[15]=1;
+        for(int a=0;a<3;a++) {
+            view[a*4]=right[a];view[a*4+1]=vertical[a];view[a*4+2]=-dir[a];
+            view[12]-=right[a]*pos[h][a];view[13]-=vertical[a]*pos[h][a];view[14]+=dir[a]*pos[h][a];
+        }
+        mat_persp(2*atanf(shape[1]*1.15f),shape[0]/shape[1],.05f,shape[3],projection);
+        mat_mul(projection,view,matrices[h]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s->texture[h],0);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        if(pos[h][3]<.5f)continue;
+        glUniformMatrix4fv(s->mvp,1,GL_FALSE,matrices[h]);
+        for(int i=0;i<count;i++) {
+            const N2Batch *b=batches+i;
+            if(b->drawmode!=N2_DRAW_OPAQUE && b->drawmode!=N2_DRAW_CUTOUT)continue;
+            if(!headlight_caster_visible(b,matrices[h]))continue;
+            glBindTexture(GL_TEXTURE_2D,b->tex?b->tex:s->white);
+            glUniform1f(s->cutout,b->tex && b->drawmode==N2_DRAW_CUTOUT?1.0f:0.0f);
+            draw_batch(b);draws++;
+        }
+    }
+restore:
+    glBindFramebuffer(GL_FRAMEBUFFER,(GLuint)fbo);glBindRenderbuffer(GL_RENDERBUFFER,(GLuint)rb);
+    glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);glUseProgram((GLuint)program);
+    glClearColor(clear[0],clear[1],clear[2],clear[3]);glColorMask(mask[0],mask[1],mask[2],mask[3]);
+    glDepthFunc((GLenum)depthfunc);glDepthMask(depthmask);
+#ifdef N2_GLES
+    glClearDepthf(clear_depth);
+#else
+    glClearDepth(clear_depth);
+#endif
+    if(depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);
+    if(cull)glEnable(GL_CULL_FACE);else glDisable(GL_CULL_FACE);
+    if(scissor)glEnable(GL_SCISSOR_TEST);else glDisable(GL_SCISSOR_TEST);
+    if(dither)glEnable(GL_DITHER);else glDisable(GL_DITHER);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)texture);
+    if(draws>=0) {
+        glUniformMatrix4fv(r->uHeadShadowMVP,2,GL_FALSE,matrices[0]);
+        /* Units 1 and 2 are reserved for the two maps; ordinary textures use 0. */
+        for(int h=0;h<2;h++){glActiveTexture(GL_TEXTURE1+h);glBindTexture(GL_TEXTURE_2D,s->texture[h]);}
+        glUniform1i(r->uHeadShadowMap[0],1);glUniform1i(r->uHeadShadowMap[1],2);
+        glUniform1f(r->uHeadShadow,1.0f);
+    }
+    glActiveTexture((GLenum)active);return draws;
+}
+
+void render_headlights(const RProg *r, const float model[16], const float anchors[4][4],
+                       int high, float pitch, float range, float gain) {
+    float pos[2][4];
+    for(int b=0;b<2;b++) {
+        for(int a=0;a<3;a++)pos[b][a]=model[a]*anchors[b][0]+model[4+a]*anchors[b][1]+
+                                    model[8+a]*anchors[b][2]+model[12+a];
+        pos[b][3]=anchors[b][3];
+    }
+    glUniform4fv(r->uHeadPos,2,&pos[0][0]);
+    glUniform3fv(r->uHeadForward,1,model);
+    glUniform3fv(r->uHeadRight,1,model+4);
+    glUniform3fv(r->uHeadUp,1,model+8);
+    glUniform4f(r->uHeadShape,high?.20f:.38f,high?.095f:.12f,
+                tanf(pitch*3.14159265f/180.0f),fmaxf(range,1.0f));
+    glUniform1f(r->uHeadLow,high?0.0f:1.0f);
+    glUniform1f(r->uHeadGain,fmaxf(gain,0.0f));
+    glUniform1f(r->uHeadShadow,0.0f); /* maps must be refreshed for this pose */
+}
+
 RProg render_program(void) {
     RProg r;
     r.prog = glCreateProgram();
@@ -384,6 +595,20 @@ RProg render_program(void) {
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
     r.uFresnel = glGetUniformLocation(r.prog, "uFresnel");
     r.uClearcoat = glGetUniformLocation(r.prog, "uClearcoat");
+    r.uHeadPos = glGetUniformLocation(r.prog, "uHeadPos[0]");
+    r.uHeadForward = glGetUniformLocation(r.prog, "uHeadForward");
+    r.uHeadRight = glGetUniformLocation(r.prog, "uHeadRight");
+    r.uHeadUp = glGetUniformLocation(r.prog, "uHeadUp");
+    r.uHeadShape = glGetUniformLocation(r.prog, "uHeadShape");
+    r.uHeadGain = glGetUniformLocation(r.prog, "uHeadGain");
+    r.uHeadLow = glGetUniformLocation(r.prog, "uHeadLow");
+    r.uHeadShadow = glGetUniformLocation(r.prog, "uHeadShadow");
+    r.uHeadShadowMap[0] = glGetUniformLocation(r.prog, "uHeadShadowMap0");
+    r.uHeadShadowMap[1] = glGetUniformLocation(r.prog, "uHeadShadowMap1");
+    r.uHeadShadowMVP = glGetUniformLocation(r.prog, "uHeadShadowMVP[0]");
+    glUniform1i(r.uHeadShadowMap[0],0);glUniform1i(r.uHeadShadowMap[1],0);
+    glUniform1f(r.uHeadShadow,0.0f);
+    glUniform1f(r.uHeadGain,0.0f);
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
     glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);
@@ -970,9 +1195,14 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glGetIntegerv(GL_BLEND_SRC_ALPHA,&srca);glGetIntegerv(GL_BLEND_DST_ALPHA,&dsta);
     GLboolean blend=glIsEnabled(GL_BLEND),depth=glIsEnabled(GL_DEPTH_TEST),mask;
     glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
-    /* Zero keeps the texture mode supplied by the caller. */
     unsigned char amode = mesh->draw_mode ? mesh->draw_mode : (unsigned char)mode;
     int cut=texture && amode==N2_DRAW_CUTOUT, translucent=texture && amode==N2_DRAW_BLEND;
+    /* The wheel INTERIOR slice is the inboard barrel/backing. Its atlas
+       rectangle also contains transparent texels from the tread strip, so
+       alpha discard breaks the generated round backing into black facets.
+       Keep its authored RGB (usually black) but make the backing continuous;
+       TIRE and RIM retain their authored cutout textures. */
+    if (mesh->car_material == N2_MAT_INTERIOR) cut = 0;
     glBindTexture(GL_TEXTURE_2D,texture);
     glUniform1f(r->uUseTex,texture?1.0f:0.0f);
     glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);

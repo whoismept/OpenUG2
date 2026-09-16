@@ -1231,7 +1231,30 @@ static void wheel_backing_opening_test(void) {
     n2_free_scene(&s);
 }
 
+static void headlight_material_test(void) {
+    Buf f={.n=0};
+    const float p[][3]={{2,.4f,.5f},{2,.7f,.5f},{2,.5f,.7f},
+        {1.8f,.45f,.55f},{1.8f,.6f,.55f},{1.8f,.5f,.65f},{99,99,99}};
+    const uint16_t idx[]={0,1,2,3,4,5};
+    const uint32_t tex[]={7},mat[]={N2_MAT_HEADLIGHTGLASS,N2_MAT_CHROME};
+    const SubSpec sub[]={{3,0,0,0},{3,0,1,3}};
+    object(&f,"TESTCAR_KIT00_HEADLIGHT_LEFT_A",tex,1,mat,2,sub,2,p,7,idx,6);
+    N2CarConfig cfg={0};N2Scene s;
+    n2_load_car(f.b,f.n,&s,tex,1,&cfg);
+    chk("lamp cover and chrome retain separate material ranges",s.count==2 &&
+        s.meshes[0].car_material==N2_MAT_HEADLIGHTGLASS && s.meshes[1].car_material==N2_MAT_CHROME);
+    if(s.count==2) {
+        float anchors[4][4];n2_car_light_anchors(&s,anchors);
+        chk("small indexed lens anchors exclude housing/shared unused vertices",anchors[0][3]==1 &&
+            fabsf(anchors[0][0]-2.015f)<1e-5f && fabsf(anchors[0][1]-.55f)<1e-5f && fabsf(anchors[0][2]-.6f)<1e-5f);
+        chk("absent lamps never create guessed light sources",!anchors[1][3] && !anchors[2][3] && !anchors[3][3]);
+        chk("headlight glass and chrome do not glow as bulbs",!n2_headlight_emitter(s.meshes) && !n2_headlight_emitter(s.meshes+1));
+    }
+    n2_free_scene(&s);
+}
+
 int main(void) {
+    headlight_material_test();
     wheel_tyre_rounding_test();
     wheel_backing_opening_test();
     exhaust_attachment_test();

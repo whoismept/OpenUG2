@@ -90,7 +90,21 @@ typedef struct {
           uClearcoat, /* >0: second tight specular lobe -- the lacquer over the
                          coloured base coat (car body/trim only) */
           uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+    GLint uHeadPos, uHeadForward, uHeadRight, uHeadUp, uHeadShape, uHeadGain, uHeadLow;
+    GLint uHeadShadow, uHeadShadowMap[2], uHeadShadowMVP;
 } RProg;
+
+typedef struct {
+    GLuint fbo, depth, texture[2], white, program;
+    GLint mvp, cutout, range;
+    int failed;
+} HeadlightShadows;
+/* Returns caster draws, or -1 if offscreen rendering is unavailable. */
+int render_headlight_shadows(const RProg *r, HeadlightShadows *s, const N2Batch *batches, int count);
+void free_headlight_shadows(HeadlightShadows *s);
+
+void render_headlights(const RProg *r, const float model[16], const float anchors[4][4],
+                       int high, float pitch, float range, float gain);
 
 /* world-space sun direction (night scene key light) */
 #define N2_SUN_X 0.4f

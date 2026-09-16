@@ -178,10 +178,12 @@ static void test_parts_archive(const char *root,const char *name) {
 }
 
 int main(int argc,char **argv) {
-    assert(fabsf(body_ride_height(.35f,-.20f,.06f)-.29f)<1e-6f);
-    assert(fabsf(body_ride_height(.35f,-.29f,.06f)-.33f)<1e-6f);
-    assert(fabsf(body_ride_height(.35f,-.33f,.06f)-.35f)<1e-6f);
-    assert(fabsf(body_ride_height(.35f,-.20f,-.1f)-.35f)<1e-6f);
+    /* 2 cm of body-shell clearance is kept; the drop is clamped to what the
+       model allows and never lifts the car. */
+    assert(fabsf(body_ride_height(.35f,-.20f,.06f)-.29f)<1e-6f);   /* room to spare */
+    assert(fabsf(body_ride_height(.35f,-.29f,.06f)-.31f)<1e-6f);   /* clamped to 4 cm */
+    assert(fabsf(body_ride_height(.35f,-.33f,.06f)-.35f)<1e-6f);   /* already on the deck */
+    assert(fabsf(body_ride_height(.35f,-.20f,-.1f)-.35f)<1e-6f);   /* negative drop ignored */
     assert(body_ride_height(.05f,.20f,.12f)>=.05f);
     const unsigned char archive[] = {0};
     N2Scene scene = {0}; GpuMesh *gm = NULL;

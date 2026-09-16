@@ -20,7 +20,8 @@ These controls do not spend money, unlock content, maintain owned inventory, or
 require entering a shop. The Safe House currently shows installed part choices
 without claiming ownership. Performance packages, vinyl/decal editing, advanced
 paint finishes and most specialty mechanics are still open. Selecting another
-car still restarts the session and does not preserve a garage of configurations.
+car or track now stays in the running SDL/GL session; per-car garage ownership
+and installed configurations are still not persisted.
 
 ## Story and opening
 
@@ -318,9 +319,15 @@ are not normal dealer rewards.
 
 ## Vehicle presentation and world-placement follow-up
 
-The current default requests 6 cm of body lowering, limited by available body
-clearance; wheels retain their contact height. The old Miata-only adjustment was
-4 cm. The shared body pose feeds rendering and collision. This is an adjustable
+The current default requests **14 cm** of body lowering (was 6 cm), limited by
+available body clearance; wheels retain their contact height. The clearance
+budget is measured against the **body shell only** and keeps 2 cm under it. The
+earlier limit used the whole car AABB, which also covers the rim and brake
+slices at hub height: that reported roughly zero clearance on every car and
+silently cancelled the entire requested drop, so the cars rode visibly tall. The
+shared body pose feeds rendering and collision; collision still uses the full
+AABB. `Vehicle Diagnostics -> body lowering` tunes it per car, and the boot log
+prints both the requested and the applied drop. This is an adjustable
 presentation trim, not a decoded performance suspension package. Clear coat is
 slightly stronger by default; Graphics owns its preview controls.
 

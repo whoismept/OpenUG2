@@ -106,7 +106,11 @@ typedef struct {
 
     /* --- lighting (fed to the shader as uniforms) --- */
     int   night_mode;   /* 1 = night: low ambient + emissive light lenses + headlight
-                           pools/bloom; 0 = day: raised ambient, lenses lit normally */
+                           beams/bloom; 0 = day: raised ambient, lenses lit normally */
+    int headlight_mode; /* 0 low, 1 high, 2 off; L/J momentarily override */
+    float low_beam_pitch, high_beam_pitch, low_beam_range, high_beam_range;
+    float headlight_gain, headlight_lens_alpha;
+    int headlight_shadows, headlight_shadow_draws;
     float ambient, diffuse, body_spec;
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
     float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */
@@ -141,7 +145,7 @@ typedef struct {
      * move afterward, so the raw pointer is safe for the process lifetime.
      * The panel writes want_car/want_track (else leaves them -1) when the
      * user picks a different entry; main.c polls them once per frame and
-     * performs the SAME relaunch() the arrow-key menu already uses. */
+     * stages an in-process car or track transition. */
     const char (*car_list)[64];
     const char (*track_list)[64];
     int  want_car, want_track;
