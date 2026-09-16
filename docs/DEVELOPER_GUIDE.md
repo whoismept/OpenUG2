@@ -342,11 +342,11 @@ are still approximations. Investigate them in this order, using fixed-pose
 captures and source attribution rather than global brightness or draw-distance
 changes:
 
-1. **Headlight placement and road glow.** Compare the car-local light meshes,
-   bloom anchors and transformed world positions for several cars. Verify the
-   front/rear quadrant classification and the ground-glow contact point against
-   the road plane. A per-car offset is only acceptable when the source mesh or
-   transform proves it; do not hand-tune the symptom.
+1. **Headlight placement and road lighting.** Low/high beams use indexed lamp
+   geometry, preferring the outer lens bounds, and follow the full body pose.
+   Missing lamps do not create fallback sources. Per-lamp shadow maps let opaque
+   and cutout world geometry block the beams. Compare several installed lamp
+   styles; opponent-car lighting and shadows remain unimplemented.
 2. **District and fixture lights.** Separate authored `0x135003` point-light
    records from ordinary mesh fixtures and emissive/glow materials. The
    current `SFX_FLARE_GLOWA` camera-facing quad can read as a flat texture;
@@ -736,7 +736,8 @@ tuning pass. The current checklist is:
    placement once proven.
 3. Expose the proven asset families through the ImGui inspector as separate,
    reversible selections: bumpers, spoilers, rims, full body kits, headlights
-   and roof/body stickers or vinyls.
+   and roof/body stickers or vinyls. Headlight/taillight STYLE selections now
+   feed emissive strength; `L` holds high beam and `J` flashes the headlights.
 
 Each part must keep its authored mesh/material relationship, preserve the
 stock fallback when an optional library is absent, and include one screenshot

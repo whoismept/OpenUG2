@@ -1,10 +1,11 @@
 # Vehicle customization and in-place switching
 
 Status updated 2026-09-15. The development checkout now implements independent
-visual-part replacement, failure-safe rim/kit replacement and coloured shop
-subtabs in ImGui. Full vehicle switching, persistent ownership, purchases,
-career unlocks and in-world shop access are still unimplemented. Visual acceptance
-is pending user testing; no gameplay capture was made for this change.
+visual-part replacement, failure-safe rim/kit replacement, coloured shop
+subtabs and in-process vehicle/map transitions in ImGui. Persistent ownership,
+purchases, career unlocks and in-world shop access are still unimplemented.
+Visual acceptance is pending user testing; no gameplay capture was made for this
+change.
 
 The requested story, progression tables and shop access contract are collected
 in [GAME_FLOW.md](GAME_FLOW.md). That reference separates sourced retail behavior
@@ -34,12 +35,13 @@ The [Underground 2 PC manual, printed pp. 4–5](https://oldgamesdownload.com/wp
 also describes visual/performance upgrades and four reorderable vinyl layers.
 These sources describe game behavior; they are not implementation code.
 
-The active-car selector is above the
-shop subtabs. It currently restarts the session. Every available player car uses
-this same surface, with options
-derived from its asset inventory. Missing parts are unavailable, not silently
-substituted from another car. Future in-place switching must retain each car's chosen configuration when
-switching away and back; session-local storage is the first boundary. Disk
+The active-car selector is above the shop subtabs. It now stages and commits a
+new car while the SDL window, world and player pose remain alive. Every available
+player car uses this same surface, with options derived from its asset inventory.
+Missing parts are unavailable, not silently substituted from another car. The
+current debug switch resets that car's visual part selection to stock; retaining
+per-car configurations when switching away and back is a later inventory
+boundary. Disk
 save format, money, unlocks and purchase/refund rules remain later mechanics,
 not guessed behavior in a debug menu.
 
@@ -48,13 +50,13 @@ audio live in Specialties. Wheel placement, handling scalars and engine-cover
 mesh inspection live in Vehicle Diagnostics. Performance controls must
 not pretend prototype handling scalars are decoded retail performance parts.
 
-## Future vehicle switch must not restart the world
+## Vehicle switch resource contract
 
-Car selection will replace the **active vehicle bundle**, not call `relaunch`.
+Car selection replaces the **active vehicle bundle** without calling `relaunch`.
 "Model only" means vehicle-specific geometry, materials, textures, attachments,
-measurements, handling profile and engine audio remain consistent together.
-Replacing only the mesh while keeping another car's wheel radius/collision
-body or audio is incorrect.
+measurements and handling profile remain consistent together. Engine audio still
+uses the previous active bank during the transition and is the next ownership
+boundary to close.
 
 | Retain unchanged | Rebuild/rebind for the selected car |
 | --- | --- |
@@ -73,9 +75,9 @@ vehicle only when no render/audio consumer can use it. Asset decoding may later
 move off-thread if measured stalls justify it; GPU work stays with the owning
 GL context. The initial design does not require a new streaming framework.
 
-Current opponents share the player's render resources. In-place player changes
+Current opponents share some player texture lookups. In-place player changes
 must not unexpectedly turn every opponent into the newly selected car: preserve
-their old shared bundle lifetime or give opponents explicit asset ownership
+their old texture ownership or give opponents explicit asset ownership
 before allowing the switch with opponents active. Race AI state stays intact.
 
 Engine audio is also part of the transaction. Current loaders mutate callback-
@@ -88,9 +90,10 @@ the old data. Do not stop/reinitialize the whole game to avoid ownership work.
 
 - `src/debugui.cpp::dbgui_frame`: existing `MasterInspectorTabs`/`BeginTabItem`
   pattern. `src/debug.h::DbgState` already carries momentary car/rim requests.
-- `src/main.c::relaunch`: currently uses `SDL_Quit`/`execvp` for both car and
-  track changes. Replace the **two car callers** (arrow selection and ImGui),
-  not track switching as an unrelated expansion.
+- Track selection stages a complete `WorldResident` and swaps it in the running
+  SDL/GL session; failed loads keep the current map and session alive. Car
+  selection uses the same staged in-process transaction for geometry, profile,
+  wheel fit and textures, preserving the current world and pose.
 - `src/main.c::load_rim_style`: shared startup/F6/ImGui path now stages
   geometry, diffuse texture and GPU uploads; failures retain the old wheels.
 - `prepare_body_kit` and the K/ImGui request path now validate and stage complete
@@ -108,11 +111,11 @@ the old data. Do not stop/reinitialize the whole game to avoid ownership work.
 
 ## Remaining delivery order and acceptance
 
-The user's latest priority put independent parts and shop organization before
-whole-vehicle hot switching. Both now exist as debug previews. Next implement
-purchase/ownership/save and shop-entry gates according to GAME_FLOW.md, while
-preserving the existing prepare/validate/commit failure behavior. Whole-vehicle
-switching still needs the resource and audio boundary described above.
+The debug preview now covers in-process geometry/profile/wheel/texture switching.
+Next implement purchase/ownership/save and shop-entry gates according to
+GAME_FLOW.md, then give opponents isolated textures and add synchronized engine
+audio replacement while preserving the existing prepare/validate/commit failure
+behavior.
 
 Validation completed: 276 material assertions, rollback at 11 failure boundaries,
 all 44 catalog cars through kit cycling, and 9,312 independent choices across the

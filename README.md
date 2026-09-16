@@ -80,6 +80,14 @@ world-surface artifact with its own capture and acceptance criteria.
 - **Vehicle contact** — four wheel locations probe the world independently and
   feed a sprung body-height/orientation model. Walls use a mesh narrow phase
   and resolve along the contacted face instead of an enclosing AABB axis.
+- **Stance** — every car now ships lowered by default. The clearance limit is
+  measured against the body shell alone; the rim and brake slices reach hub
+  height, and counting them made the engine think each car was already on the
+  deck, so nothing could be lowered. Tyres stay on the road surface, and
+  Vehicle Diagnostics → *body lowering* still tunes it per car.
+- **Vehicle modification** — body parts, full kits, rims, paint, rim paint and
+  neon are selectable live from the ImGui developer menu, with per-car asset
+  inventories and reversible stock fallbacks.
 - **Driving** — keyboard-controlled arcade acceleration, braking, steering,
   handbrake, surface-dependent grip and geometry-derived per-car differences.
 - **Racing** — closed-circuit loading and AI racing-line opponents work on the
@@ -103,13 +111,17 @@ world-surface artifact with its own capture and acceptance criteria.
   a proven world-placement or mesh-linkage rule.
 - The experimental `--tier full` panorama pass still exposes opaque authored
   backdrop sheets as hard-edged bands at some headings. It is not the default.
-- Vehicle presentation still needs a complete tyre/rim render pass, attribution
-  of the unexplained object below the car, and an asset-backed ImGui modification
-  flow for bumpers, spoilers, rims, full body kits, headlights and stickers.
-- Lighting fidelity is incomplete: headlights need source-verified placement,
-  district and road-closure lights need material/group attribution, neon needs a
-  grounded road response, and the NFSU2-style wet/rainy asphalt path is not yet
-  implemented.
+- Vehicle presentation still needs a complete tyre/rim render pass and
+  attribution of the unexplained object below the car. The ImGui modification
+  flow now covers bumpers, skirts, hoods, spoilers, exhausts, lights, full body
+  kits, rims, paint and neon; vinyls, decals, mirrors, wide-body kits, rim
+  sizing and every performance package are still missing, as are ownership,
+  money, purchases and saving.
+- Lighting fidelity is still evolving: installed headlight/taillight styles now
+  scale emissive output, `L`/`J` drive low/high and flash beams, and `N` gives a
+  small nitro headroom with stretched tail glow and soft screen-corner haze.
+  District and road-closure lights still need material/group attribution, and
+  the NFSU2-style wet/rainy asphalt path is not yet implemented.
 - Open-world collision attribution still needs to classify overlapping or
   duplicate instance meshes before any collision threshold is changed.
 - The northern mountain-road route needs a source-level visibility audit; after
@@ -125,6 +137,9 @@ Developer references:
   ownership, runtime data flow, invariants, tests and agent workflow.
 - [`docs/FORMATS.md`](docs/FORMATS.md) — evidence-labelled file layouts,
   parser contracts and clean-room format notes.
+- [`docs/VEHICLE_CUSTOMIZATION.md`](docs/VEHICLE_CUSTOMIZATION.md) and
+  [`docs/GAME_FLOW.md`](docs/GAME_FLOW.md) — the shop/modification surface and
+  the retail game-flow contract behind it.
 
 ## Build
 
@@ -136,15 +151,59 @@ Needs **SDL2** and **zlib**.
 
 make                 # desktop build -> ./nfsu2
 make gles            # OpenGL ES 2.0 build (embedded/mobile ARM)
-make debug           # desktop build + Dear ImGui debug panel (dev only)
+make debug           # desktop build + Dear ImGui developer menu (dev only)
 ```
 
-`make debug` adds a live tuning overlay (Dear ImGui, vendored under
-`third_party/`): freecam, wheel placement, lighting, per-part visibility, paint,
-and readouts. It's dev-only — plain `make` ships without it.
+> ⚠️ **Customization, modifications and engine internals live behind
+> `make debug`.** A plain `make` build compiles the panel out completely: `1`
+> only toggles the provisional pixel-font HUD, and there is no way to reach the
+> shops or diagnostics. If you want to change rims, body kits, paint, neon or
+> lighting, or inspect anything the engine has parsed, you **must** build with
+> `make debug` and open the panel with `1`. See
+> [Developer menu (ImGui)](#developer-menu-imgui) below.
 
 Cross-compiling for another ARM target is just the compiler swap, e.g.
 `CC=aarch64-linux-gnu-gcc make gles`.
+
+## Developer menu (ImGui)
+
+Build with **`make debug`**, run the engine, then press **`1`** to open the
+**NFSU2 Master Inspector** (Dear ImGui, vendored under `third_party/`). This is
+where every modification, diagnostic and tuning control lives. Plain `make`
+builds compile the panel out entirely, so none of this is reachable there —
+`1` gives you only the provisional viewport HUD.
+
+| Tab | What you get |
+| --- | --- |
+| **Modification** | The vehicle shop surface. Live car selector (swaps the vehicle without restarting the world or losing your pose) plus colour-coded Underground 2 shop subtabs. |
+| **Vehicle Diagnostics** | Per-car wheel stance (axle, track, ride, body lowering), live handling readouts, engine-cover and car-part inspection, mesh inspector, wheel spin/steer demo. |
+| **Lighting & Environment** | Night mode, headlight beam preview, beam pitch/reach/intensity, lens opacity, headlight shadows, chase-camera distance/height/stiffness, ambient/diffuse/fog. |
+| **World & Entities** | Loaded track selector, scenery semantics census, nearby world chunks, decoded `ZCV_`/`ZCS_` entity definitions, UV checker, HUD toggle. |
+| **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, freecam. |
+| **Navigation & Races** | Top-down nav graph drawn from the authored route files, district colouring, right-click GPS routing, the shipped race-event catalog, and freeroam/race mode switching with a live race HUD. |
+
+The Modification subtabs follow the retail shop colours:
+
+| Subtab | Working today |
+| --- | --- |
+| **Body** (green) | Front/rear bumpers, skirts, hood, headlight and taillight assemblies, spoiler, exhaust, roof scoop; full body-kit presets; wheel brand and rim style from the `CARS/WHEELS` library. |
+| **Specialties** (yellow) | Trunk audio, neon underglow (on/off, colour, intensity). |
+| **Graphics** (red) | Body paint with clear-coat, highlight and reflection controls; rim paint with chrome/OEM/gunmetal presets. |
+| **Performance** (blue) | Placeholder — no decoded performance packages yet. |
+| **Safe House** (purple) | Read-only list of installed parts; ownership and saving are not implemented. |
+
+Changes are free and instant — this is a preview surface, not career progression.
+Parts a car does not ship are shown as unavailable rather than substituted, and
+you have to stop the car before swapping parts. Full design notes are in
+[`docs/VEHICLE_CUSTOMIZATION.md`](docs/VEHICLE_CUSTOMIZATION.md) and
+[`docs/GAME_FLOW.md`](docs/GAME_FLOW.md).
+
+For reproducible documentation captures, `--devui` opens the panel at launch so
+`--shot` can grab it:
+
+```sh
+./nfsu2 DATA --car SKYLINE --devui --chase 8,1.6 --shot docs/panel.png
+```
 
 ## Run
 
@@ -182,6 +241,10 @@ the nearest safe authored road; no internal world-mode or spawn flag is needed.
 - `--event ID` — start a shipped race event such as L4RB sprint `4201`.
 - `--tier ordinary` — production renderer and the default. `--tier full` is an
   experimental panorama path with known visual defects.
+- `--chase D,H` — chase-camera distance and height in metres, e.g. `--chase 9,1.8`.
+  Useful for framing captures without touching the ImGui sliders.
+- `--devui` — open the developer menu at launch (`make debug` builds only), so a
+  `--shot` capture includes the panel.
 
 The old `--world2` option remains accepted for scripts, but it is now only a
 backward-compatible alias. `--spawn start|X,Y` and `--heading DEG` are developer
@@ -196,7 +259,9 @@ milestone.
 
 **Controls:** driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
 grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look ·
-`E`/`Q` up/down · `Shift` faster), `1` developer overlay, `F6` cycle rim style
+`E`/`Q` up/down · `Shift` faster), `L` high beam, `J` headlight flash (open-world
+racer invite), `N` nitro, **`1` developer menu** (the ImGui Master Inspector, in
+`make debug` builds), `F6` cycle rim style
 (once per press), `K` cycle body kit, `Esc` quit. Cars
 collide and building contact is confirmed against source mesh faces before the
 car is pushed. `--shot out.png` renders one frame to a PNG and exits.
@@ -238,13 +303,15 @@ then moves outward to world correctness and race systems:
 1. **Vehicle foundation and presentation** — complete tyre/rim rendering,
    identify the unexplained under-car object, and verify body transforms,
    wheel/contact placement and measured handling behaviour.
-2. **Vehicle operations and modification flow** — add a Modification tab with
-   Body, Performance, Graphics/Color and Car Specialties shop subtabs; keep
-   per-car selections and switch vehicle assets without restarting the world.
-   Connect proven part libraries with reversible stock fallbacks. See the
-   [customization and in-place switching design](docs/VEHICLE_CUSTOMIZATION.md).
-3. **Vehicle/world lighting fidelity** — fix headlight transforms and grounded
-   neon first, then attribute district/fixture lights, road-closure guidance
+2. **Vehicle operations and modification flow** — the Modification tab and its
+   Body, Performance, Graphics and Car Specialties subtabs exist, and vehicle
+   assets swap without restarting the world. What is left: persistent per-car
+   selections, ownership/money/saving, vinyls and decals, and real performance
+   packages. See the
+   [customization and in-place switching design](docs/VEHICLE_CUSTOMIZATION.md)
+   and the [game flow reference](docs/GAME_FLOW.md).
+3. **Vehicle/world lighting fidelity** — verify model-derived headlight transforms
+   and grounded neon first, then attribute district/fixture lights, road-closure guidance
    lights and the measured wet/rainy asphalt path.
 4. **Open-world collision attribution** — classify overlapping/duplicate
    instance meshes and false barriers before changing collision thresholds.

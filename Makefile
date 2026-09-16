@@ -260,3 +260,9 @@ clean:
 	rm -rf build
 
 .PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
+
+.PHONY: headlight-render-test
+headlight-render-test: tools/headlight_render_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/headlight_render_test.c src/render.c -o build/headlight_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/headlight_render_test

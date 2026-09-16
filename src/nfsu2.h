@@ -1865,6 +1865,46 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_MAGSILVER   0x22719fa9u
 #define N2_MAT_MAGCHROME   0xfd102a92u
 #define N2_MAT_DULLPLASTIC 0x0fedee40u
+#define N2_MAT_CHROME      0x54949afdu
+#define N2_MAT_MOLDINGS    0x12c9453cu
+#define N2_MAT_HEADLIGHT   0x9c645529u
+#define N2_MAT_HEADLIGHTGLASS 0xa6348ee3u
+
+/* HEADLIGHTGLASS is the outer lens on stock and STYLE lamps (Miata/Golf).
+ * Hashes above use the same h=h*33+c convention as wheel materials. */
+static int n2_headlight_emitter(const N2Mesh *m) {
+    return m->cat==N2_CAR_LIGHT && m->car_material!=N2_MAT_HEADLIGHTGLASS &&
+           m->car_material!=N2_MAT_CHROME && m->car_material!=N2_MAT_MOLDINGS &&
+           m->car_material!=N2_MAT_DULLPLASTIC;
+}
+
+/* Indexed bounds exclude other materials' vertices in a shared vertex pool.
+ * Prefer the headlamp cover's outward surface so a halo is not buried inside
+ * its housing. Missing lamps stay absent; even a small lens is sufficient. */
+static void n2_car_light_anchors(const N2Scene *car, float out[4][4]) {
+    float lo[4][3],hi[4][3]; int priority[4]={0};
+    memset(out,0,16*sizeof(float));
+    for(int b=0;b<4;b++)for(int a=0;a<3;a++){lo[b][a]=1e30f;hi[b][a]=-1e30f;}
+    for(int i=0;i<car->count;i++) {
+        const N2Mesh *m=car->meshes+i;
+        if(m->cat!=N2_CAR_LIGHT && m->cat!=N2_CAR_BRAKELIGHT)continue;
+        int rank=m->car_material==N2_MAT_HEADLIGHTGLASS?2:1;
+        for(int j=0;j<m->nidx;j++) {
+            if(m->idx[j]>=m->nverts)continue;
+            const float *p=m->verts+5*m->idx[j];
+            int b=(m->cat==N2_CAR_BRAKELIGHT?2:0)+(p[1]<0);
+            if(rank<priority[b])continue;
+            if(rank>priority[b])for(int a=0;a<3;a++){lo[b][a]=1e30f;hi[b][a]=-1e30f;}
+            priority[b]=rank;
+            for(int a=0;a<3;a++){lo[b][a]=fminf(lo[b][a],p[a]);hi[b][a]=fmaxf(hi[b][a],p[a]);}
+        }
+    }
+    for(int b=0;b<4;b++)if(priority[b]) {
+        for(int a=0;a<3;a++)out[b][a]=(lo[b][a]+hi[b][a])*.5f;
+        out[b][0]=b<2?hi[b][0]+.015f:lo[b][0]-.015f;
+        out[b][3]=1;
+    }
+}
 
 /* Classify one submesh's material hash. `fallback` is the object-level
  * category from n2_car_category, used whenever the hash is 0 (absent/out of
@@ -1983,6 +2023,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             uint32_t subtex[32], submat[32]; int matcls[32];
             int differ = 0, clsdiffer = 0, matdiffer = 0, big = 0;
             int wheel_materials = mount == N2_MOUNT_WHEEL;
+            int light_materials = cat==N2_CAR_LIGHT || cat==N2_CAR_BRAKELIGHT;
             for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
                 subtex[k] = sub[k].mat < (uint32_t)nslot
                           ? (brake ? slots[sub[k].mat]
@@ -2016,7 +2057,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                atomically instead of resolving each split slice on its own. */
             static uint32_t g_car_tierid_next = 1;
             uint32_t tierid = g_car_tierid_next++;
-            if (part_ok && nsub > 1 && (differ || clsdiffer || (wheel_materials && matdiffer))) {
+            if (part_ok && nsub > 1 && (differ || clsdiffer || ((wheel_materials || light_materials) && matdiffer))) {
                 for (int k = 0; k < nsub; k++) {
                     int before = scene->count;
                     n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28, 0,

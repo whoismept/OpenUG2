@@ -67,10 +67,8 @@ extern "C" void dbgui_frame(void) {
     ImGui::SetNextWindowSize(ImVec2(620, 720), ImGuiCond_FirstUseEver);
     ImGui::Begin("NFSU2 Master Inspector", nullptr, ImGuiWindowFlags_None);
     g_dbg.fps = (int)ImGui::GetIO().Framerate;
-    /* Momentary car/track switch requests: reset EVERY frame (not inside a tab,
-       or an inactive tab would leave want_car at 0 = a valid index and main.c
-       would relaunch the process every frame). The combos below set them on
-       change only. */
+    /* Momentary car/track switch requests: reset every frame. The main loop
+       consumes them on the frame thread while keeping the SDL/GL session alive. */
     g_dbg.want_car = -1; g_dbg.want_track = -1;
 
     if (ImGui::BeginTabBar("MasterInspectorTabs")) {
@@ -86,7 +84,7 @@ extern "C" void dbgui_frame(void) {
                 }
                 ImGui::EndCombo();
             }
-            ImGui::TextDisabled("Changing car restarts the session with its own available kits.");
+            ImGui::TextDisabled("Car changes apply when the vehicle bundle is ready; the session stays open.");
         }
         ImGui::TextWrapped("Shop preview: changes are free for testing. Career purchases and shop entry restrictions are not active yet.");
         if (ImGui::BeginTabBar("ShopTabs")) {
@@ -138,7 +136,8 @@ extern "C" void dbgui_frame(void) {
             ImGui::ColorEdit3("neon colour", g_dbg.neon_col);
             ImGui::SliderFloat("intensity", &g_dbg.neon_str, 0.0f, 1.5f);
         }
-            ImGui::TextWrapped("Not yet supported: custom gauges, doors, split hoods, hydraulics, light colours, engine/trunk neon, nitrous purge, spinners, window tint.");
+            ImGui::TextWrapped("Driving effects: hold L for high beams, J to flash, N for nitro. Beam preview and aiming are in Lighting & Environment.");
+            ImGui::TextWrapped("Not yet supported: custom gauges, doors, split hoods, hydraulics, engine/trunk neon, nitrous purge, spinners, window tint.");
             ImGui::EndTabItem();
         }
         if (shop_tab("Graphics", ImVec4(1, 0.4f, 0.4f, 1))) {
@@ -205,7 +204,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("front track",  &g_dbg.wheel.front_track, 0.8f, 2.2f, "%.3f m");
             ImGui::SliderFloat("rear track",   &g_dbg.wheel.rear_track,  0.8f, 2.2f, "%.3f m");
             ImGui::SliderFloat("wheel hub height",&g_dbg.wheel.ride_y,  -0.5f, 0.5f, "%.3f m");
-            ImGui::SliderFloat("body lowering", &g_dbg.body_drop, 0.0f, 0.12f, "%.3f m");
+            ImGui::SliderFloat("body lowering", &g_dbg.body_drop, 0.0f, 0.20f, "%.3f m");
             ImGui::TextDisabled("Body lowering is limited by ground clearance; wheel contact stays fixed.");
             ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
             ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
@@ -268,14 +267,30 @@ extern "C" void dbgui_frame(void) {
     /* ---- Tab 2: Lighting & Environment ---- */
     if (ImGui::BeginTabItem("Lighting & Environment")) {
         if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
-            /* Night mode: emissive light lenses + headlight pools/bloom + low
+            /* Night mode: emissive light lenses + headlight beams/bloom + low
                ambient. Toggling applies an ambient preset; the slider below still
-               fine-tunes it. The emissive/pool gating is read live in the draw. */
+               fine-tunes it. The emissive/beam gating is read live in the draw. */
             if (ImGui::Checkbox("Night Mode", (bool *)&g_dbg.night_mode))
                 g_dbg.ambient = g_dbg.night_mode ? 0.38f : 0.78f;
             ImGui::SameLine();
             ImGui::TextDisabled(g_dbg.night_mode ? "(lenses glow, headlights on)"
                                                  : "(daylight, lenses off)");
+        }
+        if (ImGui::CollapsingHeader("Headlights", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Combo("Beam preview", &g_dbg.headlight_mode, "Low beam\0High beam\0Off\0");
+            ImGui::TextWrapped("Hold L for high beam or J to flash. Enable Night Mode for steady lights. Change the installed lamp in Modification / Body.");
+            ImGui::SliderFloat("Low beam downward angle", &g_dbg.low_beam_pitch, 1.0f, 10.0f, "%.1f deg");
+            ImGui::SliderFloat("High beam downward angle", &g_dbg.high_beam_pitch, 0.0f, 5.0f, "%.1f deg");
+            ImGui::SliderFloat("Low beam reach", &g_dbg.low_beam_range, 10.0f, 60.0f, "%.0f m");
+            ImGui::SliderFloat("High beam reach", &g_dbg.high_beam_range, 40.0f, 140.0f, "%.0f m");
+            ImGui::SliderFloat("Lamp intensity", &g_dbg.headlight_gain, 0.0f, 3.0f);
+            ImGui::SliderFloat("Clear lens opacity", &g_dbg.headlight_lens_alpha, 0.0f, 0.6f);
+            bool shadows = g_dbg.headlight_shadows != 0;
+            if (ImGui::Checkbox("Headlight shadows", &shadows)) g_dbg.headlight_shadows = shadows;
+            if (g_dbg.headlight_shadow_draws < 0)
+                ImGui::TextDisabled("Shadow maps unavailable on this renderer.");
+            else
+                ImGui::TextDisabled("World shadow caster draws: %d", g_dbg.headlight_shadow_draws);
         }
         if (ImGui::CollapsingHeader("Camera (3rd-person chase)", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("distance (back)", &g_dbg.chase_distance,  3.0f, 25.0f, "%.1f m");
