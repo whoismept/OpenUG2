@@ -45,7 +45,16 @@ typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
     GLuint ibo;               /* consolidated u16 IBO (<= 65535 verts/batch) */
     int index_count;
-    uint32_t texkey;          /* first member mesh's TPK key (debugging) */
+    uint32_t texkey;          /* first member mesh's TPK key -- DIAGNOSTIC ONLY.
+                             Do not gate drawing on it: a batch's members can
+                             disagree about whether they named a texture, and
+                             this reports one of them. Use `unresolved`. */
+    unsigned char unresolved; /* 1 only when EVERY member named a TPK key and the
+                             resolver produced nothing, i.e. the batch really is
+                             missing art rather than being authored untextured.
+                             A batch that mixes the two draws (flat colour) --
+                             an untextured mesh must not vanish because a
+                             neighbour in its cell lost its texture. */
     GLuint tex;               /* resolved GL texture (0 = untextured fallback) */
     int nmesh;                /* source meshes merged in (drawn-mesh metric) */
     int scen_count[8];        /* source N2_SC_* membership (visibility audit) */
@@ -89,7 +98,15 @@ typedef struct {
           uFresnel, /* >0.5: alpha rides the fresnel term (car glass pass only) */
           uClearcoat, /* >0: second tight specular lobe -- the lacquer over the
                          coloured base coat (car body/trim only) */
-          uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          uRimTint, /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          uEmissive; /* vec3 added AFTER lighting: a lamp lens that is lit AND
+                        glowing. Going fully uUnlit instead is what made every
+                        taillight a flat red sticker -- it discards the
+                        specular, the fresnel rim and the environment
+                        reflection, i.e. everything that reads as moulded
+                        plastic. Dome-weighted by dot(N,V) in the shader, so a
+                        curved lens is hottest where it faces the camera.
+                        Zero everywhere else; the car pass clears it. */
     GLint uHeadPos, uHeadForward, uHeadRight, uHeadUp, uHeadShape, uHeadGain, uHeadLow;
     GLint uHeadShadow, uHeadShadowMap[2], uHeadShadowMVP;
 } RProg;
@@ -137,10 +154,12 @@ void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order
 
 /* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
  * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */
+/* halo: sprite size multiplier (1 = tuned default); gain: emission multiplier. */
 int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
                            const N2LightSrc *lights, int nlights,
                            const float cam[3], const float look[3],
-                           const float mvp[16], float viewdist);
+                           const float mvp[16], float viewdist,
+                           float halo, float gain);
 
 /* Merge the static world into per-(cell,texture) batches and upload them.
  * mtex = per-mesh resolved GL texture, texTerr = grass fallback for terrain
@@ -190,6 +209,16 @@ GLuint   upload_tex(const N2Tex *t);
    portable CPU-decoded RGBA path (upload_tex) otherwise. Leaves the texture
    bound (callers may override wrap/filter after). */
 GLuint   upload_tpk_texture_to_gpu(const N2Tex *t);
+/* Anisotropic filtering, the one texture-detail knob this renderer was missing.
+ * Trilinear alone samples a square footprint, so any surface seen at a grazing
+ * angle -- which is most of a road, a kerb and a car's own flanks -- drops to a
+ * far coarser mip than it needs and smears. Measured on a race frame: 6.2% of
+ * pixels change between 1x and 16x. `render_texture_detail` re-applies the
+ * setting to every texture already uploaded, so the in-game slider takes effect
+ * immediately instead of on the next load. */
+extern int   g_tex_aniso_max;   /* 1 = extension absent; else the GL maximum */
+extern float g_tex_aniso;       /* current setting, clamped to [1, max] */
+void render_texture_detail(float aniso);
 extern int g_tex_s3tc;   /* 1 = GL_EXT_texture_compression_s3tc present; set once at GL init */
 
 /* ---- 3x5 bitmap font (uppercase, digits, _ - /) ---- */

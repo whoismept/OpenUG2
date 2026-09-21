@@ -18,6 +18,9 @@ typedef struct {
     char name[28];
     unsigned char has_matrix;
     unsigned char is_vista;
+    /* Set by the ownership pre-pass: some record places this prototype with a
+     * real transform, so it is an instanced object and not a ground chunk. */
+    unsigned char instanced;
 } WInstProto;
 
 typedef struct {
@@ -294,13 +297,22 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
     int is_vista = 0;
+    uint32_t slot[64];
+    int nslot = n2_mesh_texslots(data, begin, end, slot, 64);
     /* Match n2_walk_meshes' established PAN_* contract. These authored
        horizon models render through the vista tier, but must never enter the
-       ordinary scene where TERRAIN members become ground/collision support. */
+       ordinary scene where TERRAIN members become ground/collision support.
+       The same two exceptions apply here, or free roam and a race would
+       disagree about which objects are backdrop: PAN_OCEAN is the water
+       surface, not a billboard, and three unnamed leftovers are backdrop that
+       no name rule can see -- both are decided by measurement/material. */
+    N2Geom geometry;
     if (!strncmp(name, "PAN", 3)) {
+        is_vista = !(n2_obj_geom(data, begin, end, matrix, &geometry) &&
+                     n2_is_ground_sheet(&geometry));
+    } else if (n2_impostor_atlas(slot, nslot)) {
         is_vista = 1;
     } else if (n2_vista_family(name)) {
-        N2Geom geometry;
         is_vista = n2_obj_geom(data, begin, end, matrix, &geometry) &&
                    n2_is_vista_impostor(name, &geometry);
     }
@@ -316,9 +328,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
      * identical whole-object path instead of silently losing geometry. */
     int sub_ok = 0;
     N2Sub sub[64];
-    uint32_t slot[64];
     int nsub = 0;
-    int nslot = n2_mesh_texslots(data, begin, end, slot, 64);
     if (cat != N2_GLOW && pairs == 1) {
         nsub = n2_mesh_submeshes(data, begin, end, sub, 64);
         if (nsub > 0 && nslot > 0) {
@@ -339,9 +349,28 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
             if (sub_ok && chain != available - available % 3) sub_ok = 0;
         }
     }
+    {   /* Diagnostic twin of nfsu2.h's OPENUG2_OBJ_PROBE, for the instance
+           walker: which texture slot does each submesh of this object
+           select, and does this bundle's key set actually supply it? */
+        static const char *probe = (const char *)1;
+        if (probe == (const char *)1) probe = getenv("OPENUG2_SLOT_PROBE");
+        if (probe && name[0] && n2_icontains((const unsigned char *)name, (long)strlen(name), probe)) {
+            fprintf(stderr, "SLOTPROBE %-28s nslot=%d nsub=%d sub_ok=%d pairs=%d cat=%d texkey=%08x\n",
+                    name, nslot, nsub, sub_ok, pairs, cat, texkey);
+            for (int q = 0; q < nslot; q++)
+                fprintf(stderr, "SLOTPROBE   slot[%d]=%08x resolved=%08x\n",
+                        q, slot[q], n2_resolve_key(slot[q], keys, nkeys));
+            for (int q = 0; q < nsub; q++)
+                fprintf(stderr, "SLOTPROBE   sub[%d] start=%u count=%u mat=%u matid=%08x\n",
+                        q, sub[q].start, sub[q].count, sub[q].mat, sub[q].matid);
+        }
+    }
     if (sub_ok) {
         for (int i = 0; i < nsub; i++) {
             uint32_t authored = slot[sub[i].mat];
+            /* A light-pool card has no diffuse map anywhere to fall back to;
+               emitting it means painting a sibling texture across it. */
+            if (n2_slot_is_lightpool(authored)) continue;
             /* SKYDOME resolves from shared LOC4 after prototype placement,
                not from this bundle's regional key inventory. Preserve the
                verified positional slot exactly, matching n2_walk_meshes. */
@@ -614,6 +643,18 @@ int winst_decode_placement(const unsigned char *record, long len,
     return 1;
 }
 
+/* A record whose transform is the identity is the authored world-space ground
+ * chunk contract: the prototype's vertices are already map coordinates, so the
+ * ground pass emits it once and the section walk leaves it alone. Exact
+ * comparison is sound -- the 3x3 arrives as s16/8192, where 1.0 and 0.0 are
+ * exact, and the translation is read straight out of the file. */
+static int winst_identity_placement(const float m[16]) {
+    return m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f &&
+           m[0] == 1.0f && m[5] == 1.0f && m[10] == 1.0f &&
+           m[1] == 0.0f && m[2] == 0.0f && m[4] == 0.0f &&
+           m[6] == 0.0f && m[8] == 0.0f && m[9] == 0.0f;
+}
+
 typedef struct {
     int region_id;
     const unsigned char *types;
@@ -865,10 +906,96 @@ static int winst_build_visit(const WInstPlacement *placement,
     N2Scene *dst = proto->is_vista ? build->vista : build->scene;
     for (int i = 0; i < proto->scene.count; i++) {
         const N2Mesh *mesh = &proto->scene.meshes[i];
-        if (mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN) continue;
+        int ground = mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN;
+        /* A chunk prototype belongs to the ground pass outright. An instanced
+         * one is placed here, at its own record's matrix, like anything else:
+         * leaving it to the ground pass stranded every copy on one authored
+         * origin, up to 855 m from where the record puts it. */
+        if (ground && !proto->instanced) continue;
         if (!winst_place_mesh(dst, mesh, placement->matrix, type_name,
                              build->stats)) return 0;
+        if (ground && build->stats) build->stats->instanced_ground_meshes++;
     }
+    return 1;
+}
+
+/* winst_collect_model assigns one category to a whole object, so a prototype
+ * is ground or it is not. */
+static int winst_proto_is_ground(const WInstProto *proto) {
+    for (int i = 0; i < proto->scene.count; i++) {
+        int cat = proto->scene.meshes[i].cat;
+        if (cat == N2_ROAD || cat == N2_TERRAIN) return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    WInstLibrary *library;
+    uint32_t *ground_keys;   /* sorted; gates the walk away from the library scan */
+    int ground_key_count;
+} WInstOwnership;
+
+static int winst_cmp_key(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int winst_ownership_open(WInstOwnership *own, WInstLibrary *library) {
+    memset(own, 0, sizeof *own);
+    own->library = library;
+    if (library->count <= 0) return 1;
+    own->ground_keys = (uint32_t *)malloc((size_t)library->count *
+                                          sizeof *own->ground_keys);
+    if (!own->ground_keys) return 0;
+    for (int i = 0; i < library->count; i++)
+        if (library->items[i].model_key &&
+            winst_proto_is_ground(&library->items[i]))
+            own->ground_keys[own->ground_key_count++] = library->items[i].model_key;
+    qsort(own->ground_keys, (size_t)own->ground_key_count,
+          sizeof *own->ground_keys, winst_cmp_key);
+    return 1;
+}
+
+/* Ownership pre-pass. Scanned unfiltered on purpose: an instance outside the
+ * view radius, or hidden by an event's scenery selection, still has to suppress
+ * the identity copy rather than leave it stranded at the prototype origin. */
+static int winst_mark_instanced(const WInstPlacement *placement,
+                                const char *type_name, void *userdata) {
+    WInstOwnership *own = (WInstOwnership *)userdata;
+    WInstLibrary *library = own->library;
+    if (winst_identity_placement(placement->matrix)) return 1;
+    int keyed = 0, ground = 0;
+    for (int lod = 0; lod < 3; lod++) {
+        uint32_t key = placement->model_keys[lod];
+        if (!key) continue;
+        keyed = 1;
+        if (bsearch(&key, own->ground_keys, (size_t)own->ground_key_count,
+                    sizeof *own->ground_keys, winst_cmp_key)) ground = 1;
+    }
+    if (keyed) {
+        if (!ground) return 1;
+        /* Claim every authored LOD alternative and every duplicated copy of
+         * this object, not only the one the resolver picks. The bundle carries
+         * 1a/1b/1z models of the same object and repeats them per region; an
+         * unclaimed sibling is still emitted at the prototype origin. */
+        for (int lod = 0; lod < 3; lod++) {
+            uint32_t key = placement->model_keys[lod];
+            if (!key) continue;
+            for (int i = 0; i < library->count; i++)
+                if (library->items[i].model_key == key)
+                    library->items[i].instanced = 1;
+        }
+        return 1;
+    }
+    /* Records carrying no authored key at all are matched by name, exactly as
+     * winst_library_resolve falls back to doing. */
+    char folded[28];
+    uint32_t hash = winst_name_key(type_name, folded);
+    for (int i = 0; i < library->count; i++)
+        if (library->items[i].name_hash == hash &&
+            !strcmp(library->items[i].name, folded) &&
+            winst_proto_is_ground(&library->items[i]))
+            library->items[i].instanced = 1;
     return 1;
 }
 
@@ -882,6 +1009,7 @@ static int winst_place_ground_prototypes(const WInstLibrary *library,
     if (!library || !scene || !vista) return 0;
     for (int i = 0; i < library->count; i++) {
         const WInstProto *proto = &library->items[i];
+        if (proto->instanced) continue;
         int own_matrix = winst_proto_has_own_matrix(library, proto);
         const float *matrix = own_matrix ? proto->matrix : identity;
         N2Scene *dst = proto->is_vista ? vista : scene;
@@ -1128,6 +1256,18 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     }
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
     free(keys);
+
+    WInstOwnership owner;
+    WInstWalk ownership;
+    if (!winst_ownership_open(&owner, &library)) goto cleanup;
+    memset(&ownership, 0, sizeof ownership);
+    ownership.find_region = -1;
+    ownership.view_radius = WINST_WORLD_LIMIT;
+    ownership.visit = winst_mark_instanced;
+    ownership.userdata = &owner;
+    int owned = winst_walk_sections(bundle_data, 0, bundle_len, &ownership);
+    free(owner.ground_keys);
+    if (!owned) goto cleanup;
 
     if (!winst_place_ground_prototypes(&library, &built_scene, &built_vista,
                                        &local_stats)) goto cleanup;

@@ -27,6 +27,9 @@ typedef struct {
     long meshes_placed;
     long missing_models;
     long own_matrix_meshes;
+    /* ROAD/TERRAIN meshes placed at a record's own transform instead of by the
+     * ground pass: the instanced-ground repair's regression handle. */
+    long instanced_ground_meshes;
     long rejected_meshes;
     long keyed_models;
     long lod_fallbacks;

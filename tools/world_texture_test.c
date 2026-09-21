@@ -348,6 +348,57 @@ static void test_sliced_batches(void) {
     assert(glGetError()==GL_NO_ERROR);
 }
 
+/* A batch is "missing art" only when EVERY member asked for a texture. The old
+   gate read the FIRST member's texkey, so in a cell that mixes an authored
+   untextured mesh with one whose texture failed to resolve, whether the whole
+   batch drew or vanished depended on sort order. No shipped bundle produces
+   such a mix today (measured: 68 wholly-unresolved batches across five, zero
+   mixed), which is exactly why this needs a fixture rather than a screenshot. */
+static void test_unresolved_batch_needs_every_member(void) {
+    const float triangle[15]={0,0,0,0,0, 4,0,0,1,0, 0,4,0,0,1};
+    uint16_t indices[3]={0,1,2};
+    /* `untex` picks WHICH member is the authored-untextured one, because the old
+       rule read the first member in sort order -- so the bug only shows when the
+       named member happens to sort first. Both orders must give the same answer. */
+    for (int untex = -1; untex < 2; untex++) {
+        N2Mesh meshes[2]={{0}}; N2Scene scene={meshes,2,2};
+        float verts[2][15],bounds[2][4]; unsigned char colors[2][12];
+        unsigned char modes[2]={0};
+        GLuint textures[2]={0,0};              /* neither resolved to a GL name */
+        for (int i=0;i<2;i++) {
+            memcpy(verts[i],triangle,sizeof triangle); memset(colors[i],i+20,12);
+            bounds[i][0]=bounds[i][1]=0; bounds[i][2]=bounds[i][3]=4;
+            meshes[i].verts=verts[i]; meshes[i].idx=indices; meshes[i].vcol=colors[i];
+            meshes[i].nverts=3; meshes[i].nidx=3; meshes[i].cat=N2_ROAD;
+            meshes[i].mat_exact=0;             /* same material group -> one batch */
+            meshes[i].texkey=0x1000u+(uint32_t)i;
+        }
+        if (untex >= 0) meshes[untex].texkey=0;   /* -1 = nobody, wholly unresolved */
+        N2Batch *bat=NULL; int map[2];
+        int n=upload_world_batches(&scene,bounds,textures,0,&bat,NULL,map,modes);
+        assert(n==1 && map[0]==map[1]);        /* they really do share a batch */
+        assert(bat[0].tex==0);
+        assert(bat[0].unresolved == (untex >= 0 ? 0 : 1));
+        render_batch_array_free(&bat,&n);
+    }
+    /* and a batch that DID resolve is never "missing art" */
+    {
+        N2Mesh meshes[1]={{0}}; N2Scene scene={meshes,1,1};
+        float verts[15],bounds[1][4]; unsigned char colors[12]={0};
+        unsigned char modes[1]={0}; GLuint textures[1]={7};
+        memcpy(verts,triangle,sizeof triangle);
+        bounds[0][0]=bounds[0][1]=0; bounds[0][2]=bounds[0][3]=4;
+        meshes[0].verts=verts; meshes[0].idx=indices; meshes[0].vcol=colors;
+        meshes[0].nverts=3; meshes[0].nidx=3; meshes[0].cat=N2_ROAD;
+        meshes[0].texkey=0x2000u;
+        N2Batch *bat=NULL; int map[1];
+        int n=upload_world_batches(&scene,bounds,textures,0,&bat,NULL,map,modes);
+        assert(n==1 && !bat[0].unresolved);
+        render_batch_array_free(&bat,&n);
+    }
+    assert(glGetError()==GL_NO_ERROR);
+}
+
 static void test_sliced_u16_limit(void) {
     N2Mesh meshes[3]={{0}};N2Scene scene={meshes,3,3};
     float bounds[3][4]={{0,0,4,4},{0,0,4,4},{0,0,4,4}};
@@ -408,6 +459,47 @@ static void test_incremental_retirement(void) {
     }
 }
 
+/* The contrast-only reject rule discarded 17 of the 21 textures it caught on
+   STREAML4RA -- neon shop signs, a letter panel, a badge, a roof tile -- and
+   those signs then rendered without a face. n2_tex_noise must keep rejecting a
+   mis-decoded surface while keeping high-contrast art. The bar fixtures use a
+   4-pixel bar so x and x+4 -- the contrast term's own sample pair -- always
+   straddle an edge: all three fixtures trip that term, so only the hue and
+   palette terms decide the verdict. */
+static void test_noise_rejects_only_mis_decodes(void) {
+    enum { W = 64, H = 64 };
+    static unsigned char px[W*H*3];
+    N2Tex t = {0}; t.w = W; t.h = H; t.rgb = px;
+
+    /* A wrong swizzle: every channel independent, so edges have no shared
+       direction and the palette is huge. */
+    unsigned seed = 12345u;
+    for (int i = 0; i < W*H*3; i++) { seed = seed*1103515245u + 12345u; px[i] = (unsigned char)(seed >> 16); }
+    assert(n2_tex_noise(&t));
+
+    /* Sign art: hard black/white vertical bars on the sample stride. Maximum
+       contrast, but every edge moves all three channels the same way and the
+       palette is two colours. */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            unsigned char v = (unsigned char)(((x >> 2) & 1) ? 250 : 5);
+            unsigned char *p = px + ((long)y*W + x)*3;
+            p[0] = p[1] = p[2] = v;
+        }
+    assert(!n2_tex_noise(&t));
+
+    /* Coloured sign art (a neon letter on black): still one hue direction. */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            int on = ((x >> 2) & 1);
+            unsigned char *p = px + ((long)y*W + x)*3;
+            p[0] = (unsigned char)(on ? 255 : 0);
+            p[1] = (unsigned char)(on ? 210 : 2);
+            p[2] = (unsigned char)(on ?  40 : 0);
+        }
+    assert(!n2_tex_noise(&t));
+}
+
 int main(void) {
     char root[]="build/world-texture-XXXXXX";assert(mkdtemp(root));
     char tracks[160],global[160],region[192],common[192],master[192];
@@ -422,8 +514,10 @@ int main(void) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,1);
     SDL_Window *win=SDL_CreateWindow("world-texture-test",0,0,32,32,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
     assert(win);SDL_GLContext ctx=SDL_GL_CreateContext(win);assert(ctx);
+    test_noise_rejects_only_mis_decodes();
     test_resident_resource_cleanup();
     test_sliced_batches();
+    test_unresolved_batch_needs_every_member();
     test_sliced_u16_limit();
     test_incremental_retirement();
     test_sliced_resident_textures(master);

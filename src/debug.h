@@ -115,6 +115,13 @@ typedef struct {
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
     float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */
     float fog_density;          /* exp^2 fog: f = exp(-(depth*density)^2) */
+/* Texture detail = anisotropic filtering, 1 = off (plain trilinear) up to the
+ * GL maximum. Changing it re-filters every texture already resident, so the
+ * slider is live rather than needing a reload. Defaults to the hardware
+ * maximum: it is the one quality knob that costs a fraction of a millisecond
+ * and it is what stops road, kerb and car flanks smearing at grazing angles. */
+    float tex_detail;
+    float light_halo, light_gain;  /* district flare sprite size / emission scale */
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
@@ -217,6 +224,14 @@ typedef struct {
     int   scen_count[8];        /* mesh count per N2_SC_* class */
     int   scen_near_n;          /* named chunks near the car (<=12) */
     char  scen_near[12][40];    /* "NAME  [CLASS]  d=..m" rows */
+
+    /* --- placement marking (engine writes each frame; Placement Marks tab
+           captures it). The probe follows the car, or the camera in freecam,
+           so a mark carries the surface it was taken on and not just an XY. --- */
+    float probe[3];             /* world point a mark would capture */
+    float probe_ground_z;       /* ground selector result under probe */
+    int   probe_ground_cat;     /* WSURF_NONE / WSURF_ROAD / WSURF_TERRAIN */
+    char  probe_asset[32];      /* sname of the covering mesh, "" if none */
 
     /* --- rim paint (recolor the OEM gold rim diffuse; silver by default) --- */
     int   rim_paint;        /* 1 = tint toward rim_color, 0 = raw OEM texture */

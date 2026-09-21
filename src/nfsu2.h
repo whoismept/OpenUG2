@@ -512,7 +512,20 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.verts[i*5+2] = px*mtx[2]+py*mtx[6]+pz*mtx[10]+mtx[14];
         } else { m.verts[i*5+0]=px; m.verts[i*5+1]=py; m.verts[i*5+2]=pz; }
         memcpy(m.verts + i*5 + 3, rec + i*stride + uvoff, 8);
-        if (m.vcol) memcpy(m.vcol + i*4, rec + i*stride + coloff, 4);
+        if (m.vcol) {
+            /* The prelight slot is a D3DCOLOR: little-endian ARGB, so the bytes
+               sit in memory as B,G,R,A. Copying the run straight through as
+               RGBA swapped red and blue. It hid for years because 58.7% of
+               L4RA's 7.36M prelight vertices are neutral grey (R==G==B, which
+               the swap leaves untouched); it only shows on saturated baked
+               colour, where it turned the traffic lights' red lens purple and
+               the amber lens teal, green being its own mirror. The remaining
+               coloured vertices also skewed 2.06:1 toward blue, which no
+               warm-lit night city does. */
+            const unsigned char *pc = rec + i*stride + coloff;
+            m.vcol[i*4+0] = pc[2]; m.vcol[i*4+1] = pc[1];
+            m.vcol[i*4+2] = pc[0]; m.vcol[i*4+3] = pc[3];
+        }
     }
     /* the index leaf carries the same 0x11 filler prefix as the vertex leaf
        (as whole 0x1111 u16 words). Skipping it is essential: when the filler is
@@ -792,6 +805,51 @@ static int n2_is_vista_impostor(const char *nm, const N2Geom *g) {
            g->zspan >= N2_VISTA_Z && g->planarity >= N2_VISTA_PLANAR;
 }
 
+/* Backdrop-impostor ATLASES, keyed by texture rather than by spelling. Three
+ * impostor objects carry no usable 0x134011 name -- retail left one as
+ * "OBJECT01" and two whose name leaf is not ASCII at all -- so neither the PAN_
+ * prefix nor n2_vista_family can see them and they reached the world as solid
+ * geometry. The worst of them lays TRN_COASTROADLOD_A_DM across the
+ * conservatory park at z 0..35 (a 1016 x 365 m sheet that reads on screen as a
+ * river running into the greenhouse) with an ARC_PANARAMABUILDINGS billboard
+ * standing in it; at 1016 m of span it is far under N2_VISTA_XY, so the
+ * measured test cannot reach it either.
+ * Census over all eight shipped bundles (28985 objects,
+ * tools/impostor_atlas_census.py): 89 objects bind one of these six atlases and
+ * every one of them is an impostor; the only five records that are not already
+ * PAN_* / TRN_PANARAMA* are those three leftovers (L4RA and its L4RD twin ship
+ * two of them each) -- no false positive to trade off. Keys are the FNV name
+ * hash, identical in every bundle that ships the texture (verified on all
+ * eight). */
+static int n2_impostor_atlas(const uint32_t *slot, int nslot) {
+    static const uint32_t atlas[6] = {
+        0x0801e3a1u,   /* TRN_COASTROADLOD_A_DM   */
+        0x531cd2dbu,   /* TRN_TREELINEA_DM        */
+        0x5db83e34u,   /* TRN_FREEWAYLOD_A_DM     */
+        0xb83ca1b6u,   /* TRN_TREES_FENCES_LOD_A_ */
+        0xea9eb4a8u,   /* ARC_PANARAMABUILDINGSB_ */
+        0xea9f4109u,   /* ARC_PANARAMABUILDINGSC_ */
+    };
+    for (int i = 0; i < nslot; i++)
+        for (int a = 0; a < 6; a++) if (slot[i] == atlas[a]) return 1;
+    return 0;
+}
+
+/* The one PAN_ asset that is not a billboard: the map's WATER SURFACE. PAN_OCEAN
+ * measures 10021 m of footprint against 13 m of Z, planarity 1.000 and a
+ * dominant normal of exactly +Z (PAN_OCEAN_B98 in L4RF: 3278 m, 0 m, 1.000).
+ * Culling it by prefix is why the canals and the bay render as empty void down
+ * to the fog colour. Every other PAN_ asset measured over the eight bundles is a
+ * vertical wall or a closed shell; the nearest horizontal one is a
+ * PAN_INDUSTRIALNORTHBRIDGE_C fragment at 234 m, so the footprint floor
+ * separates them with the sample's own gap. */
+#define N2_SHEET_XY   1000.0f
+#define N2_SHEET_Z      50.0f
+static int n2_is_ground_sheet(const N2Geom *g) {
+    return g->xyspan >= N2_SHEET_XY && g->zspan <= N2_SHEET_Z &&
+           g->planarity >= 0.99f && g->dom[2] >= 0.99f;
+}
+
 /* ---- M102 fallback census -------------------------------------------------
  * Records WHY each ROAD/TERRAIN object took the per-submesh path or the old
  * single-last-slot fallback. Pure bookkeeping: it reads the same values the
@@ -865,6 +923,30 @@ static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
                             uint32_t *out, int cap);
 static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys);
 
+/* A texture slot usually names a diffuse map. A few name a MATERIAL that never
+ * carries one, and those must not take the "substitute the object's sibling
+ * key" fallback below: there is no art to approximate, so the substitute is
+ * always the wrong picture rather than a near-enough one.
+ *
+ * HEADLIGHTGLOW is the light-pool card on street fixtures -- the soft cone a
+ * lamp throws onto the ground. Measured on STREAML4RA: 210 submeshes across
+ * 132 object kinds carry it, and NO TPK record for it exists in any shipped
+ * pack (all five STREAM*.BUN, LOC4DYNTEX.BIN, GLOBALB.BUN). On XO_LightWallA
+ * the fallback handed its 16-triangle cone the fixture's OWN lens texture
+ * (OBJ_SHOEBOX, a bright disc over a dark housing) stretched across a 2.8 m
+ * card, which is the pale disc the player reported as a "moon" standing in
+ * the road. The name is pinned to this hash by world_instance_test.
+ *
+ * ponytail: a named constant, not a detector. The other 270 unresolved
+ * submeshes DO name real textures (ARC_*, SGN_*, LOD_*) that merely live in a
+ * pack this bundle does not ship, and for those the sibling fallback is a
+ * reasonable wall-for-wall guess -- dropping them would punch holes in
+ * buildings. Add a constant here only for a material proven to have no art. */
+#define N2_MAT_HEADLIGHTGLOW 0x3394fe62u
+static int n2_slot_is_lightpool(uint32_t slotkey) {
+    return slotkey == N2_MAT_HEADLIGHTGLOW;
+}
+
 /* M132: when set, vista/LOD impostors are EMITTED into this scene instead of
  * being dropped on the floor. They still never reach the ordinary world scene,
  * so ground, collision, navigation and spawn selection are untouched -- those
@@ -898,12 +980,22 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                centroids form the coherent city that matches the nav graph), so
                cull only the impostors. ponytail: cull, not a backdrop-ring pass --
                re-add far-plane billboards if the empty horizon ever matters. */
+            float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
+            uint32_t slot[64];
+            int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
             if (!strncmp(anm, "PAN", 3)) {
-                if (!n2_vista_out) { n2_obj_vista++; o = ds + size; continue; }  /* dropped */
-                scene = n2_vista_out; n2_vista_objs++; n2_vista_pan++;
+                /* ...except the water surface, which wears the same prefix and
+                   is ordinary world ground. n2_is_ground_sheet measures that
+                   apart instead of spelling it. */
+                N2Geom og;
+                int sheet = n2_obj_geom(d, ds, ds + size, objm, &og) &&
+                            n2_is_ground_sheet(&og);
+                if (!sheet) {
+                    if (!n2_vista_out) { n2_obj_vista++; o = ds + size; continue; }  /* dropped */
+                    scene = n2_vista_out; n2_vista_objs++; n2_vista_pan++;
+                }
             }
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
-            float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             { /* M133 diagnostic: how many 0x134011 headers does this object
                  carry, and what translation does each one hold? Name matching
                  is diagnostic only and never reaches production behaviour. */
@@ -938,10 +1030,13 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                they were reaching the world as ordinary opaque TERRAIN and walling
                the camera in (Milestone 75). Family test first -- it is free, and
                the geometry measure below allocates. */
-            if (scene == scene0 && n2_vista_family(anm)) {
+            if (scene == scene0) {
                 N2Geom vg;
-                if (n2_obj_geom(d, ds, ds + size, objm, &vg) &&
-                    n2_is_vista_impostor(anm, &vg)) {
+                int impostor = n2_impostor_atlas(slot, nslot) ||
+                    (n2_vista_family(anm) &&
+                     n2_obj_geom(d, ds, ds + size, objm, &vg) &&
+                     n2_is_vista_impostor(anm, &vg));
+                if (impostor) {
                     if (!n2_vista_out) { n2_obj_vista++; o = ds + size; continue; }  /* dropped */
                     scene = n2_vista_out; n2_vista_objs++; n2_vista_fam++;
                 }
@@ -967,8 +1062,6 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
              * straight through to the unchanged single-mesh path below. */
             int sub_ok = 0;
             N2Sub sub[64]; int nsub = 0;
-            uint32_t slot[64];
-            int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
             int fb_why = -1; long fb_idx = 0, fb_chain = 0;   /* M102 census only */
             if (cat != N2_GLOW && pairs == 1) {
                 nsub  = n2_mesh_submeshes(d, ds, ds + size, sub, 64);
@@ -1040,6 +1133,10 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                        index partition are identical either way -- only the key
                        differs -- so nothing is dropped or duplicated. */
                     uint32_t authored = slot[sub[a].mat];
+                    /* A light-pool card has no diffuse map anywhere to fall
+                       back to; emitting it means painting a sibling texture
+                       across it. Drop the range instead. */
+                    if (n2_slot_is_lightpool(authored)) continue;
                     /* SKYDOME's two proven slots live in shared LOC4, so they
                        are intentionally absent from the region-local key set.
                        Preserve those authored keys for world_bind_textures to
@@ -1254,6 +1351,8 @@ static void n2_census_walk(const unsigned char *d, long beg, long end,
                 int cat = n2_mesh_category(d, ds, ds + size);
                 /* order must match the enum at the top: ROAD=0 TERRAIN=1 OTHER=2 SKY=3 GLOW=4 */
                 static const char *cn[] = { "ROAD","TERRAIN","OTHER","SKY","GLOW" };
+                uint32_t cslot[64];
+                int ncslot = n2_mesh_texslots(d, ds, ds + size, cslot, 64);
                 printf("%-11s %-28s %-7s %-8s %8.0f %8.0f %7ld  "
                        "dom(%5.2f %5.2f %5.2f) planar %.3f  %s\n",
                        rn, anm[0] ? anm : "(unnamed)",
@@ -1261,7 +1360,10 @@ static void n2_census_walk(const unsigned char *d, long beg, long end,
                        n2_scen_name(n2_scen_class(anm)),
                        g.xyspan, g.zspan, g.tris,
                        g.dom[0], g.dom[1], g.dom[2], g.planarity,
-                       !strncmp(anm, "PAN", 3) ? "PAN_ (culled by prefix)" :
+                       !strncmp(anm, "PAN", 3)
+                         ? (n2_is_ground_sheet(&g) ? "PAN_ ground sheet (retained)"
+                                                   : "PAN_ (culled by prefix)") :
+                       n2_impostor_atlas(cslot, ncslot) ? "IMPOSTOR (atlas, culled)" :
                        n2_is_vista_impostor(anm, &g) ? "IMPOSTOR (culled)" :
                          (n2_vista_family(anm) ? "family, geometry-failed" : "retained"));
             }
@@ -1869,6 +1971,56 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_MOLDINGS    0x12c9453cu
 #define N2_MAT_HEADLIGHT   0x9c645529u
 #define N2_MAT_HEADLIGHTGLASS 0xa6348ee3u
+
+/* Tail-light assembly materials, cracked with the same h=h*33+c convention and
+ * verified against the ten constants above. A tail light is NOT one part: over
+ * eight cars' BRAKELIGHT objects the per-submesh material census reads
+ *   BRAKELIGHT       596 submeshes  78867 indices   <- the lit lens
+ *   BRAKELIGHTGLASS  347            21576           <- clear outer cover
+ *   MOLDINGS         343            36819           <- black trim
+ *   CARSKIN          120            31059           <- body-coloured surround
+ *   f7fc7674         117            12288           <- see below
+ *   CLEARPLASTIC     110             5442
+ *   CHROME            90            14481
+ *   ALUMINUM          35             1602
+ *   CARBONFIBRE       12             2196
+ * so more than half of the geometry is not the lens, and painting the whole
+ * object with the lens emission is what made a tail light read as a flat red
+ * sticker with its trim and chrome glowing too. */
+#define N2_MAT_BRAKELIGHT      0x05bc3a3cu
+#define N2_MAT_BRAKELIGHTGLASS 0xd79597d6u
+#define N2_MAT_CLEARPLASTIC    0x33a26cb6u
+#define N2_MAT_ALUMINUM        0x2e65e067u
+#define N2_MAT_CARBONFIBRE     0x721aff7cu
+/* A SECOND lens material whose name did not fall out of the hash. Identified by
+ * measurement, like N2_MAT_INTERIOR: across all 29 cars' 664 tail-light objects
+ * it and BRAKELIGHT are perfectly MUTUALLY EXCLUSIVE -- 85 objects carry this
+ * and no BRAKELIGHT, 579 carry BRAKELIGHT and not this, zero carry both, over
+ * 16 different cars. A trim or cover material would co-occur with the lens; an
+ * alternative for the same job cannot. Treating it as anything but a lens would
+ * black out those 16 cars' tail lights. */
+#define N2_MAT_BRAKELIGHT_B    0xf7fc7674u
+
+/* Which slice of a tail-light assembly actually emits. 0 means the loader could
+ * not trust a single material for the mesh (absent/mixed/invalid), and that
+ * keeps the previous whole-object behaviour rather than risking a dark lamp. */
+static int n2_brakelight_lens(uint32_t mat) {
+    return mat == 0 || mat == N2_MAT_BRAKELIGHT || mat == N2_MAT_BRAKELIGHT_B;
+}
+
+/* The transparent outer cover of a lamp unit, front or rear. It must not be
+ * drawn as opaque geometry: it sits IN FRONT of the lit lens, so an opaque
+ * cover hides the lamp it is supposed to reveal (measured: shading the 350Z's
+ * BRAKELIGHTGLASS as ordinary dark plastic blacked out both of its tail
+ * lights). The head-lamp side already had this pass; the rear materials are
+ * BRAKELIGHTGLASS and, on cars that ship no BRAKELIGHTGLASS at all such as the
+ * CIVIC, CLEARPLASTIC -- the two transparent names in the material set. */
+static int n2_lamp_clear_cover(int cat, uint32_t mat) {
+    if (cat == N2_CAR_LIGHT)      return mat == N2_MAT_HEADLIGHTGLASS;
+    if (cat == N2_CAR_BRAKELIGHT) return mat == N2_MAT_BRAKELIGHTGLASS ||
+                                         mat == N2_MAT_CLEARPLASTIC;
+    return 0;
+}
 
 /* HEADLIGHTGLASS is the outer lens on stock and STYLE lamps (Miata/Golf).
  * Hashes above use the same h=h*33+c convention as wheel materials. */
@@ -2976,6 +3128,40 @@ static int n2_car_dxt1(const unsigned char *src, N2Tex *t) {
     free(t->alpha);t->alpha=NULL;return 1;
 }
 
+/* The 24-byte NAME a car-pack slot carries in the 144-byte record at the end of
+ * its HUFF payload. This is the whole vinyl catalogue: 1783 named designs per
+ * car (SKYLINE_WILD_059_MASK, MIATA_FLAME_014_MASK, GOLF_AEM_SCORPION ...),
+ * named exactly like the retail vinyl menu's own categories. It does not show up
+ * in `strings` because the record is inside the compressed stream, which is why
+ * VINYLS.BIN read as 1786 anonymous keys. Returns 0 and leaves `out` empty when
+ * the slot is absent, is not HUFF-wrapped, or its record fails validation. */
+static int n2_car_tex_name_by_key(const unsigned char *d, long len, uint32_t key,
+                                  char *out, int cap) {
+    if (cap > 0) out[0] = 0;
+    uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
+    if (!p || cap < 25) return 0;
+    for (uint32_t i = 0; i + 0x18 <= sz; i += 0x18) {
+        if (n2_u32(p + i) != key) continue;
+        int absoff = (int)n2_u32(p + i + 4), enc = (int)n2_u32(p + i + 8),
+            dec = (int)n2_u32(p + i + 12);
+        if (dec <= 144 || enc < 20 || absoff < 0 || (long)absoff + enc > len) return 0;
+        if (memcmp(d + absoff, "HUFF", 4)) return 0;
+        unsigned char *raw = (unsigned char *)malloc(dec);
+        if (!raw) return 0;
+        int ok = n2_huff(d + absoff + 16, enc - 16, raw, dec) == dec &&
+                 n2_u32(raw + dec - 144 + 0x18) == key;
+        if (ok) {
+            memcpy(out, raw + dec - 144, 24); out[24] = 0;
+            for (int c = 0; c < 24; c++)
+                if (out[c] && (out[c] < 32 || out[c] > 126)) { out[c] = 0; break; }
+            ok = out[0] != 0;
+        }
+        free(raw);
+        return ok;
+    }
+    return 0;
+}
+
 /* Decode ONE car texture through its offset-slot table and embedded header. */
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
@@ -3146,6 +3332,29 @@ static int n2_load_texture(const unsigned char *d, long len, const char *name, N
  * wrong format/swizzle decodes to high-frequency rainbow. Used to reject a
  * texture we can't decode correctly (e.g. a swizzled surface) so it falls back
  * instead of binding garbage. */
+/* CONTRAST alone is not the test, and using it alone was throwing away real
+ * assets. Measured over STREAML4RA's 1119 decoded textures: 21 tripped the >55
+ * contrast rule, and dumping all 21 showed only FOUR are actually mis-decoded
+ * (SFX_LIGHT_BEAMA and three barrier/beam surfaces -- rainbow confetti). The
+ * other seventeen decode perfectly and are exactly the assets you would expect
+ * to be high-contrast at a 4-pixel sample stride: neon shop signs (VICTOR,
+ * ROYALE, PARKING, BURGER KING, W HARPER), a Chinese shop sign, an "M" letter
+ * panel, an LV badge, a cherry-blossom cutout and a terracotta roof tile --
+ * that last one scored the HIGHEST contrast of all 21 (109) purely because its
+ * ridges happen to alternate on the sample stride. Those seventeen signs then
+ * lost their texture and their batch was dropped by main.c's
+ * "!b->tex && b->texkey" gate, so they rendered without their faces.
+ *
+ * Two further terms, both measured on those 21:
+ *   coherent  the fraction of horizontal edges whose per-channel deltas share a
+ *             sign. A real edge moves the channels together (a lit pixel is lit
+ *             in all three); a wrong swizzle moves them independently. The four
+ *             mis-decodes score 0.37/0.40/0.41/0.48, every genuine sign 0.54..1.00
+ *             -- except one neon tube at 0.29, which the palette term rescues.
+ *   palette   distinct 5-bit colours per pixel. Confetti needs a big palette
+ *             (0.097..0.122); the neon tube uses eight colours (0.008).
+ * All three must agree before a texture is discarded, so this rule is strictly
+ * narrower than the old one: nothing that used to bind can stop binding. */
 static int n2_tex_noise(const N2Tex *t) {
     long sum = 0, cnt = 0;
     for (int y = 0; y < t->h; y += 4)
@@ -3153,7 +3362,30 @@ static int n2_tex_noise(const N2Tex *t) {
             const unsigned char *a = t->rgb + ((long)y*t->w + x)*3, *b = a + 12;
             sum += abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2]); cnt++;
         }
-    return cnt && (sum / (cnt*3)) > 55;
+    if (!cnt || (sum / (cnt*3)) <= 55) return 0;
+
+    unsigned char seen[1 << 12] = {0};   /* 2^15 quantised colours, one bit each */
+    long edges = 0, coherent = 0, colours = 0, pixels = 0;
+    for (int y = 0; y < t->h; y++) {
+        const unsigned char *r = t->rgb + (long)y*t->w*3;
+        for (int x = 0; x < t->w; x++) {
+            const unsigned char *a = r + x*3;
+            unsigned q = (unsigned)(a[0] >> 3) << 10 | (unsigned)(a[1] >> 3) << 5 | (a[2] >> 3);
+            if (!(seen[q >> 3] & (1u << (q & 7)))) { seen[q >> 3] |= (unsigned char)(1u << (q & 7)); colours++; }
+            pixels++;
+            if (x + 1 >= t->w) continue;
+            const unsigned char *b = a + 3;
+            int d0 = b[0]-a[0], d1 = b[1]-a[1], d2 = b[2]-a[2];
+            int m = abs(d0); if (abs(d1) > m) m = abs(d1); if (abs(d2) > m) m = abs(d2);
+            if (m <= 16) continue;          /* flat: carries no hue evidence */
+            edges++;
+            int up = (d0 > 4) + (d1 > 4) + (d2 > 4);
+            int dn = (d0 < -4) + (d1 < -4) + (d2 < -4);
+            if (!up || !dn) coherent++;     /* channels agree on the direction */
+        }
+    }
+    if (!edges || !pixels) return 0;
+    return coherent * 100 < edges * 52 && colours * 1000 > pixels * 50;
 }
 
 /* A STREAM TPK opened once for repeated by-hash lookups. A region can have MANY

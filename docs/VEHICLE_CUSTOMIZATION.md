@@ -124,3 +124,54 @@ are CPU/ASan/UBSan checks with simulated GPU ownership, not visual acceptance.
 Normal/debug builds pass. Keep actual gameplay and asset attachment appearance
 pending until manually tested; never mark an undecoded career mechanic complete
 because a debug selector exists.
+
+## Vinyls: the catalogue, and why they were invisible (2026-09-20)
+
+`CARS/<CAR>/VINYLS.BIN` is a HUFF-compressed TPK of ~1786 slots, ~14 MB per car.
+It read as anonymous keys because each slot names itself inside its COMPRESSED
+payload: the 144-byte record at the end carries a 24-byte name, so `strings` on
+the archive shows only entropy. `n2_car_tex_name_by_key` reads it, and
+`tools/vinyl_census.c` dumps the lot:
+
+    make vinyl-census && ./build/vinyl_census .. SKYLINE --all
+
+1783 of 1786 decode and **every one is named**, in exactly the retail vinyl
+menu's own families — `STRIPES_` 32, `ART_F_` 26, `FLAME_` 23, `TRIBAL_` 20,
+`MODERNS_` 20, `CONTEST_` 20, `WILD_` 17, `TEAR_` 15, `LIGHTNG_` 15, `BODY_` 15,
+`LIQUIDS_`, `FLAG_`, `HOOD_*`, `TOP_*`, `UNIQUE_*`, plus sponsor art such as
+`AEM_KENWOOD` and `AEM_SCORPION`.
+
+**The keys do not overlap between cars at all** (SKYLINE vs GOLF vs MIATA: 1786
+each, 0 shared). Each design is pre-baked into that car's own body UV layout.
+That is the fact that makes vinyls work: a vinyl can be drawn straight over the
+paint on untextured body panels and it lands as a coherent design following the
+flank, not a smear. The older warning in `n2_walk_car` about texture-less panels
+not sharing a UV sheet was about the BADGE atlas, a different texture, and still
+holds for that one.
+
+What was there before: the first slot whose opaque-alpha fraction fell in
+[4%, 55%] was composited *under the badge atlas*. Both halves were wrong. The
+choice was arbitrary — every stock SKYLINE wore `WILD_059`, every MIATA
+`FLAME_014`, every GOLF the `AEM_SCORPION` sponsor decal — and since the badge
+atlas covers almost no UV, the result was invisible anyway: measured at 18-343
+pixels, 0.00-0.05% of the frame, on four cars.
+
+Now: a stock car carries **no vinyl**, which is what retail ships, and the choice
+is explicit. A successful vehicle switch clears the preview because each
+car uses its own vinyl UV layout; failed switches keep the current preview.
+
+| | |
+|---|---|
+| `--vinyl list` | print the car's catalogue (key + name) |
+| `--vinyl FLAME_128` | case-insensitive substring match, first hit wins |
+| (default) | none |
+
+The selected design is uploaded as its own texture and drawn through the
+existing `uDecal` path on body panels, so the paint shows wherever the design is
+cut away. Removing the old badge-atlas composite changes a stock car by 33
+pixels (0.005%) — it was doing almost nothing.
+
+OPEN: vinyl **colour**. The palette in these slots ships all-zero — retail
+recolours a vinyl from the player's own choices — so `n2_load_car_tex_by_key`
+synthesises a dark cut-vinyl look. Per-vinyl colour selection, and NFSU2's
+multi-layer stacking, are not implemented.

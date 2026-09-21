@@ -114,14 +114,22 @@ world-surface artifact with its own capture and acceptance criteria.
 - Vehicle presentation still needs a complete tyre/rim render pass and
   attribution of the unexplained object below the car. The ImGui modification
   flow now covers bumpers, skirts, hoods, spoilers, exhausts, lights, full body
-  kits, rims, paint and neon; vinyls, decals, mirrors, wide-body kits, rim
+  kits, rims, paint and neon; in-menu vinyl editing, decals, mirrors, wide-body kits, rim
   sizing and every performance package are still missing, as are ownership,
   money, purchases and saving.
 - Lighting fidelity is still evolving: installed headlight/taillight styles now
   scale emissive output, `L`/`J` drive low/high and flash beams, and `N` gives a
   small nitro headroom with stretched tail glow and soft screen-corner haze.
-  District and road-closure lights still need material/group attribution, and
-  the NFSU2-style wet/rainy asphalt path is not yet implemented.
+  Street/district lamps now draw as camera-facing flares of near-constant screen
+  size instead of the authored 10 m influence radius, which used to intersect
+  the lamp post, the ground and nearby walls and leave hard-edged bright slabs
+  wherever the depth test cut the quad. The authored light shafts no longer
+  render as solid black wedges hanging off the buildings: their
+  `SFX_LIGHT_BEAMA` texture does not decode from the offset its record names,
+  and an untextured world batch is now skipped instead of drawn as a flat grey
+  slab. Recovering that texture's real data offset is still open. Road-closure lights
+  still need material/group attribution, and the NFSU2-style wet/rainy asphalt
+  path is not yet implemented.
 - Open-world collision attribution still needs to classify overlapping or
   duplicate instance meshes before any collision threshold is changed.
 - The northern mountain-road route needs a source-level visibility audit; after
@@ -177,8 +185,9 @@ builds compile the panel out entirely, so none of this is reachable there —
 | --- | --- |
 | **Modification** | The vehicle shop surface. Live car selector (swaps the vehicle without restarting the world or losing your pose) plus colour-coded Underground 2 shop subtabs. |
 | **Vehicle Diagnostics** | Per-car wheel stance (axle, track, ride, body lowering), live handling readouts, engine-cover and car-part inspection, mesh inspector, wheel spin/steer demo. |
-| **Lighting & Environment** | Night mode, headlight beam preview, beam pitch/reach/intensity, lens opacity, headlight shadows, chase-camera distance/height/stiffness, ambient/diffuse/fog. |
+| **Lighting & Environment** | Night mode, headlight beam preview, beam pitch/reach/intensity, lens opacity, headlight shadows, street/district flare size and brightness, chase-camera distance/height/stiffness, ambient/diffuse/fog. |
 | **World & Entities** | Loaded track selector, scenery semantics census, nearby world chunks, decoded `ZCV_`/`ZCS_` entity definitions, UV checker, HUD toggle. |
+| **Placement Marks** | Report a misplaced object by driving to it. Live probe readout (world XYZ, the ground selector's surface height and category, the covering chunk's asset name, district), then `F9` marks the defect and `F10` marks where it should be. Marks carry a note, list colour-coded, and go to the clipboard or `placement_marks.txt` — and every mark is echoed to stdout, so nothing is lost if the session ends. |
 | **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, freecam. |
 | **Navigation & Races** | Top-down nav graph drawn from the authored route files, district colouring, right-click GPS routing, the shipped race-event catalog, and freeroam/race mode switching with a live race HUD. |
 

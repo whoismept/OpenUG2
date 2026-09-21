@@ -1253,6 +1253,61 @@ static void headlight_material_test(void) {
     n2_free_scene(&s);
 }
 
+/* A tail light is an ASSEMBLY. Its material hashes were cracked with the same
+   h=h*33+c convention the repo already proves for CARSKIN/WINDSHIELD, so pin
+   each constant to the name it came from -- a drifted constant would silently
+   turn a lens into trim (dark lamp) or trim into a lens (glowing chrome). */
+static uint32_t mat_hash(const char *s) {
+    uint32_t h = 0xFFFFFFFFu;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) h = h*33u + *p;
+    return h;
+}
+static void brakelight_material_test(void) {
+    printf("  tail-light assembly materials\n");
+    chk("hash convention still reproduces the two proven constants",
+        mat_hash("CARSKIN") == N2_MAT_CARSKIN &&
+        mat_hash("WINDSHIELD") == N2_MAT_WINDSHIELD);
+    chk("BRAKELIGHT constant is the hash of \"BRAKELIGHT\"",
+        mat_hash("BRAKELIGHT") == N2_MAT_BRAKELIGHT);
+    chk("BRAKELIGHTGLASS constant is the hash of \"BRAKELIGHTGLASS\"",
+        mat_hash("BRAKELIGHTGLASS") == N2_MAT_BRAKELIGHTGLASS);
+    chk("CLEARPLASTIC constant is the hash of \"CLEARPLASTIC\"",
+        mat_hash("CLEARPLASTIC") == N2_MAT_CLEARPLASTIC);
+    chk("ALUMINUM constant is the hash of \"ALUMINUM\"",
+        mat_hash("ALUMINUM") == N2_MAT_ALUMINUM);
+    chk("CARBONFIBRE constant is the hash of \"CARBONFIBRE\"",
+        mat_hash("CARBONFIBRE") == N2_MAT_CARBONFIBRE);
+
+    chk("the lens emits", n2_brakelight_lens(N2_MAT_BRAKELIGHT));
+    chk("the second, measurement-named lens emits",
+        n2_brakelight_lens(N2_MAT_BRAKELIGHT_B));
+    chk("an untrusted/mixed material keeps emitting (no dark lamp)",
+        n2_brakelight_lens(0));
+    chk("black trim does not emit", !n2_brakelight_lens(N2_MAT_MOLDINGS) &&
+                                    !n2_brakelight_lens(N2_MAT_DULLPLASTIC));
+    chk("chrome, aluminium and carbon do not emit",
+        !n2_brakelight_lens(N2_MAT_CHROME) &&
+        !n2_brakelight_lens(N2_MAT_ALUMINUM) &&
+        !n2_brakelight_lens(N2_MAT_CARBONFIBRE));
+    chk("the clear cover is not itself the emitter",
+        !n2_brakelight_lens(N2_MAT_BRAKELIGHTGLASS) &&
+        !n2_brakelight_lens(N2_MAT_CLEARPLASTIC));
+
+    chk("rear clear covers go to the cover pass, not the opaque pass",
+        n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHTGLASS) &&
+        n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_CLEARPLASTIC));
+    chk("the head-lamp cover rule is unchanged",
+        n2_lamp_clear_cover(N2_CAR_LIGHT, N2_MAT_HEADLIGHTGLASS) &&
+        !n2_lamp_clear_cover(N2_CAR_LIGHT, N2_MAT_CLEARPLASTIC));
+    chk("a lens is never treated as a cover",
+        !n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHT) &&
+        !n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHT_B));
+    chk("body and other classes never reach either lamp rule",
+        !n2_lamp_clear_cover(N2_CAR_BODY, N2_MAT_BRAKELIGHTGLASS) &&
+        !n2_lamp_clear_cover(N2_CAR_GLASS, N2_MAT_CLEARPLASTIC));
+    printf("\n");
+}
+
 int main(void) {
     headlight_material_test();
     wheel_tyre_rounding_test();
@@ -1264,6 +1319,7 @@ int main(void) {
     rim_tier_test();
     rim_orientation_test();
     car_mount_test();
+    brakelight_material_test();
     printf("MILESTONE 135  car material routing / complete-tier LOD regression\n\n");
 
     /* -------------------------------------------------------------------

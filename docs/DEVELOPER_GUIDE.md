@@ -321,6 +321,48 @@ requests the shipped `SFX_FLARE_GLOWA` key through the same regional/LOC4/master
 resolver as world materials. Do not add a second texture decoder or keep
 region bytes alive after binding merely for lights.
 
+### Unresolvable textures and the black light-shaft wedges
+
+`XO_*SPOTLIGHT*` / `*BEAMYA*` submeshes (747 of them in L4RA) are the authored
+light shafts. They name texture key `2e95ce7c` = `SFX_LIGHT_BEAMA`, a 32x256
+DXT3 record in `GLOBAL/InGameCommon.bun` whose draw descriptor is
+`(order,usage,blend,wz) = (7,2,2,0)` -- a late-order additive layer. The key is
+rejected by `n2_tex_noise` and the meshes end up with no bound texture.
+
+That rejection is correct. Dumping the decoded pixels shows saturated
+per-block colour static, the signature of DXT blocks read from a base the
+record's `Offset` does not actually address: `n2_tpk_open` puts this block's
+`dbase` at 46083 (pixel block at 45960 plus a 123-byte `0x11` filler run),
+which is not 16-byte aligned, and every 16-aligned base nearby decodes to flat
+yellow rather than a beam gradient. **The correct base for this archive is an
+open format question**; do not "fix" it by exempting the key from the noise
+filter, which only replaces black wedges with rainbow ones.
+
+What the renderer does instead: a world batch with no bound texture whose
+meshes did name one is **not drawn**. Untextured it falls back to flat grey,
+which under night ambient is the solid dark slab that made every light shaft
+look like a black wedge hanging off a building. Skipping it also drops their
+fill cost -- these cones cover large screen areas (36 batches / 575 meshes at
+the L4RA clock-tower reference pose, 5316 -> 5280 draws). Terrain still gets
+its baked grass fallback, and a batch that never named a texture keeps the
+existing flat-colour treatment.
+
+Run `--tex-audit` to list `TEXFAIL ... DECODED-BUT-REJECTED-AS-NOISE` with the
+owning mesh whenever a surface goes missing or renders wrong.
+
+`r_in` (10 m on every shipped L4RA record) and `r_out` (30 m) are the light's
+**influence radii, not a sprite size**. Sizing the billboard from `r_in`
+directly put a 10 m quad at the lamp's own position, where it intersected the
+lamp post, the ground and nearby walls: the depth test then cut the additive
+quad along those intersections and left hard-edged bright slabs and wedges
+scattered through the night city. The sprite is therefore sized for a
+near-constant *screen* footprint (`d * 0.07`, clamped to `r_in * 0.35` and a
+0.45 m floor), nudged toward the camera by 0.9 of its size so a lamp cannot
+clip its own flare, and faded out over the last quarter of the view range
+instead of popping. Occlusion behind buildings still comes from the ordinary
+depth test. `Lighting & Environment -> District lights` scales both size and
+brightness at runtime; neither knob changes which sources are selected.
+
 At night, sources inside the ordinary fog-derived view distance draw as
 camera-facing quads in `render_district_lights`. This late additive pass enables
 depth testing, turns depth writes off, consumes texture alpha through
@@ -1003,7 +1045,12 @@ Prefer the narrowest diagnostic that observes the production path:
 | surface/layer selection | `--surface-stack`, `--cover-probe` |
 | race start and progression | `--startline-audit`, `--grid-audit`, `--race-trace` |
 | collision feature | `--wall-probe`, `--face-census`, rail census tools |
-| panorama classification | `--vista-census`, `--lod-census` |
+| legacy collision rects | `--face-census` (the only consumer left; world2 uses the resident's own arrays) |
+| vinyl catalogue | `./build/vinyl_census DATAROOT CAR --all`, or `--vinyl list` |
+| texture detail (anisotropy) | `--texture-detail N`, or the live slider in *Lighting & Environment* |
+| texture rejection census | `--tex-audit` (one `TEXFAIL` line per discarded texture, with the owning mesh) |
+| wrong picture on a mesh | `OPENUG2_SLOT_PROBE=<object name>` prints each submesh's texture slot and whether the bundle supplies it; `make texkey-probe && ./build/texkey_probe DATAROOT TRACK KEYHEX` then says what that key actually is (set `N2_PROBE_DIR` to dump the pixels) |
+| panorama classification | `--vista-census` (add `0` to list every object, not just the giants), `--lod-census`, `tools/impostor_atlas_census.py` |
 
 Audit code must not change production behaviour. If an audit needs an override,
 gate it entirely inside the audit flag and prove the ordinary path is unchanged.
