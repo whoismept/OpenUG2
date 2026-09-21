@@ -13,6 +13,11 @@
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl2.h"
 #include "debug.h"
+extern "C" {
+    extern int   g_tex_aniso_max;
+    extern float g_tex_aniso;
+    void render_texture_detail(float aniso);
+}
 
 extern "C" void dbgui_init(struct SDL_Window *win, void *glctx) {
     IMGUI_CHECKVERSION();
@@ -57,6 +62,68 @@ static void part_selector(int p) {
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Placement marks. The user drives (or freecams) to a spot that looks wrong,
+ * presses M, then drives to where it should be and presses Shift+M. Each mark
+ * records the probe point AND what the production ground selector reports
+ * under it, so a report names the actual covering chunk instead of an XY guess.
+ * Marks live here, not in DbgState: nothing on the engine side reads them. */
+enum { MARK_MAX = 256, MARK_NOTE = 64 };
+struct PlacementMark {
+    int  target;                 /* 0 = defect here, 1 = should be here */
+    float pos[3], ground_z;
+    int  cat;
+    char asset[32], district[24], note[MARK_NOTE];
+};
+static PlacementMark g_marks[MARK_MAX];
+static int g_nmarks = 0;
+static char g_mark_note[MARK_NOTE] = "";
+
+static const char *mark_cat_name(int cat) {
+    return cat == 1 ? "ROAD" : cat == 2 ? "TERRAIN" : "none";
+}
+
+static void mark_line(const PlacementMark *m, int index, char *out, size_t cap) {
+    snprintf(out, cap,
+             "MARK %02d %-9s x=%9.2f y=%9.2f z=%8.2f  groundZ=%8.2f cat=%-7s "
+             "asset=%-28s district=%-3s note=%s",
+             index + 1, m->target ? "SHOULD-BE" : "DEFECT",
+             m->pos[0], m->pos[1], m->pos[2], m->ground_z,
+             mark_cat_name(m->cat), m->asset[0] ? m->asset : "-",
+             m->district[0] ? m->district : "-", m->note);
+}
+
+static void mark_capture(int target) {
+    if (g_nmarks >= MARK_MAX) return;
+    PlacementMark *m = &g_marks[g_nmarks];
+    m->target = target;
+    m->pos[0] = g_dbg.probe[0]; m->pos[1] = g_dbg.probe[1]; m->pos[2] = g_dbg.probe[2];
+    m->ground_z = g_dbg.probe_ground_z;
+    m->cat = g_dbg.probe_ground_cat;
+    snprintf(m->asset, sizeof m->asset, "%s", g_dbg.probe_asset);
+    snprintf(m->district, sizeof m->district, "%s", g_dbg.zone_name);
+    snprintf(m->note, sizeof m->note, "%s", g_mark_note);
+    char line[320];
+    mark_line(m, g_nmarks, line, sizeof line);
+    printf("%s\n", line);          /* also in the log, so nothing is lost on quit */
+    fflush(stdout);
+    g_nmarks++;
+}
+
+/* One text block for both the clipboard and the file, so what the user pastes
+   is byte-for-byte what lands on disk. */
+static void mark_text(char *out, size_t cap) {
+    size_t used = (size_t)snprintf(out, cap,
+        "# OpenUG2 placement marks -- track %s, car %s\n", g_dbg.track_name,
+        g_dbg.car_name);
+    for (int i = 0; i < g_nmarks && used < cap; i++) {
+        char line[320];
+        mark_line(&g_marks[i], i, line, sizeof line);
+        used += (size_t)snprintf(out + used, cap - used, "%s\n", line);
+    }
 }
 
 extern "C" void dbgui_frame(void) {
@@ -297,18 +364,47 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("height (up)",     &g_dbg.chase_height,    1.0f, 15.0f, "%.1f m");
             ImGui::SliderFloat("stiffness (lerp)",&g_dbg.chase_stiffness, 0.02f, 1.0f, "%.2f/frame");
             if (ImGui::Button("reset chase cam")) {
-                g_dbg.chase_distance=10.0f; g_dbg.chase_height=4.5f; g_dbg.chase_stiffness=0.22f;
+                g_dbg.chase_distance=6.0f; g_dbg.chase_height=3.0f; g_dbg.chase_stiffness=0.22f;
             }
             ImGui::TextDisabled("low stiffness = looser spring; 1.0 = rigidly glued");
             ImGui::Separator();
             ImGui::Checkbox("Auto-Drive (camera test)", (bool *)&g_dbg.auto_drive);
             ImGui::TextDisabled("steady throttle + sine steer -> hands-free S-curve");
         }
+        if (ImGui::CollapsingHeader("District lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SliderFloat("flare size", &g_dbg.light_halo, 0.2f, 3.0f, "%.2fx");
+            ImGui::SliderFloat("flare brightness", &g_dbg.light_gain, 0.0f, 3.0f, "%.2fx");
+            ImGui::TextDisabled("authored street/district lamps; Night Mode must be on");
+        }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);
             ImGui::SliderFloat("fog density", &g_dbg.fog_density, 0.0f, 0.01f, "%.4f");
             ImGui::ColorEdit3("fog / sky colour", &g_dbg.fog_r);
+        }
+        if (ImGui::CollapsingHeader("Texture detail", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (g_tex_aniso_max <= 1) {
+                ImGui::TextWrapped("Anisotropic filtering unavailable on this GL "
+                                   "context; textures stay at plain trilinear.");
+            } else {
+                /* Live: render_texture_detail re-filters every resident texture,
+                   so the picture changes while the slider moves rather than on
+                   the next load. */
+                int steps = 1; while ((1 << steps) <= g_tex_aniso_max) steps++;
+                int cur = 0; while ((1 << (cur + 1)) <= (int)g_dbg.tex_detail &&
+                                    (1 << (cur + 1)) <= g_tex_aniso_max) cur++;
+                char label[32];
+                snprintf(label, sizeof label, "%dx", 1 << cur);
+                if (ImGui::SliderInt("anisotropy", &cur, 0, steps - 1, label))
+                    g_dbg.tex_detail = (float)(1 << cur);
+                render_texture_detail(g_dbg.tex_detail);
+                ImGui::SameLine();
+                ImGui::TextDisabled("(max %dx)", g_tex_aniso_max);
+                ImGui::TextWrapped("Sharpens any surface seen edge-on -- road, "
+                                   "kerbs, the car's own flanks. 1x is plain "
+                                   "trilinear; a race frame changes 6.2%% of its "
+                                   "pixels between 1x and 16x.");
+            }
         }
         ImGui::EndTabItem();
     }
@@ -354,6 +450,85 @@ extern "C" void dbgui_frame(void) {
             }
             ImGui::EndChild();
         }
+        ImGui::EndTabItem();
+    }
+
+    /* ---- Tab: Placement Marks ---- */
+    if (ImGui::BeginTabItem("Placement Marks")) {
+        static bool hotkeys = true;
+        static char status[256] = "";
+        ImGui::TextWrapped("Drive or freecam onto a spot, then mark it. M = the "
+                           "defect, Shift+M = where it should be. Fill the note first "
+                           "so both ends of a pair share a name. (F9/F10 still work "
+                           "where the function row is reachable.)");
+        ImGui::Separator();
+        ImGui::Text("probe   %s", g_dbg.freecam ? "camera (freecam)" : "car");
+        ImGui::Text("XYZ     %9.2f  %9.2f  %8.2f",
+                    g_dbg.probe[0], g_dbg.probe[1], g_dbg.probe[2]);
+        ImGui::Text("ground  z=%8.2f  %s", g_dbg.probe_ground_z,
+                    mark_cat_name(g_dbg.probe_ground_cat));
+        ImGui::Text("under   %s", g_dbg.probe_asset[0] ? g_dbg.probe_asset : "(no covering surface)");
+        ImGui::Text("district %s", g_dbg.zone_name[0] ? g_dbg.zone_name : "-");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(320);
+        ImGui::InputText("note", g_mark_note, sizeof g_mark_note);
+        ImGui::Checkbox("M / Shift+M hotkeys", &hotkeys);
+        /* letter hotkeys must stand down while the note field has focus, or
+           typing a note fires a mark per keystroke. F9/F10 keep working as
+           aliases -- on a Mac the function row is behind fn/Mission Control. */
+        if (hotkeys && !ImGui::GetIO().WantTextInput) {
+            int shift = ImGui::GetIO().KeyShift;
+            if (ImGui::IsKeyPressed(ImGuiKey_M, false)) mark_capture(shift ? 1 : 0);
+        }
+        if (hotkeys && ImGui::IsKeyPressed(ImGuiKey_F9, false))  mark_capture(0);
+        if (hotkeys && ImGui::IsKeyPressed(ImGuiKey_F10, false)) mark_capture(1);
+        if (ImGui::Button("Mark DEFECT (M)"))    mark_capture(0);
+        ImGui::SameLine();
+        if (ImGui::Button("Mark SHOULD-BE (Shift+M)")) mark_capture(1);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_nmarks == 0);
+        if (ImGui::Button("Undo last")) g_nmarks--;
+        ImGui::SameLine();
+        if (ImGui::Button("Clear all")) { g_nmarks = 0; status[0] = 0; }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        ImGui::BeginDisabled(g_nmarks == 0);
+        if (ImGui::Button("Copy all to clipboard")) {
+            static char blob[MARK_MAX * 320 + 128];
+            mark_text(blob, sizeof blob);
+            ImGui::SetClipboardText(blob);
+            snprintf(status, sizeof status, "%d mark(s) copied -- paste them straight into the report", g_nmarks);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Write placement_marks.txt")) {
+            static char blob[MARK_MAX * 320 + 128];
+            mark_text(blob, sizeof blob);
+            FILE *f = fopen("placement_marks.txt", "w");
+            if (f) { fputs(blob, f); fclose(f);
+                     snprintf(status, sizeof status, "wrote placement_marks.txt (%d marks) next to the working directory", g_nmarks); }
+            else   snprintf(status, sizeof status, "could not write placement_marks.txt");
+        }
+        ImGui::EndDisabled();
+        if (status[0]) ImGui::TextDisabled("%s", status);
+        ImGui::Separator();
+        ImGui::Text("%d mark(s)", g_nmarks);
+        ImGui::BeginChild("marklist", ImVec2(0, 260), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        for (int i = 0; i < g_nmarks; i++) {
+            PlacementMark *m = &g_marks[i];
+            ImGui::PushStyleColor(ImGuiCol_Text, m->target
+                ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)    /* should-be */
+                : ImVec4(0.95f, 0.55f, 0.35f, 1.0f));  /* defect */
+            ImGui::Text("%02d %-9s", i + 1, m->target ? "SHOULD-BE" : "DEFECT");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::Text("%8.1f %8.1f %7.1f  gz%7.1f %-7s %-28s %s",
+                        m->pos[0], m->pos[1], m->pos[2], m->ground_z,
+                        mark_cat_name(m->cat), m->asset[0] ? m->asset : "-",
+                        m->note);
+        }
+        if (!g_nmarks) ImGui::TextDisabled("(nothing marked yet)");
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
 

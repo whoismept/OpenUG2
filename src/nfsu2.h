@@ -1972,6 +1972,56 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_HEADLIGHT   0x9c645529u
 #define N2_MAT_HEADLIGHTGLASS 0xa6348ee3u
 
+/* Tail-light assembly materials, cracked with the same h=h*33+c convention and
+ * verified against the ten constants above. A tail light is NOT one part: over
+ * eight cars' BRAKELIGHT objects the per-submesh material census reads
+ *   BRAKELIGHT       596 submeshes  78867 indices   <- the lit lens
+ *   BRAKELIGHTGLASS  347            21576           <- clear outer cover
+ *   MOLDINGS         343            36819           <- black trim
+ *   CARSKIN          120            31059           <- body-coloured surround
+ *   f7fc7674         117            12288           <- see below
+ *   CLEARPLASTIC     110             5442
+ *   CHROME            90            14481
+ *   ALUMINUM          35             1602
+ *   CARBONFIBRE       12             2196
+ * so more than half of the geometry is not the lens, and painting the whole
+ * object with the lens emission is what made a tail light read as a flat red
+ * sticker with its trim and chrome glowing too. */
+#define N2_MAT_BRAKELIGHT      0x05bc3a3cu
+#define N2_MAT_BRAKELIGHTGLASS 0xd79597d6u
+#define N2_MAT_CLEARPLASTIC    0x33a26cb6u
+#define N2_MAT_ALUMINUM        0x2e65e067u
+#define N2_MAT_CARBONFIBRE     0x721aff7cu
+/* A SECOND lens material whose name did not fall out of the hash. Identified by
+ * measurement, like N2_MAT_INTERIOR: across all 29 cars' 664 tail-light objects
+ * it and BRAKELIGHT are perfectly MUTUALLY EXCLUSIVE -- 85 objects carry this
+ * and no BRAKELIGHT, 579 carry BRAKELIGHT and not this, zero carry both, over
+ * 16 different cars. A trim or cover material would co-occur with the lens; an
+ * alternative for the same job cannot. Treating it as anything but a lens would
+ * black out those 16 cars' tail lights. */
+#define N2_MAT_BRAKELIGHT_B    0xf7fc7674u
+
+/* Which slice of a tail-light assembly actually emits. 0 means the loader could
+ * not trust a single material for the mesh (absent/mixed/invalid), and that
+ * keeps the previous whole-object behaviour rather than risking a dark lamp. */
+static int n2_brakelight_lens(uint32_t mat) {
+    return mat == 0 || mat == N2_MAT_BRAKELIGHT || mat == N2_MAT_BRAKELIGHT_B;
+}
+
+/* The transparent outer cover of a lamp unit, front or rear. It must not be
+ * drawn as opaque geometry: it sits IN FRONT of the lit lens, so an opaque
+ * cover hides the lamp it is supposed to reveal (measured: shading the 350Z's
+ * BRAKELIGHTGLASS as ordinary dark plastic blacked out both of its tail
+ * lights). The head-lamp side already had this pass; the rear materials are
+ * BRAKELIGHTGLASS and, on cars that ship no BRAKELIGHTGLASS at all such as the
+ * CIVIC, CLEARPLASTIC -- the two transparent names in the material set. */
+static int n2_lamp_clear_cover(int cat, uint32_t mat) {
+    if (cat == N2_CAR_LIGHT)      return mat == N2_MAT_HEADLIGHTGLASS;
+    if (cat == N2_CAR_BRAKELIGHT) return mat == N2_MAT_BRAKELIGHTGLASS ||
+                                         mat == N2_MAT_CLEARPLASTIC;
+    return 0;
+}
+
 /* HEADLIGHTGLASS is the outer lens on stock and STYLE lamps (Miata/Golf).
  * Hashes above use the same h=h*33+c convention as wheel materials. */
 static int n2_headlight_emitter(const N2Mesh *m) {
@@ -3076,6 +3126,40 @@ static int n2_car_dxt1(const unsigned char *src, N2Tex *t) {
     n2_dxt1(src,t->w,t->h,t->rgb,t->alpha);t->afmt=1;
     for(long i=0;i<n;i++)if(t->alpha[i]!=255)return 1;
     free(t->alpha);t->alpha=NULL;return 1;
+}
+
+/* The 24-byte NAME a car-pack slot carries in the 144-byte record at the end of
+ * its HUFF payload. This is the whole vinyl catalogue: 1783 named designs per
+ * car (SKYLINE_WILD_059_MASK, MIATA_FLAME_014_MASK, GOLF_AEM_SCORPION ...),
+ * named exactly like the retail vinyl menu's own categories. It does not show up
+ * in `strings` because the record is inside the compressed stream, which is why
+ * VINYLS.BIN read as 1786 anonymous keys. Returns 0 and leaves `out` empty when
+ * the slot is absent, is not HUFF-wrapped, or its record fails validation. */
+static int n2_car_tex_name_by_key(const unsigned char *d, long len, uint32_t key,
+                                  char *out, int cap) {
+    if (cap > 0) out[0] = 0;
+    uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
+    if (!p || cap < 25) return 0;
+    for (uint32_t i = 0; i + 0x18 <= sz; i += 0x18) {
+        if (n2_u32(p + i) != key) continue;
+        int absoff = (int)n2_u32(p + i + 4), enc = (int)n2_u32(p + i + 8),
+            dec = (int)n2_u32(p + i + 12);
+        if (dec <= 144 || enc < 20 || absoff < 0 || (long)absoff + enc > len) return 0;
+        if (memcmp(d + absoff, "HUFF", 4)) return 0;
+        unsigned char *raw = (unsigned char *)malloc(dec);
+        if (!raw) return 0;
+        int ok = n2_huff(d + absoff + 16, enc - 16, raw, dec) == dec &&
+                 n2_u32(raw + dec - 144 + 0x18) == key;
+        if (ok) {
+            memcpy(out, raw + dec - 144, 24); out[24] = 0;
+            for (int c = 0; c < 24; c++)
+                if (out[c] && (out[c] < 32 || out[c] > 126)) { out[c] = 0; break; }
+            ok = out[0] != 0;
+        }
+        free(raw);
+        return ok;
+    }
+    return 0;
 }
 
 /* Decode ONE car texture through its offset-slot table and embedded header. */

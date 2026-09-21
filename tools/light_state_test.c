@@ -53,7 +53,7 @@ int main(void) {
         glUniform3fv(r.uColor,1,color);
         glUniformMatrix4fv(r.uMVP,1,GL_FALSE,saved);
         for (int i=0;i<5;i++) glUniform1f(scalars[i],values[i]);
-        assert(render_district_lights(&r,&quad,tex[0],lights,2,cam,look,mvp,10)==1);
+        assert(render_district_lights(&r,&quad,tex[0],lights,2,cam,look,mvp,10,1.0f,1.0f)==1);
         eq_uniform(&r,r.uColor,color,3);
         eq_uniform(&r,r.uMVP,saved,16);
         eq_uniform(&r,r.uFogColor,fog_color,3);

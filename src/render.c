@@ -31,7 +31,8 @@
 int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
                            const N2LightSrc *lights, int nlights,
                            const float cam[3], const float look[3],
-                           const float MVP[16], float viewdist) {
+                           const float MVP[16], float viewdist,
+                           float halo, float gain) {
     RProg rp = *r;
     int draws = 0;
     const GLint scalar_loc[] = {rp.uUnlit, rp.uEmissiveTex, rp.uUseTex,
@@ -72,15 +73,32 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
         const N2LightSrc *light = &lights[i];
         float dx = light->pos[0]-cam[0], dy = light->pos[1]-cam[1],
               dz = light->pos[2]-cam[2];
-        if (dx*dx + dy*dy + dz*dz > maxd2) continue;
-        float s = light->r_in > 1.0f ? light->r_in : 1.0f;
+        float d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 > maxd2) continue;
+        float d = sqrtf(d2); if (d < 0.5f) d = 0.5f;
+        /* r_in (10 m on the shipped records) is the light's influence radius,
+           NOT a sprite size. Drawing the quad that large buries it in its own
+           lamp post and intersects the ground and nearby walls, and the depth
+           test then slices it into hard-edged polygons -- the "solid shapes"
+           dotted around the night city. A flare is a camera-facing halo: keep
+           it at a near-constant angular size, bounded by the authored radius. */
+        float s = d * 0.070f * halo;
+        float smax = (light->r_in > 1.0f ? light->r_in : 10.0f) * 0.35f * halo;
+        if (s > smax) s = smax;
+        if (s < 0.45f) s = 0.45f;
+        /* Lift it off its own fixture so the lamp geometry cannot clip it,
+           while the depth test still hides lights behind buildings. */
+        float ox = -ld[0]*s*0.9f, oy = -ld[1]*s*0.9f, oz = -ld[2]*s*0.9f;
+        /* Fade over the last quarter of the view range instead of popping. */
+        float fade = (viewdist - d) / (viewdist * 0.25f);
+        if (fade > 1.0f) fade = 1.0f; else if (fade < 0.0f) fade = 0.0f;
         float M[16] = {
             rt[0]*s,rt[1]*s,rt[2]*s,0,
             up[0]*s,up[1]*s,up[2]*s,0,
             0,0,1,0,
-            light->pos[0]-(rt[0]+up[0])*s*0.5f,
-            light->pos[1]-(rt[1]+up[1])*s*0.5f,
-            light->pos[2]-(rt[2]+up[2])*s*0.5f,1
+            light->pos[0]+ox-(rt[0]+up[0])*s*0.5f,
+            light->pos[1]+oy-(rt[1]+up[1])*s*0.5f,
+            light->pos[2]+oz-(rt[2]+up[2])*s*0.5f,1
         };
         float LMVP[16]; mat_mul(MVP, M, LMVP);
         glUniformMatrix4fv(rp.uMVP, 1, GL_FALSE, LMVP);
@@ -88,7 +106,10 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
             (float)( light->rgba        & 0xffu) / 255.0f,
             (float)((light->rgba >> 8)  & 0xffu) / 255.0f,
             (float)((light->rgba >> 16) & 0xffu) / 255.0f);
-        glUniform1f(rp.uAlpha, (float)((light->rgba >> 24) & 0xffu) / 255.0f);
+        float a = (float)((light->rgba >> 24) & 0xffu) / 255.0f * gain * fade;
+        if (a > 1.0f) a = 1.0f;
+        if (a <= 0.002f) continue;
+        glUniform1f(rp.uAlpha, a);
         draw_gpumesh(quad); draws++;
     }
     for (int i=0; i<5; i++) glUniform1f(scalar_loc[i],scalars[i]);
@@ -127,6 +148,7 @@ static const char *FS =
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
+    "uniform vec3 uEmissive;\n"   /* lamp emission added on top of the lit result */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
     "uniform float uAlphaTest;\n" /* >0.5: discard below 0.5 texture alpha */
     "uniform float uTextureAlpha;\n" /* >0.5: output alpha = texture2D(...).a *
@@ -303,6 +325,13 @@ static const char *FS =
        texture (e.g. a lit-window sheet with transparent gaps) would draw
        fully opaque/full-strength through those gaps, since uAlpha alone
        carries no per-texel information. */
+    /* Lamp emission. Added after every lighting term so a lit lens keeps its
+       highlight, rim sheen and environment reflection and still reads as
+       switched on. The dome weight is the same dot(N,V) the fresnel uses: a
+       curved lens is hottest where its surface faces the camera and falls off
+       toward the rim, which is the difference between a lens and a sticker.
+       The 0.55 floor keeps the lamp clearly lit all over. */
+    "  if(dot(uEmissive,uEmissive)>0.0) lit += uEmissive*(0.55+0.45*clamp(dot(N,V),0.0,1.0));\n"
     "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
     /* Glass (uFresnel, the car glass pass only). A flat per-pass alpha is what
        made the cabin read as a still pool: every window sat at one constant
@@ -593,6 +622,7 @@ RProg render_program(void) {
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
+    r.uEmissive = glGetUniformLocation(r.prog, "uEmissive");
     r.uFresnel = glGetUniformLocation(r.prog, "uFresnel");
     r.uClearcoat = glGetUniformLocation(r.prog, "uClearcoat");
     r.uHeadPos = glGetUniformLocation(r.prog, "uHeadPos[0]");
@@ -611,6 +641,7 @@ RProg render_program(void) {
     glUniform1f(r.uHeadGain,0.0f);
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
     glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
+    glUniform3f(r.uEmissive, 0.0f, 0.0f, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);
     glUniform3f(r.uCamPos, 0, 0, 0); glUniform1f(r.uEnv, 0.0f);
     glUniform1f(r.uUVCheck, 0.0f);
@@ -1269,6 +1300,47 @@ void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order
 #  define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
 #endif
 int g_tex_s3tc = 0;
+int   g_tex_aniso_max = 1;
+float g_tex_aniso     = 1.0f;
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT_    0x84FE
+
+/* Every texture this renderer owns, so a detail change can re-apply to all of
+ * them. Ids are recorded on upload and validated with glIsTexture before use --
+ * residents and the world cache delete textures behind our back, and setting a
+ * parameter on a deleted name is a GL error, not a no-op. */
+static GLuint *g_tex_all; static int g_tex_all_n, g_tex_all_cap;
+static void tex_track(GLuint id) {
+    if (!id) return;
+    if (g_tex_all_n == g_tex_all_cap) {
+        int cap = g_tex_all_cap ? g_tex_all_cap * 2 : 256;
+        GLuint *t = (GLuint *)realloc(g_tex_all, (size_t)cap * sizeof *t);
+        if (!t) return;                       /* out of memory: just don't track it */
+        g_tex_all = t; g_tex_all_cap = cap;
+    }
+    g_tex_all[g_tex_all_n++] = id;
+}
+/* Caller has the texture bound; the id is only for symmetry with tex_track. */
+static void tex_apply_aniso(void) {
+    if (g_tex_aniso_max <= 1) return;
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT_, g_tex_aniso);
+}
+void render_texture_detail(float aniso) {
+    if (g_tex_aniso_max <= 1) { g_tex_aniso = 1.0f; return; }
+    if (aniso < 1.0f) aniso = 1.0f;
+    if (aniso > (float)g_tex_aniso_max) aniso = (float)g_tex_aniso_max;
+    if (aniso == g_tex_aniso) return;
+    g_tex_aniso = aniso;
+    GLint bound = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    int live = 0;
+    for (int i = 0; i < g_tex_all_n; i++) {
+        if (!glIsTexture(g_tex_all[i])) continue;      /* freed since upload */
+        g_tex_all[live++] = g_tex_all[i];
+        glBindTexture(GL_TEXTURE_2D, g_tex_all[i]);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT_, g_tex_aniso);
+    }
+    g_tex_all_n = live;                                 /* compact away dead ids */
+    glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+}
 
 GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
     if (g_tex_s3tc && t->dxtfmt && t->dxt && t->dxtlen > 0) {
@@ -1298,6 +1370,7 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                         complete ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        if (complete) { tex_apply_aniso(); tex_track(id); }   /* needs a mip chain */
         return id;
     }
     return upload_tex(t);   /* portable fallback: CPU-decoded RGBA + mipmaps */
@@ -1321,6 +1394,7 @@ GLuint upload_tex(const N2Tex *t) {
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    tex_apply_aniso(); tex_track(id);
     return id;
 }
 
