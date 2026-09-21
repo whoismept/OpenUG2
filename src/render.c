@@ -657,7 +657,8 @@ RProg render_program(void) {
     return r;
 }
 
-/* smoothed per-vertex normals for one mesh (area-weighted face accumulation);
+/* Authored car normals preserve smoothing across material/UV seams. Generated
+ * geometry and invalid source normals use area-weighted face accumulation;
  * nor must hold nverts*3 floats, zeroed by the caller. */
 static void mesh_normals(const N2Mesh *m, float *nor) {
     for (int t = 0; t + 2 < m->nidx; t += 3) {
@@ -670,6 +671,11 @@ static void mesh_normals(const N2Mesh *m, float *nor) {
         for(int e=0;e<3;e++){ nor[ii[e]*3]+=nx; nor[ii[e]*3+1]+=ny; nor[ii[e]*3+2]+=nz; }
     }
     for (int v=0;v<m->nverts;v++){ float*np=nor+v*3;
+        if(m->authored_normals) {
+            const float *source=m->verts+m->nverts*5+v*3;
+            float len2=source[0]*source[0]+source[1]*source[1]+source[2]*source[2];
+            if(isfinite(len2) && len2>1e-12f)memcpy(np,source,3*sizeof(float));
+        }
         float l=sqrtf(np[0]*np[0]+np[1]*np[1]+np[2]*np[2]); if(l<1e-6f)l=1;
         np[0]/=l; np[1]/=l; np[2]/=l; }
 }

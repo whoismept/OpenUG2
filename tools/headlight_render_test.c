@@ -62,6 +62,23 @@ int main(void) {
     SDL_Window *window=SDL_CreateWindow("Headlight shader test",0,0,128,64,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
     assert(window);SDL_GLContext context=SDL_GL_CreateContext(window);assert(context);
     RProg r=render_program();GLint linked=0;glGetProgramiv(r.prog,GL_LINK_STATUS,&linked);assert(linked);
+    /* The normal buffer uses authored smoothing, with a per-vertex fallback
+       for zero/NaN source data. Position/UV layout stays five floats wide. */
+    float normal_verts[]={0,0,0,0,0, 1,0,0,1,0, 0,1,0,0,1,
+                          1.2f,0,1.6f, NAN,0,1, 0,0,0};
+    uint16_t normal_idx[]={0,1,2};
+    N2Mesh normal_mesh={.verts=normal_verts,.idx=normal_idx,.nverts=3,.nidx=3,.authored_normals=1};
+    N2Scene normal_scene={.meshes=&normal_mesh,.count=1};
+    for(int authored=1;authored>=0;authored--) {
+        normal_mesh.authored_normals=(unsigned char)authored;
+        GpuMesh *gpu=upload_scene(&normal_scene);assert(gpu);
+        float uploaded[9];glBindBuffer(GL_ARRAY_BUFFER,gpu[0].nbo);
+        glGetBufferSubData(GL_ARRAY_BUFFER,0,sizeof uploaded,uploaded);
+        assert(fabsf(uploaded[0]-(authored?.6f:0))<1e-6f && uploaded[1]==0);
+        assert(fabsf(uploaded[2]-(authored?.8f:1))<1e-6f);
+        for(int v=1;v<3;v++)assert(uploaded[v*3]==0 && uploaded[v*3+1]==0 && uploaded[v*3+2]==1);
+        free_scene_gpu(gpu,1);
+    }
     unsigned char white[]={255,255,255};N2Tex tex={.w=1,.h=1,.rgb=white};
     GLuint texture=upload_tex(&tex); /* shader sampler remains valid even for flat colour */
     float verts[]={0,-20,0,0,0,100,-20,0,1,0,100,20,0,1,1,0,20,0,0,1};

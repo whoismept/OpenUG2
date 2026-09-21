@@ -43,7 +43,9 @@ static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
     return source_key;
 }
 typedef struct {
-    float   *verts;   /* 5 floats per vertex: pos.xyz, uv */
+    float   *verts;   /* nverts*5 floats: pos.xyz, uv; when authored_normals is set,
+                         followed by nverts*3 normal floats in the same allocation. */
+    unsigned char authored_normals;
     unsigned char *vcol; /* 4 bytes/vertex: RGBA prelight from the source stream
                             (world meshes, 24B stride, colour @ off 12). NULL for
                             car meshes and any stream without it. */
@@ -420,7 +422,7 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
 }
 
 /* Extract one (vertex,index) leaf pair. stride = 24 (scenery, uv@16) or 36
- * (car, normal@12 uv@24). cull_skybox drops huge shells (tracks only). */
+ * (car, normal@12 uv@28). cull_skybox drops huge shells (tracks only). */
 /* Widest authored coordinate in the shipped bundles is ~13 km; the corrupt
    values retail leaves behind measure ~1e38. 60000 separates them by 33 orders
    of magnitude and matches the existing absurd-span guard below. */
@@ -488,7 +490,8 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
     N2Mesh m; memset(&m, 0, sizeof(m));
     m.cat = cat; m.texkey = texkey; m.nverts = n;
     m.draw_mode = draw_mode;
-    m.verts = (float *)malloc((size_t)n * 5 * sizeof(float));
+    m.authored_normals = stride == 36 && uvoff == 28 && !mtx;
+    m.verts = (float *)malloc((size_t)n * (m.authored_normals ? 8 : 5) * sizeof(float));
     /* World stream (24B stride) packs an RGBA8 prelight colour between position
        and UV (pos@0, colour@12, uv@16). Car stream (36B) has no such slot. */
     int coloff = (stride == 24) ? 12 : -1;
@@ -512,6 +515,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.verts[i*5+2] = px*mtx[2]+py*mtx[6]+pz*mtx[10]+mtx[14];
         } else { m.verts[i*5+0]=px; m.verts[i*5+1]=py; m.verts[i*5+2]=pz; }
         memcpy(m.verts + i*5 + 3, rec + i*stride + uvoff, 8);
+        if (m.authored_normals) memcpy(m.verts + n*5 + i*3, rec + i*stride + 12, 12);
         if (m.vcol) {
             /* The prelight slot is a D3DCOLOR: little-endian ARGB, so the bytes
                sit in memory as B,G,R,A. Copying the run straight through as
@@ -2293,6 +2297,25 @@ static int n2_car_socket(const unsigned char *d,long len,const N2Scene *s,
     return found;
 }
 
+/* Sockets are validated orthonormal by n2_car_socket. Rotate normals with
+ * positions, without translation; reflected sockets also reverse winding. */
+static void n2_car_transform(N2Mesh *mesh,const float m[16],int exhaust) {
+    for(int v=0;v<mesh->nverts;v++) {
+        float *p=mesh->verts+v*5;
+        float x=exhaust?p[2]:p[0],y=p[1],z=exhaust?-p[0]:p[2];
+        for(int a=0;a<3;a++)p[a]=x*m[a]+y*m[4+a]+z*m[8+a]+m[12+a];
+        if(mesh->authored_normals) {
+            p=mesh->verts+mesh->nverts*5+v*3;
+            x=exhaust?p[2]:p[0];y=p[1];z=exhaust?-p[0]:p[2];
+            for(int a=0;a<3;a++)p[a]=x*m[a]+y*m[4+a]+z*m[8+a];
+        }
+    }
+    float det=m[0]*(m[5]*m[10]-m[6]*m[9])-m[4]*(m[1]*m[10]-m[2]*m[9])+m[8]*(m[1]*m[6]-m[2]*m[5]);
+    if(det<0)for(int j=0;j+2<mesh->nidx;j+=3) {
+        uint16_t tmp=mesh->idx[j+1];mesh->idx[j+1]=mesh->idx[j+2];mesh->idx[j+2]=tmp;
+    }
+}
+
 /* Exhaust geometry is authored with its outlet facing -X and up +Z.
  * Bumper sockets use outward +Z and up +X: source (x,y,z) -> (z,y,-x).
  * Measured on the stock source meshes and socket bases, independently of
@@ -2317,23 +2340,16 @@ static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
     int n=0;
     for(int side=0;side<2;side++)if(have[side]) {
         const float *m=socket[side];
-        float det=m[0]*(m[5]*m[10]-m[6]*m[9])-m[4]*(m[1]*m[10]-m[2]*m[9])+m[8]*(m[1]*m[6]-m[2]*m[5]);
         for(int i=0;i<s->count;i++)if(s->meshes[i].car_source==exhaust_source) {
             const N2Mesh *src=s->meshes+i;N2Mesh *dst=placed+n++;
             *dst=*src;
-            dst->verts=(float *)malloc((size_t)src->nverts*5*sizeof(float));
+            dst->verts=(float *)malloc((size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
             dst->idx=(uint16_t *)malloc((size_t)src->nidx*sizeof(uint16_t));
             dst->vcol=NULL; /* car decoder emits no vertex colour stream */
             if(!dst->verts || !dst->idx)goto failed;
-            memcpy(dst->verts,src->verts,(size_t)src->nverts*5*sizeof(float));
+            memcpy(dst->verts,src->verts,(size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
             memcpy(dst->idx,src->idx,(size_t)src->nidx*sizeof(uint16_t));
-            for(int v=0;v<src->nverts;v++) {
-                const float *p=src->verts+v*5;
-                for(int a=0;a<3;a++)dst->verts[v*5+a]=p[2]*m[a]+p[1]*m[4+a]-p[0]*m[8+a]+m[12+a];
-            }
-            if(det<0)for(int j=0;j+2<dst->nidx;j+=3) {
-                uint16_t tmp=dst->idx[j+1];dst->idx[j+1]=dst->idx[j+2];dst->idx[j+2]=tmp;
-            }
+            n2_car_transform(dst,m,1);
         }
     }
     /* Prepare every copy before replacing any source slice. */
@@ -2361,18 +2377,9 @@ static void n2_car_attach_spoiler(const unsigned char *d,long len,N2Scene *s) {
     if(!needed)return;
     float t[16];
     if(n2_car_socket(d,len,s,0xc93b73fdu,t)!=1)return;
-    float det=t[0]*(t[5]*t[10]-t[6]*t[9])-t[4]*(t[1]*t[10]-t[2]*t[9])+t[8]*(t[1]*t[6]-t[2]*t[5]);
-    for(int i=0;i<s->count;i++) {
-        N2Mesh *m=s->meshes+i;
-        if(m->car_part!=N2_PART_SPOILER+1)continue;
-        for(int v=0;v<m->nverts;v++) {
-            float *p=m->verts+v*5,x=p[0],y=p[1],z=p[2];
-            for(int a=0;a<3;a++)p[a]=x*t[a]+y*t[4+a]+z*t[8+a]+t[12+a];
-        }
-        if(det<0)for(int j=0;j+2<m->nidx;j+=3) {
-            uint16_t tmp=m->idx[j+1];m->idx[j+1]=m->idx[j+2];m->idx[j+2]=tmp;
-        }
-    }
+    for(int i=0;i<s->count;i++)
+        if(s->meshes[i].car_part==N2_PART_SPOILER+1)
+            n2_car_transform(s->meshes+i,t,0);
 }
 
 static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
@@ -2421,6 +2428,9 @@ static void n2_prepare_wheel_mesh(N2Mesh *m) {
     for (int v=0;v<m->nverts;v++) {
         m->verts[v*5] = -m->verts[v*5];
         m->verts[v*5+1] = ymid-m->verts[v*5+1];
+        if(m->authored_normals) {
+            float *n=m->verts+m->nverts*5+v*3;n[0]=-n[0];n[1]=-n[1];
+        }
     }
 }
 
@@ -2492,6 +2502,7 @@ static int n2_round_wheel_tyre(const N2Mesh *source, N2Mesh *out) {
         if (owned) { free(work.verts); free(work.idx); }
         if (!ok || !ne) { free(verts); free(idx); return 0; }
         work.verts=verts; work.idx=idx; work.nverts=nv; work.nidx=ni; owned=1;
+        work.authored_normals=0; /* topology changed: derive normals at upload */
     }
     *out=work;
     return 1;
@@ -2595,6 +2606,7 @@ static int n2_open_wheel_backing(N2Scene *s, int mi) {
     }
     free(m->verts); free(m->idx);
     m->verts=verts; m->idx=idx; m->nverts=nv; m->nidx=ni;
+    m->authored_normals=0; /* generated backing has a different vertex pool */
     return 1;
 }
 
