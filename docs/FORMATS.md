@@ -145,11 +145,34 @@ real data byte cannot be consumed accidentally.
 
 | asset | stride | offsets |
 |---|---:|---|
-| STREAM scenery | 24 B | position `f32[3] @+0`; prelight RGBA8 `@+12`; UV `f32[2] @+16` |
+| STREAM scenery | 24 B | position `f32[3] @+0`; prelight **D3DCOLOR (BGRA8) `@+12`**; UV `f32[2] @+16` |
 | car part | 36 B | position `f32[3] @+0`; normal `f32[3] @+12`; colour `u32 @+24`; UV `f32[2] @+28` |
 
 OpenUG2 stores parsed vertices as five floats `{x,y,z,u,v}`. World prelight is
-retained separately as four bytes per vertex. Source indices remain `u16`.
+retained separately as four bytes per vertex, **byte-swapped to RGBA on read**.
+Source indices remain `u16`.
+
+**Prelight byte order (PROVEN).** The `@+12` slot is a D3DCOLOR: little-endian
+ARGB, so the bytes sit in the stream as `B,G,R,A`. Copying the run straight
+through as RGBA swaps red and blue. Three independent measurements on
+`STREAML4RA`:
+
+1. `XO_TRAFFICLIGHTC_1A_00` lens vertices read `(78,78,163)`, `(83,83,163)`,
+   `(89,89,165)` — R==G with a high third byte. Re-read as BGRA they are
+   `(163,78,78)`, a saturated dark red: the stop lens.
+2. The rendered triple was purple / teal / green. Under an R↔B swap, red
+   `(255,0,0)` → blue-violet, amber `(255,190,0)` → teal `(0,190,255)`, and
+   green `(0,255,0)` is its own mirror and stays correct. All three observed
+   colours match that permutation exactly, including green being the one that
+   looked right.
+3. Across all 7,363,547 prelight vertices in the bundle, 58.7% are neutral
+   grey (`R==G==B`, invariant under the swap — which is why the fault stayed
+   hidden), and of the rest the blue-dominant vertices outnumber red-dominant
+   ones 1,968,986 to 956,758. A city baked under sodium and tungsten street
+   lighting does not skew 2.06:1 cool.
+
+Fixing the order warms the whole baked night scene (pavement, shop interiors,
+stone facades) and restores red/amber/green traffic lenses.
 
 **Corrupt-vertex recovery (PROVEN parser robustness, not a new file field).**
 Some otherwise valid world objects contain isolated NaN or approximately
@@ -248,6 +271,34 @@ example `OBJ_RAILING`) across every opaque wall. A key available in the
 region/shared TPK wins; an unavailable key falls back only for that range. A
 malformed object falls back to the legacy one-key whole-object path rather
 than partially dropping geometry.
+
+### Slots that name a material, not a texture
+
+A slot usually names a diffuse map. A few name a **material** that never
+carries one, and for those the "fall back to the object's sibling key" rule
+above is always wrong: there is no art to approximate, so the substitute is a
+different picture rather than a near-enough one.
+
+`HEADLIGHTGLOW` (`0x3394fe62`, hashed by the usual `h = h*33 + c` seeded
+`0xFFFFFFFF`) is the light-pool card on street fixtures -- the soft cone a lamp
+throws. Measured on `STREAML4RA`: 210 submeshes across 132 object kinds carry
+it, and **no TPK record for it exists in any shipped pack** (all five
+`STREAM*.BUN`, `LOC4DYNTEX.BIN`, `GLOBALB.BUN`). On `XO_LightWallA` the
+fallback handed its 16-triangle cone the fixture's own lens texture
+(`OBJ_SHOEBOX`, a bright disc over a dark housing) stretched across a 2.8 m
+card. Smaller cards read as pale discs standing in the road; the large ones
+read as opaque black slabs across the sky, hiding whole city blocks.
+
+`n2_slot_is_lightpool()` drops those ranges in both walkers (`n2_walk_meshes`
+and `winst_collect_model`). World mesh count on `STREAML4RA` falls 57540 ->
+56922; vista count and the dedup residual are unchanged.
+
+This is a named constant, **not a detector**. The other 270 unresolved
+submeshes (91 distinct keys, 79 of them crackable to `ARC_*` / `SGN_*` /
+`LOD_*` / `RDP_*` names) do name real textures that merely live in a pack this
+bundle does not ship, and for those the sibling fallback is a reasonable
+wall-for-wall guess -- dropping them would punch holes in buildings. Add a
+constant here only for a material proven to have no art anywhere.
 
 `N2Mesh.mat_exact` records whether a range owns its texture structurally. A
 verified range and a true single-slot object set it; an unresolved range or a
@@ -373,6 +424,69 @@ ordinary collision/ground scene. Production `--tier ordinary` does not batch
 or draw them; the common texture-binding pass may still resolve a vista key
 before the tier gate. `--tier full` is experimental because some shipped
 sheets are fully opaque and still form hard horizon bands.
+
+Two shipped cases do not follow the spelling, and both are decided by
+measurement or material instead (`--vista-census 0` prints the verdict per
+object):
+
+* **`PAN_OCEAN` / `PAN_OCEAN_B98` are the water surface, not backdrop.** They
+  measure 10021 m and 3278 m of footprint against 13 m and 0 m of Z, planarity
+  1.000, dominant normal exactly `+Z`. `n2_is_ground_sheet` keeps a PAN\_ object
+  that measures as a large horizontal sheet in the ordinary scene, so the bay
+  and the canals have water and ground again instead of reading through to the
+  fog colour. Every other PAN\_ asset is a vertical wall or a closed shell; the
+  nearest horizontal one is a 234 m `PAN_INDUSTRIALNORTHBRIDGE_C` fragment, so
+  the 1000 m footprint floor separates them with the sample's own gap.
+* **Three impostor objects carry no usable name.** Retail left one as
+  `OBJECT01` and two whose `0x134011` name leaf is not ASCII at all, so no
+  spelling rule can reach them and they entered the world as solid geometry --
+  `TRN_COASTROADLOD_A_DM` laid across the conservatory park at z 0..35 with an
+  `ARC_PANARAMABUILDINGS` billboard standing in it. `n2_impostor_atlas` matches
+  the object's `0x134012` slots against the six backdrop atlases instead:
+
+  | key | atlas |
+  |---|---|
+  | `0801e3a1` | `TRN_COASTROADLOD_A_DM` |
+  | `531cd2db` | `TRN_TREELINEA_DM` |
+  | `5db83e34` | `TRN_FREEWAYLOD_A_DM` |
+  | `b83ca1b6` | `TRN_TREES_FENCES_LOD_A_` |
+  | `ea9eb4a8` | `ARC_PANARAMABUILDINGSB_` |
+  | `ea9f4109` | `ARC_PANARAMABUILDINGSC_` |
+
+  `tools/impostor_atlas_census.py TRACKS` is the evidence: of 28985 objects in
+  the eight bundles, 89 bind one of these atlases, all 89 are impostors, and
+  only those three leftovers are not already `PAN_*` / `TRN_PANARAMA*`.
+
+### Rejecting a mis-decoded texture (`n2_tex_noise`)
+
+A decoded texture is discarded only when **all three** of these agree, measured
+over STREAML4RA's 1119 decoded textures (`--tex-audit` prints a `TEXFAIL` line
+per rejection):
+
+| term | what it measures | mis-decoded | genuine art |
+|---|---|---|---|
+| contrast | mean abs difference of pixels 4 apart | > 55 | (17 of 21 also exceed it) |
+| hue coherence | fraction of horizontal edges whose per-channel deltas share a sign | 0.37 – 0.48 | 0.54 – 1.00 |
+| palette | distinct 5-bit colours per pixel | 0.097 – 0.122 | 0.008 – 0.081 |
+
+Contrast alone used to decide, and it was wrong 17 times out of 21. The
+survivors of that rule were dumped and inspected: only four are actually
+mis-decoded (`SFX_LIGHT_BEAMA`, a second beam sheet and two track-barrier
+surfaces — rainbow confetti). The other seventeen decode perfectly and are
+exactly the assets that are legitimately high-contrast at a 4-pixel stride:
+neon shop signs (VICTOR, ROYALE, PARKING, BURGER KING, W HARPER), a Chinese
+shop sign, an `ARC_M` letter panel, an LV badge, a cherry-blossom cutout, a red
+neon tube and a terracotta roof tile — the roof tile scored the **highest**
+contrast of all 21 (109) purely because its ridges alternate on the sample
+stride.
+
+Those seventeen lost their texture, and a world batch with a named-but-
+unresolved key is dropped by `main.c`'s `b->unresolved` gate or falls
+back to flat grey, so the signs rendered as blank slabs. With the three-term
+rule, STREAML4RA binds 1115 distinct textures instead of 1098 and reports 4
+`TEXFAIL`s instead of 21. The rule is strictly narrower than the old one, so no
+texture that used to bind can stop binding; the regression fixture lives in
+`tools/world_texture_test.c` (`test_noise_rejects_only_mis_decodes`).
 
 ### Instance-driven world districts (`0x341xx`)
 
@@ -1137,3 +1251,22 @@ independent implementation.
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — reference for the
   Gnsu20 table layout and the EA-XAS v0 frame format (`meta/gin.c`,
   `coding/ea_xas_decoder.c`).
+
+## Open: SFX_LIGHT_BEAMA pixel base (`GLOBAL/InGameCommon.bun`)
+
+Key `2e95ce7c`, name `SFX_LIGHT_BEAMA`, 32x256, format tag `0x24` (DXT3),
+`Offset = 166528`, `Size = 10752` (base level 8192 plus two mip levels),
+draw descriptor `(order,usage,blend,wz) = (7,2,2,0)` -> additive.
+
+Decoding at the block base `n2_tpk_open` derives (pixel block `0x33320002` at
+45960 plus a 123-byte `0x11` filler run -> `dbase` 46083) produces saturated
+per-block colour static. 46083 is not 16-byte aligned; the nearby 16-aligned
+bases decode to flat yellow, not a beam gradient. Every other measured
+consumer of this archive resolves correctly, so the filler rule is not
+obviously wrong in general.
+
+UNPROVEN. Until the real base is established, `n2_tex_noise` correctly rejects
+the decode and the renderer skips the resulting untextured batches -- see
+`docs/DEVELOPER_GUIDE.md`, "Unresolvable textures and the black light-shaft
+wedges". The 747 authored `XO_*SPOTLIGHT*` / `*BEAMYA*` cones in L4RA are
+invisible until this is solved.

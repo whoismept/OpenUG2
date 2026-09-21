@@ -162,6 +162,200 @@ the separate `CARS/WHEELS` library. Wheel-only views must record their selected
 car/style, view and dimensions. They isolate wheel surfaces but cannot approve
 body attachment, road contact or whole-scene transparency.
 
+## Lamp glow direction and occlusion (2026-09-19)
+
+Tail-light halos used to be drawn twice: once by the per-lens bloom in the car
+pass (depth-tested, facing-culled) and once by a whole-field overlay pass that
+ran with `glDisable(GL_DEPTH_TEST)`, no facing test and no night gate. The
+overlay is why a red taillight blob sat over the windscreen when the camera was
+in front of the car, and why the rear panel, bumper and the ground behind the
+car washed pink.
+
+Three rules now hold for every lamp halo, player and AI:
+
+* **Occluded.** The halo is depth-tested, so the body hides its own glow. It is
+  nudged 0.33 m toward the camera, not 0.08 m: the lens sits behind the boot-lid
+  lip, and at 0.08 m the depth test ate everything except the few pixels
+  directly over the already-saturated lens, so the halo added nothing visible.
+  At a third of a metre the halo clears the surround and the cluster is still
+  metres behind the body when the camera is at the other end of the car.
+* **Direction-culled on the ground plane.** `facing` is the car's forward axis
+  against the camera→lamp vector with the vertical component dropped. The old
+  full 3D dot dimmed a lamp because the camera was higher than it: the ordinary
+  chase pose (3 m back, 4 m up) scores 0.23, and `alpha * facing^2` then left
+  0.03 — an invisible halo, which is what the always-on overlay was
+  compensating for.
+* **Night-gated.** An additive halo in daylight reads as a bug, not a lamp.
+
+The player is no longer drawn by the AI pass: its own per-lens bloom is
+positioned on the authored `bloomc` anchors and tuned against them, and drawing
+a second 0.9-alpha 1.1 m quad over it was the wash. The AI pass also no longer
+applies the *player's* taillight-part gain and nitro brightness to rival cars.
+
+Measured on SKYLINE at night, `--shot-empty`, 5 m chase, red-excess pixels:
+
+| camera yaw | before | after |
+|---|---|---|
+| 0 (behind) | 15826 | 4696 |
+| 45 | 10818 | 651 |
+| 90 (side) | 5380 | 140 |
+| 135 (front quarter) | 3085 | **2** |
+
+### The lens material
+
+A lamp that is ON now stays on the LIT path and adds its output through a new
+`uEmissive` uniform, instead of switching to `uUnlit`. `uUnlit` returns a flat
+`uColor` and discards the specular lobe, the fresnel rim sheen and the
+environment reflection -- every term that shows a lens is a curved moulded part
+-- which is why each taillight rendered as a flat red sticker. The emission is
+dome-weighted by the same `dot(N,V)` the fresnel uses, so a curved lens is
+hottest where it faces the camera and falls off toward the rim; the 0.55 floor
+keeps the whole lamp clearly lit. The base colour under it is dark red plastic
+(`0.17, 0.020, 0.016`), so the shading has something to shade.
+
+Emitting lenses also drop to `uSpec 0.26` / `uEnv 0.16` from the shared car
+values (0.45 / 0.55): at full strength the warm near-white environment sphere
+washes over the whole lamp and turns a red lens pink.
+
+Lamps that are OFF are byte-identical to before -- the non-emitting branch sets
+the same `uColor` and the same `uUnlit 0` it always did. `uEmissive` is cleared
+at the top of every car-mesh iteration and again when the car pass hands back to
+the world, so nothing else can inherit it: a full night race frame changed 772
+of 455400 pixels, all of them inside the car's own rear.
+
+### CLOSED: the lamp keys were never texture keys (2026-09-20)
+
+The earlier note here guessed at an undecoded "material-hash -> texture-key
+indirection". There is none, and the evidence is conclusive: the head- and
+tail-light keys appear in **every one of the 29 cars' `GEOMETRY.BIN` and nowhere
+else** in 1895 MB / 4010 scanned files. A per-car texture cannot be identical
+across 29 cars; a shared MATERIAL NAME is. `54949afd`, sitting in that same
+"texture slot" list, is the hash of `CHROME`, which settles the convention. So a
+lamp lens has no diffuse map to find, by design -- and the material-driven lens
+(lit base + `uEmissive`) above is the right answer, not a workaround.
+
+What that unlocked instead: the 0x134013 material hashes crack with the same
+`h = h*33 + c`. Newly recovered, and pinned to their names by test:
+
+| hash | name |
+|---|---|
+| `05bc3a3c` | `BRAKELIGHT` |
+| `d79597d6` | `BRAKELIGHTGLASS` |
+| `33a26cb6` | `CLEARPLASTIC` |
+| `2e65e067` | `ALUMINUM` |
+| `721aff7c` | `CARBONFIBRE` |
+| `f7fc7674` | second lens material, named by measurement |
+
+`f7fc7674` resisted the dictionary, so it is identified the way `N2_MAT_INTERIOR`
+was: across all 29 cars' 664 tail-light objects it and `BRAKELIGHT` are perfectly
+mutually exclusive (85 objects carry it and no `BRAKELIGHT`, 579 the reverse,
+zero both, over 16 different cars). Only an alternative for the same job behaves
+like that; a cover or a trim would co-occur.
+
+A tail light is therefore an **assembly**, not a lamp. Per-submesh census over
+eight cars' `BRAKELIGHT` objects:
+
+| material | submeshes | indices |
+|---|---|---|
+| `BRAKELIGHT` | 596 | 78867 |
+| `BRAKELIGHTGLASS` | 347 | 21576 |
+| `MOLDINGS` | 343 | 36819 |
+| `CARSKIN` | 120 | 31059 |
+| `f7fc7674` (lens B) | 117 | 12288 |
+| `CLEARPLASTIC` | 110 | 5442 |
+| `CHROME` | 90 | 14481 |
+| `ALUMINUM` | 35 | 1602 |
+| `CARBONFIBRE` | 12 | 2196 |
+
+More than half of it is not the lens, and all of it was being painted with the
+lens emission -- glowing black trim and glowing chrome, which is most of why a
+tail light read as a flat red sticker. The loader already splits these slices
+and tags each with its own `car_material`; only the renderer ignored it. Now:
+
+* `BRAKELIGHT`, `f7fc7674`, and material `0` (untrusted/mixed, so no lamp can go
+  dark on a parse failure) emit;
+* `MOLDINGS` / `DULLPLASTIC` become dark moulded trim; `CHROME` / `ALUMINUM` /
+  `CARBONFIBRE` keep the lamp class's specular and reflection but stop emitting;
+* `BRAKELIGHTGLASS` and `CLEARPLASTIC` go through the **clear-cover pass** the
+  head lamps already had. That part is not optional: shading the cover as
+  ordinary dark plastic puts an opaque shell in front of the lit lens and
+  blacked out both of the 350Z's tail lights -- measured, then fixed.
+
+`CARSKIN` slices never reach any of this; `n2_mat_class` already routes them to
+BODY and they take the car's paint.
+
+Effect, same camera, `--shot-empty`: CIVIC 2.78% of pixels changed, 350Z 1.41%,
+MIATA 1.01%. The SKYLINE changes **0 pixels** -- its active tail light is lens
+all the way through, which is exactly the control case this rule must not touch.
+
+## The neon/glow pass never sampled its texture (2026-09-20)
+
+Investigating "big red translucent planes over the city at long camera
+distance" found two defects compounding.
+
+The glow pass binds each batch's texture and sets `uUnlit`. But `uUnlit` is not
+the texture-backed emissive path: the shader's unlit branch returns a flat
+`uColor` and never touches `uTex`. So every neon sign, lamp flare and lit glass
+batch in the game drew as a **flat silhouette in whatever colour `uColor`
+happened to hold when the pass started** — correct-looking only by luck.
+`uEmissiveTex` is the branch that samples the texture and modulates it by
+`uColor`, so a textured batch now takes that one with `uColor` at white, and the
+flat warm bulb colour is used only for a batch that genuinely has no texture.
+
+What made it obvious was the second defect: the tail-light pass ran immediately
+before, and set `uUnlit = 1` and `uColor = red` **without restoring either**. So
+the city's 118 `SFX_FLARE_GLOWA` lamp-flare objects and the conservatory's glass
+turned into flat red planes spanning hundreds of metres. That pass now restores
+everything it sets.
+
+Verified on the conservatory camera (`--cam-at 200 860 --shot-yaw 215
+--shot-pitch 28 --chase 320,120`):
+
+* forcing the tail-light pass to run now changes **0 of 819200 pixels** — the
+  leak is closed;
+* the glow fix alone changes 2785 pixels, all inside the conservatory's own
+  bounding box: its lit glass panels finally show their texture instead of a
+  flat fill;
+* a neon-heavy street (Amy's Boutique / ROYALE corner) is unchanged apart from
+  one lamp head, so the pass was not made brighter or dimmer — it was made
+  correct by construction instead of by inherited state.
+
+## Texture detail setting (2026-09-20)
+
+`Lighting & Environment > Texture detail` in the developer menu, `--texture-detail N`
+on the command line, `g_dbg.tex_detail` in code. It is anisotropic filtering,
+1x (plain trilinear) up to the GL maximum, defaulting to the maximum.
+
+Trilinear samples a square footprint, so a surface seen at a grazing angle drops
+to a far coarser mip than it needs and smears. The slider is **live**:
+`render_texture_detail` walks every texture the renderer has uploaded and
+re-applies the filter, so the picture changes as it moves rather than on the
+next load. Dead ids are validated with `glIsTexture` first and compacted out --
+residents and the world texture cache delete textures independently, and setting
+a parameter on a deleted name is a GL error, not a no-op. Only textures with a
+complete mip chain are enrolled; a short chain stays base-only LINEAR, where
+anisotropy has nothing to sample.
+
+Measured on a night race frame (1400x788):
+
+| comparison | pixels changed |
+|---|---|
+| 1x vs 4x | 5.35% |
+| 1x vs 16x | 4.78% |
+| 4x vs 16x | 1.37% |
+
+**Where the gain actually is, honestly:** the same 1x/16x comparison on the
+**isolated car** (`--shot-empty`, no world) changes only **0.20%** of pixels.
+Almost all of the benefit is road, kerb, verge and building -- surfaces the
+camera sees edge-on. That is not a shortfall in the setting; it is what the car
+data contains. NFSU2 car bodies carry **no diffuse map at all**: the paint is
+shaded, not textured (see the census above -- of ~45 values in a car's
+`0x134012` list only 6 are real texture keys, and none of them is a body panel).
+The textured parts of a car are its rims, tyres, badges, decals and vinyls, and
+they are small on screen. So car *skin* quality is driven by the paint path --
+clearcoat, environment reflection, specular, the cavity term -- not by texture
+filtering, and those are already exposed as their own sliders.
+
 ## Exhaust attachment and remaining presentation work
 
 The next UI/resource-ownership stage is specified in

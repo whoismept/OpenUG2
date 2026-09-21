@@ -339,7 +339,20 @@ Do not blanket-disable scenery collision or move a district based on appearance.
 
 Read-only placement census on 15 September: eight local STREAM bundles, 174
 water-related instance placements, no unresolved models and at most 0.001 m of
-transformed geometry outside the authored bounds. PAN_OCEAN ground prototypes
-are assigned to the vista tier. This name-based sample does not establish the
-reported object's identity, animation state, material correctness or collision
-response; those remain open. No world runtime change was made from this census.
+transformed geometry outside the authored bounds. This name-based sample did not
+establish the reported object's identity, and no world runtime change was made
+from it.
+
+RESOLVED on 18 September, and the two halves of the report were one defect. The
+"river running into the conservatory" was never water: it is `OBJECT01`, an
+unnamed backdrop impostor textured `TRN_COASTROADLOD_A_DM` +
+`ARC_PANARAMABUILDINGSC_` + `TRN_TREELINEA_DM`, whose 1016 x 365 m sheet reaches
+z 35.5 exactly where the park lawn sits at z 29.7-32.2. Because it is 1016 m
+wide it also stayed far under the 3000 m measured impostor test, and it has no
+name a rule can spell. Meanwhile the real water, `PAN_OCEAN`, was culled by the
+`PAN_` prefix, which is why the canals and the bay rendered as empty void. Both
+are now classified by material/measurement -- see `docs/FORMATS.md` -- so the
+park is clean terrain and the water is back under the bridges. The impostor's
+own collision was never in the ground scene (it is category OTHER), so no
+collision behaviour changed for it; `PAN_OCEAN` does now answer ground queries
+over open water at z ~= 0.
