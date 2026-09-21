@@ -90,6 +90,7 @@ static void test_tex_parameter(GLenum target, GLenum name, GLint value) {
 #define upload_scene test_upload_scene
 #define free_scene_gpu test_free_scene_gpu
 #define upload_tpk_texture_to_gpu test_upload_texture
+#define upload_tex test_upload_texture
 #define glGetError test_gl_error
 #define glDeleteTextures test_delete_textures
 #define glTexParameteri test_tex_parameter
@@ -177,6 +178,70 @@ static void test_parts_archive(const char *root,const char *name) {
     printf("PART CENSUS PASS %s: %d independent choices, mixed assembly and stock restoration\n",name,count);fflush(stdout);
 }
 
+static void test_car_switch_archive(const char *root) {
+    char cars[64][64];int selected=0;
+    int count=res_list_cars(root,cars,64,"",&selected);assert(count>0);
+    long len=0;unsigned char *global=load_global_car_data(root,&len);assert(global && len>0);
+    test_real_assets=1;test_stage=0;int factory=0;
+    for(int i=0;i<count;i++) {
+        next_handle=1;CarSwitchCandidate candidate={0};
+        assert(prepare_car_switch(&candidate,root,cars[i]));
+        int stock=candidate.stock_wheel;
+        assert(stock>=0 && stock<candidate.scene.count);
+        assert(candidate.scene.meshes[stock].car_mount==N2_MOUNT_WHEEL);
+        int from_global=0;
+        VehicleWheelConfig expected=wheel_config_for(cars[i],&candidate.profile,global,len,&from_global);
+        factory+=from_global;
+        printf("CAR SWITCH %s stance=%s\n",cars[i],from_global?"factory":"body fallback");
+        assert(fabsf(candidate.wheel.front_axle-expected.front_axle)<1e-6f);
+        assert(fabsf(candidate.wheel.rear_axle-expected.rear_axle)<1e-6f);
+        assert(fabsf(candidate.wheel.front_track-expected.front_track)<1e-6f);
+        assert(fabsf(candidate.wheel.rear_track-expected.rear_track)<1e-6f);
+        car_switch_release(&candidate);
+        assert(!live_buffers && !live_textures);
+    }
+    assert(factory>0);test_real_assets=0;free(global);
+    printf("CAR SWITCH PASS: all %d cars retain stock wheels and startup stance (%d factory); no leaked handles\n",count,factory);
+}
+
+static void test_vinyl_selection(void) {
+    clear_car_vinyl();g_vinyl_data=calloc(1,1);g_vinyl_len=1;
+    g_dbg.vinyl_count=2;g_dbg.vinyl_catalog_ready=1;
+    g_vinyl_keys[0]=7;g_vinyl_keys[1]=8;test_stage=0;
+    assert(select_car_vinyl(1));GLuint before=g_car_vinyl_tex;
+    const int failures[]={5,9,10};
+    for(int i=0;i<3;i++) {
+        test_stage=failures[i];assert(!select_car_vinyl(2));
+        assert(g_car_vinyl_tex==before && g_dbg.vinyl_current==1 && live_textures==1);
+    }
+    assert(!select_car_vinyl(-1) && !select_car_vinyl(3));
+    test_stage=0;assert(select_car_vinyl(2));
+    assert(g_car_vinyl_tex!=before && !handles[before] && live_textures==1);
+    assert(select_car_vinyl(0) && !g_car_vinyl_tex && !live_textures);
+    assert(select_car_vinyl(1));clear_car_vinyl();
+    assert(!g_vinyl_data && !g_car_vinyl_tex && !g_dbg.vinyl_count &&
+           !g_dbg.vinyl_catalog_ready && g_dbg.vinyl_request==-1 && !live_textures);
+    puts("VINYL PASS: selection, replacement, removal, failed decode/upload rollback, car reset");
+}
+
+static void test_vinyl_archives(const char *root) {
+    const char *cars[]={"MIATA","GOLF"};test_real_assets=1;test_stage=0;
+    for(int c=0;c<2;c++) {
+        clock_t start=clock();load_vinyl_catalog(root,cars[c]);
+        assert(g_dbg.vinyl_count>1000 && g_dbg.vinyl_catalog_ready);
+        for(int i=0;i<g_dbg.vinyl_count;i++)assert(g_vinyl_keys[i] && g_vinyl_names[i][0]);
+        unsigned char *data=g_vinyl_data;load_vinyl_catalog(root,cars[c]);
+        assert(data==g_vinyl_data); /* cached until the next car */
+        assert(select_car_vinyl(1) && select_car_vinyl(g_dbg.vinyl_count));
+        printf("VINYL ARCHIVE PASS %s: %d named entries, %.2f CPU seconds\n",
+               cars[c],g_dbg.vinyl_count,(double)(clock()-start)/CLOCKS_PER_SEC);
+        clear_car_vinyl();assert(!live_textures);
+    }
+    load_vinyl_catalog("/nonexistent-openug2-test-data","MISSING");
+    assert(!g_dbg.vinyl_count && g_dbg.vinyl_catalog_ready && select_car_vinyl(0));
+    clear_car_vinyl();test_real_assets=0;
+}
+
 int main(int argc,char **argv) {
     /* 2 cm of body-shell clearance is kept; the drop is clamped to what the
        model allows and never lifts the car. */
@@ -245,7 +310,12 @@ int main(int argc,char **argv) {
         assert(!live_buffers && !live_textures);
     }
     puts("body_kit_reload_test: PASS (rollback at 11 boundaries; 20 repeated preparations; cached textures retained)");
-    if(argc>2 && (!strcmp(argv[2],"--all-cars") || !strcmp(argv[2],"--all-parts"))) {
+    test_vinyl_selection();
+    if(argc>2 && !strcmp(argv[2],"--vinyls")) {
+        test_vinyl_archives(argv[1]);
+    } else if(argc>2 && !strcmp(argv[2],"--car-switches")) {
+        test_car_switch_archive(argv[1]);
+    } else if(argc>2 && (!strcmp(argv[2],"--all-cars") || !strcmp(argv[2],"--all-parts"))) {
         char cars[64][64];int selected=0;
         int count=res_list_cars(argv[1],cars,64,"",&selected);assert(count>0);
         for(int i=0;i<count;i++) {

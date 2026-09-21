@@ -209,6 +209,33 @@ extern "C" void dbgui_frame(void) {
         }
         if (shop_tab("Graphics", ImVec4(1, 0.4f, 0.4f, 1))) {
             ImGui::TextUnformatted("Red / Graphics Shop");
+        if (ImGui::CollapsingHeader("Vinyl", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if(!g_dbg.vinyl_catalog_ready) {
+                g_dbg.vinyl_catalog_request=1;
+                ImGui::TextDisabled("Loading this car's vinyl catalogue...");
+            } else {
+                static ImGuiTextFilter filter;
+                const char *current=g_dbg.vinyl_current>0 && g_dbg.vinyl_current<=g_dbg.vinyl_count
+                    ? g_dbg.vinyl_names[g_dbg.vinyl_current-1] : "None";
+                ImGui::Text("Selected: %s",current);
+                if(ImGui::Button("Remove vinyl"))g_dbg.vinyl_request=0;
+                ImGui::SameLine();ImGui::TextDisabled("%d designs",g_dbg.vinyl_count);
+                filter.Draw("Search vinyl");
+                if(ImGui::BeginListBox("##vinyl_list",ImVec2(-1,180))) {
+                    if(ImGui::Selectable("None",g_dbg.vinyl_current==0))g_dbg.vinyl_request=0;
+                    for(int i=0;i<g_dbg.vinyl_count;i++) {
+                        if(!filter.PassFilter(g_dbg.vinyl_names[i]))continue;
+                        ImGui::PushID(i);
+                        if(ImGui::Selectable(g_dbg.vinyl_names[i],g_dbg.vinyl_current==i+1))
+                            g_dbg.vinyl_request=i+1;
+                        ImGui::PopID();
+                    }
+                    ImGui::EndListBox();
+                }
+                ImGui::TextDisabled("One vinyl at a time. Changing cars clears the selection.");
+                if(g_dbg.vinyl_status[0])ImGui::TextWrapped("%s",g_dbg.vinyl_status);
+            }
+        }
         if (ImGui::CollapsingHeader("Body paint", ImGuiTreeNodeFlags_DefaultOpen)) {
             /* body paint -> u_PaintColor (uColor) when override is on; the draw
                loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
@@ -234,7 +261,7 @@ extern "C" void dbgui_frame(void) {
                 g_dbg.rim_paint=1; g_dbg.rim_color[0]=0.30f; g_dbg.rim_color[1]=0.32f; g_dbg.rim_color[2]=0.36f;
             }
         }
-            ImGui::TextWrapped("Not yet supported: vinyl layers, decals, individual part paint, metallic and pearlescent finishes. Matte is a planned OpenUG2 option.");
+            ImGui::TextWrapped("Not yet supported: multiple vinyl layers, decals, individual part paint, metallic and pearlescent finishes. Matte is a planned OpenUG2 option.");
             ImGui::EndTabItem();
         }
         if (shop_tab("Performance", ImVec4(0.4f, 0.65f, 1, 1))) {

@@ -43,6 +43,32 @@ not a finished release or a claim of pixel-perfect retail fidelity.
 | --- | --- |
 | ![OpenUG2 350Z on the L4RB suspension bridge](docs/images/openug2-350z-suspension-bridge.png) | ![OpenUG2 Eclipse on a wooded L4RB road](docs/images/openug2-eclipse-wooded-road.png) |
 
+### Recent development gallery
+
+Recent runtime captures of vehicle detail, texture filtering, the modification
+UI and world lighting. These show work in progress; fountain animation, sea
+quality and shop-light visibility still need further work.
+
+| City plaza | Red shop vinyl selection |
+| --- | --- |
+| ![City plaza and fountain geometry](docs/screenshots/showcase.png) | ![Supra vinyl selection in the Red shop](docs/screenshots/showcase-2.png) |
+
+| Vehicle detail | ImGui modification menu |
+| --- | --- |
+| ![Skyline vehicle detail on a city road](docs/screenshots/detail_showcase.png) | ![ImGui modification controls](docs/screenshots/imgui.png) |
+
+| Texture filtering — 1× | Texture filtering — 16× |
+| --- | --- |
+| ![Road texture filtering at 1x](docs/screenshots/detail_1x.png) | ![Road texture filtering at 16x](docs/screenshots/detail_16x.png) |
+
+| Street lighting — first view | Street lighting — second view |
+| --- | --- |
+| ![Street lighting beside a parking entrance](docs/screenshots/lightpool_mark1_after.png) | ![Street lighting and nearby building fronts](docs/screenshots/lightpool_mark2_after.png) |
+
+| Building sign and street materials | Waterfront and bridge |
+| --- | --- |
+| ![Building sign textures and pavement](docs/screenshots/sign_texture_after.png) | ![Water surface beneath the bridge](docs/screenshots/water_after.png) |
+
 ### Latest verified runtime frames
 
 The gallery below focuses on the current work: route start lines, open-world
@@ -57,15 +83,18 @@ their provenance are collected in [`docs/screenshots`](docs/screenshots/).
 | --- | --- |
 | ![MIATA city run](docs/screenshots/miata-city-run.png) | ![Night open-world road](docs/screenshots/night-openworld.png) |
 
-| Two-car road test | Vehicle material showcase |
-| --- | --- |
-| ![Two-car road test](docs/screenshots/ai-two-car-road-test.png) | ![Vehicle material showcase](docs/screenshots/vehicle-material-showcase.png) |
+![Two-car road test](docs/screenshots/ai-two-car-road-test.png)
 
 Known defects are tracked alongside the progress. For example,
 [#6](https://github.com/whoismept/OpenUG2/issues/6) documents a reproducible
 world-surface artifact with its own capture and acceptance criteria.
 
 ### Working today
+
+In a debug build, open **Modification → Graphics (Red shop) → Vinyl** to
+search the current car’s designs, apply one immediately or remove it with
+**None**. The catalogue matches `--vinyl list`; `--vinyl NAME` still selects
+a design at launch. Changing cars clears the vinyl and loads that car’s catalogue.
 
 - **Track assets** — parses `STREAM*.BUN` scenery and object transforms, emits
   road/terrain material ranges per submesh, resolves regional and shared TPK
@@ -112,9 +141,11 @@ world-surface artifact with its own capture and acceptance criteria.
 - The experimental `--tier full` panorama pass still exposes opaque authored
   backdrop sheets as hard-edged bands at some headings. It is not the default.
 - Vehicle presentation still needs a complete tyre/rim render pass and
-  attribution of the unexplained object below the car. The ImGui modification
+  further visual validation across cars. The misplaced stock spoiler is now
+  attached to its trunk socket. The ImGui modification
   flow now covers bumpers, skirts, hoods, spoilers, exhausts, lights, full body
-  kits, rims, paint and neon; in-menu vinyl editing, decals, mirrors, wide-body kits, rim
+  kits, rims, paint, neon and a searchable vinyl catalogue in the Red / Graphics
+  shop. Multiple vinyl layers, decals, mirrors, wide-body kits, rim
   sizing and every performance package are still missing, as are ownership,
   money, purchases and saving.
 - Lighting fidelity is still evolving: installed headlight/taillight styles now
@@ -310,12 +341,12 @@ Current execution order starts with the vehicle and its player-facing systems,
 then moves outward to world correctness and race systems:
 
 1. **Vehicle foundation and presentation** — complete tyre/rim rendering,
-   identify the unexplained under-car object, and verify body transforms,
+   validate stock spoiler attachments, and verify body transforms,
    wheel/contact placement and measured handling behaviour.
 2. **Vehicle operations and modification flow** — the Modification tab and its
    Body, Performance, Graphics and Car Specialties subtabs exist, and vehicle
    assets swap without restarting the world. What is left: persistent per-car
-   selections, ownership/money/saving, vinyls and decals, and real performance
+   selections, ownership/money/saving, multiple vinyl layers and decals, and real performance
    packages. See the
    [customization and in-place switching design](docs/VEHICLE_CUSTOMIZATION.md)
    and the [game flow reference](docs/GAME_FLOW.md).

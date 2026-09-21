@@ -171,6 +171,12 @@ typedef struct {
     int body_kit_count, body_kit_current, body_kit_request;
     char body_kit_status[128];
 
+    /* Red shop: engine-owned per-car catalogue; 0 = none, requests -1 = idle. */
+    const char (*vinyl_names)[32];
+    int vinyl_count, vinyl_current, vinyl_request;
+    int vinyl_catalog_request, vinyl_catalog_ready;
+    char vinyl_status[128];
+
     /* --- Mesh Inspector (passive: observes/overlays, never alters assets) --- */
     int  insp_count;        /* how many car meshes are inspectable */
     const int *insp_cat;    /* N2_CAR_* per mesh (main.c owns the array) */

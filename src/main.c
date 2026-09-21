@@ -22,6 +22,7 @@
 #include <math.h>
 #include <assert.h>
 #include <time.h>
+#include <limits.h>
 #include <SDL.h>
 
 #include "nfsu2.h"
@@ -46,7 +47,7 @@
 /* debug tunables — defaults match the previously hard-coded constants, so a
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
 DbgState g_dbg = {
-    .body_kit_request = -1, .mod_request_slot = -1,
+    .body_kit_request = -1, .mod_request_slot = -1, .vinyl_request = -1,
     .freecam = 0, .speed = 0.6f,
     .chase_distance = 6.0f, .chase_height = 3.0f, .chase_stiffness = 0.22f,
     .race_maxlaps_want = 2,
@@ -302,12 +303,35 @@ static void body_kit_release(BodyKitCandidate *kit) {
     memset(kit,0,sizeof *kit);
 }
 
+/* Startup and in-process car changes must use the same factory axle table
+ * and shared brake textures. The caller owns the decompressed buffer. */
+static unsigned char *load_global_car_data(const char *root, long *len) {
+    char path[1024]; *len=0;
+    snprintf(path,sizeof path,"%s/GLOBAL/GLOBALB.BUN",root);
+    unsigned char *data=n2_read_file(path,len);
+    if(data)return data;
+    snprintf(path,sizeof path,"%s/GLOBAL/GlobalB.lzc",root);
+    long bytes=0;unsigned char *packed=n2_read_file(path,&bytes);
+    if(packed && bytes>=16 && bytes<=INT_MAX && !memcmp(packed,"JDLZ",4)) {
+        uint32_t size=n2_u32(packed+8);
+        if(size && size<(1u<<28)) {
+            data=(unsigned char *)malloc(size);
+            if(data) {
+                *len=n2_jdlz(packed,(int)bytes,data,(int)size);
+                if(*len<=0){free(data);data=NULL;*len=0;}
+            }
+        }
+    }
+    free(packed);return data;
+}
+
 /* Detached player-car load used by the in-process selector. It owns every
  * allocation until commit, so malformed or incomplete cars leave the active
  * vehicle untouched. */
 typedef struct {
-    unsigned char *data, *texdata;
-    long len, texlen;
+    unsigned char *data, *texdata, *globaldata;
+    long len, texlen, globallen;
+    N2Tpk globaltpk;
     uint32_t keys[512]; int nkeys;
     N2Scene scene; GpuMesh *gpu; int nmesh, stock_wheel;
     float bb[6], bloom[4][4];
@@ -326,6 +350,7 @@ static void car_switch_release(CarSwitchCandidate *candidate) {
     for (int i = 0; i < candidate->ntextures; i++)
         if (candidate->textures[i]) glDeleteTextures(1, &candidate->textures[i]);
     free(candidate->data); free(candidate->texdata);
+    free(candidate->globaltpk.blk); free(candidate->globaldata);
     memset(candidate, 0, sizeof *candidate);
 }
 
@@ -357,8 +382,11 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
                    WHEEL_SEED_TRACKF, n2_car_brake_radius(candidate->data, 0,
                    candidate->len), &candidate->profile);
     int from_global = 0;
-    candidate->wheel = wheel_config_for(name, &candidate->profile, NULL, 0,
-                                        &from_global);
+    candidate->globaldata=load_global_car_data(dataroot,&candidate->globallen);
+    candidate->globaltpk=candidate->globaldata
+        ? n2_tpk_open(candidate->globaldata,candidate->globallen) : (N2Tpk){0};
+    candidate->wheel = wheel_config_for(name, &candidate->profile,
+        candidate->globaldata, candidate->globallen, &from_global);
     (void)from_global;
     for (int i = 0; i < candidate->nmesh; i++) {
         uint32_t key = candidate->scene.meshes[i].texkey;
@@ -369,9 +397,14 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
         if (seen) continue;
         if (candidate->ntextures >= 128) { car_switch_release(candidate); return 0; }
         N2Tex tex = {0};
-        if (!candidate->texdata ||
-            !n2_load_car_tex_by_key(candidate->texdata, candidate->texlen,
-                                     key, &tex)) {
+        int loaded=candidate->texdata && n2_load_car_tex_by_key(
+            candidate->texdata,candidate->texlen,key,&tex);
+        int mount=candidate->scene.meshes[i].car_mount;
+        if(!loaded && candidate->globaldata &&
+           (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE))
+            loaded=n2_tpk_decode(candidate->globaldata,candidate->globallen,
+                                 candidate->globaltpk,key,&tex);
+        if (!loaded) {
             free(tex.rgb); free(tex.alpha); free(tex.dxt);
             continue; /* preserve the established flat fallback for missing keys */
         }
@@ -1589,6 +1622,62 @@ static int er_find_paths(const char *troot, const char *stem, int skip, char *ou
 /* The selected vinyl's own GL texture, drawn as a decal over the body paint.
    0 = stock, no vinyl, which is the default. */
 static GLuint g_car_vinyl_tex = 0;
+static unsigned char *g_vinyl_data;
+static long g_vinyl_len;
+static uint32_t g_vinyl_keys[4096];
+static char g_vinyl_names[4096][32];
+
+static void clear_car_vinyl(void) {
+    glDeleteTextures(1,&g_car_vinyl_tex);g_car_vinyl_tex=0;
+    free(g_vinyl_data);g_vinyl_data=NULL;g_vinyl_len=0;
+    g_dbg.vinyl_names=g_vinyl_names;g_dbg.vinyl_count=0;g_dbg.vinyl_current=0;
+    g_dbg.vinyl_request=-1;g_dbg.vinyl_catalog_request=0;g_dbg.vinyl_catalog_ready=0;
+    g_dbg.vinyl_status[0]=0;
+}
+
+/* Enumerate once per car on demand, using the same names as --vinyl list. */
+static void load_vinyl_catalog(const char *root,const char *car) {
+    if(g_dbg.vinyl_catalog_ready)return;
+    char path[1024];snprintf(path,sizeof path,"%s/CARS/%s/VINYLS.BIN",root,car);
+    g_vinyl_data=n2_read_file(path,&g_vinyl_len);
+    int raw=g_vinyl_data?n2_car_tex_keys(g_vinyl_data,g_vinyl_len,g_vinyl_keys,4096):0;
+    g_dbg.vinyl_names=g_vinyl_names;g_dbg.vinyl_count=0;
+    for(int i=0;i<raw;i++) {
+        int out=g_dbg.vinyl_count;
+        if(n2_car_tex_name_by_key(g_vinyl_data,g_vinyl_len,g_vinyl_keys[i],
+                                  g_vinyl_names[out],sizeof g_vinyl_names[out])) {
+            g_vinyl_keys[out]=g_vinyl_keys[i];g_dbg.vinyl_count++;
+        }
+    }
+    g_dbg.vinyl_catalog_ready=1;g_dbg.vinyl_catalog_request=0;
+    if(!g_dbg.vinyl_count)snprintf(g_dbg.vinyl_status,sizeof g_dbg.vinyl_status,
+                                  "No vinyl designs are available for this car.");
+}
+
+/* Upload before replacing the current decal so failed choices keep it intact. */
+static int select_car_vinyl(int choice) {
+    if(choice<0 || choice>g_dbg.vinyl_count)return 0;
+    GLuint next=0;
+    if(choice) {
+        N2Tex tex={0};
+        int loaded=g_vinyl_data && n2_load_car_tex_by_key(g_vinyl_data,g_vinyl_len,
+                                                        g_vinyl_keys[choice-1],&tex);
+        if(loaded)next=upload_tex(&tex);
+        free(tex.rgb);free(tex.alpha);free(tex.dxt);
+        if(!next || glGetError()!=GL_NO_ERROR) {
+            if(next)glDeleteTextures(1,&next);
+            snprintf(g_dbg.vinyl_status,sizeof g_dbg.vinyl_status,
+                     "Could not load this vinyl. The current design was kept.");
+            return 0;
+        }
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    }
+    glDeleteTextures(1,&g_car_vinyl_tex);g_car_vinyl_tex=next;
+    g_dbg.vinyl_current=choice;g_dbg.vinyl_status[0]=0;
+    return 1;
+}
+
 int main(int argc, char **argv) {
     collide_walls_selftest();
     phys_selftest();
@@ -3876,28 +3965,8 @@ int main(int argc, char **argv) {
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
-        /* The GLOBALB per-car table holds each car's factory wheel positions.
-           Prefer the pre-decompressed GLOBALB.BUN; if it is absent, decompress
-           the shipped GlobalB.lzc in place (it is a JDLZ stream) so the pipeline
-           is fully self-contained from the retail files. */
-        long globlen = 0; char gp[1024];
-        snprintf(gp, sizeof gp, "%s/GLOBAL/GLOBALB.BUN", dataroot);
-        unsigned char *globdata = n2_read_file(gp, &globlen);
-        if (!globdata) {
-            snprintf(gp, sizeof gp, "%s/GLOBAL/GlobalB.lzc", dataroot);
-            long clen2 = 0; unsigned char *cz = n2_read_file(gp, &clen2);
-            if (cz && clen2 >= 16 && memcmp(cz, "JDLZ", 4) == 0) {
-                uint32_t usize = n2_u32(cz + 8);
-                if (usize > 0 && usize < (1u << 28)) {
-                    globdata = (unsigned char *)malloc(usize);
-                    if (globdata) {
-                        globlen = n2_jdlz(cz, (int)clen2, globdata, (int)usize);
-                        printf("GLOBAL: decompressed GlobalB.lzc (JDLZ) -> %ld bytes\n", globlen);
-                    }
-                }
-            }
-            free(cz);
-        }
+        long globlen=0;
+        unsigned char *globdata=load_global_car_data(dataroot,&globlen);
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
@@ -3961,60 +4030,21 @@ int main(int argc, char **argv) {
         }
         free(globaltpk.blk); free(globdata);
         printf("car textures bound: %d distinct\n", nmap);
-        /* Vinyls. VINYLS.BIN is a HUFF-compressed TPK holding this car's own
-           1783-design catalogue, each slot naming itself in the 144-byte record
-           at the end of its payload (n2_car_tex_name_by_key). The keys do not
-           overlap between cars because each design is pre-baked into that car's
-           BODY UV layout -- which is exactly why a vinyl can be drawn straight
-           over the paint on untextured body panels and lands as a coherent
-           design rather than a smear. (The earlier warning about texture-less
-           panels not sharing a UV sheet was about the BADGE atlas, a different
-           texture, and it still holds for that one.)
-
-           Previously this picked the FIRST slot whose opaque-alpha fraction fell
-           in [4%, 55%] and composited it under the badge atlas. Two problems:
-           the choice was arbitrary -- every stock SKYLINE wore WILD_059, every
-           GOLF wore the AEM_SCORPION sponsor decal -- and the badge atlas covers
-           so little UV that the result was invisible anyway (measured: 18..343
-           pixels, 0.00-0.05% of the frame). A stock car carries no vinyl, so the
-           default is now none and the choice is explicit. */
-        {
-            char vpath[512];
-            snprintf(vpath, sizeof vpath, "%s/CARS/%s/VINYLS.BIN", dataroot, carname);
-            long vlen; unsigned char *vdata = n2_read_file(vpath, &vlen);
-            static uint32_t vkeys[4096];
-            int nvk = vdata ? n2_car_tex_keys(vdata, vlen, vkeys, 4096) : 0;
-            if (vinyl_want && !strcmp(vinyl_want, "list")) {
-                printf("vinyl catalogue for %s (%d slots):\n", carname, nvk);
-                for (int k = 0; k < nvk; k++) {
-                    char nm[32];
-                    if (n2_car_tex_name_by_key(vdata, vlen, vkeys[k], nm, sizeof nm))
-                        printf("  %08x  %s\n", vkeys[k], nm);
-                }
-                free(vdata); free(cdata); return 0;
+        /* CLI and Red shop share the car's own named vinyl catalogue. */
+        if(vinyl_want) {
+            load_vinyl_catalog(dataroot,carname);
+            if(!strcmp(vinyl_want,"list")) {
+                printf("vinyl catalogue for %s (%d entries):\n",carname,g_dbg.vinyl_count);
+                for(int i=0;i<g_dbg.vinyl_count;i++)
+                    printf("  %08x  %s\n",g_vinyl_keys[i],g_vinyl_names[i]);
+                clear_car_vinyl();free(cdata);return 0;
             }
-            if (vinyl_want && nvk) {
-                uint32_t pick = 0; char picked[32] = "";
-                for (int k = 0; k < nvk && !pick; k++) {
-                    char nm[32];
-                    if (!n2_car_tex_name_by_key(vdata, vlen, vkeys[k], nm, sizeof nm)) continue;
-                    if (n2_icontains((const unsigned char *)nm, (long)strlen(nm), vinyl_want)) {
-                        pick = vkeys[k]; snprintf(picked, sizeof picked, "%s", nm);
-                    }
-                }
-                N2Tex vt;
-                if (pick && n2_load_car_tex_by_key(vdata, vlen, pick, &vt)) {
-                    g_car_vinyl_tex = upload_tex(&vt);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                    printf("vinyl: %s (%08x, %dx%d) over the paint\n",
-                           picked, pick, vt.w, vt.h);
-                    free(vt.rgb); free(vt.alpha); free(vt.dxt);
-                } else
-                    fprintf(stderr, "vinyl: no catalogue entry matches \"%s\" "
-                                    "(try --vinyl list)\n", vinyl_want);
-            }
-            free(vdata);
+            int pick=0;
+            for(int i=0;i<g_dbg.vinyl_count && !pick;i++)
+                if(n2_icontains((const unsigned char *)g_vinyl_names[i],
+                               (long)strlen(g_vinyl_names[i]),vinyl_want))pick=i+1;
+            if(pick && select_car_vinyl(pick))printf("vinyl: %s over the paint\n",g_vinyl_names[pick-1]);
+            else fprintf(stderr,"vinyl: could not load \"%s\" (try --vinyl list)\n",vinyl_want);
         }
         if (world2 && !world2_spawn_set) {
             float hl=(carbb[3]-carbb[0])*0.5f, hw=(carbb[4]-carbb[1])*0.5f;
@@ -5682,6 +5712,7 @@ int main(int argc, char **argv) {
                             free_scene_gpu(cgm, ncar); n2_free_scene(&car);
                         }
                         car = candidate.scene; cgm = candidate.gpu; ncar = candidate.nmesh;
+                        stock_wheel = candidate.stock_wheel;
                         candidate.gpu = NULL; memset(&candidate.scene, 0, sizeof candidate.scene);
                         free(cdata); free(ctdata);
                         cdata = candidate.data; clen = candidate.len;
@@ -5733,7 +5764,7 @@ int main(int argc, char **argv) {
                         n2_mod_catalog(dataroot, cdata, clen, &car, modification);
                         /* Vinyl UVs belong to the previous car; a successful
                            swap starts the new car without that decal. */
-                        glDeleteTextures(1, &g_car_vinyl_tex); g_car_vinyl_tex = 0;
+                        clear_car_vinyl();
                         carname = next_car; selcar = requested; kit_cursor = 0;
                         g_dbg.body_kit_current = 0; g_dbg.mod_current = carcfg;
                         g_ride_ready = 0;
@@ -5841,6 +5872,11 @@ int main(int argc, char **argv) {
         }
 
         /* Both K and the panel use one stopped-car transaction, before drawing. */
+        if(g_dbg.vinyl_catalog_request)load_vinyl_catalog(dataroot,carname);
+        if(g_dbg.vinyl_request>=0) {
+            int choice=g_dbg.vinyl_request;g_dbg.vinyl_request=-1;
+            select_car_vinyl(choice);
+        }
         if(g_dbg.body_kit_request>=0 || g_dbg.mod_request_slot>=0) {
             int requested=g_dbg.body_kit_request, cursor=kit_cursor;
             int part=g_dbg.mod_request_slot,value=g_dbg.mod_request_value;
@@ -7783,9 +7819,9 @@ int main(int argc, char **argv) {
                 /* A tail light is an assembly, not a lamp: only its lens slices
                    emit. The trim, chrome and clear cover around them are the
                    same object and used to glow with it. */
-                int emitting = c==N2_CAR_LIGHT ? n2_headlight_emitter(car.meshes+i) && headlights_on
+                int emitting = c==N2_CAR_LIGHT ? n2_headlight_emitter(&car,i) && headlights_on
                                               : c==N2_CAR_BRAKELIGHT && g_dbg.night_mode
-                                                && n2_brakelight_lens(cgm[i].car_material);
+                                                && n2_car_tail_lens(&car,i);
                 /* A lamp that is ON stays on the LIT path. uUnlit returns a
                    flat uColor and throws away the specular, the fresnel rim
                    sheen and the environment reflection -- everything that
@@ -7826,10 +7862,24 @@ int main(int argc, char **argv) {
                 GLuint tex = 0; int hasalpha = 0, texmode = N2_DRAW_OPAQUE;
                 for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
                     tex = maptex[j]; hasalpha = mapalpha[j]; texmode = mapmode[j]; break; }
-                if (c == N2_CAR_LIGHT) {
+                uint32_t material=cgm[i].car_material;
+                int dark_trim=n2_car_dark_trim(material),metal_trim=n2_car_metal_trim(material);
+                if((dark_trim || metal_trim) &&
+                   (c==N2_CAR_BODY || c==N2_CAR_MISC || (is_light && !emitting))) {
+                    /* Authored plastic/metal stays unpainted, including lamp
+                       housings. Only painted panels receive the selected vinyl. */
+                    int chrome=material==N2_MAT_CHROME || material==N2_MAT_MAGCHROME;
+                    if(dark_trim)glUniform3f(uColor,.030f,.032f,.035f);
+                    else glUniform3f(uColor,.38f,.40f,.42f);
+                    glUniform1f(uSpec,dark_trim?.06f:chrome?.80f:.35f);
+                    glUniform1f(uGloss,dark_trim?12.0f:chrome?90.0f:25.0f);
+                    glUniform1f(rp.uEnv,dark_trim?.04f:chrome?.85f:.30f);
+                    glUniform1f(rp.uClearcoat,0.0f);
+                    glUniform1f(uUseTex,tex?1.0f:0.0f);
+                    if(tex)glBindTexture(GL_TEXTURE_2D,tex);
+                } else if (c == N2_CAR_LIGHT) {
                     float gain=light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT])*g_dbg.headlight_gain;
                     float level=emitting?gain*((beam_high || beam_flash)?1.0f:0.78f):0.65f;
-                    if(cgm[i].car_material==N2_MAT_MOLDINGS || cgm[i].car_material==N2_MAT_DULLPLASTIC)level=0.035f;
                     if (emitting && level > 0.1f) {
                         /* dim glass base, beam output on top */
                         glUniform3f(uColor, 0.10f, 0.098f, 0.090f);
@@ -7838,7 +7888,6 @@ int main(int argc, char **argv) {
                         glUniform3f(uColor,level,level,level);
                     glUniform1f(uUseTex,tex?1.0f:0.0f);
                     if(tex)glBindTexture(GL_TEXTURE_2D,tex);
-                    if(!emitting && level<0.1f){glUniform1f(uSpec,.04f);glUniform1f(rp.uEnv,0.0f);}
                 } else if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
@@ -7852,15 +7901,8 @@ int main(int argc, char **argv) {
                        most of them; on the Miata almost every body/misc
                        mesh has no texkey at all, so the fallback painted
                        the composite's stretched hook-shape/checker pattern
-                       across large panels like the engine bay, reading as
-                       a solid mismatched block. TODO: the data actually
-                       supports per-submesh materials via the 0x134B02
-                       submesh table (mat_id -> its own 0x134011/0x134012) —
-                       n2_walk_car currently assigns ONE texkey per whole
-                       mesh object from the first material found. Modeling
-                       submesh-level materials would let genuinely-textured
-                       sub-regions (if any exist) resolve correctly instead
-                       of an all-or-nothing per-object key. Not implemented. */
+                       across large panels like the engine bay. Material slices
+                       now keep their individual texture bindings.) */
                     /* Roof panels are ordinary painted body: the data carries
                        no soft-top marker (M111), so they take the same paint and
                        their own texture like every other body mesh. */
@@ -7884,19 +7926,10 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);  /* wheel/brake */
                 } else {
                     glUniform1f(uUseTex, 0.0f);
-                    if (c == N2_CAR_BRAKELIGHT && !n2_brakelight_lens(cgm[i].car_material)) {
-                        /* Not the lens: the surround the lens sits in. Dark
-                           moulded trim, or a clear cover / bare metal that keeps
-                           the light class's own specular and reflection so it
-                           still reads as part of a lamp unit. CARSKIN slices
-                           never reach here -- n2_mat_class already routes those
-                           to BODY and they take the car's paint. */
-                        uint32_t mat = cgm[i].car_material;
-                        int moulded = mat == N2_MAT_MOLDINGS || mat == N2_MAT_DULLPLASTIC;
-                        glUniform3f(uColor, moulded ? 0.030f : 0.055f,
-                                            moulded ? 0.030f : 0.055f,
-                                            moulded ? 0.032f : 0.058f);
-                        if (moulded) { glUniform1f(uSpec, 0.06f); glUniform1f(rp.uEnv, 0.05f); }
+                    if (c == N2_CAR_BRAKELIGHT && !n2_car_tail_lens(&car,i)) {
+                        /* Unresolved non-lens material: conservative dark housing.
+                           Known plastic and metal were handled above. */
+                        glUniform3f(uColor,.055f,.055f,.058f);
                     }
                     else if (c == N2_CAR_BRAKELIGHT) {
                         /* lens glows hot while braking (S, rolling forward) or the
@@ -8025,86 +8058,43 @@ int main(int argc, char **argv) {
               glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
                                  -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
               glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
-            /* glass pass: translucent tint, blended over the finished body,
-               depth-write off (no self-occlusion), spec kept by the shader's
-               uAlpha output. State restored before anything else draws. */
-            if (g_dbg.show_glass) {
-                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                /* Window normals are authored per pane and not guaranteed to
-                   share one winding after the material split. Transparent
-                   glass is two-sided; retaining the body back-face cull made
-                   one side of the Miata/Golf windows disappear at oblique
-                   chase angles. */
-                glDisable(GL_CULL_FACE);
-#ifdef DEBUG_UI
-                glDepthMask(g_dbg.insp_glass_depth ? GL_TRUE : GL_FALSE);
-#else
-                glDepthMask(GL_FALSE);
-#endif
-                glUniform1f(rp.uDecal, 0.0f); glUniform1f(uUseTex, 0.0f);
-                glUniform1f(rp.uClearcoat, 0.0f);
-                /* Tint, opacity and reflection all retuned together (the three
-                   are one look, tuning one alone just moves the artefact):
-                     - the archive does carry measured inner-cabin slices, but
-                       before the INTERIOR material split they inherited body
-                       paint and a pale opaque pane blended that surface up into
-                       the cabin -- one flat sheet that read as water;
-                     - the interior is now matte/dark and near-black tint +
-                       Fresnel alpha (uFresnel) leaves it visible head-on while
-                       keeping a bright reflection at grazing angles, so the
-                       window reads as a pane instead of a filled surface;
-                     - the tight gloss puts a small hard highlight on it, the
-                       broad one it had before smeared across the whole pane. */
-                glUniform1f(uSpec, 0.85f); glUniform1f(uGloss, 90.0f);
-                glUniform1f(uAlpha, 0.46f); glUniform1f(rp.uFresnel, 1.0f);
-                glUniform1f(rp.uEnv, 0.95f);   /* glass reflects hardest */
-                glUniform3f(uColor, 0.020f, 0.024f, 0.032f);
-                for (int i = 0; i < ncar; i++)
-                    if (cgm[i].cat == N2_CAR_GLASS && car.meshes[i].car_mount == N2_MOUNT_BODY) {
-#ifdef DEBUG_UI
-                        /* the opaque loop skips glass, so the inspector overlay
-                           has to be applied here too or selecting a window did
-                           nothing at all. */
-                        int gi = (g_dbg.insp_sel == i);
-                        if (gi && g_dbg.insp_highlight) {
-                            glUniform1f(uUnlit, 1.0f); glUniform1f(uAlpha, 1.0f);
-                            glUniform3f(uColor, 1.0f, 0.08f, 0.85f);
-                        }
-                        if (gi && g_dbg.insp_wire) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-#endif
-                        draw_gpumesh(&cgm[i]); g_dbg.drawn++;
-#ifdef DEBUG_UI
-                        if (gi && g_dbg.insp_wire) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-                        if (gi && g_dbg.insp_highlight) {
-                            glUniform1f(uUnlit, 0.0f); glUniform1f(uAlpha, 0.46f);
-                            glUniform3f(uColor, 0.020f, 0.024f, 0.032f);
-                        }
-#endif
-                    }
-                glUniform1f(uAlpha, 1.0f); glUniform1f(rp.uFresnel, 0.0f);
-                glDepthMask(GL_TRUE); glDisable(GL_BLEND);
-            }
-            glDisable(GL_CULL_FACE);   /* car shell only; FX/wheels below are two-sided */
-            glUniform1f(rp.uClearcoat, 0.0f);   /* lacquer is body paint only */
-            /* Clear HEADLIGHTGLASS stays reflective but reveals the selected
-               housing and emitters. It must not write an opaque depth cover. */
-            if(g_dbg.show_lights) {
+            /* Windows and lamp covers share one back-to-front pass. Drawing
+               in archive order let a far pane overwrite a nearer pane's tint. */
+            if(ncar>0 && (g_dbg.show_glass || g_dbg.show_lights)) {
+                int order[ncar];int count=render_car_glass_order(&car,MVPc,order);
                 glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
-                glDepthMask(GL_FALSE);
-                glEnable(GL_CULL_FACE);glCullFace(GL_BACK);
-                glUniform1f(uUnlit,0.0f);glUniform1f(uUseTex,0.0f);
-                glUniform1f(uSpec,.45f);glUniform1f(uGloss,90.0f);
-                glUniform1f(rp.uEnv,.25f);glUniform1f(rp.uFresnel,0.0f);
-                glUniform1f(uAlpha,g_dbg.headlight_lens_alpha);
-                glUniform3f(uColor,.30f,.32f,.34f);
-                for(int i=0;i<ncar;i++)
-                    if(car.meshes[i].car_mount!=N2_MOUNT_WHEEL &&
-                       n2_lamp_clear_cover(cgm[i].cat, cgm[i].car_material)) {
-                        draw_gpumesh(cgm+i);g_dbg.drawn++;
+                glDisable(GL_CULL_FACE);glDepthMask(GL_FALSE);
+                glUniform1f(rp.uDecal,0.0f);glUniform1f(uUseTex,0.0f);
+                glUniform1f(rp.uClearcoat,0.0f);glUniform1f(rp.uFresnel,1.0f);
+                glUniform1f(uGloss,90.0f);
+                for(int k=0;k<count;k++) {
+                    int i=order[k],window=cgm[i].cat==N2_CAR_GLASS;
+                    if(window?!g_dbg.show_glass:!g_dbg.show_lights)continue;
+                    glUniform1f(uUnlit,0.0f);
+                    glUniform1f(uSpec,window?.85f:.70f);
+                    glUniform1f(rp.uEnv,window?.95f:.65f);
+                    glUniform1f(uAlpha,window?.46f:g_dbg.headlight_lens_alpha);
+                    if(window)glUniform3f(uColor,.020f,.024f,.032f);
+                    else glUniform3f(uColor,.30f,.32f,.34f);
+#ifdef DEBUG_UI
+                    glDepthMask(window && g_dbg.insp_glass_depth?GL_TRUE:GL_FALSE);
+                    int selected=g_dbg.insp_sel==i;
+                    if(selected && g_dbg.insp_highlight) {
+                        glUniform1f(uUnlit,1.0f);glUniform1f(uAlpha,1.0f);
+                        glUniform3f(uColor,1.0f,.08f,.85f);
                     }
-                glUniform1f(rp.uFresnel,0.0f);glUniform1f(uAlpha,1.0f);
-                glDepthMask(GL_TRUE);glDisable(GL_BLEND);glDisable(GL_CULL_FACE);
+                    if(selected && g_dbg.insp_wire)glPolygonMode(GL_FRONT_AND_BACK,GL_LINE);
+#endif
+                    draw_gpumesh(cgm+i);g_dbg.drawn++;
+#ifdef DEBUG_UI
+                    if(selected && g_dbg.insp_wire)glPolygonMode(GL_FRONT_AND_BACK,GL_FILL);
+#endif
+                }
+                glUniform1f(uUnlit,0.0f);glUniform1f(uAlpha,1.0f);
+                glUniform1f(rp.uFresnel,0.0f);glDepthMask(GL_TRUE);glDisable(GL_BLEND);
             }
+            glDisable(GL_CULL_FACE);
+            glUniform1f(rp.uClearcoat,0.0f);
             /* Headlight/taillight bloom: a soft camera-facing additive halo over
                each lens cluster -- night-time light diffusion the flat lens mesh
                can't give on its own. Front clusters glow warm, rear red. Blend is
@@ -9568,7 +9558,7 @@ int main(int argc, char **argv) {
     if (controller) SDL_GameControllerClose(controller);
     world_texture_cache_clear();
     free_headlight_shadows(&headlight_shadows);
-    glDeleteTextures(1, &g_car_vinyl_tex); g_car_vinyl_tex = 0;
+    clear_car_vinyl();
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return final_status;
 }
