@@ -45,7 +45,16 @@ typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
     GLuint ibo;               /* consolidated u16 IBO (<= 65535 verts/batch) */
     int index_count;
-    uint32_t texkey;          /* first member mesh's TPK key (debugging) */
+    uint32_t texkey;          /* first member mesh's TPK key -- DIAGNOSTIC ONLY.
+                             Do not gate drawing on it: a batch's members can
+                             disagree about whether they named a texture, and
+                             this reports one of them. Use `unresolved`. */
+    unsigned char unresolved; /* 1 only when EVERY member named a TPK key and the
+                             resolver produced nothing, i.e. the batch really is
+                             missing art rather than being authored untextured.
+                             A batch that mixes the two draws (flat colour) --
+                             an untextured mesh must not vanish because a
+                             neighbour in its cell lost its texture. */
     GLuint tex;               /* resolved GL texture (0 = untextured fallback) */
     int nmesh;                /* source meshes merged in (drawn-mesh metric) */
     int scen_count[8];        /* source N2_SC_* membership (visibility audit) */

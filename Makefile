@@ -86,6 +86,10 @@ world-instance-test: tools/world_instance_test.c src/world_instance.c src/physic
 	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c src/physics.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
+texkey-probe: tools/texkey_probe.c src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/texkey_probe.c -o build/texkey_probe -lz -lm
+
 car-material-test: tools/car_material_test.c src/nfsu2.h src/car_config.h src/car_mod.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm

@@ -696,8 +696,13 @@ static void test_selection_never_hides_ground(void) {
     /* "ROAD" in the authored name is what n2_mesh_category keys on. */
     long slen=add_keyed_model(stream,0,"XB_ROADSLAB",0x11112222,4);
     slen=add_keyed_model(stream,slen,"XB_WALLPANEL",0x33334444,4);
+    /* The drivable surface is an authored world-space chunk, so its records
+       carry the identity transform -- that is what makes it the ground pass's
+       to own and keeps it out of reach of the scenery selection. A transformed
+       record would make it an ordinary instance instead, which
+       test_ground_prototype_follows_its_instance_transform covers. */
     for(int i=0;i<2;i++){
-        make_instance_record(roads+64*i,0,(float)(i*4-8),-4,(float)(i*4-4),-2);
+        make_instance_record(roads+64*i,0,-2,-2,2,2);
         make_instance_record(walls+64*i,0,(float)(i*4+0),2,(float)(i*4+4),4);
     }
     slen=add_section(stream,slen,17,"XB_ROADSLAB",roads,2);
@@ -721,6 +726,87 @@ static void test_selection_never_hides_ground(void) {
         assert(nroad==1);
         free_scene(&scene);free_scene(&vista);
     }
+    remove(cp);remove(sp);rmdir(root);
+}
+
+/* A ground-classified prototype reached by a record that carries a transform is
+ * an instanced object, not a world-space chunk. Retail data proves the
+ * partition: across every shipped bundle no ground prototype is reached by both
+ * an identity and a transformed record, and L4RA alone had 66 transformed ones
+ * -- XO_RoadBarrierB, TRN_OldTownGrass and TRN_wallguardpost02 collapsed onto
+ * the map origin, TRN_BushBottomwall_02 stranded 203 m from its record. */
+static void test_ground_prototype_follows_its_instance_transform(void) {
+    const char *root="build/world_instance_ground_xform_fixture";
+    const char *cp="build/world_instance_ground_xform_fixture/L4RA.BUN";
+    const char *sp="build/world_instance_ground_xform_fixture/STREAML4RA.BUN";
+    assert(mkdir(root,0777)==0 || errno==EEXIST);
+    unsigned char companion[1024],stream[8192],slabs[2*64];
+    long clen=make_regions(companion,sizeof companion);
+    assert(write_fixture_file(cp,companion,clen));
+
+    /* "ROAD" in the authored name is what n2_mesh_category keys on. */
+    long slen=add_keyed_model(stream,0,"XB_ROADSLAB",0x11112222,4);
+    make_instance_record(slabs+0,0,  2,  6,   6, 10);   /* T = ( 4, 8) */
+    make_instance_record(slabs+64,0,-14,-10, -10,-6);   /* T = (-12,-8) */
+    slen=add_section(stream,slen,17,"XB_ROADSLAB",slabs,2);
+    assert(write_fixture_file(sp,stream,slen));
+
+    const char *bundles[]={"STREAML4RA"};
+    N2Scene scene={0},vista={0};WInstStats stats;
+    assert(world_instance_build(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats)==1);
+    /* One mesh per record, at that record's matrix -- never one copy at the
+       prototype origin standing in for both. */
+    assert(scene.count==2 && vista.count==0);
+    assert(stats.own_matrix_meshes==0);
+    int at_first=0,at_second=0,at_origin=0;
+    for(int i=0;i<scene.count;i++){
+        assert(scene.meshes[i].cat==N2_ROAD);
+        float x=scene.meshes[i].verts[0],y=scene.meshes[i].verts[1];
+        if(near(x,4.0f)&&near(y,8.0f))at_first++;
+        else if(near(x,-12.0f)&&near(y,-8.0f))at_second++;
+        else if(near(x,0.0f)&&near(y,0.0f))at_origin++;
+    }
+    assert(at_first==1 && at_second==1 && at_origin==0);
+    free_scene(&scene);free_scene(&vista);
+
+    /* The same prototype reached only by identity records keeps the chunk
+       contract: emitted once by the ground pass, whatever the record count. */
+    memset(stream,0,sizeof stream);
+    slen=add_keyed_model(stream,0,"XB_ROADSLAB",0x11112222,4);
+    make_instance_record(slabs+0,0,-2,-2,2,2);
+    make_instance_record(slabs+64,0,-2,-2,2,2);
+    slen=add_section(stream,slen,17,"XB_ROADSLAB",slabs,2);
+    assert(write_fixture_file(sp,stream,slen));
+    memset(&scene,0,sizeof scene);memset(&vista,0,sizeof vista);
+    assert(world_instance_build(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats)==1);
+    assert(scene.count==1 && scene.meshes[0].cat==N2_ROAD);
+    assert(near(scene.meshes[0].verts[0],0.0f));
+    free_scene(&scene);free_scene(&vista);
+
+    /* The authored LOD alternatives and the bundle's duplicated copies of the
+       same object must all be claimed, not just the one the resolver picks:
+       an unclaimed ground sibling is still emitted at the prototype origin. */
+    memset(stream,0,sizeof stream);
+    slen=add_keyed_model(stream,0,"XB_ROADSLAB_1A",0xaaaa0001,4);
+    slen=add_keyed_model(stream,slen,"XB_ROADSLAB_1B",0xbbbb0002,4);
+    slen=add_keyed_model(stream,slen,"XB_ROADSLAB_1A",0xaaaa0001,4); /* duplicate */
+    make_instance_record(slabs+0,0,2,6,6,10);   /* T = (4, 8) */
+    long sec=slen;
+    slen=add_section(stream,slen,17,"XB_ROADSLAB_1A",slabs,1);
+    {
+        N2Leaf types[1]; int nt=0;
+        n2_find_leaves(stream,sec+8,slen,0x34102,types,&nt,1);
+        assert(nt==1);
+        put_u32(stream+types[0].off+0x20,0xaaaa0001ul);
+        put_u32(stream+types[0].off+0x24,0xbbbb0002ul);
+    }
+    assert(write_fixture_file(sp,stream,slen));
+    memset(&scene,0,sizeof scene);memset(&vista,0,sizeof vista);
+    assert(world_instance_build(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats)==1);
+    assert(scene.count==1 && scene.meshes[0].cat==N2_ROAD);
+    assert(near(scene.meshes[0].verts[0],4.0f) && near(scene.meshes[0].verts[1],8.0f));
+    free_scene(&scene);free_scene(&vista);
+
     remove(cp);remove(sp);rmdir(root);
 }
 
@@ -1186,6 +1272,111 @@ static void test_panorama_prototype_routes_to_vista(void) {
     }
 }
 
+/* The conservatory "river": three shipped impostor objects carry no usable
+   0x134011 name -- retail left one as OBJECT01 and two whose name leaf is not
+   ASCII -- so no spelling rule can reach them and they entered the world as
+   solid geometry, laying TRN_COASTROADLOD_A_DM across the park. Their MATERIAL
+   is the identification, and routing must not depend on the name. */
+static void test_impostor_atlas_routes_unnamed_backdrop_to_vista(void) {
+    static const char *names[] = { "OBJECT01", "ACvE7B" };
+    for (int i = 0; i < 2; i++) {
+        unsigned char object[4096];
+        uint32_t keys[2] = { 0x0801e3a1u, 0x11223344u };  /* TRN_COASTROADLOD_A_DM */
+        WInstLibrary library = {0};
+        long length = add_common_material_model_named(
+            object, 0, 0x55667788u, keys[0], keys[1], names[i]);
+        winst_collect_models(&library, object, 0, length, keys, 2);
+        assert(library.count == 1);
+        assert(library.items[0].is_vista == 1);
+        winst_library_free(&library);
+    }
+    /* ...and an ordinary material under the same names still reaches the world. */
+    unsigned char object[4096];
+    uint32_t keys[2] = { 0xaabbccddu, 0x11223344u };
+    WInstLibrary library = {0};
+    long length = add_common_material_model_named(
+        object, 0, 0x55667788u, keys[0], keys[1], "OBJECT01");
+    winst_collect_models(&library, object, 0, length, keys, 2);
+    assert(library.count == 1);
+    assert(library.items[0].is_vista == 0);
+    winst_library_free(&library);
+}
+
+/* A texture slot may name a MATERIAL with no diffuse map rather than a
+   texture. HEADLIGHTGLOW is the light-pool card on street fixtures; no shipped
+   pack holds a record for it, so the "substitute the object's sibling key"
+   fallback painted the fixture's own lens art across a 2.8 m cone -- the pale
+   disc the player reported as a "moon" standing in the road (XO_LightWallA,
+   210 submeshes across 132 object kinds on STREAML4RA). Both halves matter:
+   the light-pool range must be dropped, and an ordinary unresolved slot -- a
+   real texture that merely lives in a pack this bundle does not ship -- must
+   still take the fallback, or buildings lose walls. */
+static uint32_t mat_name_hash(const char *name) {
+    uint32_t h = 0xFFFFFFFFu;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        h = h * 33u + *p;
+    return h;
+}
+
+static void test_lightpool_slot_is_dropped_not_substituted(void) {
+    assert(mat_name_hash("HEADLIGHTGLOW") == N2_MAT_HEADLIGHTGLOW);
+    assert(n2_slot_is_lightpool(N2_MAT_HEADLIGHTGLOW));
+    assert(!n2_slot_is_lightpool(0u));
+
+    /* slot0 shipped, slot1 = the light pool. The fixture's two submeshes pick
+       mat 0 and mat 1, so exactly one range may survive. */
+    unsigned char object[4096];
+    uint32_t keys[1] = { 0xaabbccddu };
+    WInstLibrary library = {0};
+    long length = add_common_material_model_named(
+        object, 0, 0x55667788u, keys[0], N2_MAT_HEADLIGHTGLOW, "XO_LIGHTWALLA_1A_00");
+    winst_collect_models(&library, object, 0, length, keys, 1);
+    assert(library.count == 1);
+    assert(library.items[0].scene.count == 1);
+    assert(library.items[0].scene.meshes[0].texkey == keys[0]);
+    winst_library_free(&library);
+
+    /* Same shape, but slot1 is an ordinary texture this bundle does not ship
+       (ARC_UC_RODEO01_LB). That range still draws, wearing the sibling key. */
+    WInstLibrary unshipped = {0};
+    length = add_common_material_model_named(
+        object, 0, 0x55667788u, keys[0], 0x1ef14012u, "XB_UC_RODEOTOWERA_1A_00");
+    winst_collect_models(&unshipped, object, 0, length, keys, 1);
+    assert(unshipped.count == 1);
+    assert(unshipped.items[0].scene.count == 2);
+    for (int i = 0; i < 2; i++)
+        assert(unshipped.items[0].scene.meshes[i].texkey == keys[0]);
+    winst_library_free(&unshipped);
+}
+
+/* PAN_OCEAN wears the backdrop prefix but is the map's water surface, and
+   culling it by prefix left every canal and the bay as empty void. The measured
+   numbers below are the shipped ones (--vista-census 0): the ocean is a
+   horizontal sheet, every other PAN_ asset is a wall or a shell, and the
+   nearest horizontal one is a 234 m PAN_INDUSTRIALNORTHBRIDGE_C fragment. */
+static void test_ground_sheet_separates_water_from_backdrops(void) {
+    N2Geom ocean = {0};
+    ocean.xyspan = 10021.0f; ocean.zspan = 13.0f;
+    ocean.planarity = 1.000f; ocean.dom[2] = 1.000f;
+    assert(n2_is_ground_sheet(&ocean));
+    N2Geom ocean_b98 = ocean;                    /* L4RF's smaller inlet sheet */
+    ocean_b98.xyspan = 3278.0f; ocean_b98.zspan = 0.0f;
+    assert(n2_is_ground_sheet(&ocean_b98));
+
+    N2Geom bridge = {0};                         /* horizontal, but 234 m wide */
+    bridge.xyspan = 234.0f; bridge.zspan = 20.0f;
+    bridge.planarity = 0.998f; bridge.dom[2] = 0.99f;
+    assert(!n2_is_ground_sheet(&bridge));
+    N2Geom hillridge = {0};                      /* 8958 m wide, but a wall */
+    hillridge.xyspan = 8958.0f; hillridge.zspan = 1856.0f;
+    hillridge.planarity = 0.768f; hillridge.dom[2] = 1.000f;
+    assert(!n2_is_ground_sheet(&hillridge));
+    N2Geom skydome = {0};                        /* huge, flat-ish, but a shell */
+    skydome.xyspan = 19397.0f; skydome.zspan = 8010.0f;
+    skydome.planarity = 0.637f; skydome.dom[2] = -1.000f;
+    assert(!n2_is_ground_sheet(&skydome));
+}
+
 static long make_common_tpk(unsigned char *buf, size_t cap,
                             uint32_t slot0, uint32_t slot1) {
     const long record_size = 0x7c, header_size = 2 * record_size;
@@ -1252,6 +1443,7 @@ static void test_common_key_submesh_resolution(void) {
 int main(void) {
     test_scenery_event_assembly();
     test_selection_never_hides_ground();
+    test_ground_prototype_follows_its_instance_transform();
     test_builder_authored_model_keys();
     test_positioned_model_name_boundaries();
     test_regions();
@@ -1269,6 +1461,9 @@ int main(void) {
     test_world_spawn_policy();
     test_common_key_submesh_resolution();
     test_panorama_prototype_routes_to_vista();
+    test_impostor_atlas_routes_unnamed_backdrop_to_vista();
+    test_lightpool_slot_is_dropped_not_substituted();
+    test_ground_sheet_separates_water_from_backdrops();
     puts("world_instance_test: PASS");
     return 0;
 }

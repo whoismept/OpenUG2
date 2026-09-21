@@ -875,10 +875,18 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
     b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
+    int named = 0;
     for (int k = i0; k < i1; k++) {
         int sc = s->meshes[ent[k].idx].scen;
         if (sc >= 0 && sc < 8) b->scen_count[sc]++;
+        if (s->meshes[ent[k].idx].texkey) named++;
     }
+    /* Only a batch with no GL texture can be "missing art", and only when every
+       member asked for one. Measured over five shipped bundles: 68 batches are
+       wholly unresolved and NOT ONE mixes the two kinds, so this changes no
+       shipped frame -- it removes the dependence on which member happened to
+       sort first, which is what `texkey` reported. */
+    b->unresolved = (unsigned char)(!tex && named == i1 - i0);
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
     free(bv); free(bi);
     return 1;

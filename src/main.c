@@ -2772,9 +2772,11 @@ int main(int argc, char **argv) {
                st->bundle[0] ? st->bundle : "-", st->home_region,
                st->regions_selected, st->regions_total, world_options.view_radius);
         printf("INSTANCE counts seen=%ld in-range=%ld meshes=%ld missing=%ld "
-               "own-matrix=%ld rejected=%ld triangles=%ld vista=%d\n",
+               "own-matrix=%ld instanced-ground=%ld rejected=%ld triangles=%ld "
+               "vista=%d\n",
                st->instances_seen, st->instances_in_range, st->meshes_placed,
-               st->missing_models, st->own_matrix_meshes, st->rejected_meshes,
+               st->missing_models, st->own_matrix_meshes,
+               st->instanced_ground_meshes, st->rejected_meshes,
                triangles, world.neighborhood.vista.count);
         printf("INSTANCE model-links keyed=%ld lod-fallback=%ld unkeyed-name=%ld\n",
                st->keyed_models, st->lod_fallbacks, st->unkeyed_models);
@@ -2898,16 +2900,34 @@ int main(int argc, char **argv) {
     }
     printf("dense build-up centre: (%.0f,%.0f)\n", densx, densy);
 
-    /* building collision footprints — the car is kept out of these */
-    #define MAXOBST 32768   /* whole city worth of building footprints */
-    static float obst_store[MAXOBST][4];
-    static int obstsrc_store[MAXOBST];
-    static float obstz_store[MAXOBST][2];
-    float (*obst)[4] = obst_store;
-    int *obstsrc = obstsrc_store;   /* source mesh per rect, same collection pass */
-    float (*obstz)[2] = obstz_store;/* its Z span, measured in that same pass */
-    int nobst = phys_collect_walls(&scene, obst, obstsrc, obstz, MAXOBST);
-    printf("collision obstacles: %d buildings\n", nobst);
+    /* Building collision footprints for the LEGACY (non-world2) path.
+     *
+     * Sized from the scene, not a fixed 32768: phys_collect_walls emits at most
+     * one rect per mesh, so scene.count is the exact bound, and world_resident.c
+     * already sizes its own copy that way. The old fixed cap silently stopped
+     * mid-scene -- STREAML4RA needs 36522 rects, so 3754 of them, and every mesh
+     * after the cut, simply had no wall collision on that path. It also printed
+     * the cap as if it were a count, which is what made it look like a whole-map
+     * defect: it is not, because when world2 is on (the default) the resident's
+     * own collision arrays replace these below and a failed resident build is
+     * fatal. So on the default path this collection was 15.8 ms of startup work
+     * whose result was thrown away unread; only --face-census still needs it. */
+    float (*obst)[4] = NULL;
+    int *obstsrc = NULL;             /* source mesh per rect, same collection pass */
+    float (*obstz)[2] = NULL;        /* its Z span, measured in that same pass */
+    int nobst = 0;
+    if (!world2 || facecensus) {
+        obst    = (float (*)[4])malloc((size_t)scene.count * sizeof *obst);
+        obstsrc = (int *)malloc((size_t)scene.count * sizeof *obstsrc);
+        obstz   = (float (*)[2])malloc((size_t)scene.count * sizeof *obstz);
+        if (!obst || !obstsrc || !obstz) {
+            fprintf(stderr, "collision obstacles: out of memory for %d meshes\n",
+                    scene.count);
+            return 1;
+        }
+        nobst = phys_collect_walls(&scene, obst, obstsrc, obstz, scene.count);
+        printf("collision obstacles: %d buildings (legacy collision path)\n", nobst);
+    }
     if (facecensus) {
         /* M131 evidence: how tall is a near-vertical face on a collision mesh?
            The threshold that separates a seam from a barrier has to come out of
@@ -7380,6 +7400,15 @@ int main(int argc, char **argv) {
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
+            /* A batch whose meshes named a texture the resolver could not
+               supply has nothing to draw. Untextured it falls back to a flat
+               grey, and under night ambient that is a solid dark slab: it is
+               how every spotlight cone whose SFX_LIGHT_BEAMA decode was
+               rejected rendered -- the black wedges hanging off the buildings.
+               Skipping it also drops their fill cost. Terrain still gets the
+               baked grass fallback, and a batch that never named a texture
+               keeps the existing flat-colour treatment. */
+            if (b->unresolved) continue;
             float dx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
                      : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
             float dy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
