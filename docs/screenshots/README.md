@@ -12,4 +12,13 @@ vehicle/lighting state.
 | ![HUMMER on the L4RB start line](hummer-l4rb-startline.png) | HUMMER sprint start on the L4RB route |
 | ![Night open-world road](night-openworld.png) | Road, guardrail, foliage and lighting composition in the open-world bundle |
 | ![Two-car road test](ai-two-car-road-test.png) | Player and opponent vehicle test on the recovered road surface |
-| ![Vehicle material showcase](vehicle-material-showcase.png) | Close vehicle view used while validating body, glass, lights and wheel materials |
+| ![City plaza](showcase.png) | Plaza, fountain geometry and surrounding buildings; water animation remains work in progress |
+| ![Vehicle detail](detail_showcase.png) | Skyline body, glass, wheels and lamp presentation |
+| ![Modification menu](imgui.png) | ImGui body-shop modification controls |
+| ![Texture filtering 1x](detail_1x.png) | Road scene with 1× texture filtering |
+| ![Texture filtering 16x](detail_16x.png) | Road scene with 16× texture filtering |
+| ![Street lighting first view](lightpool_mark1_after.png) | Lighting near a parking entrance |
+| ![Street lighting second view](lightpool_mark2_after.png) | Lighting along the road and building fronts |
+| ![Sign textures](sign_texture_after.png) | Building sign, pavement and road materials |
+| ![Waterfront](water_after.png) | Current water surface, bridge and waterfront geometry |
+| ![Red shop vinyl selection](showcase-2.png) | Supra with a selected vinyl in the Red / Graphics shop |
