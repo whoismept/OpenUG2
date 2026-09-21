@@ -1017,6 +1017,7 @@ static void exhaust_attachment_test(void) {
             } else ok &= !memcmp(m->verts,pos[0],3*sizeof(float)) &&
                         !memcmp(m->idx,idx+(n%2)*3,3*sizeof(uint16_t));
             ok &= m->texkey==tex[0] && m->car_material==mat[n%2];
+            ok &= m->authored_normals && m->verts[m->nverts*5+2]==1;
             for(int v=0;v<m->nverts;v++)ok &= m->verts[v*5+3]==0 && m->verts[v*5+4]==0;
             n++;
         }
@@ -1082,16 +1083,19 @@ static void independent_parts_test(void) {
 static void wheel_tyre_rounding_test(void) {
     printf("\n  GPU tyre arcs keep source physics geometry unchanged\n");
     const float angle=3.14159265f/10;
-    float verts[]={1,-.2f,0,0,0, cosf(angle),-.2f,sinf(angle),1,0,
+    float verts[32]={1,-.2f,0,0,0, cosf(angle),-.2f,sinf(angle),1,0,
                    cosf(angle),.2f,sinf(angle),1,1, 1,.2f,0,0,1};
     uint16_t idx[]={0,1,2,0,2,3};
     N2Mesh source={0}, rounded={0};
     source.verts=verts; source.idx=idx; source.nverts=4; source.nidx=6;
+    source.authored_normals=1;
     source.car_mount=N2_MOUNT_WHEEL; source.car_material=N2_MAT_RUBBER;
     float saved[20],bb[6],after[6];memcpy(saved,verts,sizeof saved);n2_mesh_bbox(&source,bb);
     chk("tyre arc refinement succeeds",n2_round_wheel_tyre(&source,&rounded));
     if(!rounded.verts)return;
     chk("two subdivisions share edge midpoints",rounded.nidx==96 && rounded.nverts==25);
+    chk("generated tyre pool cannot reuse source normals",!rounded.authored_normals);
+    source.authored_normals=0;
     int arc=1,uv=1,winding=1;
     for(int j=0;j<rounded.nverts;j++){
         const float *v=rounded.verts+5*j;
@@ -1223,6 +1227,7 @@ static void wheel_backing_opening_test(void) {
     chk("every ring edge clears the measured tyre opening",clear);
     chk("ring stays on the recessed backing plane with original winding",plane && winding);
     oldverts=m->verts;oldidx=m->idx;
+    chk("generated backing derives normals from its new topology",!m->authored_normals);
     chk("opening is idempotent",!n2_open_wheel_backing(&s,1) && m->verts==oldverts && m->idx==oldidx);
     n2_free_scene(&s);
     n2_load_car(f.b,f.n,&s,tex,1,NULL);
@@ -1356,7 +1361,48 @@ static void stock_attachment_and_trim_test(void) {
         n2_headlight_emitter(&car,0));
 }
 
+static void authored_normals_test(void) {
+    Buf f={.n=0};
+    const float pos[][3]={{0,0,0},{1,0,0},{0,1,0},{0,0,1}};
+    const uint16_t idx[]={0,1,2,0,3,1};
+    const uint32_t mat[]={N2_MAT_CARSKIN,N2_MAT_DULLPLASTIC};
+    const SubSpec sub[]={{3,0,0,0},{3,0,1,3}};
+    object(&f,"TEST_KIT00_BODY_A",NULL,0,mat,2,sub,2,pos,4,idx,6);
+    N2Leaf leaf[1];int nl=0;n2_find_leaves(f.b,0,f.n,0x00134B01u,leaf,&nl,1);
+    const float normal[]={.6f,0,.8f};
+    if(nl==1) {
+        long start=leaf[0].off+n2_skip_filler(f.b+leaf[0].off,(int)leaf[0].size);
+        for(int v=0;v<4;v++)memcpy(f.b+start+v*36+12,normal,sizeof normal);
+    }
+    N2Scene scene={0};n2_load_car(f.b,f.n,&scene,NULL,0,NULL);
+    int ok=nl==1 && scene.count==2;
+    for(int i=0;i<scene.count;i++) {
+        N2Mesh *m=scene.meshes+i;
+        ok &= m->authored_normals;
+        if(m->authored_normals)for(int v=0;v<m->nverts;v++)
+            ok &= !memcmp(m->verts+m->nverts*5+v*3,normal,sizeof normal);
+    }
+    chk("material slices preserve the same authored normals at shared vertices",ok);
+    if(scene.count==2 && scene.meshes[0].authored_normals) {
+        N2Mesh *m=scene.meshes;
+        const float socket[]={0,0,1,0, 0,1,0,0, 1,0,0,0, 7,8,9,1};
+        n2_car_transform(m,socket,0);
+        float *n=m->verts+m->nverts*5;
+        chk("reflected sockets rotate normals without translating or negating them",
+            fabsf(n[0]-.8f)<1e-6f && n[1]==0 && fabsf(n[2]-.6f)<1e-6f &&
+            m->verts[0]==7 && m->verts[1]==8 && m->verts[2]==9 && m->idx[1]==2);
+        n2_prepare_wheel_mesh(m);
+        chk("wheel hub conversion also rotates authored normals",
+            fabsf(n[0]+.8f)<1e-6f && fabsf(n[2]-.6f)<1e-6f);
+        m=scene.meshes+1;n2_car_transform(m,socket,1);n=m->verts+m->nverts*5;
+        chk("exhaust axis conversion applies to normals as well as positions",
+            fabsf(n[0]+.6f)<1e-6f && n[1]==0 && fabsf(n[2]-.8f)<1e-6f);
+    }
+    n2_free_scene(&scene);
+}
+
 int main(void) {
+    authored_normals_test();
     stock_attachment_and_trim_test();
     headlight_material_test();
     wheel_tyre_rounding_test();

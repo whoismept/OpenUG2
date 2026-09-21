@@ -113,19 +113,12 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
     for(int k=0;k<ns;k++)for(int i=0;i<part.count;i++) {
         N2Mesh *src=part.meshes+i,*dst=car->meshes+car->count++;
         *dst=*src;dst->car_source=0;dst->famkey=0;dst->car_part=(unsigned char)(slot+1);
-        dst->verts=(float *)malloc((size_t)src->nverts*5*sizeof(float));
+        dst->verts=(float *)malloc((size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
         dst->idx=(uint16_t *)malloc((size_t)src->nidx*sizeof(uint16_t));dst->vcol=NULL;
         if(!dst->verts || !dst->idx){n2_free_scene(&part);return 0;}
-        memcpy(dst->verts,src->verts,(size_t)src->nverts*5*sizeof(float));
+        memcpy(dst->verts,src->verts,(size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
         memcpy(dst->idx,src->idx,(size_t)src->nidx*sizeof(uint16_t));
-        const float *m=sockets[k];
-        float det=m[0]*(m[5]*m[10]-m[6]*m[9])-m[4]*(m[1]*m[10]-m[2]*m[9])+m[8]*(m[1]*m[6]-m[2]*m[5]);
-        for(int j=0;j<src->nverts;j++) {
-            const float *v=src->verts+j*5;
-            float x=slot==N2_PART_EXHAUST?v[2]:v[0], z=slot==N2_PART_EXHAUST?-v[0]:v[2];
-            for(int a=0;a<3;a++)dst->verts[j*5+a]=x*m[a]+v[1]*m[4+a]+z*m[8+a]+m[12+a];
-        }
-        if(det<0)for(int j=0;j+2<dst->nidx;j+=3){uint16_t tmp=dst->idx[j+1];dst->idx[j+1]=dst->idx[j+2];dst->idx[j+2]=tmp;}
+        n2_car_transform(dst,sockets[k],slot==N2_PART_EXHAUST);
     }
     n2_free_scene(&part);return 1;
 }

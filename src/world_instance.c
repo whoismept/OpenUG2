@@ -85,6 +85,7 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
     }
 
     N2Mesh placed = *src;
+    placed.authored_normals = 0; /* world placement rebuilds the vertex pool */
     placed.verts = (float *)winst_place_alloc(nverts * 5 * sizeof *placed.verts);
     placed.idx = (uint16_t *)winst_place_alloc(nidx * sizeof *placed.idx);
     placed.vcol = src->vcol ? (unsigned char *)winst_place_alloc(nverts * 4) : NULL;

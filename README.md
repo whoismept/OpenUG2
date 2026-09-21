@@ -31,20 +31,6 @@ pipeline works, but only selected content has been verified end to end.
 
 ### Current development screenshots
 
-These are unedited captures from the current single-region open-world path,
-rendered from user-supplied retail data. They show the engine's present state,
-not a finished release or a claim of pixel-perfect retail fidelity.
-
-| Golf — L4RA city road | Miata — L4RA hillside |
-| --- | --- |
-| ![OpenUG2 Golf on an L4RA city road](docs/images/openug2-golf-city-road.png) | ![OpenUG2 Miata on an L4RA hillside road](docs/images/openug2-miata-hillside.png) |
-
-| 350Z — L4RB suspension bridge | Eclipse — L4RB wooded road |
-| --- | --- |
-| ![OpenUG2 350Z on the L4RB suspension bridge](docs/images/openug2-350z-suspension-bridge.png) | ![OpenUG2 Eclipse on a wooded L4RB road](docs/images/openug2-eclipse-wooded-road.png) |
-
-### Recent development gallery
-
 Recent runtime captures of vehicle detail, texture filtering, the modification
 UI and world lighting. These show work in progress; fountain animation, sea
 quality and shop-light visibility still need further work.
@@ -57,9 +43,9 @@ quality and shop-light visibility still need further work.
 | --- | --- |
 | ![Skyline vehicle detail on a city road](docs/screenshots/detail_showcase.png) | ![ImGui modification controls](docs/screenshots/imgui.png) |
 
-| Texture filtering — 1× | Texture filtering — 16× |
+|  Vehicle detail | Road detail |
 | --- | --- |
-| ![Road texture filtering at 1x](docs/screenshots/detail_1x.png) | ![Road texture filtering at 16x](docs/screenshots/detail_16x.png) |
+| ![Golf car detail](docs/screenshots/car_detail.png) | ![Road detail](docs/screenshots/detail_16x.png) |
 
 | Street lighting — first view | Street lighting — second view |
 | --- | --- |
@@ -69,21 +55,6 @@ quality and shop-light visibility still need further work.
 | --- | --- |
 | ![Building sign textures and pavement](docs/screenshots/sign_texture_after.png) | ![Water surface beneath the bridge](docs/screenshots/water_after.png) |
 
-### Latest verified runtime frames
-
-The gallery below focuses on the current work: route start lines, open-world
-city scale, vehicle presentation and the two-car road test. More captures and
-their provenance are collected in [`docs/screenshots`](docs/screenshots/).
-
-| MIATA — L4RA route | HUMMER — L4RB sprint |
-| --- | --- |
-| ![MIATA on the L4RA start line](docs/screenshots/miata-l4ra-startline.png) | ![HUMMER on the L4RB start line](docs/screenshots/hummer-l4rb-startline.png) |
-
-| MIATA — city run | Night open-world road |
-| --- | --- |
-| ![MIATA city run](docs/screenshots/miata-city-run.png) | ![Night open-world road](docs/screenshots/night-openworld.png) |
-
-![Two-car road test](docs/screenshots/ai-two-car-road-test.png)
 
 Known defects are tracked alongside the progress. For example,
 [#6](https://github.com/whoismept/OpenUG2/issues/6) documents a reproducible
