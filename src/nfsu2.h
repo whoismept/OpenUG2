@@ -1992,13 +1992,9 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
 #define N2_MAT_CLEARPLASTIC    0x33a26cb6u
 #define N2_MAT_ALUMINUM        0x2e65e067u
 #define N2_MAT_CARBONFIBRE     0x721aff7cu
-/* A SECOND lens material whose name did not fall out of the hash. Identified by
- * measurement, like N2_MAT_INTERIOR: across all 29 cars' 664 tail-light objects
- * it and BRAKELIGHT are perfectly MUTUALLY EXCLUSIVE -- 85 objects carry this
- * and no BRAKELIGHT, 579 carry BRAKELIGHT and not this, zero carry both, over
- * 16 different cars. A trim or cover material would co-occur with the lens; an
- * alternative for the same job cannot. Treating it as anything but a lens would
- * black out those 16 cars' tail lights. */
+/* Unresolved material name. It is the only lens on Miata, but coexists
+ * with BRAKELIGHT on Golf and also occurs in Supra headlights. Its role
+ * cannot be inferred globally from the hash alone. */
 #define N2_MAT_BRAKELIGHT_B    0xf7fc7674u
 
 /* Which slice of a tail-light assembly actually emits. 0 means the loader could
@@ -2006,6 +2002,28 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
  * keeps the previous whole-object behaviour rather than risking a dark lamp. */
 static int n2_brakelight_lens(uint32_t mat) {
     return mat == 0 || mat == N2_MAT_BRAKELIGHT || mat == N2_MAT_BRAKELIGHT_B;
+}
+
+/* Use the explicit red lens when the assembly provides one. The unknown
+ * fallback material also covers auxiliary surfaces on those assemblies.
+ * ponytail: small scene scan; cache assembly roles if profiling warrants it. */
+static int n2_car_tail_lens(const N2Scene *car, int index) {
+    const N2Mesh *m=car->meshes+index;
+    if(m->car_material!=N2_MAT_BRAKELIGHT_B)return n2_brakelight_lens(m->car_material);
+    for(int i=0;i<car->count;i++)
+        if(car->meshes[i].tierid==m->tierid &&
+           car->meshes[i].car_material==N2_MAT_BRAKELIGHT)return 0;
+    return 1;
+}
+
+static int n2_car_dark_trim(uint32_t mat) {
+    return mat==N2_MAT_DULLPLASTIC || mat==N2_MAT_MOLDINGS || mat==N2_MAT_RUBBER;
+}
+
+/* Bare metal also occurs on bumpers, badges and lamp housings. */
+static int n2_car_metal_trim(uint32_t mat) {
+    return mat==N2_MAT_CHROME || mat==N2_MAT_ALUMINUM ||
+           mat==N2_MAT_MAGCHROME || mat==N2_MAT_MAGSILVER;
 }
 
 /* The transparent outer cover of a lamp unit, front or rear. It must not be
@@ -2016,7 +2034,8 @@ static int n2_brakelight_lens(uint32_t mat) {
  * BRAKELIGHTGLASS and, on cars that ship no BRAKELIGHTGLASS at all such as the
  * CIVIC, CLEARPLASTIC -- the two transparent names in the material set. */
 static int n2_lamp_clear_cover(int cat, uint32_t mat) {
-    if (cat == N2_CAR_LIGHT)      return mat == N2_MAT_HEADLIGHTGLASS;
+    if (cat == N2_CAR_LIGHT)      return mat == N2_MAT_HEADLIGHTGLASS ||
+                                         mat == N2_MAT_CLEARPLASTIC;
     if (cat == N2_CAR_BRAKELIGHT) return mat == N2_MAT_BRAKELIGHTGLASS ||
                                          mat == N2_MAT_CLEARPLASTIC;
     return 0;
@@ -2024,10 +2043,18 @@ static int n2_lamp_clear_cover(int cat, uint32_t mat) {
 
 /* HEADLIGHTGLASS is the outer lens on stock and STYLE lamps (Miata/Golf).
  * Hashes above use the same h=h*33+c convention as wheel materials. */
-static int n2_headlight_emitter(const N2Mesh *m) {
-    return m->cat==N2_CAR_LIGHT && m->car_material!=N2_MAT_HEADLIGHTGLASS &&
-           m->car_material!=N2_MAT_CHROME && m->car_material!=N2_MAT_MOLDINGS &&
-           m->car_material!=N2_MAT_DULLPLASTIC;
+static int n2_headlight_emitter(const N2Scene *car,int index) {
+    const N2Mesh *m=car->meshes+index;
+    if(m->cat!=N2_CAR_LIGHT || n2_lamp_clear_cover(m->cat,m->car_material) ||
+       n2_car_dark_trim(m->car_material) || m->car_material==N2_MAT_CHROME)return 0;
+    if(m->car_material==N2_MAT_HEADLIGHT)return 1;
+    /* Some stock assemblies (Miata/RX7/Hummer) have no HEADLIGHT hash.
+     * Keep their legacy emitter; only suppress it beside an explicit bulb.
+     * ponytail: small scene scan; cache assembly roles if profiling warrants it. */
+    for(int i=0;i<car->count;i++)
+        if(car->meshes[i].tierid==m->tierid &&
+           car->meshes[i].car_material==N2_MAT_HEADLIGHT)return 0;
+    return 1;
 }
 
 /* Indexed bounds exclude other materials' vertices in a shared vertex pool.
@@ -2071,36 +2098,9 @@ static int n2_mat_class(uint32_t hash, int fallback) {
     return fallback;
 }
 
-/* Parse a car GEOMETRY.BIN (36-byte verts w/ normals), tagging each mesh with
- * a class from its material name and its per-mesh diffuse texture key.
- *
- * INVESTIGATED (car submesh materials, Golf, all findings verified against
- * real bytes): 0x134B02 DOES exist per car mesh object and DOES hold
- * multiple 60-byte records (same 0x11-filler-prefix convention as every
- * other leaf in this format; skip filler, then size/60 is exact) with
- * varying mat_id/flag fields — e.g. GOLF_KIT00_FRONT_BUMPER_A has 5 records,
- * mat_id 0-3, flag 0-4. Splitting the index buffer at these record
- * boundaries and checking each record's vertex bbox confirms they ARE real,
- * spatially-distinct sub-groups (a small asymmetric bracket vs. the big
- * symmetric shell, etc.) — this part of the directive was right.
- *
- * BUT: the chain that would make this useful for TEXTURE routing —
- * mat_id -> 0x134003 hash list -> a DIFFERENT 0x134011/0x134012 per submesh
- * — does not exist for car objects. Checked every Golf mesh: zero objects
- * have more than one 0x134011 material block or more than one 0x134012
- * texture-slot list. There is exactly one texture key per whole object,
- * full stop; mat_id/flag never select among alternatives because no
- * alternatives are stored. flag's value set is a small, consistent {0..4}
- * across unrelated meshes and mirrors (L/R copies of the same part keep the
- * same flag, different mat_id) — looks like a small built-in render-state
- * enum (cull mode / blend mode / vertex-color-source, guessing), not a
- * material-lookup key. So "bind a different texture per submesh" is not
- * implementable from this data — there is nothing per-submesh to bind.
- * Splitting meshes at these boundaries anyway (same texture on every
- * resulting piece) would add draw calls for a pixel-identical result, so
- * it isn't done. If a future car is found with >1 material/texslot block
- * per object, THAT would be the real signal this is worth revisiting.
- * removed vinyl/badge fallback, not a real submesh material). */
+/* Parse 36-byte car vertices and validated material/index partitions.
+ * Retain distinct materials even when their category and diffuse key match:
+ * painted shells and dark grille inserts otherwise become one painted mesh. */
 static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *scene,
                         const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
     long o = beg;
@@ -2174,17 +2174,12 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             int trust_cls = nsub == 1 || part_ok;
             uint32_t subtex[32], submat[32]; int matcls[32];
             int differ = 0, clsdiffer = 0, matdiffer = 0, big = 0;
-            int wheel_materials = mount == N2_MOUNT_WHEEL;
-            int light_materials = cat==N2_CAR_LIGHT || cat==N2_CAR_BRAKELIGHT;
             for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
                 subtex[k] = sub[k].mat < (uint32_t)nslot
                           ? (brake ? slots[sub[k].mat]
                                    : n2_resolve_key(slots[sub[k].mat], keys, nkeys)) : 0;
                 uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
                 submat[k] = mh;
-                /* Library object names lack FRONT_WHEEL; their authored
-                   RUBBER range identifies the same tyre/rim material boundary. */
-                if (mh == N2_MAT_RUBBER) wheel_materials = 1;
                 if (submat[k] != submat[0]) matdiffer = 1;
                 matcls[k] = n2_mat_class(mh, cat);
                 if (subtex[k] != subtex[0]) differ = 1;
@@ -2209,7 +2204,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                atomically instead of resolving each split slice on its own. */
             static uint32_t g_car_tierid_next = 1;
             uint32_t tierid = g_car_tierid_next++;
-            if (part_ok && nsub > 1 && (differ || clsdiffer || ((wheel_materials || light_materials) && matdiffer))) {
+            if (part_ok && nsub > 1 && (differ || clsdiffer || matdiffer)) {
                 for (int k = 0; k < nsub; k++) {
                     int before = scene->count;
                     n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28, 0,
@@ -2358,6 +2353,28 @@ failed:
     free(placed);return -1;
 }
 
+/* Stock spoilers, like library spoilers, are authored around their mount.
+ * Apply the selected trunk's marker once on a fresh scene, after LOD selection. */
+static void n2_car_attach_spoiler(const unsigned char *d,long len,N2Scene *s) {
+    int needed=0;
+    for(int i=0;i<s->count;i++)needed |= s->meshes[i].car_part==N2_PART_SPOILER+1;
+    if(!needed)return;
+    float t[16];
+    if(n2_car_socket(d,len,s,0xc93b73fdu,t)!=1)return;
+    float det=t[0]*(t[5]*t[10]-t[6]*t[9])-t[4]*(t[1]*t[10]-t[2]*t[9])+t[8]*(t[1]*t[6]-t[2]*t[5]);
+    for(int i=0;i<s->count;i++) {
+        N2Mesh *m=s->meshes+i;
+        if(m->car_part!=N2_PART_SPOILER+1)continue;
+        for(int v=0;v<m->nverts;v++) {
+            float *p=m->verts+v*5,x=p[0],y=p[1],z=p[2];
+            for(int a=0;a<3;a++)p[a]=x*t[a]+y*t[4+a]+z*t[8+a]+t[12+a];
+        }
+        if(det<0)for(int j=0;j+2<m->nidx;j+=3) {
+            uint16_t tmp=m->idx[j+1];m->idx[j+1]=m->idx[j+2];m->idx[j+2]=tmp;
+        }
+    }
+}
+
 static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
                        const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
     static const N2CarConfig stock = {0};
@@ -2366,6 +2383,7 @@ static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
     n2_walk_car(d, 0, len, scene, keys, nkeys, cfg);
     n2_car_apply_config(scene, cfg);   /* aftermarket parts shadow stock ones */
     n2_car_dedupe_lod(scene);          /* collapse each LOD family to its best tier */
+    n2_car_attach_spoiler(d,len,scene);
     if(n2_car_attach_exhaust(d,len,scene)<0)
         fprintf(stderr,"car exhaust: unresolved attachment; keeping source geometry\n");
     return scene->count;

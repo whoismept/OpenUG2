@@ -151,6 +151,8 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode);
 /* Sort the four instances of a library's material slices by view depth.
  * order has space for 4 * scene->count entries (hub * count + slice). */
 void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order);
+/* Caller provides scene->count indices; returns glass/cover count in draw order. */
+int render_car_glass_order(const N2Scene *scene,const float mvp[16],int *order);
 
 /* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
  * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */

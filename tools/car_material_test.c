@@ -1248,7 +1248,7 @@ static void headlight_material_test(void) {
         chk("small indexed lens anchors exclude housing/shared unused vertices",anchors[0][3]==1 &&
             fabsf(anchors[0][0]-2.015f)<1e-5f && fabsf(anchors[0][1]-.55f)<1e-5f && fabsf(anchors[0][2]-.6f)<1e-5f);
         chk("absent lamps never create guessed light sources",!anchors[1][3] && !anchors[2][3] && !anchors[3][3]);
-        chk("headlight glass and chrome do not glow as bulbs",!n2_headlight_emitter(s.meshes) && !n2_headlight_emitter(s.meshes+1));
+        chk("headlight glass and chrome do not glow as bulbs",!n2_headlight_emitter(&s,0) && !n2_headlight_emitter(&s,1));
     }
     n2_free_scene(&s);
 }
@@ -1296,9 +1296,9 @@ static void brakelight_material_test(void) {
     chk("rear clear covers go to the cover pass, not the opaque pass",
         n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHTGLASS) &&
         n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_CLEARPLASTIC));
-    chk("the head-lamp cover rule is unchanged",
-        n2_lamp_clear_cover(N2_CAR_LIGHT, N2_MAT_HEADLIGHTGLASS) &&
-        !n2_lamp_clear_cover(N2_CAR_LIGHT, N2_MAT_CLEARPLASTIC));
+    chk("head-lamp glass and clear plastic use the transparent cover pass",
+        n2_lamp_clear_cover(N2_CAR_LIGHT,N2_MAT_HEADLIGHTGLASS) &&
+        n2_lamp_clear_cover(N2_CAR_LIGHT,N2_MAT_CLEARPLASTIC));
     chk("a lens is never treated as a cover",
         !n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHT) &&
         !n2_lamp_clear_cover(N2_CAR_BRAKELIGHT, N2_MAT_BRAKELIGHT_B));
@@ -1308,7 +1308,56 @@ static void brakelight_material_test(void) {
     printf("\n");
 }
 
+static void stock_attachment_and_trim_test(void) {
+    chk("chrome/aluminium stay unpainted; glass, plastic and body paint stay distinct",
+        n2_car_metal_trim(N2_MAT_CHROME) && n2_car_metal_trim(N2_MAT_ALUMINUM) &&
+        n2_car_metal_trim(N2_MAT_MAGCHROME) && n2_car_metal_trim(N2_MAT_MAGSILVER) &&
+        !n2_car_metal_trim(N2_MAT_CARSKIN) && !n2_car_metal_trim(N2_MAT_WINDSHIELD) &&
+        !n2_car_metal_trim(N2_MAT_DULLPLASTIC) && !n2_car_metal_trim(0));
+
+    Buf f={.n=0};
+    const float pos[][3]={{0,0,0},{.2f,0,0},{0,.1f,.1f}};
+    const uint16_t idx[]={0,1,2,2,1,0};
+    const uint32_t tex[]={7},mat[]={N2_MAT_CARSKIN,N2_MAT_DULLPLASTIC};
+    const SubSpec sub[]={{3,0,0,0},{3,0,1,3}};
+    object(&f,"TEST_KIT00_SPOILER_A",tex,1,mat,2,sub,2,pos,3,idx,6);
+    long start=f.n;
+    object(&f,"TEST_KIT00_TRUNK_A",tex,1,NULL,0,NULL,0,pos,3,idx,3);
+    Buf marks={.n=0};
+    bu32(&marks,0xc93b73fdu);bu32(&marks,0);bu32(&marks,0);bu32(&marks,0);
+    float t[]={1,0,0,0, 0,-1,0,0, 0,0,1,0, -2,0,.8f,1};
+    for(int a=0;a<16;a++)bf32(&marks,t[a]);
+    chunk(&f,0x0013401au,&marks);
+    uint32_t size=(uint32_t)(f.n-start-8);memcpy(f.b+start+4,&size,4);
+    for(int pass=0;pass<2;pass++) {
+        N2Scene s={0};n2_load_car(f.b,f.n,&s,tex,1,NULL);
+        chk("paint and dark plastic retain separate slices with a shared texture",
+            s.count==3 && s.meshes[0].car_material==N2_MAT_CARSKIN &&
+            n2_car_dark_trim(s.meshes[1].car_material) && !n2_car_dark_trim(s.meshes[0].car_material));
+        chk("stock spoiler mounts once per fresh load, preserving reflected winding and UVs",
+            s.count==3 && fabsf(s.meshes[0].verts[0]+2)<1e-6f &&
+            fabsf(s.meshes[1].verts[2]-.8f)<1e-6f &&
+            fabsf(s.meshes[1].verts[11]+.1f)<1e-6f &&
+            s.meshes[0].idx[1]==2 && s.meshes[0].verts[3]==0);
+        n2_free_scene(&s);
+    }
+    N2Mesh meshes[3]={{.cat=N2_CAR_BRAKELIGHT,.tierid=1,.car_material=N2_MAT_BRAKELIGHT_B},
+        {.cat=N2_CAR_BRAKELIGHT,.tierid=1,.car_material=N2_MAT_BRAKELIGHT},
+        {.cat=N2_CAR_BRAKELIGHT,.tierid=2,.car_material=N2_MAT_BRAKELIGHT_B}};
+    N2Scene car={.meshes=meshes,.count=3};
+    chk("explicit red lens excludes auxiliary surfaces in the same assembly only",
+        !n2_car_tail_lens(&car,0) && n2_car_tail_lens(&car,1) && n2_car_tail_lens(&car,2));
+    meshes[0].cat=meshes[1].cat=N2_CAR_LIGHT;
+    meshes[1].car_material=N2_MAT_HEADLIGHT;
+    chk("unknown headlamp surround does not glow beside an explicit bulb",
+        !n2_headlight_emitter(&car,0) && n2_headlight_emitter(&car,1));
+    meshes[1].tierid=3;
+    chk("headlamps without the explicit hash retain their fallback emitter",
+        n2_headlight_emitter(&car,0));
+}
+
 int main(void) {
+    stock_attachment_and_trim_test();
     headlight_material_test();
     wheel_tyre_rounding_test();
     wheel_backing_opening_test();

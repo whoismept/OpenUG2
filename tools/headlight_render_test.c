@@ -36,7 +36,27 @@ static int sample(const RProg *r,GpuMesh *road,const float model[16],int high,fl
     return pixels[(32*128+x)*4];
 }
 int main(void) {
+    /* Window and lamp-cover order uses each slice's indices, not the shared
+       pool (which also contains an unrelated far vertex). Equal depths are stable. */
+    float glass_verts[]={0,0,0,0,0, 0,0,2,0,0, 0,0,999,0,0};
+    uint16_t glass_idx[]={0,0,0,1,1,1};
+    N2Mesh panes[5]={0};
+    for(int i=0;i<5;i++) {
+        panes[i].verts=glass_verts;panes[i].nverts=3;
+        panes[i].idx=glass_idx+(i?3:0);panes[i].nidx=3;
+        panes[i].cat=N2_CAR_GLASS;
+    }
+    panes[1].cat=N2_CAR_LIGHT;panes[1].car_material=N2_MAT_HEADLIGHTGLASS;
+    panes[2].cat=N2_CAR_BODY;panes[4].car_mount=N2_MOUNT_WHEEL;
+    N2Scene glass_scene={.meshes=panes,.count=5};
+    float view[16]={0};view[11]=1;view[15]=10;int order[5];
+    assert(render_car_glass_order(&glass_scene,view,order)==3);
+    assert(order[0]==1 && order[1]==3 && order[2]==0);
+    view[11]=-1;
+    assert(render_car_glass_order(&glass_scene,view,order)==3);
+    assert(order[0]==0 && order[1]==1 && order[2]==3);
     assert(SDL_Init(SDL_INIT_VIDEO)==0);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE,8);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,1);
     SDL_Window *window=SDL_CreateWindow("Headlight shader test",0,0,128,64,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
@@ -118,6 +138,27 @@ int main(void) {
     assert(sample(&r,road,model,1,1,25)>off);
     assert(glGetError()==GL_NO_ERROR);
     printf("PASS: low road=%d off=%d; far low=%d high=%d; heading and upper cutoff\n",low,off,low_far,high_far);
+    /* Two-sided car glass must not become opaque when seen from inside.
+       Same pane and camera, opposite index winding; inspect the shader alpha. */
+    glUniform1f(r.uHeadGain,0);glUniform1f(r.uFresnel,1);glUniform1f(r.uAlpha,.2f);
+    glUniform1f(r.uSpec,.5f);glUniform1f(r.uGloss,40);glUniform1f(r.uEnv,.4f);
+    glUniform1f(r.uFogDensity,0);glUniform3f(r.uLight,0,0,1);
+    glUniform3f(r.uCamPos,20,0,10);glUniform3f(r.uColor,.05f,.05f,.05f);
+    glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_CULL_FACE);
+    unsigned char glass[2][4];
+    for(int side=0;side<2;side++) {
+        for(int v=0;v<4;v++)verts[v*5+2]=0;
+        mesh.idx=side?(uint16_t *)down:idx;
+        GpuMesh *pane=upload_scene(&scene);assert(pane);
+        glClear(GL_COLOR_BUFFER_BIT);draw_gpumesh(pane);glFinish();
+        glReadPixels(25,32,1,1,GL_RGBA,GL_UNSIGNED_BYTE,glass[side]);
+        free_scene_gpu(pane,1);
+    }
+    printf("glass alpha front=%u back=%u\n",glass[0][3],glass[1][3]);fflush(stdout);
+    assert(glass[0][3]>50 && glass[0][3]<240 && abs(glass[0][3]-glass[1][3])<=1);
+    for(int c=0;c<3;c++)assert(abs(glass[0][c]-glass[1][c])<=1);
+    assert(glGetError()==GL_NO_ERROR);
+    puts("PASS: car glass tint/reflection/opacity agree from both sides");
     free_headlight_shadows(&shadows);
     free_scene_gpu(road,1);glDeleteTextures(1,&texture);glDeleteProgram(r.prog);
     SDL_GL_DeleteContext(context);SDL_DestroyWindow(window);SDL_Quit();return 0;

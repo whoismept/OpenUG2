@@ -114,7 +114,11 @@ int main(void) {
             unsigned char sample[4],corner[4];
             glReadPixels(28,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,sample);
             glReadPixels(4,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,corner);
-            assert(corner[0]<5 && corner[1]<5 && corner[2]>245);
+            /* The continuous inboard backing deliberately ignores cutout
+               alpha; unlike tyre/spokes, it must not reveal a hole here. */
+            if(mode==N2_DRAW_CUTOUT && materials[material]==N2_MAT_INTERIOR)
+                assert(!memcmp(corner,sample,3));
+            else assert(corner[0]<5 && corner[1]<5 && corner[2]>245);
             if(!paint)memcpy(raw,sample,4);
             else if(material==3 || material==4)assert(sample[1]>sample[0]+10);
             else assert(!memcmp(raw,sample,3)); /* no tint, including unknowns */

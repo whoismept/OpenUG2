@@ -226,6 +226,9 @@ static const char *FS =
     "  vec3 L=normalize(uLight); vec3 N=normalize(vN);\n"
     "  if(uFlipN>0.5) N = -N;\n"
     "  vec3 V=normalize(uCamPos - vPos);\n"
+    /* Two-sided glass reflects the viewer-facing side; a backwards normal
+       otherwise forces Fresnel to 1 and makes the far window fully opaque. */
+    "  if(uFresnel>0.5 && dot(N,V)<0.0) N=-N;\n"
     "  float nl=max(dot(N,L),0.0);\n"
     "  float d=uAmbient+uDiffuse*nl;\n"   /* directional; reveals body form */
     /* uAmbient/uDiffuse are one shared per-frame pair (world+cars both read
@@ -1266,25 +1269,45 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glDepthMask(mask);
 }
 
+/* A split material slice shares its vertex pool with other surfaces. Only
+ * indexed vertices describe the centre that should determine its draw depth. */
+static void mesh_indexed_center(const N2Mesh *m,float center[3]) {
+    float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
+    for(int j=0;j<m->nidx;j++)for(int a=0;a<3;a++) {
+        float v=m->verts[m->idx[j]*5+a];
+        if(v<lo[a])lo[a]=v;if(v>hi[a])hi[a]=v;
+    }
+    for(int a=0;a<3;a++)center[a]=(lo[a]+hi[a])*.5f;
+}
+
 void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order) {
     if(!scene || scene->count<=0 || !order)return;
     int n=scene->count;float depth[4*n];
     for(int i=0;i<n;i++) {
-        const N2Mesh *m=scene->meshes+i;
-        float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
-        /* Split slices share the entire vertex pool: use their own indices. */
-        for(int j=0;j<m->nidx;j++)for(int a=0;a<3;a++) {
-            float v=m->verts[m->idx[j]*5+a];
-            if(v<lo[a])lo[a]=v;if(v>hi[a])hi[a]=v;
-        }
+        float center[3];mesh_indexed_center(scene->meshes+i,center);
         for(int k=0;k<4;k++) {
             int at=k*n+i;order[at]=at;depth[at]=mvp[k][15];
-            for(int a=0;a<3;a++)depth[at]+=mvp[k][a*4+3]*(lo[a]+hi[a])*.5f;
+            for(int a=0;a<3;a++)depth[at]+=mvp[k][a*4+3]*center[a];
         }
     }
     /* ponytail: source-slice centres give painter order, not per-triangle
        transparency. Intersecting translucent surfaces still need finer sorting. */
     n2_sort_back_to_front(order,4*n,depth);
+}
+
+int render_car_glass_order(const N2Scene *scene,const float mvp[16],int *order) {
+    if(!scene || scene->count<=0 || !order)return 0;
+    float depth[scene->count];int n=0;
+    for(int i=0;i<scene->count;i++) {
+        const N2Mesh *m=scene->meshes+i;
+        if(m->car_mount!=N2_MOUNT_BODY || (m->cat!=N2_CAR_GLASS &&
+           !n2_lamp_clear_cover(m->cat,m->car_material)))continue;
+        float center[3];mesh_indexed_center(m,center);
+        order[n++]=i;depth[i]=mvp[15];
+        for(int a=0;a<3;a++)depth[i]+=mvp[a*4+3]*center[a];
+    }
+    /* ponytail: pane centres, as for wheels; intersecting panes need finer sorting. */
+    n2_sort_back_to_front(order,n,depth);return n;
 }
 
 /* S3TC format enums + capability flag. glext.h / SDL_opengl.h define these on
