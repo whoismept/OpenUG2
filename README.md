@@ -89,7 +89,13 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
   neon are selectable live from the ImGui developer menu, with per-car asset
   inventories and reversible stock fallbacks.
 - **Driving** — keyboard-controlled arcade acceleration, braking, steering,
-  handbrake, surface-dependent grip and geometry-derived per-car differences.
+  handbrake and surface-dependent grip. Per-car source records provide mass,
+  torque, gearbox and steering values; measured geometry supplies lateral grip
+  and load transfer.
+- **Open-world traffic** — traffic and roaming racers follow authored road
+  points through steering and speed targets. Player and AI share suspension,
+  airborne momentum and landing response; the camera reacts to landing impact.
+  Spawns require road support, clearance and an off-screen location.
 - **Racing** — closed-circuit loading and AI racing-line opponents work on the
   verified L4RA route. L4RB sprint event 4201 starts on its shipped supported
   grid and its three checkpoints can complete end to end under the route
@@ -100,9 +106,14 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
 
 ### Major gaps
 
-- Vehicle handling is still an arcade approximation, not NFSU2-equivalent:
-  there is no decoded drivetrain, torque curve, gearing, tyre load, weight
-  transfer or independent per-wheel suspension simulation.
+- Vehicle handling is still an arcade approximation, not NFSU2-equivalent.
+  Stock mass, RPM limits, torque curve, steering response and drivetrain, plus
+  four source power/gearbox levels, are read from each car's
+  `GLOBAL/GLOBALB.BUN` record. The engine does not yet simulate a full
+  drivetrain or decoded brake, tyre and suspension upgrade packages.
+- Traffic junction selection, route-end queues and collision impulses remain
+  provisional. Short deterministic drives pass, but long-session traffic flow
+  and retail handling fidelity are not yet established.
 - Only selected L4RA/L4RB content is gameplay-tested. Other region bundles and
   eight remaining L4RB sprint events still need systematic coverage.
 - Sprint AI opponents, the in-game driving/race HUD semantics and a
@@ -117,7 +128,7 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
   flow now covers bumpers, skirts, hoods, spoilers, exhausts, lights, full body
   kits, rims, paint, neon and a searchable vinyl catalogue in the Red / Graphics
   shop. Multiple vinyl layers, decals, mirrors, wide-body kits, rim
-  sizing and every performance package are still missing, as are ownership,
+  sizing and individual performance packages are still missing, as are ownership,
   money, purchases and saving.
 - Lighting fidelity is still evolving: installed headlight/taillight styles now
   scale emissive output, `L`/`J` drive low/high and flash beams, and `N` gives a
@@ -200,7 +211,7 @@ The Modification subtabs follow the retail shop colours:
 | **Body** (green) | Front/rear bumpers, skirts, hood, headlight and taillight assemblies, spoiler, exhaust, roof scoop; full body-kit presets; wheel brand and rim style from the `CARS/WHEELS` library. |
 | **Specialties** (yellow) | Trunk audio, neon underglow (on/off, colour, intensity). |
 | **Graphics** (red) | Body paint with clear-coat, highlight and reflection controls; rim paint with chrome/OEM/gunmetal presets. |
-| **Performance** (blue) | Placeholder — no decoded performance packages yet. |
+| **Performance** (blue) | Source power-curve and transmission levels, applied live; exact ECU/engine/turbo product mapping and the remaining packages are still being decoded. |
 | **Safe House** (purple) | Read-only list of installed parts; ownership and saving are not implemented. |
 
 Changes are free and instant — this is a preview surface, not career progression.
@@ -405,6 +416,8 @@ Format reverse-engineering builds on prior community work, used as references
   Big thanks for the great work.
 - **[Nikki](https://github.com/SpeedReflect/Nikki)** — TPK / texture header reference.
 - **[OpenNFSTools](https://github.com/MWisBest/OpenNFSTools)** — JDLZ algorithm reference.
+- **[PryHUB](https://github.com/bdrtr/PryHUB)** — GLOBALB car-record and
+  powertrain-upgrade layout reference, revalidated against the local retail data.
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — Gnsu20 / EA-XAS v0 format reference.
 - **[noclip.website](https://github.com/magcius/noclip.website)** — Jasper St.
   Pierre (magcius) and contributors, especially the

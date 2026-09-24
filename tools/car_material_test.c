@@ -25,6 +25,41 @@ static void bbytes(Buf *o, const void *p, long n) { memcpy(o->b + o->n, p, n); o
 static void bstr(Buf *o, const char *s) { bbytes(o, s, (long)strlen(s)); }
 static void bfill11(Buf *o, int n) { for (int i = 0; i < n; i++) o->b[o->n++] = 0x11; }
 
+static void physics_attr_test(void) {
+    unsigned char d[0x1000]={0};
+    const char *path="CARS\\TESTCAR\\GEOMETRY.BIN";
+    memcpy(d+0x40,path,strlen(path));
+    long b=0;float f;int gears=5;
+#define PAF(off,val) do{f=(val);memcpy(d+b+(off),&f,4);}while(0)
+    PAF(0x220,1.25f);PAF(0x300,800);PAF(0x304,6500);PAF(0x308,7000);
+    for(int i=0;i<9;i++)PAF(0x310+i*4,.12f+i*.01f);
+    PAF(0x380,1.15f);PAF(0x2d0,1.0f);
+    const int gb[4]={0x2c0,0x460,0x4a0,0x4e0};
+    const int gain[4]={0x530,0x570,0x5b0,0x5f0};
+    for(int level=0;level<4;level++) {
+        PAF(gb[level]+8,4.1f-level*.1f);PAF(gb[level]+0x20,-3.1f);
+        memcpy(d+b+gb[level]+0x18,&gears,4);
+        for(int i=0;i<5;i++)PAF(gb[level]+0x28+i*4,3.2f/(i+1));
+        for(int i=0;i<9;i++)PAF(gain[level]+i*4,level*.01f*(i+1));
+    }
+#undef PAF
+    N2PhysicsAttr a;
+    chk("GLOBALB stock physics record decodes by exact car path",
+        n2_global_physics_attr(d,sizeof d,"TESTCAR",&a));
+    chk("mass, rpm, drivetrain and steering preserve source values",
+        fabsf(a.mass_tonnes-1.25f)<1e-6f&&fabsf(a.idle_rpm-800)<1e-6f&&
+        fabsf(a.limiter_rpm-7000)<1e-6f&&fabsf(a.rear_drive-1)<1e-6f&&
+        fabsf(a.steer_ratio-1.15f)<1e-6f);
+    chk("all source torque and transmission upgrade levels decode",
+        fabsf(a.torque[8]-.20f)<1e-6f&&a.gearbox[3].gear_count==5&&
+        fabsf(a.gearbox[0].forward[0]-3.2f)<1e-6f&&
+        fabsf(a.gearbox[3].final_drive-3.8f)<1e-6f&&
+        fabsf(a.torque_gain[3][8]-.27f)<1e-6f);
+    memcpy(d+0x900,path,strlen(path));
+    chk("duplicate car paths are rejected instead of choosing a record",
+        !n2_global_physics_attr(d,sizeof d,"TESTCAR",&a));
+}
+
 /* Wrap `payload` (already-built bytes) as one chunk: magic, size, payload. */
 static void chunk(Buf *o, uint32_t magic, const Buf *payload) {
     bu32(o, magic); bu32(o, (uint32_t)payload->n); bbytes(o, payload->b, payload->n);
@@ -209,6 +244,76 @@ static void car_mount_test(void) {
             sc.count==1 && sc.meshes[0].texkey==(invalid?0:tex[0]));
         n2_free_scene(&sc);
     }
+}
+
+static void textureless_car_color_test(void) {
+    Buf f={0};
+    float pos[3][3]={{0,0,0},{1,0,0},{0,1,0}};
+    uint16_t idx[]={0,1,2};
+    object(&f,"TRAFFIC_BODY_A",NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+    N2Leaf leaf[2];int count=0;
+    n2_find_leaves(f.b,0,f.n,0x00134B01u,leaf,&count,2);
+    chk("traffic fixture has one vertex stream",count==1);
+    if(count!=1)return;
+    int pad=n2_skip_filler(f.b+leaf[0].off,(int)leaf[0].size);
+    for(int i=0;i<3;i++) {
+        uint32_t color=0xff112233u;
+        memcpy(f.b+leaf[0].off+pad+i*36+24,&color,4);
+    }
+    N2Scene plain={0},colored={0};
+    n2_load_car(f.b,f.n,&plain,NULL,0,NULL);
+    n2_load_car_colored(f.b,f.n,&colored,NULL,0,NULL,1);
+    chk("detailed-car path leaves vertex prelight unused",
+        plain.count==1 && plain.meshes[0].vcol==NULL);
+    chk("textureless-car path keeps authored RGB",
+        colored.count==1 && colored.meshes[0].vcol &&
+        colored.meshes[0].vcol[0]==0x11 && colored.meshes[0].vcol[1]==0x22 &&
+        colored.meshes[0].vcol[2]==0x33 && colored.meshes[0].vcol[3]==0xff);
+    n2_free_scene(&plain);n2_free_scene(&colored);
+}
+static void roof_alternative_test(void) {
+    Buf f={0};
+    float pos[3][3]={{0,0,0},{1,0,0},{0,1,0}};
+    uint16_t idx[]={0,1,2};
+    object(&f,"TEST_KIT00_FULLROOF_A",NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+    N2Scene s={0};
+    n2_load_car(f.b,f.n,&s,NULL,0,NULL);
+    chk("lone full roof remains available",s.count==1);
+    n2_free_scene(&s);
+    object(&f,"TEST_KIT00_ROOF_A",NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+    n2_load_car(f.b,f.n,&s,NULL,0,NULL);
+    chk("sunroof assembly replaces overlapping full roof",s.count==1);
+    n2_free_scene(&s);
+}
+static void fleet_name_and_traffic_glass_test(void) {
+    Buf f={0},p={0},name={0};
+    float pos[3][3]={{0,0,0},{1,0,0},{0,1,0}};
+    uint16_t idx[]={0,1,2};
+    bstr(&name,"AP7XC");bu32(&name,0);
+    bstr(&name,"G35_KITW03_BODY_A");bu32(&name,0);
+    chunk(&p,0x00134011u,&name);
+    leaf_verts(&p,pos,3);leaf_idx(&p,idx,3);
+    chunk(&f,0x80134010u,&p);
+    char parsed[64];n2_car_mesh_name(f.b,8,f.n,parsed);
+    chk("prefixed metadata token does not hide a wide-body part name",
+        strcmp(parsed,"G35_KITW03_BODY_A")==0);
+    N2Scene s={0};n2_load_car(f.b,f.n,&s,NULL,0,NULL);
+    chk("unselected wide-body geometry is filtered from the stock car",s.count==0);
+    n2_free_scene(&s);
+
+    f.n=0;
+    uint32_t mat[]={N2_MAT_TRAFFICWINDOWS};
+    SubSpec sub[]={{3,0,0,0}};
+    object(&f,"BUS_BODY_A",NULL,0,mat,1,sub,1,pos,3,idx,3);
+    n2_load_car_colored(f.b,f.n,&s,NULL,0,NULL,1);
+    chk("authored TRAFFICWINDOWS material routes to the glass pass",
+        s.count==1 && s.meshes[0].cat==N2_CAR_GLASS);
+    chk("opaque window mask uses dark trim instead of body paint",
+        n2_car_dark_trim(N2_MAT_WINDOWMASK) &&
+        !n2_car_dark_trim(N2_MAT_TRAFFICWINDOWS));
+    chk("literal INTERIOR material does not take exterior paint",
+        n2_mat_class(N2_MAT_INTERIOR_NAMED,N2_CAR_BODY)==N2_CAR_INTERIOR);
+    n2_free_scene(&s);
 }
 
 /* M136 RED/GREEN regression: SKY is a narrow authored family and the shipped
@@ -1272,6 +1377,11 @@ static void brakelight_material_test(void) {
     chk("hash convention still reproduces the two proven constants",
         mat_hash("CARSKIN") == N2_MAT_CARSKIN &&
         mat_hash("WINDSHIELD") == N2_MAT_WINDSHIELD);
+    chk("shared traffic and window-mask names match source hashes",
+        mat_hash("TRAFFICWINDOWS")==N2_MAT_TRAFFICWINDOWS &&
+        mat_hash("WINDOWMASK")==N2_MAT_WINDOWMASK);
+    chk("literal INTERIOR name matches the additional cabin hash",
+        mat_hash("INTERIOR")==N2_MAT_INTERIOR_NAMED);
     chk("BRAKELIGHT constant is the hash of \"BRAKELIGHT\"",
         mat_hash("BRAKELIGHT") == N2_MAT_BRAKELIGHT);
     chk("BRAKELIGHTGLASS constant is the hash of \"BRAKELIGHTGLASS\"",
@@ -1401,7 +1511,67 @@ static void authored_normals_test(void) {
     n2_free_scene(&scene);
 }
 
+static int count_chunk(const unsigned char *d,uint32_t tag,long beg,long end,void *ctx) {
+    (void)d;(void)beg;(void)end;
+    (*(int *)ctx)++;
+    return tag==42; /* reader-defined container, not a U2 magic convention */
+}
+static void recursive_chunks_test(void) {
+    Buf flat={.n=0},nested={.n=0},outer={.n=0};
+    const float pos[][3]={{0,0,0},{1,0,0},{0,1,0}};
+    const uint16_t idx[]={0,1,2};
+    const uint32_t mat[]={N2_MAT_CARSKIN};
+    const SubSpec sub[]={{3,0,0,0}};
+    object(&flat,"UNLISTED_KIT00_FRONT_BUMPER_A",NULL,0,mat,1,sub,1,pos,3,idx,3);
+    /* Different wrapper names/depths must not require a car-name entry. */
+    chunk(&nested,0x81234567u,&flat);
+    chunk(&outer,0x8fedcba9u,&nested);
+    N2Scene direct={0},wrapped={0};
+    n2_load_car(flat.b,flat.n,&direct,NULL,0,NULL);
+    n2_load_car(outer.b,outer.n,&wrapped,NULL,0,NULL);
+    chk("unlisted car parses identically through nested containers",
+        direct.count==1 && wrapped.count==1 &&
+        direct.meshes[0].car_material==wrapped.meshes[0].car_material &&
+        wrapped.meshes[0].authored_normals &&
+        !memcmp(direct.meshes[0].verts,wrapped.meshes[0].verts,3*8*sizeof(float)) &&
+        !memcmp(direct.meshes[0].idx,wrapped.meshes[0].idx,3*sizeof(uint16_t)));
+    N2Leaf leaf[2];int n=0;n2_find_leaves(outer.b,0,outer.n,0x00134B01u,leaf,&n,2);
+    chk("recursive leaf lookup preserves absolute source offsets",n==1 && leaf[0].off>16);
+    static N2PartMenu menus[N2_PART_COUNT];memset(menus,0,sizeof menus);
+    n2_mod_catalog_walk(outer.b,0,outer.n,0,menus);
+    chk("modification catalog discovers the same nested part",menus[N2_PART_FRONT].count==1);
+    n2_free_scene(&direct);n2_free_scene(&wrapped);
+
+    Buf leafbuf={.n=0},empty={.n=0},custom={.n=0};
+    chunk(&leafbuf,7,&empty);chunk(&custom,42,&leafbuf);
+    int seen=0;
+    chk("format reader chooses recursion independently of tag bits",
+        asset_chunks_walk(custom.b,0,custom.n,count_chunk,&seen) && seen==2);
+    seen=0;
+    chk("partial chunk headers fail within the supplied range",
+        !asset_chunks_walk(custom.b,0,7,count_chunk,&seen) && seen==0);
+    uint32_t huge=UINT32_MAX;memcpy(custom.b+4,&huge,4);seen=0;
+    chk("oversized payload rejected before invoking a decoder",
+        !asset_chunks_walk(custom.b,0,custom.n,count_chunk,&seen) && seen==0);
+    custom.n=0;chunk(&custom,42,&leafbuf);memcpy(custom.b+12,&huge,4);seen=0;
+    chk("nested child cannot escape its parent",
+        !asset_chunks_walk(custom.b,0,custom.n,count_chunk,&seen) && seen==1);
+    n=0;n2_find_leaves(custom.b,0,custom.n,42,leaf,&n,1);
+    chk("a matching container is returned as an opaque leaf",n==1 && leaf[0].off==8);
+
+    custom.n=0;
+    for(int depth=0;depth<70;depth++) { nested.n=0;chunk(&nested,42,&custom);custom=nested; }
+    seen=0;
+    chk("deep untrusted trees stop at the recursion limit",
+        !asset_chunks_walk(custom.b,0,custom.n,count_chunk,&seen) && seen==64);
+    n2_load_car(custom.b,7,&wrapped,NULL,0,NULL);
+    chk("truncated car container emits no partial mesh",wrapped.count==0);
+    n2_free_scene(&wrapped);
+}
+
 int main(void) {
+    physics_attr_test();
+    recursive_chunks_test();
     authored_normals_test();
     stock_attachment_and_trim_test();
     headlight_material_test();
@@ -1414,6 +1584,9 @@ int main(void) {
     rim_tier_test();
     rim_orientation_test();
     car_mount_test();
+    textureless_car_color_test();
+    roof_alternative_test();
+    fleet_name_and_traffic_glass_test();
     brakelight_material_test();
     printf("MILESTONE 135  car material routing / complete-tier LOD regression\n\n");
 

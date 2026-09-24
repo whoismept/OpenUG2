@@ -128,12 +128,13 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
 static const char *VS =
     GLSL_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
-    "uniform mat4 uMVP; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
+    "uniform mat4 uMVP; uniform mat4 uModel; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
     "varying vec3 vPos; varying vec4 vColor;\n"
     /* clip.w == view-space depth under a perspective projection, for world
        (P*V) and car (P*V*M) alike — no view matrix or extra uniforms needed.
        NDC-drawn HUD quads have w==1, so fog leaves them alone. */
-    "void main(){ vUV=aUV; vN=aNor; vPos=aPos; vColor=aColor;\n"
+    "void main(){ vUV=aUV; vN=(uModel*vec4(aNor,0.0)).xyz;\n"
+    "  vPos=(uModel*vec4(aPos,1.0)).xyz; vColor=aColor;\n"
     "  gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
 
 static const char *FS =
@@ -141,7 +142,7 @@ static const char *FS =
     "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec3 vPos;\n"
     "varying vec4 vColor;\n"
     "uniform sampler2D uTex;\n"
-    "uniform float uVColor;\n"   /* 0..1: apply the source per-vertex prelight */
+    "uniform float uVColor;\n"   /* 0 off, 1 world MODULATE2X, 2 car diffuse */
     "uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
@@ -220,9 +221,8 @@ static const char *FS =
     "  if(uUnlit>0.5){ float a=uAlpha;\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
     "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
-    /* uLight is the sun direction in the OBJECT's model space: normals stay
-       model-space (no per-vertex transform), so a rotated object (the car)
-       must counter-rotate the light or its lit side turns with it. */
+    /* Positions, normals, light and camera share world space. The model
+       includes road tilt and each wheel/brake hub's own transform. */
     "  vec3 L=normalize(uLight); vec3 N=normalize(vN);\n"
     "  if(uFlipN>0.5) N = -N;\n"
     "  vec3 V=normalize(uCamPos - vPos);\n"
@@ -283,12 +283,10 @@ static const char *FS =
     "  sp += pow(rl, 160.0)*uClearcoat;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
-    /* per-vertex prelight (world geometry): the source stores baked AO/lighting
-       and terrain tint in the vertex colour. MODULATE2X (0.5 == neutral) is the
-       PS2/RenderWare convention, so building bases darken, terrain gets its
-       grass/dirt variation back, and the flat "cardboard" look goes away. Gated
-       by uVColor so cars/props (which don't carry it) are untouched. */
-    "  if(uVColor>0.001) lit = mix(lit, lit*clamp(vColor.rgb*2.0, 0.0, 1.6), uVColor);\n"
+    /* World prelight uses MODULATE2X (0.5 neutral); textureless vehicle assets
+       use the same byte slot as direct diffuse color for windows and trim. */
+    "  if(uVColor>1.5) lit *= vColor.rgb;\n"
+    "  else if(uVColor>0.001) lit *= clamp(vColor.rgb*2.0, 0.0, 1.6);\n"
     /* Surface lighting and per-lamp world-geometry shadows. */
     "  if(uHeadGain>0.0) for(int h=0;h<2;h++){\n"
     "    vec3 ray=vPos-uHeadPos[h].xyz; float dist=length(ray);\n"
@@ -306,8 +304,8 @@ static const char *FS =
     "  }\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
-       sampled with the model-space reflection vector, fresnel-weighted.
-       uCamPos is the camera in the SAME space as vPos/vN. */
+       sampled with the world-space reflection vector, fresnel-weighted.
+       The horizon stays level when the car banks or a wheel spins. */
     "  float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "  if(uEnv>0.001){\n"
     "    vec3 R = reflect(-V, N);\n"
@@ -591,6 +589,25 @@ void render_headlights(const RProg *r, const float model[16], const float anchor
     glUniform1f(r->uHeadShadow,0.0f); /* maps must be refreshed for this pose */
 }
 
+void render_tail_lamp(const RProg *r,GLuint texture,int running,int braking,
+                      int boost,float gain) {
+    int on=running || braking,hot=braking || boost;
+    float level=on?fmaxf(gain,0.0f):0.0f;
+    glUniform1f(r->uUnlit,0.0f);
+    glUniform3f(r->uColor,.17f,.020f,.016f);
+    glUniform3f(r->uEmissive,(hot?1.00f:.62f)*level,
+                            (hot?.16f:.05f)*level,(hot?.10f:.04f)*level);
+    glUniform1f(r->uSpec,.26f);glUniform1f(r->uEnv,.16f);
+    glUniform1f(r->uGloss,20.0f);glUniform1f(r->uClearcoat,0.0f);
+    glUniform1f(r->uDecal,0.0f);glUniform1f(r->uUseTex,texture?1.0f:0.0f);
+    if(texture)glBindTexture(GL_TEXTURE_2D,texture);
+}
+
+void render_model(const RProg *r,const float model[16]) {
+    static const float identity[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    glUniformMatrix4fv(r->uModel,1,GL_FALSE,model?model:identity);
+}
+
 RProg render_program(void) {
     RProg r;
     r.prog = glCreateProgram();
@@ -602,6 +619,8 @@ RProg render_program(void) {
     glBindAttribLocation(r.prog, 3, "aColor");
     glLinkProgram(r.prog); glUseProgram(r.prog);
     r.uMVP     = glGetUniformLocation(r.prog, "uMVP");
+    r.uModel   = glGetUniformLocation(r.prog, "uModel");
+    render_model(&r,NULL);
     r.uUseTex  = glGetUniformLocation(r.prog, "uUseTex");
     r.uColor   = glGetUniformLocation(r.prog, "uColor");
     r.uUnlit   = glGetUniformLocation(r.prog, "uUnlit");
@@ -685,6 +704,7 @@ void free_scene_gpu(GpuMesh *gm, int count) {
     for (int i = 0; i < count; i++) {
         glDeleteBuffers(1, &gm[i].vbo);
         glDeleteBuffers(1, &gm[i].nbo);
+        glDeleteBuffers(1, &gm[i].cbo);
         glDeleteBuffers(1, &gm[i].ibo);
     }
     free(gm);
@@ -709,6 +729,10 @@ GpuMesh *upload_scene(N2Scene *s) {
         glBufferData(GL_ARRAY_BUFFER, m->nverts*5*sizeof(float), m->verts, GL_STATIC_DRAW);
         glGenBuffers(1,&gm[i].nbo); glBindBuffer(GL_ARRAY_BUFFER,gm[i].nbo);
         glBufferData(GL_ARRAY_BUFFER, m->nverts*3*sizeof(float), nor, GL_STATIC_DRAW);
+        if (m->vcol) {
+            glGenBuffers(1,&gm[i].cbo); glBindBuffer(GL_ARRAY_BUFFER,gm[i].cbo);
+            glBufferData(GL_ARRAY_BUFFER, m->nverts*4, m->vcol, GL_STATIC_DRAW);
+        }
         glGenBuffers(1,&gm[i].ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
@@ -1163,8 +1187,8 @@ GpuMesh make_wheel(float R, float halfW) {
         int j = (i+1)%N;
         m.idx[k++]=i;    m.idx[k++]=j;    m.idx[k++]=N+j;      /* tread quad */
         m.idx[k++]=i;    m.idx[k++]=N+j;  m.idx[k++]=N+i;
-        m.idx[k++]=c0;   m.idx[k++]=i;    m.idx[k++]=j;         /* +Y face */
-        m.idx[k++]=c1;   m.idx[k++]=N+j;  m.idx[k++]=N+i;       /* -Y face */
+        m.idx[k++]=c0;   m.idx[k++]=j;    m.idx[k++]=i;         /* +Y face */
+        m.idx[k++]=c1;   m.idx[k++]=N+i;  m.idx[k++]=N+j;       /* -Y face */
     }
     m.nidx = k; m.cat = N2_CAR_TIRE;
     N2Scene s; s.meshes = &m; s.count = 1; s.cap = 1;
@@ -1220,7 +1244,11 @@ GpuMesh make_quad(void) {
 }
 
 void draw_gpumesh(GpuMesh *g) {
-    glDisableVertexAttribArray(3);   /* cars carry no prelight; draw_batch left it on */
+    if (g->cbo) {
+        glBindBuffer(GL_ARRAY_BUFFER,g->cbo);
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3,4,GL_UNSIGNED_BYTE,GL_TRUE,0,(void*)0);
+    } else glDisableVertexAttribArray(3);
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5*sizeof(float), (void*)0);

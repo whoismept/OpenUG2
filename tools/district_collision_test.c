@@ -270,6 +270,30 @@ int main(void) {
     assert(collect_one(&scene, obst, src, obz) == 0);
     make_vertical_panel(&scene, &mesh, verts, idx, N2_SC_TERRAIN, 4.0f);
     assert(collect_one(&scene, obst, src, obz) == 0);
+    /* The authored divider sign is 1.70 m wide but was classified STRUCT and
+       became a permanent wall. Large XS structures still block. */
+    make_vertical_panel(&scene, &mesh, verts, idx, N2_SC_STRUCT, 5.18f);
+    strcpy(mesh.sname,"XS_WARNDIVIDEEND_1A_00");
+    verts[5]=verts[10]=1.70f;
+    assert(collect_one(&scene, obst, src, obz) == 0);
+    verts[5]=verts[10]=4.0f;
+    assert(collect_one(&scene, obst, src, obz) == 1);
+    strcpy(mesh.sname,"XB_WALL_1A_00");
+    assert(collect_one(&scene, obst, src, obz) == 1);
+    /* Overhead arm widens a streetlight's full box; the base stays narrow. */
+    float street[8*5]={0};
+    for(int j=0;j<8;j++) {
+        street[j*5] = j&1 ? (j<4?.4f:3.5f) : 0;
+        street[j*5+1] = j&2 ? (j<4?.4f:3.5f) : 0;
+        street[j*5+2] = j<4 ? 0 : 8;
+    }
+    mesh.verts=street;mesh.nverts=8;mesh.scen=N2_SC_PROP;
+    strcpy(mesh.sname,"XO_STREETLIGHTS_1A_00");
+    assert(collect_one(&scene, obst, src, obz) == 0);
+    for(int j=0;j<4;j++) {
+        street[j*5]=(j&1)*4.0f;street[j*5+1]=((j>>1)&1)*4.0f;
+    }
+    assert(collect_one(&scene, obst, src, obz) == 1);
 
     test_wall_contact_uses_car_height();
     test_five_vertex_height_slice();

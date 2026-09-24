@@ -47,8 +47,9 @@ not guessed behavior in a debug menu.
 
 Paint/rim paint and clear-coat controls now live in Graphics; neon and trunk
 audio live in Specialties. Wheel placement, handling scalars and engine-cover
-mesh inspection live in Vehicle Diagnostics. Performance controls must
-not pretend prototype handling scalars are decoded retail performance parts.
+mesh inspection live in Vehicle Diagnostics. Performance exposes the active
+car's four decoded power-curve and transmission levels; individual engine, ECU
+and turbo products stay separate until their exact mapping is proved.
 
 ## Vehicle switch resource contract
 
@@ -105,7 +106,8 @@ the old data. Do not stop/reinitialize the whole game to avoid ownership work.
   `upload_scene` already supply the relevant parsing/preparation/profile steps.
   `src/car_config.h` now carries independent visual-part selections;
   `src/car_mod.h` discovers compatible drawable options and assembles libraries.
-  Decals, material finishes and performance packages are not part of it yet.
+  Decals, material finishes, ownership and saved performance products are not
+  part of it yet; decoded power/transmission levels are live debug selections.
 - `audio_load_ginsu_sweeps`/`audio_load_engine_bank` and their callback ownership
   must be addressed explicitly. There is no existing public hot-swap API.
 

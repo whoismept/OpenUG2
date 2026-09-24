@@ -237,6 +237,9 @@ extern "C" void dbgui_frame(void) {
             }
         }
         if (ImGui::CollapsingHeader("Body paint", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const char *quality[] = { "Low", "Medium", "High" };
+            ImGui::Combo("Vehicle detail", &g_dbg.vehicle_quality, quality, 3);
+            ImGui::TextDisabled("Controls paint, clear coat and glass reflections for every car.");
             /* body paint -> u_PaintColor (uColor) when override is on; the draw
                loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
             ImGui::Checkbox("custom paint (override per-car colour)", (bool *)&g_dbg.paint_override);
@@ -266,8 +269,19 @@ extern "C" void dbgui_frame(void) {
         }
         if (shop_tab("Performance", ImVec4(0.4f, 0.65f, 1, 1))) {
             ImGui::TextUnformatted("Blue / Performance Shop");
-            ImGui::TextWrapped("Packages not yet implemented: engine, ECU, transmission, turbo, nitrous, suspension, brakes, tyres, weight reduction.");
-            ImGui::TextWrapped("Handling test controls are in Vehicle Diagnostics. They do not install performance packages.");
+            if(g_dbg.perf_source_available) {
+                const char *levels[]={"Stock","Street / L1","Pro / L2","Extreme / L3"};
+                ImGui::Combo("Power curve",&g_dbg.perf_power_level,levels,4);
+                ImGui::Text("Peak power: %.1f kW",g_dbg.perf_peak_kw[g_dbg.perf_power_level]);
+                ImGui::Combo("Transmission",&g_dbg.perf_transmission_level,levels,4);
+                int t=g_dbg.perf_transmission_level;
+                ImGui::Text("%d gears, final drive %.3f",g_dbg.perf_gears[t],
+                            g_dbg.perf_final_drive[t]);
+                ImGui::TextDisabled("Values come from this car's GLOBALB record and affect driving live.");
+            } else ImGui::TextDisabled("This vehicle has no validated GLOBALB performance record.");
+            ImGui::Separator();
+            ImGui::TextWrapped("The file proves four power curves and four transmissions. Exact ECU, engine and turbo product-to-curve mapping is still being decoded, so they are not given invented individual multipliers.");
+            ImGui::TextWrapped("Nitrous, suspension, brakes, tyres and weight reduction remain pending.");
             ImGui::EndTabItem();
         }
         if (shop_tab("Safe House", ImVec4(0.8f, 0.55f, 1, 1))) {

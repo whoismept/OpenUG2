@@ -18,7 +18,8 @@ Engine-cover geometry is a diagnostic, not a purchased engine package.
 
 These controls do not spend money, unlock content, maintain owned inventory, or
 require entering a shop. The Safe House currently shows installed part choices
-without claiming ownership. Performance packages, vinyl/decal editing, advanced
+without claiming ownership. The blue shop can preview the four source power and
+transmission levels, while exact product mapping, vinyl/decal editing, advanced
 paint finishes and most specialty mechanics are still open. Selecting another
 car or track now stays in the running SDL/GL session; per-car garage ownership
 and installed configurations are still not persisted.

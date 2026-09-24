@@ -379,7 +379,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
                             ? authored : n2_resolve_key(authored, keys, nkeys);
             int exact = subkey != 0;
             int before = local.count;
-            n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, cat != N2_SKY,
+            n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, 12, cat != N2_SKY,
                         subkey ? subkey : texkey, NULL,
                         (long)sub[i].start, (long)sub[i].count,
                         (unsigned char)N2_DRAW_OPAQUE);
@@ -390,7 +390,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         int exact_single_slot = nslot == 1 && slot[0] != 0;
         for (int i = 0; i < pairs; i++) {
             int before = local.count;
-            n2_add_pair(data, vtx[i], idx[i], cat, &local, 24, 16, cat != N2_SKY,
+            n2_add_pair(data, vtx[i], idx[i], cat, &local, 24, 16, 12, cat != N2_SKY,
                         texkey, NULL, 0, -1, (unsigned char)N2_DRAW_OPAQUE);
             for (int j = before; j < local.count; j++)
                 local.meshes[j].mat_exact = (unsigned char)exact_single_slot;

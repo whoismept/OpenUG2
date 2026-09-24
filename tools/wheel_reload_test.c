@@ -46,6 +46,13 @@ static int test_load_car(const unsigned char *d, long len, N2Scene *s,
     }
     return test_stage == 1 ? 0 : s->count; /* partial parse must be released */
 }
+static int test_load_car_colored(const unsigned char *d, long len, N2Scene *s,
+                                const uint32_t *keys, int nk,
+                                const N2CarConfig *cfg, int prelight) {
+    if (test_real_assets)
+        return n2_load_car_colored(d,len,s,keys,nk,cfg,prelight);
+    return test_load_car(d,len,s,keys,nk,cfg);
+}
 static int test_load_texture(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     if(test_real_assets)return n2_load_car_tex_by_key(d,len,key,t);
     (void)d; (void)len; (void)key;
@@ -86,6 +93,7 @@ static void test_tex_parameter(GLenum target, GLenum name, GLint value) {
     (void)target; (void)name; (void)value;
 }
 #define n2_load_car test_load_car
+#define n2_load_car_colored test_load_car_colored
 #define n2_load_car_tex_by_key test_load_texture
 #define upload_scene test_upload_scene
 #define free_scene_gpu test_free_scene_gpu
@@ -182,10 +190,19 @@ static void test_car_switch_archive(const char *root) {
     char cars[64][64];int selected=0;
     int count=res_list_cars(root,cars,64,"",&selected);assert(count>0);
     long len=0;unsigned char *global=load_global_car_data(root,&len);assert(global && len>0);
-    test_real_assets=1;test_stage=0;int factory=0;
+    test_real_assets=1;test_stage=0;int factory=0,shared_windows=0,traffic=0;
     for(int i=0;i<count;i++) {
         next_handle=1;CarSwitchCandidate candidate={0};
         assert(prepare_car_switch(&candidate,root,cars[i]));
+        if(candidate.texlen==0)traffic++;
+        if(candidate.texlen==0)for(int m=0;m<candidate.scene.count;m++)
+            if(candidate.scene.meshes[m].cat==N2_CAR_GLASS){
+                uint32_t key=candidate.scene.meshes[m].texkey;
+                int bound=0;
+                for(int t=0;t<candidate.ntextures;t++)if(candidate.tex_keys[t]==key)bound=1;
+                assert(key==0x008a6835u && bound);
+                shared_windows++;
+            }
         int stock=candidate.stock_wheel;
         assert(stock>=0 && stock<candidate.scene.count);
         assert(candidate.scene.meshes[stock].car_mount==N2_MOUNT_WHEEL);
@@ -200,7 +217,8 @@ static void test_car_switch_archive(const char *root) {
         car_switch_release(&candidate);
         assert(!live_buffers && !live_textures);
     }
-    assert(factory>0);test_real_assets=0;free(global);
+    printf("CAR SWITCH shared traffic windows: %d\n",shared_windows);
+    assert(factory>0 && traffic>0 && shared_windows==traffic);test_real_assets=0;free(global);
     printf("CAR SWITCH PASS: all %d cars retain stock wheels and startup stance (%d factory); no leaked handles\n",count,factory);
 }
 
@@ -243,6 +261,12 @@ static void test_vinyl_archives(const char *root) {
 }
 
 int main(int argc,char **argv) {
+    GLuint roaming_tex=new_handle(2), player_tex=new_handle(2);
+    GLuint texmap[]={roaming_tex,player_tex};
+    car_texture_map_clear(texmap,2,&roaming_tex,1);
+    assert(handles[roaming_tex] && !handles[player_tex] && live_textures==1);
+    car_texture_map_clear(&roaming_tex,1,NULL,0);
+    assert(!live_textures);
     /* 2 cm of body-shell clearance is kept; the drop is clamped to what the
        model allows and never lifts the car. */
     assert(fabsf(body_ride_height(.35f,-.20f,.06f)-.29f)<1e-6f);   /* room to spare */

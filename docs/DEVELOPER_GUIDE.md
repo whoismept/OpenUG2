@@ -795,9 +795,11 @@ There are two coupled but distinct systems.
 
 `phys_car_step` runs at 60 Hz in metres per tick. It owns XY velocity,
 heading, acceleration/braking, drag, speed-sensitive steering and lateral scrub.
-`PhysSurface` multiplies road/terrain behaviour; `PhysVehicle` applies bounded
-geometry-derived car differences. No decoded torque curve, gears, drivetrain or
-mass currently feeds the model.
+`PhysSurface` multiplies road/terrain behaviour. `PhysVehicle` reads stock mass,
+torque, steering response and four power/transmission levels from each car's
+`GLOBALB.BUN` record; body and tyre measurements supply lateral grip and load
+transfer. This remains an arcade approximation: gear changes, brake packages
+and suspension upgrades are not simulated yet.
 
 Audio's virtual gearbox is not a physics gearbox.
 

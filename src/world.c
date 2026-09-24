@@ -1684,6 +1684,29 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
     return bestcat;
 }
 
+int world_ride_gather(const N2Scene *scene,const float pos[3],float heading,
+                      const float vel[2],float old_heading,const PhysRideState *ride,
+                      PhysRideSupport *support,WGroundHit hit[4],
+                      WGroundHit cand[4],int verdict[4]) {
+    float co=cosf(heading),sn=sinf(heading);
+    float down=ride?phys_ride_reach_down(ride,1.0f/60.0f):PHYS_RIDE_REACH_DOWN;
+    int count=0;
+    for(int k=0;k<4;k++) {
+        float ax=support->ax[k],ay=support->ay[k];
+        float wz=ride?phys_ride_wheel_z(ride,support,k):pos[2];
+        WGroundHit local;
+        WGroundHit *h=hit?&hit[k]:&local;
+        support->valid[k]=world_wheel_support(scene,pos[0]+co*ax-sn*ay,
+            pos[1]+sn*ax+co*ay,wz,PHYS_RIDE_REACH_UP,down,
+            h,cand?&cand[k]:NULL,verdict?&verdict[k]:NULL)!=WSURF_NONE;
+        support->z[k]=support->valid[k]?h->z:wz;
+        support->vz[k]=support->valid[k]?phys_ride_support_vz(h->normal,vel,
+            old_heading,heading,ax,ay,1.0f/60.0f):0;
+        count+=support->valid[k];
+    }
+    return count;
+}
+
 int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
                         WGroundHit *hit, WGroundHit *cand, int *verdict) {

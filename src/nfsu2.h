@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include "asset_chunks.h"
 
 /* One drawable submesh: interleaved [px,py,pz,u,v] verts + u16 triangle list. */
 enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
@@ -203,7 +204,7 @@ static unsigned char *n2_read_file(const char *path, long *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    unsigned char *buf = (unsigned char *)malloc(n);
+    unsigned char *buf = (unsigned char *)malloc(n > 0 ? (size_t)n : 1);
     if (buf && fread(buf, 1, n, f) != (size_t)n) { free(buf); buf = NULL; }
     fclose(f);
     if (out_len) *out_len = n;
@@ -211,8 +212,7 @@ static unsigned char *n2_read_file(const char *path, long *out_len) {
 }
 
 static uint32_t n2_u32(const unsigned char *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
-           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+    return asset_chunk_u32(p);
 }
 
 /* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
@@ -303,16 +303,21 @@ static void n2_push_mesh(N2Scene *s, N2Mesh m) {
 
 /* Collect leaf chunk (start,size) pairs of a given magic within [beg,end). */
 typedef struct { long off; uint32_t size; } N2Leaf;
+typedef struct { uint32_t want; N2Leaf *out; int *count,cap; } N2LeafWalk;
+static int n2_leaf_chunk(const unsigned char *d,uint32_t tag,long beg,long end,void *context) {
+    (void)d;
+    N2LeafWalk *w=(N2LeafWalk *)context;
+    if(*w->count>=w->cap)return 0;
+    if(tag==w->want) {
+        w->out[*w->count]=(N2Leaf){beg,(uint32_t)(end-beg)};(*w->count)++;
+        return 0;
+    }
+    return (tag>>28)==8;
+}
 static void n2_find_leaves(const unsigned char *d, long beg, long end,
                            uint32_t want, N2Leaf *out, int *n, int cap) {
-    long o = beg;
-    while (o + 8 <= end) {
-        uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
-        long ds = o + 8;
-        if (magic == want && *n < cap) { out[*n].off = ds; out[*n].size = size; (*n)++; }
-        else if (magic != 0 && (magic >> 28) == 8) n2_find_leaves(d, ds, ds + size, want, out, n, cap);
-        o = ds + size;
-    }
+    N2LeafWalk walk={want,out,n,cap};
+    asset_chunks_walk(d,beg,end,n2_leaf_chunk,&walk);
 }
 
 /* substring search within an unterminated byte run */
@@ -429,7 +434,7 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
 #define N2_VERT_SANE 60000.0f
 static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                         int cat, N2Scene *scene,
-                        int stride, int uvoff, int cull_skybox, uint32_t texkey,
+                        int stride, int uvoff, int coloff, int cull_skybox, uint32_t texkey,
                         const float *mtx, long istart, long icount, unsigned char draw_mode) {
     const unsigned char *vb = d + vtx.off;
     int vlen = (int)vtx.size;
@@ -492,9 +497,8 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
     m.draw_mode = draw_mode;
     m.authored_normals = stride == 36 && uvoff == 28 && !mtx;
     m.verts = (float *)malloc((size_t)n * (m.authored_normals ? 8 : 5) * sizeof(float));
-    /* World stream (24B stride) packs an RGBA8 prelight colour between position
-       and UV (pos@0, colour@12, uv@16). Car stream (36B) has no such slot. */
-    int coloff = (stride == 24) ? 12 : -1;
+    /* Both streams can carry D3DCOLOR prelight: world@12, car@24.
+       Detailed cars leave car colour unused; textureless traffic uses it. */
     if (coloff >= 0) m.vcol = (unsigned char *)malloc((size_t)n * 4);
     /* M133-R: every allocation this function owns is checked before use, and
        every early return below frees exactly what was owned at that point —
@@ -1151,7 +1155,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                     int exact = sk != 0;
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;
-                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, cull,
+                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, 12, cull,
                                   sk, objm,
                                   (long)sub[a].start, (long)sub[a].count,
                                   (unsigned char)N2_DRAW_OPAQUE);
@@ -1166,7 +1170,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                 int exact_single_slot = nslot == 1 && slot[0] != 0;
                 for (int k = 0; k < pairs; k++) {
                     int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull,
+                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, 12, cull,
                                   tk, objm, 0, -1,
                                   (unsigned char)N2_DRAW_OPAQUE);
                     for (int m2 = before; m2 < scene->count; m2++) {
@@ -1519,7 +1523,13 @@ static void n2_car_mesh_name(const unsigned char *d,long beg,long end,char out[6
         for(long i=0;i+5<size;i++)if(p[i]>='A' && p[i]<='Z') {
             long j=i;
             while(j<size && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9')))j++;
-            if(j-i>=5) {int n=j-i<63?(int)(j-i):63;memcpy(out,p+i,(size_t)n);out[n]=0;return;}
+            /* Some wide-body records put a short uppercase token (e.g.
+               AP7XC) before the actual G35_KITW03_BODY_A name. A car part
+               name always has a separator; do not promote that token into a
+               mesh name and accidentally render every unselected KITW body. */
+            if(j-i>=5 && memchr(p+i,'_',(size_t)(j-i))) {
+                int n=j-i<63?(int)(j-i):63;memcpy(out,p+i,(size_t)n);out[n]=0;return;
+            }
             i=j;
         }
     }
@@ -1595,7 +1605,7 @@ static void n2_car_apply_config(N2Scene *s, const N2CarConfig *cfg) {
     }
     int w = 0;
     for (int i = 0; i < n; i++) {
-        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
+        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol); continue; }
         if (w != i) s->meshes[w] = s->meshes[i];
         w++;
     }
@@ -1615,26 +1625,13 @@ static void n2_car_apply_config(N2Scene *s, const N2CarConfig *cfg) {
  * is why they kept rendering stacked. Hashing the stripped name groups both
  * spellings; n2_car_dedupe_lod then resolves each group spatially. */
 static uint32_t n2_car_name_key(const unsigned char *d, long beg, long end) {
-    N2Leaf mat[4]; int nm = 0;
-    n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
-    for (int k = 0; k < nm; k++) {
-        const unsigned char *p = d + mat[k].off; long s = mat[k].size;
-        for (long i = 0; i + 5 < s; i++) {
-            if (p[i] >= 'A' && p[i] <= 'Z') {
-                long j = i;
-                while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
-                long L = j - i;
-                if (L >= 5) {
-                    if (p[i+L-2] == '_' && p[i+L-1] >= 'A' && p[i+L-1] <= 'D') L -= 2;
-                    uint32_t h = 2166136261u;
-                    for (long q = 0; q < L; q++) { h ^= p[i+q]; h *= 16777619u; }
-                    return h ? h : 1u;          /* 0 is reserved for "unnamed" */
-                }
-                i = j;
-            }
-        }
-    }
-    return 0;
+    char name[64]; n2_car_mesh_name(d,beg,end,name);
+    size_t L=strlen(name);
+    if(!L)return 0;
+    if(L>=2 && name[L-2]=='_' && name[L-1]>='A' && name[L-1]<='D')L-=2;
+    uint32_t h=2166136261u;
+    for(size_t q=0;q<L;q++){h^=(unsigned char)name[q];h*=16777619u;}
+    return h?h:1u;
 }
 
 static void n2_mesh_bbox(const N2Mesh *m, float *bb) {
@@ -1771,12 +1768,48 @@ static void n2_car_dedupe_lod(N2Scene *s) {
 
     int w = 0;
     for (int i = 0; i < n; i++) {
-        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
+        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol); continue; }
         if (w != i) s->meshes[w] = s->meshes[i];
         w++;
     }
     s->count = w;
     free(bb); free(drop);
+}
+
+/* FULLROOF is the closed-panel alternative to ROOF's sunroof assembly.
+ * Four stock cars contain both; drawing both puts opaque triangles over the
+ * glass. Keep FULLROOF only when this variant has no ROOF counterpart. */
+static void n2_car_source_name(const unsigned char *d,long len,
+                               const N2Mesh *m,char out[64]) {
+    out[0]=0;
+    long off=m->car_source;
+    if(off<8 || off>len)return;
+    uint32_t size=n2_u32(d+off-4);
+    if(size>(uint32_t)(len-off))return;
+    n2_car_mesh_name(d,off,off+size,out);
+}
+static void n2_car_select_roof(const unsigned char *d,long len,N2Scene *s) {
+    char *drop=calloc((size_t)(s->count?s->count:1),1);
+    if(!drop)return;
+    for(int i=0;i<s->count;i++) {
+        const N2Mesh *m=s->meshes+i;
+        char name[64];n2_car_source_name(d,len,m,name);
+        if(!strstr(name,"_FULLROOF_"))continue;
+        for(int j=0;j<s->count;j++) {
+            const N2Mesh *other=s->meshes+j;
+            if(other->vkind!=m->vkind || other->vnum!=m->vnum)continue;
+            char alternative[64];n2_car_source_name(d,len,other,alternative);
+            if(strstr(alternative,"_ROOF_") && !strstr(alternative,"_FULLROOF_"))
+                {drop[i]=1;break;}
+        }
+    }
+    int w=0;
+    for(int i=0;i<s->count;i++) {
+        N2Mesh *m=s->meshes+i;
+        if(drop[i]){free(m->verts);free(m->idx);free(m->vcol);}
+        else {if(w!=i)s->meshes[w]=*m;w++;}
+    }
+    s->count=w;free(drop);
 }
 
 /* Plastic trim within N2_CAR_BODY: bumpers and rocker skirts are moulded
@@ -1839,7 +1872,7 @@ static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
 static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys) {
     if (!v) return 0;
     for (int i = 0; i < nkeys; i++) if (keys[i] == v) return v;
-    return 0;   /* lives in a pack we don't ship — caller falls back to paint */
+    return 0;   /* absent from supplied packs — caller falls back to paint */
 }
 
 /* One 0x134B02 record = one material slice of the index buffer. Layout,
@@ -1933,17 +1966,13 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
     return n;
 }
 
-/* Two material hashes this milestone proves and uses; both independently
- * recomputed against live GOLF data (see n2_mesh_submeshes' comment above),
- * not copied from any external source. n2_str_hash is documented here rather
- * than implemented as a general runtime function: only these two literal,
- * pre-verified constants are consulted, deliberately narrower than a full
- * name-hash chain (chrome/aluminium/moldings/plastics/lights are measurable
- * the same way but are NOT classified here -- a separate, evidenced change).
- *   h = 0xFFFFFFFF; for each byte c: h = h*33 + c;
- *   n2_str_hash("WINDSHIELD") == 0x471a1dca
- *   n2_str_hash("CARSKIN")    == 0xd6d6080a  */
+/* Material hashes are recomputed from names found in the local archives:
+ * h = 0xFFFFFFFF; for each byte c: h = h*33 + c.
+ * WINDSHIELD/CARSKIN were first checked against GOLF material slices;
+ * TRAFFICWINDOWS and WINDOWMASK against the full stock fleet. */
 #define N2_MAT_WINDSHIELD 0x471a1dcau
+#define N2_MAT_TRAFFICWINDOWS 0x1ff8c329u
+#define N2_MAT_WINDOWMASK 0x3ed70c43u
 #define N2_MAT_CARSKIN    0xd6d6080au
 
 /* Third material, identified by MEASUREMENT rather than by cracking its name
@@ -1963,6 +1992,8 @@ static int n2_mesh_matslots(const unsigned char *d, long beg, long end,
  * opening. Treating it as unpainted interior is what the placement supports;
  * the actual authored name remains unknown. */
 #define N2_MAT_INTERIOR   0x010cb64au
+/* Four stock cars also use the literal INTERIOR name hash on their cabin. */
+#define N2_MAT_INTERIOR_NAMED 0x2787edabu
 
 /* Independently recomputed with h=h*33+c, starting at UINT32_MAX.
  * Wheel source ranges place RUBBER on the tyre, MAG* on the spokes and
@@ -2021,7 +2052,8 @@ static int n2_car_tail_lens(const N2Scene *car, int index) {
 }
 
 static int n2_car_dark_trim(uint32_t mat) {
-    return mat==N2_MAT_DULLPLASTIC || mat==N2_MAT_MOLDINGS || mat==N2_MAT_RUBBER;
+    return mat==N2_MAT_DULLPLASTIC || mat==N2_MAT_MOLDINGS ||
+           mat==N2_MAT_RUBBER || mat==N2_MAT_WINDOWMASK;
 }
 
 /* Bare metal also occurs on bumpers, badges and lamp housings. */
@@ -2092,178 +2124,192 @@ static void n2_car_light_anchors(const N2Scene *car, float out[4][4]) {
 /* Classify one submesh's material hash. `fallback` is the object-level
  * category from n2_car_category, used whenever the hash is 0 (absent/out of
  * bounds -- n2_mesh_submeshes and the matid bounds check both fail safe to
- * this), or is not one of the two proven mappings below. This is the ONLY
+ * this), or has no proven mapping below. This is the ONLY
  * thing that lets a same-texture BODY+WINDSHIELD object split correctly: the
  * pre-existing texture-key split cannot see this distinction at all. */
 static int n2_mat_class(uint32_t hash, int fallback) {
-    if (hash == N2_MAT_WINDSHIELD) return N2_CAR_GLASS;
+    if (hash == N2_MAT_WINDSHIELD || hash == N2_MAT_TRAFFICWINDOWS) return N2_CAR_GLASS;
     if (hash == N2_MAT_CARSKIN)    return N2_CAR_BODY;
-    if (hash == N2_MAT_INTERIOR)   return N2_CAR_INTERIOR;
+    if (hash == N2_MAT_INTERIOR || hash == N2_MAT_INTERIOR_NAMED) return N2_CAR_INTERIOR;
     return fallback;
 }
 
 /* Parse 36-byte car vertices and validated material/index partitions.
  * Retain distinct materials even when their category and diffuse key match:
  * painted shells and dark grille inserts otherwise become one painted mesh. */
-static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *scene,
-                        const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
-    long o = beg;
-    while (o + 8 <= end) {
-        uint32_t m = n2_u32(d + o), s = n2_u32(d + o + 4);
-        long ds = o + 8;
-        if (m == 0x80134010u) {
-            int vkind = 0, vnum = 0; uint32_t vfam = 0;
-            if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
-            int cat = n2_car_category(d, ds, ds + s);
-            char part[64]; n2_car_mesh_name(d, ds, ds + s, part);
-            int part_slot=n2_car_part(part);
-            if(part_slot==N2_PART_HEADLIGHT)cat=N2_CAR_LIGHT;
-            if(part_slot==N2_PART_TAILLIGHT)cat=N2_CAR_BRAKELIGHT;
-            int mount = cat == N2_CAR_TIRE ? N2_MOUNT_WHEEL : N2_MOUNT_BODY;
-            if (cat != N2_CAR_BRAKELIGHT) {
-                /* FRONT_BRAKE is truncated to FRONT_BRAK on long car names. */
-                if (strstr(part, "_FRONT_BRAK")) mount = N2_MOUNT_FRONT_BRAKE;
-                else if (strstr(part, "_REAR_BRAKE")) mount = N2_MOUNT_REAR_BRAKE;
-            }
-            int brake = mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE;
-            if (brake)
-                cat = N2_CAR_MECH;
-            int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
-                        uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
-            uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
-            N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
-            n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 64);
-            n2_find_leaves(d, ds, ds + s, 0x00134B03u, idx, &ni, 64);
-            int pairs = nv < ni ? nv : ni;
-
-            /* Per-submesh material routing. One object can mix materials: a
-               bumper is mostly body paint with a small badge patch, and its
-               0x134012 list carries a key per material. Binding the ONE key
-               we can resolve to the whole object smears the badge atlas over
-               the entire panel (MIATA's front bumper: the badge owns 18 of
-               1143 indices, 1.6%, but was painting 100% of it dark). So when
-               the records actually resolve to different textures, emit one
-               mesh per record instead. */
-            uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
-            uint32_t mslots[32]; int nmslot = n2_mesh_matslots(d, ds, ds + s, mslots, 32);
-            N2Sub sub[32]; int nsub = pairs == 1 ? n2_mesh_submeshes(d, ds, ds + s, sub, 32) : 0;
-            /* Validate the partition structurally before trusting a split at
-               all (M135): first range at 0, contiguous, in-bounds, ending at
-               the decoded index buffer's own end. Mirrors n2_add_pair's own
-               paired-0x1111 filler convention for the index leaf so this
-               checks the SAME triangle count n2_add_pair will actually see. */
-            long total_idx = 0;
-            if (nsub > 1) {
-                const unsigned char *ib0 = d + idx[0].off;
-                int ibytes = (int)idx[0].size, ip = 0;
-                while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
-                total_idx = (ibytes - ip) / 2;
-            }
-            int part_ok = nsub > 1 && n2_car_submesh_partition_ok(sub, nsub, total_idx);
-            /* Classification (which class a submesh's matid names) does not
-               need a validated multi-record PARTITION -- it only needs
-               sub[k].matid to be in range, which is already individually
-               bounds-checked below regardless of start/count. Partition
-               validity only matters for trusting per-submesh index RANGES
-               well enough to actually SPLIT the geometry. So classification
-               is trusted whenever nsub==1 (a single record IS the whole
-               object -- trivially "whole," nothing to partition) or when
-               nsub>1 AND part_ok (a validated multi-record partition).
-               A malformed multi-record partition (nsub>1, !part_ok) keeps
-               the conservative cat-based fallback for classification too --
-               a corrupt start/count strongly suggests the whole record is
-               suspect, so its matid is not trusted either (M135-R item 4:
-               "ensure material classification works without requiring
-               nsub > 1", scoped to the case that's actually safe). */
-            int trust_cls = nsub == 1 || part_ok;
-            uint32_t subtex[32], submat[32]; int matcls[32];
-            int differ = 0, clsdiffer = 0, matdiffer = 0, big = 0;
-            for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
-                subtex[k] = sub[k].mat < (uint32_t)nslot
-                          ? (brake ? slots[sub[k].mat]
-                                   : n2_resolve_key(slots[sub[k].mat], keys, nkeys)) : 0;
-                uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
-                submat[k] = mh;
-                if (submat[k] != submat[0]) matdiffer = 1;
-                matcls[k] = n2_mat_class(mh, cat);
-                if (subtex[k] != subtex[0]) differ = 1;
-                if (matcls[k] != matcls[0]) clsdiffer = 1;
-                if (sub[k].count > sub[big].count) big = k;
-            }
-            /* Whole-object category when NOT splitting: matcls[0] whenever
-               classification is trusted (it is then, by construction,
-               uniform across every submesh reaching this branch -- if it
-               disagreed AND part_ok held, the split branch below would have
-               been taken instead), else the original name-based cat. This is
-               what lets a single-submesh WINDSHIELD-material object with a
-               non-GLASS name (real on GOLF, see the M135-R census note at
-               n2_mat_class) resolve to GLASS without ever needing to split. */
-            int wholecat = (trust_cls && nsub >= 1) ? matcls[0] : cat;
-            /* Brake discs reference shared GLOBALB textures absent from the
-               per-car key list. Retain only validated slot ownership; the
-               runtime resolves the exact key locally or in the shared pack. */
-            if (brake && trust_cls && nsub >= 1 && !differ) tk = subtex[0];
-            /* One 0x80134010 occurrence, split or not, shares one tierid so
-               n2_car_dedupe_lod can score and drop/keep its whole slice set
-               atomically instead of resolving each split slice on its own. */
-            static uint32_t g_car_tierid_next = 1;
-            uint32_t tierid = g_car_tierid_next++;
-            if (part_ok && nsub > 1 && (differ || clsdiffer || matdiffer)) {
-                for (int k = 0; k < nsub; k++) {
-                    int before = scene->count;
-                    n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28, 0,
-                                subtex[k], NULL, sub[k].start, sub[k].count,
-                                (unsigned char)N2_DRAW_OPAQUE);
-                    if (scene->count > before) {
-                        scene->meshes[before].trim = trim;
-                        scene->meshes[before].car_material = submat[k];
-                        scene->meshes[before].car_source = ds;
-                        scene->meshes[before].car_part=(unsigned char)(part_slot+1);
-                        scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
-                        /* The dominant slice keeps the plain family key so it
-                           still dedupes against LOD tiers that never split
-                           (a lower tier can lack the badge slot entirely, so
-                           it stays whole); the small extra slices get their
-                           own keys and only ever match the same slice of
-                           another tier. Complete-tier selection (tierid,
-                           scored by total index count) is what actually
-                           protects an unmatched slice now; namekey is only
-                           the cross-tier family grouping. */
-                        scene->meshes[before].namekey =
-                            k == big ? nk2 : nk2 ^ (0x9e3779b9u * (sub[k].mat + 1));
-                        scene->meshes[before].vkind = vkind;
-                        scene->meshes[before].vnum = vnum;
-                        scene->meshes[before].famkey = vfam;
-                        scene->meshes[before].tierid = tierid;
-                        scene->meshes[before].car_mount = (unsigned char)mount;
-                    }
-                }
-            } else {
-                for (int k = 0; k < pairs; k++) {   /* car parts have identity transforms */
-                    int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28, 0,
-                                  tk, NULL, 0, -1,
-                                  (unsigned char)N2_DRAW_OPAQUE);
-                    if (scene->count > before) {
-                        scene->meshes[before].trim = trim;
-                        scene->meshes[before].car_material = trust_cls && nsub && !matdiffer ? submat[0] : 0;
-                        scene->meshes[before].car_source = ds;
-                        scene->meshes[before].car_part=(unsigned char)(part_slot+1);
-                        scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
-                        scene->meshes[before].namekey = nk2;
-                        scene->meshes[before].vkind = vkind;
-                        scene->meshes[before].vnum = vnum;
-                        scene->meshes[before].famkey = vfam;
-                        scene->meshes[before].tierid = tierid;
-                        scene->meshes[before].car_mount = (unsigned char)mount;
-                    }
-                }
-            }
-        } else if (m != 0 && (m >> 28) == 8) {
-            n2_walk_car(d, ds, ds + s, scene, keys, nkeys, cfg);
+typedef struct {
+    N2Scene *scene;
+    const uint32_t *keys;
+    int nkeys;
+    const N2CarConfig *cfg;
+    int prelight;
+} N2CarWalk;
+static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,void *context) {
+    N2CarWalk *walk=(N2CarWalk *)context;
+    N2Scene *scene=walk->scene;
+    const uint32_t *keys=walk->keys;
+    int nkeys=walk->nkeys;
+    const N2CarConfig *cfg=walk->cfg;
+    long s=end-ds;
+    if(tag==0x80134010u) {
+        int vkind = 0, vnum = 0; uint32_t vfam = 0;
+        if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) return 0;
+        int cat = n2_car_category(d, ds, ds + s);
+        char part[64]; n2_car_mesh_name(d, ds, ds + s, part);
+        int part_slot=n2_car_part(part);
+        if(part_slot==N2_PART_HEADLIGHT)cat=N2_CAR_LIGHT;
+        if(part_slot==N2_PART_TAILLIGHT)cat=N2_CAR_BRAKELIGHT;
+        int mount = cat == N2_CAR_TIRE ? N2_MOUNT_WHEEL : N2_MOUNT_BODY;
+        if (cat != N2_CAR_BRAKELIGHT) {
+            /* FRONT_BRAKE is truncated to FRONT_BRAK on long car names. */
+            if (strstr(part, "_FRONT_BRAK")) mount = N2_MOUNT_FRONT_BRAKE;
+            else if (strstr(part, "_REAR_BRAKE")) mount = N2_MOUNT_REAR_BRAKE;
         }
-        o = ds + s;
+        int brake = mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE;
+        if (brake)
+            cat = N2_CAR_MECH;
+        int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
+                    uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
+        uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
+        N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
+        n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 64);
+        n2_find_leaves(d, ds, ds + s, 0x00134B03u, idx, &ni, 64);
+        int pairs = nv < ni ? nv : ni;
+
+        /* Per-submesh material routing. One object can mix materials: a
+           bumper is mostly body paint with a small badge patch, and its
+           0x134012 list carries a key per material. Binding the ONE key
+           we can resolve to the whole object smears the badge atlas over
+           the entire panel (MIATA's front bumper: the badge owns 18 of
+           1143 indices, 1.6%, but was painting 100% of it dark). So when
+           the records actually resolve to different textures, emit one
+           mesh per record instead. */
+        uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
+        uint32_t mslots[32]; int nmslot = n2_mesh_matslots(d, ds, ds + s, mslots, 32);
+        N2Sub sub[32]; int nsub = pairs == 1 ? n2_mesh_submeshes(d, ds, ds + s, sub, 32) : 0;
+        /* Validate the partition structurally before trusting a split at
+           all (M135): first range at 0, contiguous, in-bounds, ending at
+           the decoded index buffer's own end. Mirrors n2_add_pair's own
+           paired-0x1111 filler convention for the index leaf so this
+           checks the SAME triangle count n2_add_pair will actually see. */
+        long total_idx = 0;
+        if (nsub > 1) {
+            const unsigned char *ib0 = d + idx[0].off;
+            int ibytes = (int)idx[0].size, ip = 0;
+            while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+            total_idx = (ibytes - ip) / 2;
+        }
+        int part_ok = nsub > 1 && n2_car_submesh_partition_ok(sub, nsub, total_idx);
+        /* Classification (which class a submesh's matid names) does not
+           need a validated multi-record PARTITION -- it only needs
+           sub[k].matid to be in range, which is already individually
+           bounds-checked below regardless of start/count. Partition
+           validity only matters for trusting per-submesh index RANGES
+           well enough to actually SPLIT the geometry. So classification
+           is trusted whenever nsub==1 (a single record IS the whole
+           object -- trivially "whole," nothing to partition) or when
+           nsub>1 AND part_ok (a validated multi-record partition).
+           A malformed multi-record partition (nsub>1, !part_ok) keeps
+           the conservative cat-based fallback for classification too --
+           a corrupt start/count strongly suggests the whole record is
+           suspect, so its matid is not trusted either (M135-R item 4:
+           "ensure material classification works without requiring
+           nsub > 1", scoped to the case that's actually safe). */
+        int trust_cls = nsub == 1 || part_ok;
+        uint32_t subtex[32], submat[32]; int matcls[32];
+        int differ = 0, clsdiffer = 0, matdiffer = 0, big = 0;
+        for (int k = 0; k < (trust_cls ? nsub : 0); k++) {
+            subtex[k] = sub[k].mat < (uint32_t)nslot
+                      ? (brake ? slots[sub[k].mat]
+                               : n2_resolve_key(slots[sub[k].mat], keys, nkeys)) : 0;
+            uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
+            submat[k] = mh;
+            if (submat[k] != submat[0]) matdiffer = 1;
+            matcls[k] = n2_mat_class(mh, cat);
+            if (subtex[k] != subtex[0]) differ = 1;
+            if (matcls[k] != matcls[0]) clsdiffer = 1;
+            if (sub[k].count > sub[big].count) big = k;
+        }
+        /* Whole-object category when NOT splitting: matcls[0] whenever
+           classification is trusted (it is then, by construction,
+           uniform across every submesh reaching this branch -- if it
+           disagreed AND part_ok held, the split branch below would have
+           been taken instead), else the original name-based cat. This is
+           what lets a single-submesh WINDSHIELD-material object with a
+           non-GLASS name (real on GOLF, see the M135-R census note at
+           n2_mat_class) resolve to GLASS without ever needing to split. */
+        int wholecat = (trust_cls && nsub >= 1) ? matcls[0] : cat;
+        /* Brake discs reference shared GLOBALB textures absent from the
+           per-car key list. Retain only validated slot ownership; the
+           runtime resolves the exact key locally or in the shared pack. */
+        if (brake && trust_cls && nsub >= 1 && !differ) tk = subtex[0];
+        /* One 0x80134010 occurrence, split or not, shares one tierid so
+           n2_car_dedupe_lod can score and drop/keep its whole slice set
+           atomically instead of resolving each split slice on its own. */
+        static uint32_t g_car_tierid_next = 1;
+        uint32_t tierid = g_car_tierid_next++;
+        if (part_ok && nsub > 1 && (differ || clsdiffer || matdiffer)) {
+            for (int k = 0; k < nsub; k++) {
+                int before = scene->count;
+                n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28,
+                            walk->prelight ? 24 : -1, 0,
+                            subtex[k], NULL, sub[k].start, sub[k].count,
+                            (unsigned char)N2_DRAW_OPAQUE);
+                if (scene->count > before) {
+                    scene->meshes[before].trim = trim;
+                    scene->meshes[before].car_material = submat[k];
+                    scene->meshes[before].car_source = ds;
+                    scene->meshes[before].car_part=(unsigned char)(part_slot+1);
+                    scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
+                    /* The dominant slice keeps the plain family key so it
+                       still dedupes against LOD tiers that never split
+                       (a lower tier can lack the badge slot entirely, so
+                       it stays whole); the small extra slices get their
+                       own keys and only ever match the same slice of
+                       another tier. Complete-tier selection (tierid,
+                       scored by total index count) is what actually
+                       protects an unmatched slice now; namekey is only
+                       the cross-tier family grouping. */
+                    scene->meshes[before].namekey =
+                        k == big ? nk2 : nk2 ^ (0x9e3779b9u * (sub[k].mat + 1));
+                    scene->meshes[before].vkind = vkind;
+                    scene->meshes[before].vnum = vnum;
+                    scene->meshes[before].famkey = vfam;
+                    scene->meshes[before].tierid = tierid;
+                    scene->meshes[before].car_mount = (unsigned char)mount;
+                }
+            }
+        } else {
+            for (int k = 0; k < pairs; k++) {   /* car parts have identity transforms */
+                int before = scene->count;
+                n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28,
+                              walk->prelight ? 24 : -1, 0,
+                              tk, NULL, 0, -1,
+                              (unsigned char)N2_DRAW_OPAQUE);
+                if (scene->count > before) {
+                    scene->meshes[before].trim = trim;
+                    scene->meshes[before].car_material = trust_cls && nsub && !matdiffer ? submat[0] : 0;
+                    scene->meshes[before].car_source = ds;
+                    scene->meshes[before].car_part=(unsigned char)(part_slot+1);
+                    scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
+                    scene->meshes[before].namekey = nk2;
+                    scene->meshes[before].vkind = vkind;
+                    scene->meshes[before].vnum = vnum;
+                    scene->meshes[before].famkey = vfam;
+                    scene->meshes[before].tierid = tierid;
+                    scene->meshes[before].car_mount = (unsigned char)mount;
+                }
+            }
+        }
+        return 0; /* object decoder owns its nested material/vertex leaves */
     }
+    return (tag>>28)==8;
+}
+static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *scene,
+                        const uint32_t *keys, int nkeys, const N2CarConfig *cfg,
+                        int prelight) {
+    N2CarWalk walk={scene,keys,nkeys,cfg,prelight};
+    asset_chunks_walk(d,beg,end,n2_car_chunk,&walk);
 }
 /* A socket is owned by a retained source object. Material slices and LOD
  * copies may repeat it; disagreeing transforms reject the attachment. */
@@ -2345,10 +2391,11 @@ static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
             *dst=*src;
             dst->verts=(float *)malloc((size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
             dst->idx=(uint16_t *)malloc((size_t)src->nidx*sizeof(uint16_t));
-            dst->vcol=NULL; /* car decoder emits no vertex colour stream */
-            if(!dst->verts || !dst->idx)goto failed;
+            dst->vcol=src->vcol?(unsigned char *)malloc((size_t)src->nverts*4):NULL;
+            if(!dst->verts || !dst->idx || (src->vcol&&!dst->vcol))goto failed;
             memcpy(dst->verts,src->verts,(size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
             memcpy(dst->idx,src->idx,(size_t)src->nidx*sizeof(uint16_t));
+            if(src->vcol)memcpy(dst->vcol,src->vcol,(size_t)src->nverts*4);
             n2_car_transform(dst,m,1);
         }
     }
@@ -2365,7 +2412,7 @@ static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
     while(used<n)s->meshes[s->count++]=placed[used++];
     free(placed);return ns;
 failed:
-    for(int i=0;i<n;i++){free(placed[i].verts);free(placed[i].idx);}
+    for(int i=0;i<n;i++){free(placed[i].verts);free(placed[i].idx);free(placed[i].vcol);}
     free(placed);return -1;
 }
 
@@ -2382,18 +2429,24 @@ static void n2_car_attach_spoiler(const unsigned char *d,long len,N2Scene *s) {
             n2_car_transform(s->meshes+i,t,0);
 }
 
-static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
-                       const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
+static int n2_load_car_colored(const unsigned char *d, long len, N2Scene *scene,
+                       const uint32_t *keys, int nkeys, const N2CarConfig *cfg,
+                       int prelight) {
     static const N2CarConfig stock = {0};
     if (!cfg) cfg = &stock;
     memset(scene, 0, sizeof(*scene));
-    n2_walk_car(d, 0, len, scene, keys, nkeys, cfg);
+    n2_walk_car(d, 0, len, scene, keys, nkeys, cfg, prelight);
     n2_car_apply_config(scene, cfg);   /* aftermarket parts shadow stock ones */
     n2_car_dedupe_lod(scene);          /* collapse each LOD family to its best tier */
+    n2_car_select_roof(d,len,scene);
     n2_car_attach_spoiler(d,len,scene);
     if(n2_car_attach_exhaust(d,len,scene)<0)
         fprintf(stderr,"car exhaust: unresolved attachment; keeping source geometry\n");
     return scene->count;
+}
+static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
+                       const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
+    return n2_load_car_colored(d,len,scene,keys,nkeys,cfg,0);
 }
 
 /* A WHEELS library contains several size variants per STYLE. Keep the first
@@ -2627,7 +2680,9 @@ static int n2_car_prepare_wheels(N2Scene *s) {
 }
 
 static void n2_free_scene(N2Scene *s) {
-    for (int i = 0; i < s->count; i++) { free(s->meshes[i].verts); free(s->meshes[i].idx); }
+    for (int i = 0; i < s->count; i++) {
+        free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol);
+    }
     free(s->meshes); memset(s, 0, sizeof(*s));
 }
 
@@ -2873,18 +2928,25 @@ static void n2_car_profile(const N2Scene *s, const char *name,
  * Front/rear axle X and half-track Y are in the same frame and scale as the
  * model and reproduce real spec dimensions across the sampled fleet. This
  * supersedes the body-box fraction fallback. Returns 1 on a plausible hit. */
+static long n2_global_car_record(const unsigned char *g,long glen,const char *carname) {
+    if (!g || !carname) return -1;
+    char sig[128];
+    int n = snprintf(sig, sizeof sig, "CARS\\%s\\GEOMETRY.BIN", carname);
+    if (n <= 0 || n >= (int)sizeof sig) return -1;
+    long at = -1;
+    for (long i = 0; i + n <= glen; i++)
+        if (g[i] == (unsigned char)sig[0] && memcmp(g+i,sig,(size_t)n)==0) {
+            if (at >= 0) return -1; /* ambiguous archive: never guess a record */
+            at=i;
+        }
+    return at < 0x40 ? -1 : at-0x40;
+}
+
 typedef struct { float front_axle, rear_axle, front_track, rear_track; } N2WheelAttr;
 static int n2_global_wheel_attr(const unsigned char *g, long glen,
                                 const char *carname, N2WheelAttr *w) {
-    if (!g || !carname || !w) return 0;
-    char sig[128];
-    int n = snprintf(sig, sizeof sig, "CARS\\%s\\GEOMETRY.BIN", carname);
-    if (n <= 0 || n >= (int)sizeof sig) return 0;
-    long at = -1;
-    for (long i = 0; i + n <= glen; i++)
-        if (g[i] == (unsigned char)sig[0] && memcmp(g + i, sig, (size_t)n) == 0) { at = i; break; }
-    if (at < 0) return 0;
-    long base = at - 0x40;                       /* wheel block precedes the path */
+    if (!w) return 0;
+    long base = n2_global_car_record(g,glen,carname); /* wheel block precedes path */
     if (base < 0 || base + 392 + 4 > glen) return 0;
     float fx, rx, fy, ry;                        /* front/rear axle X, front/rear half-track Y */
     memcpy(&fx, g + base + 288, 4); memcpy(&rx, g + base + 384, 4);
@@ -2895,6 +2957,70 @@ static int n2_global_wheel_attr(const unsigned char *g, long glen,
           fy > 0.4f && fy < 1.3f && ry > 0.4f && ry < 1.3f)) return 0;
     w->front_axle = fx; w->rear_axle = rx;
     w->front_track = 2.0f * fy; w->rear_track = 2.0f * ry;
+    return 1;
+}
+
+/* Stock and upgraded powertrain data from the same 0x890-byte GLOBALB car
+ * record. Values remain in source units; physics.c maps them to the arcade
+ * model. Four gearbox blocks and four torque-gain curves are stored per car. */
+typedef struct {
+    float final_drive, reverse, forward[6];
+    int gear_count;
+} N2GearboxAttr;
+
+typedef struct {
+    float mass_tonnes;
+    float idle_rpm, redline_rpm, limiter_rpm;
+    float torque[9], torque_gain[4][9];
+    N2GearboxAttr gearbox[4];
+    float rear_drive, steer_ratio;
+} N2PhysicsAttr;
+
+static int n2_global_physics_attr(const unsigned char *g,long glen,
+                                  const char *carname,N2PhysicsAttr *a) {
+    static const int gb_at[4]={0x2c0,0x460,0x4a0,0x4e0};
+    static const int gain_at[4]={0x530,0x570,0x5b0,0x5f0};
+    if(!a)return 0;
+    long record=n2_global_car_record(g,glen,carname);
+    if(record<0 || record+0x890>glen)return 0;
+#define N2_PA_F(dst,off) memcpy(&(dst),g+record+(off),4)
+    memset(a,0,sizeof *a);
+    N2_PA_F(a->mass_tonnes,0x220);
+    N2_PA_F(a->idle_rpm,0x300);N2_PA_F(a->redline_rpm,0x304);
+    N2_PA_F(a->limiter_rpm,0x308);
+    memcpy(a->torque,g+record+0x310,sizeof a->torque);
+    N2_PA_F(a->steer_ratio,0x380);
+    for(int level=0;level<4;level++) {
+        N2GearboxAttr *box=a->gearbox+level;int at=gb_at[level];
+        N2_PA_F(box->final_drive,at+0x08);N2_PA_F(box->reverse,at+0x20);
+        memcpy(&box->gear_count,g+record+at+0x18,4);
+        memcpy(box->forward,g+record+at+0x28,sizeof box->forward);
+        memcpy(a->torque_gain[level],g+record+gain_at[level],
+               sizeof a->torque_gain[level]);
+    }
+    N2_PA_F(a->rear_drive,0x2d0);
+#undef N2_PA_F
+    if(!isfinite(a->mass_tonnes)||a->mass_tonnes<.3f||a->mass_tonnes>20 ||
+       !isfinite(a->idle_rpm)||!isfinite(a->redline_rpm)||!isfinite(a->limiter_rpm)||
+       a->idle_rpm<400||a->redline_rpm<=a->idle_rpm||
+       a->limiter_rpm<=a->redline_rpm||a->limiter_rpm>20000 ||
+       !isfinite(a->rear_drive)||a->rear_drive<-.01f||a->rear_drive>1.01f ||
+       !isfinite(a->steer_ratio)||a->steer_ratio<.05f||a->steer_ratio>3)return 0;
+    for(int i=0;i<9;i++) {
+        if(!isfinite(a->torque[i])||a->torque[i]<0||a->torque[i]>5)return 0;
+        for(int level=0;level<4;level++)
+            if(!isfinite(a->torque_gain[level][i])||
+               a->torque_gain[level][i]<0||a->torque_gain[level][i]>5)return 0;
+    }
+    for(int level=0;level<4;level++) {
+        N2GearboxAttr *box=a->gearbox+level;
+        if(box->gear_count<3||box->gear_count>6||
+           !isfinite(box->final_drive)||box->final_drive<.1f||box->final_drive>15||
+           !isfinite(box->reverse)||box->reverse>-.1f||box->reverse< -15)return 0;
+        for(int i=0;i<box->gear_count;i++)
+            if(!isfinite(box->forward[i])||box->forward[i]<.1f||box->forward[i]>15||
+               (i&&box->forward[i]>=box->forward[i-1]))return 0;
+    }
     return 1;
 }
 
