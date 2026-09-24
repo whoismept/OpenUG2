@@ -922,11 +922,27 @@ Each `ROUTES<REG>/` holds one `Paths<id>.bin` per race event **plus** a single
 | `0x3414d` | 0xfb70 | 0xfb70 | 0xfb70 — **byte-identical** |
 
 `0x3414a`/`0x3414d` are the shared per-region city data (same MD5 in every file
-of a region); the other three are per-event. So **a race event is a route
-network laid over the common city**, and freeroam is that city with no event
-overlay. `Routes<id>F/B.bin` confirms it from the other side: `Routes4001F.bin`
+of a region); the other three are per-event. The free-roam path file has no
+race-event overlay. `Routes<id>F/B.bin` confirms the distinction from the other
+side: `Routes4001F.bin`
 names only 6 route sectors (`TrackRoutesA21`, `A30`–`A34`) where
 `RoutesFreeRoam.bin` names all 20 (`A10`–`A44`).
+
+The actual ordered free-roam road points are in `RoutesFreeRoam.bin` leaf
+`0x34121`, not in the shared `PathsFreeRoam.bin` leaves. After the 8-byte leaf
+header, each route record stores matching `u16` point counts at `+44` and
+`+46`. Its points begin at `+128`, at 56-byte intervals, with world `f32 X/Y`
+at point offsets `+4/+8`. The next record begins after `140 + 56*N` bytes;
+the final record omits the trailing 8-byte header. Six shipped files contain
+14,695 points. Runtime links consecutive points within each record and joins
+nearby route ends; the original junction-selection rules remain unknown.
+Each point also carries two `u16` values at `+24/+26`; divided by 256, they
+range from 1 to about 53 m and vary smoothly along routes, consistent with
+lateral road extents. OpenUG2 conservatively uses the smaller value to offset
+traffic toward the right lane, then checks the shifted point against ROAD.
+No speed, headway, spawn timing or camera-visibility rule has been decoded from
+these records. Current traffic pacing and off-screen spawn selection are
+OpenUG2 behavior built on the authored road geometry, not recovered retail rules.
 
 ### `0x3414c` — race event catalog (**SOLVED**)
 
@@ -1013,18 +1029,30 @@ and track dimensions across the sampled fleet. `n2_global_wheel_attr` accepts
 the record only after conservative plausibility bounds; otherwise the caller
 falls back to measurements derived from that car's geometry.
 
-Two nearby values at offsets `+772/+776` form a pair separated by 500 and sort
-cars in a credible limiter/redline order. Their meaning is **PLAUSIBLE**, not
-structurally proven, and OpenUG2 does not consume them.
+### Stock and upgraded powertrain fields
 
-### What is not decoded
+The following offsets are relative to the 2,192-byte car record and are
+validated before runtime use:
 
-Mass, torque curves, gear ratios, drivetrain split, brake force, centre of
-gravity, spring rates and dampers remain **UNKNOWN**. A scan found no fixed
-four-byte column near the path anchor that yields distinct plausible kilogram
-mass values across the sampled cars. Current acceleration/braking differences
-therefore use a bounded body-volume proxy; that is engine policy, not a decoded
-retail field.
+| offset | type | meaning |
+|---:|---|---|
+| `+0x220` | `f32` | mass in tonnes |
+| `+0x2c0`, `+0x460`, `+0x4a0`, `+0x4e0` | 64-byte blocks | stock, L1, L2 and L3 transmissions |
+| gearbox `+0x08` | `f32` | final-drive ratio |
+| gearbox `+0x10` | `f32` | rear-drive fraction (stock block) |
+| gearbox `+0x18` | `u32` | forward gear count |
+| gearbox `+0x20..+0x3c` | `8*f32` | reverse, neutral and six forward ratios |
+| `+0x300..+0x308` | `3*f32` | idle, redline and limiter RPM |
+| `+0x310..+0x330` | `9*f32` | stock torque curve, kN·m |
+| `+0x380` | `f32` | steering-response ratio |
+| `+0x530`, `+0x570`, `+0x5b0`, `+0x5f0` | `9*f32` each | four torque-gain curves, kN·m |
+
+The torque points span idle to limiter in eight equal intervals. Source evidence
+supports the four gearbox levels directly. The gain curves form a consistent
+upgrade ladder, but their exact division among the separately sold engine, ECU
+and induction products is not yet proven, so OpenUG2 exposes them as power
+levels rather than inventing category-specific percentages. Brake, tyre and
+suspension upgrade fields remain undecoded.
 
 ### `0x00135200` AttribSys records
 

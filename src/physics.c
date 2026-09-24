@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "physics.h"
+#include "ai.h"
 
 /* handbrake: rear grip lets go, the lateral velocity survives → drift */
 #define HANDBRAKE_GRIP   0.985f
@@ -20,7 +21,7 @@
 
 PhysTune g_phys_tune = { 1.0f, 1.0f, 1.0f, 220.0f };   /* stock defaults */
 
-/* Asphalt: the tuned NFSU2 feel, unchanged. */
+/* Asphalt: current arcade defaults. */
 const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 1.00f };
 /* Dirt/grass/hillside: it can still be driven onto and across, but it will not
  * carry the car to road speed and it holds the sideways component far longer,
@@ -150,11 +151,13 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
             r->compression[k] = -PHYS_RIDE_DROOP;
             continue;                    /* no contact, no force: it falls */
         }
-        mask |= 1u << k;
         if (c > PHYS_RIDE_BUMP) c = PHYS_RIDE_BUMP;
         r->compression[k] = c;
         /* The damper resists suspension travel, not motion along a slope. */
-        force[k] = K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G;
+        force[k] = fmaxf(0.0f,K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G);
+        /* A tyre may push on the road, but cannot pull the body down onto a
+           crest. An unloaded wheel also supplies no steering/braking grip. */
+        if(force[k]>0)mask |= 1u << k;
     }
     r->contact_mask = mask;
 
@@ -172,7 +175,7 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
            already resolved the frame, so landing energy was handled twice and a
            single 4.4 m/s arrival on a continuous -6% road launched the car into
            a 6-hop, 174-of-180-frame ballistic cycle (M130-R2 case 1). */
-        if (!was) r->impact = r->vz < 0 ? -r->vz : r->vz;
+        if (!was) r->impact = fmaxf(0.0f,-r->vz);
         float fz = 0, tp = 0, tr = 0;
         for (int k = 0; k < 4; k++) { fz += force[k]; tp += ax[k]*force[k]; tr += ay[k]*force[k]; }
         r->vz         += (fz * 0.25f - PHYS_RIDE_G) * dt;
@@ -219,19 +222,59 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     }
 }
 
+void phys_ride_apply_load(PhysRideState *r, const PhysVehicle *v,
+                          float longitudinal, float lateral, float dt) {
+    static const PhysVehicle NEUTRAL = { 1, 1, 1, 1, 1, 1 };
+    if (!r || dt <= 0 || !r->contact_mask) return;
+    if (!v) v = &NEUTRAL;
+    /* The road spring already restores the chassis to its support plane. Add
+       only the inertial target here: acceleration lifts the nose, braking
+       dives it, and a left turn loads the right side. The bounded angles keep
+       a wall hit or one noisy velocity sample from kicking the body over. */
+    float pitch = pv_clamp(longitudinal / PHYS_RIDE_G * 0.025f * v->pitch_load,
+                           -0.050f, 0.050f);
+    float roll  = pv_clamp(lateral / PHYS_RIDE_G * 0.040f * v->roll_load,
+                           -0.070f, 0.070f);
+    float w = 6.2831853f * PHYS_RIDE_FREQ;
+    r->pitch_rate += w*w * pitch * dt;
+    r->roll_rate  += w*w * roll  * dt;
+}
+
+void phys_ride_up(const PhysRideState *ride,float heading,float up[3]) {
+    float co=cosf(heading),sn=sinf(heading),p=sinf(ride->pitch),r=sinf(ride->roll);
+    up[0]=-co*p+sn*r;up[1]=-sn*p-co*r;up[2]=1;
+    float length=sqrtf(up[0]*up[0]+up[1]*up[1]+1);
+    for(int k=0;k<3;k++)up[k]/=length;
+}
+
+void phys_landing_camera(float *offset,float *velocity,float impact,float dt) {
+    if(dt<=0)return;
+    *velocity-=fminf(4.0f,fmaxf(0,impact-1.5f)*.45f);
+    *velocity+=(-324.0f * *offset-16.0f * *velocity)*dt;
+    *offset+=*velocity*dt;
+}
+
 PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
                                        float wheelbase, float track, float tyre_w) {
-    PhysVehicle v = { 1.0f, 1.0f, 1.0f, 1.0f };
+    PhysVehicle v = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
     float vol = body_len * body_wid * body_hgt;
     if (vol > 1e-3f) {
-        /* mass/inertia proxy: sqrt so the 17x volume spread across the fleet
-           (8.3 to 141.7 m^3) cannot swamp the model before the clamp does */
+        /* mass/inertia proxy: sqrt so the 16x volume spread across the fleet
+           (10.2 to 165.8 m^3) cannot swamp the model before the clamp does */
         float m = sqrtf(PHYS_FLEET_VOLUME / vol);
         v.accel = pv_clamp(m, 0.75f, 1.25f);
         v.brake = pv_clamp(m, 0.75f, 1.25f);
     }
     if (wheelbase > 0.5f)
         v.steer = pv_clamp(PHYS_FLEET_WHEELBASE / wheelbase, 0.80f, 1.20f);
+    if (body_hgt > 0.2f && wheelbase > 0.5f)
+        v.pitch_load = pv_clamp((body_hgt / wheelbase) /
+                                (PHYS_FLEET_HEIGHT / PHYS_FLEET_WHEELBASE),
+                                0.70f, 1.40f);
+    if (body_hgt > 0.2f && track > 0.5f)
+        v.roll_load = pv_clamp((body_hgt / track) /
+                               (PHYS_FLEET_HEIGHT / PHYS_FLEET_TRACK),
+                               0.70f, 1.40f);
     if (tyre_w > 0.02f && track > 0.5f) {
         /* wider tyre and wider track = less sideways scrub. lat is RETENTION,
            so a grippier car gets a smaller multiplier. */
@@ -242,10 +285,38 @@ PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float bod
     return v;
 }
 
+PhysVehicle phys_vehicle_from_source(const N2PhysicsAttr *a,int power_level,
+                                     int transmission_level,float body_hgt,float wheelbase,
+                                     float track,float tyre_w) {
+    PhysVehicle v=phys_vehicle_from_geometry(0,0,body_hgt,wheelbase,track,tyre_w);
+    if(!a)return v;
+    power_level=(int)pv_clamp((float)power_level,0,3);
+    transmission_level=(int)pv_clamp((float)transmission_level,0,3);
+    float peak_power=0,stock_power=0;
+    for(int i=0;i<9;i++) {
+        float rpm=a->idle_rpm+(a->limiter_rpm-a->idle_rpm)*(float)i/8.0f;
+        float base=a->torque[i]*rpm;
+        if(base>stock_power)stock_power=base;
+        float power=base+(power_level?a->torque_gain[power_level][i]*rpm:0);
+        if(power>peak_power)peak_power=power;
+    }
+    const N2GearboxAttr *stock=a->gearbox, *box=a->gearbox+transmission_level;
+    float launch=(box->forward[0]*box->final_drive)/
+                 (stock->forward[0]*stock->final_drive);
+    /* 850 kN.m*rpm/tonne is the arcade model calibration point. All per-car
+       power, mass and transmission values above come from the source record. */
+    float stock_accel=pv_clamp(stock_power/a->mass_tonnes/850.0f,.65f,1.35f);
+    v.accel=stock_power>0
+        ? pv_clamp(stock_accel*peak_power/stock_power*launch,.65f,1.90f)
+        : stock_accel;
+    v.steer=pv_clamp(a->steer_ratio/1.10f,.70f,1.45f);
+    return v;
+}
+
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
                     const PhysSurface *sf, const PhysVehicle *vh) {
-    static const PhysVehicle NEUTRAL = { 1.0f, 1.0f, 1.0f, 1.0f };
+    static const PhysVehicle NEUTRAL = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
     if (!sf) sf = &PHYS_SURF_ROAD;
     if (!vh) vh = &NEUTRAL;
     float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE * sf->topfrac;
@@ -286,6 +357,17 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     *speed = vf;                      /* forward speed, for HUD/collision */
     pos[0] += vel[0]; pos[1] += vel[1];
     return vl < 0 ? -vl : vl;         /* drift magnitude */
+}
+
+float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
+                      float throttle, float steer, int handbrake,
+                      const PhysSurface *sf, const PhysVehicle *vh,
+                      const PhysRideState *ride) {
+    if (!ride || ride->contact_mask)
+        return phys_car_step(pos,vel,heading,speed,throttle,steer,handbrake,sf,vh);
+    pos[0]+=vel[0];pos[1]+=vel[1];
+    *speed=vel[0]*cosf(*heading)+vel[1]*sinf(*heading);
+    return fabsf(vel[0]*sinf(*heading)-vel[1]*cosf(*heading));
 }
 
 void phys_selftest(void) {
@@ -352,7 +434,7 @@ void phys_selftest(void) {
 
     /* --- vehicle profiles (M121) ---------------------------------------------
      * Geometry-derived factors must stay inside their clamps for anything the
-     * fleet can hand us, including the extremes (8.3 m^3 hatchback, 141.7 m^3
+     * fleet can hand us, including the extremes (10.2 m^3 roadster, 165.8 m^3
      * bus) and degenerate/missing measurements. */
     {
         const float ex[][6] = {
@@ -368,9 +450,11 @@ void phys_selftest(void) {
             assert(v.brake >= 0.75f && v.brake <= 1.25f);
             assert(v.steer >= 0.80f && v.steer <= 1.20f);
             assert(v.lat   >= 0.90f && v.lat   <= 1.10f);
+            assert(v.pitch_load >= 0.70f && v.pitch_load <= 1.40f);
+            assert(v.roll_load  >= 0.70f && v.roll_load  <= 1.40f);
         }
         /* a neutral profile must reproduce the NULL path exactly */
-        PhysVehicle nv = { 1.0f, 1.0f, 1.0f, 1.0f };
+        PhysVehicle nv = { 1, 1, 1, 1, 1, 1 };
         float ap[3]={0,0,0}, av[2]={0,0}, ah=0, as3=0;
         float bp[3]={0,0,0}, bv[2]={0,0}, bh=0, bs2=0;
         for (int t = 0; t < 600; t++) {
@@ -379,7 +463,8 @@ void phys_selftest(void) {
         }
         assert(ap[0] == bp[0] && ap[1] == bp[1] && ah == bh && as3 == bs2);
         /* braking still stops a heavy car: the slowest brake factor is 0.75 */
-        PhysVehicle hv = { 0.75f, 0.75f, 1.0f, 1.0f };
+        PhysVehicle hv = { .accel=0.75f, .brake=0.75f, .steer=1, .lat=1,
+                           .pitch_load=1, .roll_load=1 };
         float cp2[3]={0,0,0}, cv[2], ch=0, cs3=0; int stop = -1;
         cv[0]=100.0f/3.6f/PHYS_TICKRATE; cv[1]=0;
         for (int t = 1; t <= 10*60 && stop < 0; t++) {
@@ -387,6 +472,59 @@ void phys_selftest(void) {
             if (cs3 <= 0.0f) stop = t;
         }
         assert(stop > 0 && stop < 7*60);
+
+        /* The primary path must respond to values read from GLOBALB rather
+           than silently collapsing back to one shared vehicle profile. */
+        N2PhysicsAttr a = { .mass_tonnes=1.25f, .idle_rpm=800,
+            .redline_rpm=6500, .limiter_rpm=7000, .steer_ratio=1.05f };
+        for(int i=0;i<9;i++)a.torque[i]=.12f+i*.01f;
+        for(int level=0;level<4;level++) {
+            a.gearbox[level].final_drive=4.0f;
+            a.gearbox[level].forward[0]=3.2f;
+        }
+        for(int i=0;i<9;i++)a.torque_gain[3][i]=.05f;
+        PhysVehicle stock=phys_vehicle_from_source(&a,0,0,1.5f,2.7f,1.5f,.22f);
+        a.mass_tonnes*=2;
+        assert(phys_vehicle_from_source(&a,0,0,1.5f,2.7f,1.5f,.22f).accel<stock.accel);
+        a.mass_tonnes*=.5f;a.steer_ratio=1.25f;
+        assert(phys_vehicle_from_source(&a,0,0,1.5f,2.7f,1.5f,.22f).steer>stock.steer);
+        a.steer_ratio=1.05f;
+        assert(phys_vehicle_from_source(&a,3,0,1.5f,2.7f,1.5f,.22f).accel>stock.accel);
+        a.mass_tonnes=1.15f; /* stock exceeds the former 1.35 ceiling */
+        stock=phys_vehicle_from_source(&a,0,0,1.5f,2.7f,1.5f,.22f);
+        assert(stock.accel==1.35f);
+        assert(phys_vehicle_from_source(&a,3,0,1.5f,2.7f,1.5f,.22f).accel>stock.accel);
+        a.gearbox[2].final_drive=4.4f;
+        assert(phys_vehicle_from_source(&a,0,2,1.5f,2.7f,1.5f,.22f).accel>stock.accel);
+        assert(fabsf(stock.pitch_load-phys_vehicle_from_geometry(0,0,1.5f,2.7f,1.5f,.22f).pitch_load)<1e-6f);
+    }
+
+    /* Flat-road load transfer: tyre acceleration biases the sprung chassis,
+       while releasing the input lets the existing suspension settle it. */
+    {
+        PhysRideSupport s = {
+            .z={0,0,0,0}, .valid={1,1,1,1},
+            .ax={1.25f,1.25f,-1.25f,-1.25f},
+            .ay={.75f,-.75f,.75f,-.75f}, .vz={0,0,0,0}
+        };
+        PhysVehicle v = phys_vehicle_from_geometry(4.4f,1.9f,1.5f,2.7f,1.5f,.22f);
+        PhysRideState r; phys_ride_init(&r,&s);
+        for(int i=0;i<60;i++){
+            phys_ride_apply_load(&r,&v,7.0f,0,1.0f/60.0f);
+            phys_ride_step(&r,&s,1.0f/60.0f);
+        }
+        assert(r.pitch > 0.008f && r.pitch < 0.050f);
+        assert(r.contact_mask==15 && fabsf(r.z)<.05f);
+        assert(fabsf(r.roll) < 0.001f);
+        phys_ride_init(&r,&s);
+        for(int i=0;i<60;i++){
+            phys_ride_apply_load(&r,&v,0,8.0f,1.0f/60.0f);
+            phys_ride_step(&r,&s,1.0f/60.0f);
+        }
+        assert(r.roll > 0.010f && r.roll < 0.070f);
+        assert(r.contact_mask==15 && fabsf(r.z)<.05f);
+        for(int i=0;i<120;i++)phys_ride_step(&r,&s,1.0f/60.0f);
+        assert(fabsf(r.roll) < 0.002f);
     }
 
 }
@@ -665,7 +803,7 @@ void collide_walls_selftest(void) {
 
 /* Which scenery stops a car (Phase 65). Each mesh now carries its asset-name
  * class, so the decision is semantic instead of a pure height guess:
- *   BUILDING / WALL / STRUCT -> always a solid, immovable boundary
+ *   BUILDING / WALL / STRUCT -> solid, except narrow XS roadside signs
  *   TREE / TERRAIN           -> never a wall here (ground is the query's job)
  *   PROP  -> MEASURED, not assumed: the XO_ prefix mixes 1x1x1.5 m boxes
  *            (XO_IP_WBOX) with 24x29x36 m office blocks (XO_INDUSTRIALOFFICESA)
@@ -673,8 +811,9 @@ void collide_walls_selftest(void) {
  *            Height bands over L4RA's 939 props: <2 m 254, 2-4 274, 4-8 353,
  *            8-16 359, 16-32 166, >32 60. Street furniture is distinguished by a
  *            SMALL FOOTPRINT (poles/cans/boxes are thin), not by being short --
- *            a streetlight is 8 m tall but ~1 m wide. So a prop is solid when
- *            its shorter horizontal span reaches PROP_SOLID_SPAN; thinner props
+ *            a streetlight's arm can widen its full box while its base stays
+ *            narrow. So a prop is solid when its car-height footprint reaches
+ *            PROP_SOLID_SPAN; thinner props
  *            stay out of the AABB set for a future knock-down/rebound pass.
  * Unnamed meshes keep the old N2_OTHER height heuristic. */
 #define PROP_SOLID_SPAN 3.0f
@@ -690,8 +829,12 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
             if (sc == N2_SC_TERRAIN) continue;              /* ground, never a wall */
             /* props, trees and unclassified: let measured size decide, so a tree
-               cluster or a big container still blocks but a trunk/pole does not */
-            if (!scen_is_wall(sc)) prop_check = 1;
+               cluster or a big container still blocks but a trunk/pole does not.
+               XS includes small roadside signs as well as large storefront
+               signs; the measured footprint keeps only the latter solid. */
+            if (!scen_is_wall(sc) ||
+                (sc == N2_SC_STRUCT && !strncmp(s->meshes[i].sname,"XS_",3)))
+                prop_check = 1;
         } else if (s->meshes[i].cat != N2_OTHER) continue;   /* unnamed fallback */
         if (s->meshes[i].nverts < 3) continue;
         float ox0=1e30f,oy0=1e30f,oz0=1e30f, ox1=-1e30f,oy1=-1e30f,oz1=-1e30f;
@@ -706,9 +849,24 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
          * Keep the 2.5 m heuristic for props/unclassified meshes only. */
         if (!scen_is_wall(sc) && oz1-oz0 < WALL_MIN_HEIGHT) continue;
         if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
-        if (prop_check) {   /* thin street furniture: leave it drivable-through */
+        if (prop_check) {   /* ponytail: thin street furniture passes through until dynamic knockdown exists */
             float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;
             if (smin < PROP_SOLID_SPAN) continue;
+            /* A streetlight's arm widens its full AABB, but its car-height pole
+               is narrow. Judge a prop by the first 3 m above its lowest point;
+               keep the full span for meshes with too few base vertices. */
+            float bx0=1e30f,by0=1e30f,bx1=-1e30f,by1=-1e30f;
+            int nb=0;
+            for (int v=0;v<s->meshes[i].nverts;v++) {
+                const float *p=s->meshes[i].verts+v*5;
+                if (p[2]>oz0+3.0f) continue;
+                if (p[0]<bx0) bx0=p[0];
+                if (p[0]>bx1) bx1=p[0];
+                if (p[1]<by0) by0=p[1];
+                if (p[1]>by1) by1=p[1];
+                nb++;
+            }
+            if (nb>=4 && fminf(bx1-bx0,by1-by0)<PROP_SOLID_SPAN) continue;
         }
         obst[nobst][0]=ox0; obst[nobst][1]=oy0; obst[nobst][2]=ox1; obst[nobst][3]=oy1;
         if (obz) { obz[nobst][0]=oz0; obz[nobst][1]=oz1; }   /* same pass, already measured */
@@ -718,35 +876,55 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
     return nobst;
 }
 
-#define CAR_RADIUS 2.6f   /* car-to-car collision circle */
-
 float phys_car_contacts(float carpos[3], float vel[2], float speed,
-                        AiCar *ais, int nai) {
-    const float MIN = CAR_RADIUS*2.0f;
+                        float heading, const float bb[6], AiCar *ais, int nai) {
+    float pl=bb?0.5f*(bb[3]-bb[0]):2.2f;
+    float pw=bb?0.5f*(bb[4]-bb[1]):1.0f;
+    float ph=bb?bb[5]-bb[2]:1.6f;
+    if(pl<1.0f)pl=2.2f;if(pw<0.5f)pw=1.0f;if(ph<1.0f)ph=1.6f;
+    float pf[2]={cosf(heading),sinf(heading)},ps[2]={pf[1],-pf[0]};
     float thud = 0.0f;
-    /* player vs AI: player pushed at full weight; AIs share the rest so they
-       don't get shoved off their line too hard. */
+    /* One moving body against the supplied body snapshot. This same response
+       serves player and AI; callers retain the resolved position/velocity. */
     for (int k = 0; k < nai; k++) {
+        float ah=ais[k].height>1.0f?ais[k].height:1.6f;
+        if(carpos[2]+ph<ais[k].pos[2]+0.05f ||
+           ais[k].pos[2]+ah<carpos[2]+0.05f)continue;
+        float al=ais[k].half_length>1.0f?ais[k].half_length:2.2f;
+        float aw=ais[k].half_width>0.5f?ais[k].half_width:1.0f;
+        float af[2]={cosf(ais[k].head),sinf(ais[k].head)},as[2]={af[1],-af[0]};
         float dx = ais[k].pos[0]-carpos[0], dy = ais[k].pos[1]-carpos[1];
-        float d2 = dx*dx+dy*dy;
-        if (d2 > 1e-4f && d2 < MIN*MIN) {
-            float d = sqrtf(d2), push = (MIN - d);
-            float ux = dx/d, uy = dy/d;
-            carpos[0]    -= ux*push*0.5f; carpos[1]    -= uy*push*0.5f;
-            ais[k].pos[0]+= ux*push*0.5f; ais[k].pos[1]+= uy*push*0.5f;
-            vel[0]*=0.85f; vel[1]*=0.85f;   /* bump scrubs a little speed */
-            float s = (speed<0?-speed:speed)/PHYS_MAXSPD;
-            if (0.3f + s*0.5f > thud) thud = 0.3f + s*0.5f;
+        const float axes[4][2]={{pf[0],pf[1]},{ps[0],ps[1]},
+                                {af[0],af[1]},{as[0],as[1]}};
+        float best=1e30f,nx=0,ny=0;
+        int overlap=1;
+        for(int a=0;a<4;a++) {
+            float ux=axes[a][0],uy=axes[a][1];
+            float dist=dx*ux+dy*uy;
+            float pr=pl*fabsf(pf[0]*ux+pf[1]*uy)+
+                     pw*fabsf(ps[0]*ux+ps[1]*uy);
+            float ar=al*fabsf(af[0]*ux+af[1]*uy)+
+                     aw*fabsf(as[0]*ux+as[1]*uy);
+            float pen=pr+ar-fabsf(dist);
+            if(pen<=0){overlap=0;break;}
+            if(pen<best){best=pen;nx=ux*(dist>=0?1:-1);ny=uy*(dist>=0?1:-1);}
         }
-    }
-    for (int a = 0; a < nai; a++) for (int b = a+1; b < nai; b++) {
-        float dx = ais[b].pos[0]-ais[a].pos[0], dy = ais[b].pos[1]-ais[a].pos[1];
-        float d2 = dx*dx+dy*dy;
-        if (d2 > 1e-4f && d2 < MIN*MIN) {
-            float d = sqrtf(d2), push = (MIN - d)*0.5f, ux = dx/d, uy = dy/d;
-            ais[a].pos[0]-=ux*push; ais[a].pos[1]-=uy*push;
-            ais[b].pos[0]+=ux*push; ais[b].pos[1]+=uy*push;
-        }
+        if(!overlap)continue;
+        carpos[0]-=nx*(best+0.01f);carpos[1]-=ny*(best+0.01f);
+        float inward=vel[0]*nx+vel[1]*ny;
+        if(inward>0){vel[0]-=inward*nx;vel[1]-=inward*ny;}
+        float s=fabsf(speed)/PHYS_MAXSPD;
+        if(0.3f+s*0.5f>thud)thud=0.3f+s*0.5f;
     }
     return thud;
+}
+
+int phys_ai_overlap(const AiCar *a, const AiCar *b) {
+    float pos[3]={a->pos[0],a->pos[1],a->pos[2]},vel[2]={0,0};
+    float l=a->half_length>1.0f?a->half_length:2.2f;
+    float w=a->half_width>0.5f?a->half_width:1.0f;
+    float h=a->height>1.0f?a->height:1.6f;
+    float bb[6]={-l,-w,0,l,w,h};
+    AiCar other=*b;
+    return phys_car_contacts(pos,vel,0,a->head,bb,&other,1)>0;
 }

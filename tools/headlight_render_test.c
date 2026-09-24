@@ -35,6 +35,100 @@ static int sample(const RProg *r,GpuMesh *road,const float model[16],int high,fl
     glReadPixels(0,0,128,64,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
     return pixels[(32*128+x)*4];
 }
+/* Rendering a local mesh through a model transform must match the same
+ * vertices/normals baked into world space: bank, steering/spin and mirrored
+ * hubs must affect lighting as well as clip-space geometry. No game assets. */
+static void model_lighting_test(const RProg *r) {
+    const float projection[]={.7f,0,0,0,0,.7f,0,0,0,0,.1f,0,0,0,0,1};
+    float local[]={-.7f,-.7f,0,0,0, .7f,-.7f,0,1,0, .7f,.7f,0,1,1, -.7f,.7f,0,0,1,
+                    0,0,1, 0,0,1, 0,0,1, 0,0,1};
+    uint16_t indices[]={0,1,2,0,2,3};
+    N2Mesh mesh={.verts=local,.idx=indices,.nverts=4,.nidx=6,.authored_normals=1};
+    N2Scene scene={.meshes=&mesh,.count=1};
+    assert(r->uModel>=0);
+    glViewport(0,0,128,64);glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_CULL_FACE);
+    glUniform1f(r->uUseTex,0);glUniform1f(r->uHeadGain,0);glUniform1f(r->uFogDensity,0);
+    glUniform3f(r->uCamPos,0,0,6);glUniform3f(r->uLight,.3f,.4f,.8f);
+    glUniform3f(r->uColor,.12f,.16f,.20f);glUniform1f(r->uAmbient,.3f);glUniform1f(r->uDiffuse,.8f);
+    glUniform1f(r->uSpec,.4f);glUniform1f(r->uGloss,12);glUniform1f(r->uEnv,.45f);
+    glUniform1f(r->uClearcoat,.2f);glUniform1f(r->uAlpha,.25f);
+    for(int pose=0;pose<3;pose++)for(int glass=0;glass<2;glass++) {
+        const float pos[]={.1f,-.1f,.2f},up[]={0,.6f,.8f};
+        float body[16],hub[16],model[16],mvp[16],baked[32];
+        mat_car(pos,.7f,up,.15f,body);
+        float angle=.4f*pose,c=cosf(angle),sn=sinf(angle),scale=pose?1.4f:1;
+        float spin[]={scale*c,0,-scale*sn,0, 0,pose==2?-scale:scale,0,0,
+                      scale*sn,0,scale*c,0, 0,0,0,1};
+        mat_rotz(.2f*pose,hub);mat_mul(hub,spin,model);mat_mul(body,model,hub);
+        memcpy(model,hub,sizeof model);mat_mul(projection,model,mvp);
+        memcpy(baked,local,sizeof baked);
+        for(int v=0;v<4;v++)for(int a=0;a<3;a++) {
+            baked[v*5+a]=model[a]*local[v*5]+model[4+a]*local[v*5+1]+model[12+a];
+            baked[20+v*3+a]=model[8+a]/scale;
+        }
+        glUniform1f(r->uFresnel,(float)glass);
+        unsigned char pixel[2][4];
+        for(int pass=0;pass<2;pass++) {
+            mesh.verts=pass?baked:local;GpuMesh *gpu=upload_scene(&scene);assert(gpu);
+            render_model(r,pass?NULL:model);
+            glUniformMatrix4fv(r->uMVP,1,GL_FALSE,pass?projection:mvp);
+            glClear(GL_COLOR_BUFFER_BIT);draw_gpumesh(gpu);glFinish();
+            glReadPixels(64,32,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel[pass]);
+            free_scene_gpu(gpu,1);
+        }
+        printf("model lighting pose=%d glass=%d local=%u,%u,%u,%u baked=%u,%u,%u,%u\n",
+               pose,glass,pixel[0][0],pixel[0][1],pixel[0][2],pixel[0][3],
+               pixel[1][0],pixel[1][1],pixel[1][2],pixel[1][3]);fflush(stdout);
+        assert(pixel[1][0]>5); /* sample is inside the mesh */
+        for(int c=0;c<4;c++)assert(abs(pixel[0][c]-pixel[1][c])<=1);
+    }
+    render_model(r,NULL);
+    puts("PASS: tilted bodies, steered/spinning mirrored hubs and glass match world-space shading");
+}
+
+static void tail_lamp_test(const RProg *r) {
+    GpuMesh quad=make_quad();
+    unsigned char rgb[]={32,4,3, 192,10,6};
+    N2Tex image={.w=2,.h=1,.rgb=rgb};GLuint texture=upload_tex(&image);assert(texture);
+    float mvp[]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
+    render_model(r,NULL);glUniformMatrix4fv(r->uMVP,1,GL_FALSE,mvp);
+    glViewport(0,0,128,64);glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);glUniform1f(r->uFresnel,0);glUniform1f(r->uAlpha,1);
+    glUniform1f(r->uHeadGain,0);glUniform1f(r->uFogDensity,0);
+    glUniform1f(r->uAmbient,.3f);glUniform1f(r->uDiffuse,.8f);
+    glUniform3f(r->uLight,0,0,-1);glUniform3f(r->uCamPos,.5f,.5f,5);
+    const int running[]={0,1,0,1,1,0,1},braking[]={0,0,1,1,0,0,0},boost[]={0,0,0,0,1,1,0};
+    int red[2][7];
+    for(int textured=0;textured<2;textured++)for(int state=0;state<7;state++) {
+        render_tail_lamp(r,textured?texture:0,running[state],braking[state],boost[state],state==6?.25f:1);
+        glClear(GL_COLOR_BUFFER_BIT);draw_gpumesh(&quad);glFinish();
+        unsigned char pixel[4];glReadPixels(64,32,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+        red[textured][state]=pixel[0];
+        float use,emission[3];glGetUniformfv(r->prog,r->uUseTex,&use);
+        glGetUniformfv(r->prog,r->uEmissive,emission);
+        assert(use==(float)textured);
+        assert((emission[0]>0)==(running[state]||braking[state]));
+        if(textured && state==1) {
+            unsigned char left[4],right[4];
+            glReadPixels(32,32,1,1,GL_RGBA,GL_UNSIGNED_BYTE,left);
+            glReadPixels(96,32,1,1,GL_RGBA,GL_UNSIGNED_BYTE,right);
+            assert(right[0]>left[0]+4); /* lighting retains the lens texture */
+        }
+    }
+    for(int tex=0;tex<2;tex++) {
+        assert(red[tex][1]>red[tex][0]+50);
+        assert(red[tex][2]>red[tex][1]+10);
+        assert(red[tex][2]==red[tex][3] && red[tex][3]==red[tex][4]);
+        assert(red[tex][5]==red[tex][0]);
+        assert(red[tex][6]>red[tex][0] && red[tex][6]<red[tex][1]);
+        printf("tail lens textured=%d off=%d running=%d brake-day=%d brake-night=%d\n",
+               tex,red[tex][0],red[tex][1],red[tex][2],red[tex][3]);
+    }
+    glDeleteBuffers(1,&quad.vbo);glDeleteBuffers(1,&quad.nbo);glDeleteBuffers(1,&quad.ibo);
+    glDeleteTextures(1,&texture);glUniform3f(r->uEmissive,0,0,0);
+    puts("PASS: rear lamps retain texture detail; day/night brakes, running lights and nitro response");
+}
+
 int main(void) {
     /* Window and lamp-cover order uses each slice's indices, not the shared
        pool (which also contains an unrelated far vertex). Equal depths are stable. */
@@ -176,6 +270,8 @@ int main(void) {
     for(int c=0;c<3;c++)assert(abs(glass[0][c]-glass[1][c])<=1);
     assert(glGetError()==GL_NO_ERROR);
     puts("PASS: car glass tint/reflection/opacity agree from both sides");
+    model_lighting_test(&r);
+    tail_lamp_test(&r);
     free_headlight_shadows(&shadows);
     free_scene_gpu(road,1);glDeleteTextures(1,&texture);glDeleteProgram(r.prog);
     SDL_GL_DeleteContext(context);SDL_DestroyWindow(window);SDL_Quit();return 0;

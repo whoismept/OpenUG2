@@ -125,6 +125,7 @@ typedef struct {
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
+    int   vehicle_quality;       /* 0 low, 1 medium/current, 2 high paint/glass response */
     int   paint_override;        /* 1 = use paint[] below instead of the per-car hash */
     float paint[3];
     int   show_body, show_glass, show_lights, show_tires, show_misc, show_track;
@@ -176,6 +177,14 @@ typedef struct {
     int vinyl_count, vinyl_current, vinyl_request;
     int vinyl_catalog_request, vinyl_catalog_ready;
     char vinyl_status[128];
+
+    /* Blue shop: decoded GLOBALB package levels for the active car. The power
+       curves and four transmissions are source data; category ownership/save
+       data is a separate player-profile concern. */
+    int perf_source_available;
+    int perf_power_level, perf_transmission_level; /* 0 stock, 1..3 upgrades */
+    float perf_peak_kw[4], perf_final_drive[4];
+    int perf_gears[4];
 
     /* --- Mesh Inspector (passive: observes/overlays, never alters assets) --- */
     int  insp_count;        /* how many car meshes are inspectable */

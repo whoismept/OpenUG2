@@ -24,7 +24,7 @@
 
 /* per-mesh GPU buffers + computed normals */
 typedef struct {
-    GLuint vbo, nbo, ibo;
+    GLuint vbo, nbo, cbo, ibo;
     int nidx, cat, trim;
     uint32_t texkey, car_material;
     unsigned char draw_mode;  /* Optional override; zero uses the caller's mode. */
@@ -74,8 +74,8 @@ typedef struct {
 /* the one shader program + its uniform handles */
 typedef struct {
     GLuint prog;
-    GLint uMVP, uUseTex, uColor, uUnlit, uAlpha, uSoft, uSpec, uAmbient, uDiffuse,
-          uLight,   /* sun direction in the CURRENT object's model space */
+    GLint uMVP, uModel, uUseTex, uColor, uUnlit, uAlpha, uSoft, uSpec, uAmbient, uDiffuse,
+          uLight,   /* sun direction in world space */
           uVColor,  /* 0..1 strength of per-vertex prelight (world geometry only) */
           uDecal,   /* 1 = texture is an alpha-masked decal over uColor paint */
           uVista,                   /* >0.5: alpha-blended backdrop pass */
@@ -87,7 +87,7 @@ typedef struct {
           uEmissiveTex,             /* >0.5: texture-backed unlit RGB/alpha
                                        (authored sky and point-light sprites) */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
-          uCamPos,  /* camera in the current object's model space */
+          uCamPos,  /* camera in world space */
           uEnv,     /* environment-reflection amount (cars only) */
           uUVCheck, /* 1 = show the diagnostic UV-coordinate visualization
                        instead of lighting/texture (toggle lives in the
@@ -123,6 +123,11 @@ void free_headlight_shadows(HeadlightShadows *s);
 void render_headlights(const RProg *r, const float model[16], const float anchors[4][4],
                        int high, float pitch, float range, float gain);
 
+/* Select the material for a proven rear lens. Texture presence must not
+ * disable emission. Brake lamps work independently of night running lights. */
+void render_tail_lamp(const RProg *r,GLuint texture,int running,int braking,
+                      int boost,float gain);
+
 /* world-space sun direction (night scene key light) */
 #define N2_SUN_X 0.4f
 #define N2_SUN_Y 0.7f
@@ -137,6 +142,10 @@ void mat_car(const float *pos, float heading, const float *up, float rideh, floa
 void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +Z */
 
 /* ---- GPU objects ---- */
+/* Shading transform only; uMVP still supplies clip-space placement. NULL
+ * selects world geometry. Models must be rigid or uniformly scaled (mirrors
+ * allowed), as supplied by mat_car and the wheel/brake hub transforms. */
+void render_model(const RProg *r,const float model[16]);
 RProg    render_program(void);          /* compile+link the shader, fetch uniforms */
 GpuMesh *upload_scene(N2Scene *s);      /* VBO/NBO/IBO per mesh, normals computed */
 void free_scene_gpu(GpuMesh *gm, int count);

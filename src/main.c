@@ -73,6 +73,7 @@ DbgState g_dbg = {
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
     .tex_detail = 16.0f,   /* clamped to the GL maximum once the context exists */
+    .vehicle_quality = 1,
     .paint_override = 0, .paint = { 0.68f, 0.09f, 0.08f },
     .show_body = 1, .show_glass = 1, .show_lights = 1, .show_tires = 1,
     .show_misc = 1, .show_track = 1,
@@ -149,6 +150,30 @@ static float light_variant_gain(int value) {
     if (value <= 0) return 1.0f;
     int variant = (value - 1) % 100;
     return 1.0f + 0.025f*fminf((float)variant,8.0f);
+}
+
+static void ai_wheel_matrices(const VehicleWheelConfig *wheel,float scale,
+                              float angle,float steer,const PhysRideState *ride,
+                              float out[4][16],float brake[4][16]) {
+    float c=cosf(angle),sn=sinf(angle),sc=cosf(steer),ss=sinf(steer);
+    float half[2]={wheel->front_track*.5f,wheel->rear_track*.5f};
+    float axle[2]={wheel->front_axle,wheel->rear_axle};
+    for(int k=0;k<4;k++) {
+        int a=k/2;float side=(k&1)?-1.0f:1.0f,sy=scale*side;
+        float wz=wheel->ride_y+(ride?ride->compression[k]:0);
+        float M[16]={scale*c,0,-scale*sn,0, 0,sy,0,0,
+                     scale*sn,0,scale*c,0,
+                     axle[a],half[a]*side,wz,1};
+        float B[16]={scale,0,0,0, 0,sy,0,0, 0,0,scale,0,
+                     axle[a],half[a]*side,wz,1};
+        if(k<2) {
+            M[0]=scale*c*sc;M[1]=scale*c*ss;
+            M[4]=-sy*ss;M[5]=sy*sc;
+            M[8]=scale*sn*sc;M[9]=scale*sn*ss;
+            B[0]=scale*sc;B[1]=scale*ss;B[4]=-sy*ss;B[5]=sy*sc;
+        }
+        memcpy(out[k],M,sizeof M);memcpy(brake[k],B,sizeof B);
+    }
 }
 
 /* Read-only contact audit for the four wheels exactly where the renderer puts
@@ -337,6 +362,7 @@ typedef struct {
     float bb[6], bloom[4][4];
     N2CarProfile profile; N2CarConfig config;
     VehicleWheelConfig wheel;
+    N2PhysicsAttr physics; int has_physics;
     uint32_t tex_keys[128]; GLuint textures[128];
     char alpha[128], mode[128]; int ntextures;
 } CarSwitchCandidate;
@@ -354,6 +380,18 @@ static void car_switch_release(CarSwitchCandidate *candidate) {
     memset(candidate, 0, sizeof *candidate);
 }
 
+/* The roaming car keeps its original textures when the player switches cars.
+ * Shared GL handles survive the first switch; later player-only maps do not. */
+static void car_texture_map_clear(GLuint *textures, int count,
+                                  const GLuint *keep, int nkeep) {
+    for (int i = 0; i < count; i++) {
+        int retained = 0;
+        for (int j = 0; j < nkeep; j++)
+            if (textures[i] == keep[j]) { retained = 1; break; }
+        if (textures[i] && !retained) glDeleteTextures(1, &textures[i]);
+    }
+}
+
 static int prepare_car_switch(CarSwitchCandidate *candidate,
                               const char *dataroot, const char *name) {
     memset(candidate, 0, sizeof *candidate);
@@ -365,10 +403,17 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
     candidate->nkeys = candidate->texdata
         ? n2_car_tex_keys(candidate->texdata, candidate->texlen,
                           candidate->keys, 512) : 0;
+    candidate->globaldata=load_global_car_data(dataroot,&candidate->globallen);
+    candidate->globaltpk=candidate->globaldata
+        ? n2_tpk_open(candidate->globaldata,candidate->globallen) : (N2Tpk){0};
+    if(candidate->globaldata)
+        candidate->nkeys+=n2_tpk_keys(candidate->globaldata,candidate->globaltpk,
+                                      candidate->keys+candidate->nkeys,512-candidate->nkeys);
     candidate->config.body_kit = 0;
     if (!candidate->data || candidate->len <= 0 ||
-        n2_load_car(candidate->data, candidate->len, &candidate->scene,
-                    candidate->keys, candidate->nkeys, &candidate->config) <= 0 ||
+        n2_load_car_colored(candidate->data, candidate->len, &candidate->scene,
+                    candidate->keys, candidate->nkeys, &candidate->config,
+                    candidate->texdata && candidate->texlen==0) <= 0 ||
         !car_body_metrics(&candidate->scene, candidate->bb, candidate->bloom)) {
         car_switch_release(candidate); return 0;
     }
@@ -382,11 +427,10 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
                    WHEEL_SEED_TRACKF, n2_car_brake_radius(candidate->data, 0,
                    candidate->len), &candidate->profile);
     int from_global = 0;
-    candidate->globaldata=load_global_car_data(dataroot,&candidate->globallen);
-    candidate->globaltpk=candidate->globaldata
-        ? n2_tpk_open(candidate->globaldata,candidate->globallen) : (N2Tpk){0};
     candidate->wheel = wheel_config_for(name, &candidate->profile,
         candidate->globaldata, candidate->globallen, &from_global);
+    candidate->has_physics=n2_global_physics_attr(candidate->globaldata,
+        candidate->globallen,name,&candidate->physics);
     (void)from_global;
     for (int i = 0; i < candidate->nmesh; i++) {
         uint32_t key = candidate->scene.meshes[i].texkey;
@@ -399,9 +443,7 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
         N2Tex tex = {0};
         int loaded=candidate->texdata && n2_load_car_tex_by_key(
             candidate->texdata,candidate->texlen,key,&tex);
-        int mount=candidate->scene.meshes[i].car_mount;
-        if(!loaded && candidate->globaldata &&
-           (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE))
+        if(!loaded && candidate->globaldata)
             loaded=n2_tpk_decode(candidate->globaldata,candidate->globallen,
                                  candidate->globaltpk,key,&tex);
         if (!loaded) {
@@ -421,6 +463,24 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
     return 1;
+}
+
+static void load_traffic_visuals(const char *dataroot, char names[][64], int count,
+                                 CarSwitchCandidate *visual, GpuMesh *wheels,
+                                 int nvisual, const char *kind) {
+    for(int k=0;k<nvisual && count;k++) {
+        const char *name=names[k*count/nvisual];
+        if(!prepare_car_switch(&visual[k],dataroot,name))continue;
+        if(visual[k].stock_wheel>=0 &&
+           visual[k].scene.meshes[visual[k].stock_wheel].vcol)
+            wheels[k]=make_wheel(visual[k].profile.wheel_r,
+                fmaxf(0.04f,0.5f*visual[k].profile.wheel_w));
+        printf("free-roam %s visual %d: %s (%d meshes)\n",kind,k,name,visual[k].nmesh);
+        free(visual[k].data);visual[k].data=NULL;
+        free(visual[k].texdata);visual[k].texdata=NULL;
+        free(visual[k].globaltpk.blk);visual[k].globaltpk.blk=NULL;
+        free(visual[k].globaldata);visual[k].globaldata=NULL;
+    }
 }
 
 static int car_body_metrics(const N2Scene *car, float bb[6], float bloom[4][4]) {
@@ -457,13 +517,22 @@ static float car_body_floor(const N2Scene *car, float fallback) {
     return lo < 1e29f ? lo : fallback;
 }
 
+static float car_chase_distance(const float bb[6], float requested) {
+    /* Match the vertical field of view used by mat_persp(0.9): a bus must not
+       put the camera inside its body while ordinary cars retain the 6 m view. */
+    float x=(bb[3]-bb[0])*0.5f,y=(bb[4]-bb[1])*0.5f,z=(bb[5]-bb[2])*0.5f;
+    float fit=sqrtf(x*x+y*y+z*z)/tanf(0.45f);
+    return fmaxf(requested,fit);
+}
+
 static int prepare_body_kit(BodyKitCandidate *kit,
         const unsigned char *data,long len,const uint32_t *keys,int nkeys,
         const N2CarConfig *config,const unsigned char *texdata,long texlen,
         const N2Scene *active,const uint32_t *cached,int ncached,const char *dataroot) {
     memset(kit,0,sizeof *kit);kit->stock_wheel=-1;
     if(!data || len<=0 || ncached<0 || ncached>128)return 0;
-    if(n2_load_car(data,len,&kit->scene,keys,nkeys,config)<=0)goto failed;
+    if(n2_load_car_colored(data,len,&kit->scene,keys,nkeys,config,
+                           texdata && texlen==0)<=0)goto failed;
     if(!n2_mod_assemble(dataroot,data,len,config,&kit->scene))goto failed;
     int selected=config->body_kit==0;
     for(int p=0;p<N2_PART_COUNT;p++)if(config->parts[p])selected=1;
@@ -908,8 +977,6 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
                        const float vel[2], float old_heading,
                        const VehicleWheelConfig *wc, PhysRideSupport *sup,
                        WGroundHit hit[4], WGroundHit cand[4], int verdict[4]) {
-    float fx = cosf(heading), fy = sinf(heading);
-    float lx = -fy, ly = fx;                     /* +y = left, matching ax/ay */
     float ax[4] = { wc->front_axle, wc->front_axle, wc->rear_axle, wc->rear_axle };
     float ay[4] = { wc->front_track*0.5f, -wc->front_track*0.5f,
                     wc->rear_track *0.5f, -wc->rear_track *0.5f };
@@ -917,22 +984,13 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
        tunnel through a floor between two samples. Never a recovery reach. */
     float down = g_ride_ready ? phys_ride_reach_down(&g_ride, 1.0f/60.0f)
                               : PHYS_RIDE_REACH_DOWN;
-    int n = 0;
+    memcpy(sup->ax,ax,sizeof ax);memcpy(sup->ay,ay,sizeof ay);
+    int n=world_ride_gather(sc,pos,heading,vel,old_heading,
+                            g_ride_ready?&g_ride:NULL,sup,hit,cand,verdict);
     for (int k = 0; k < 4; k++) {
-        sup->ax[k] = ax[k]; sup->ay[k] = ay[k];
-        float wx = pos[0] + fx*ax[k] + lx*ay[k];
-        float wy = pos[1] + fy*ax[k] + ly*ay[k];
         /* reference = where this wheel's contact sits under the CURRENT body
            pose, so reach is measured from the wheel, not from the car centre */
         float wz = g_ride_ready ? phys_ride_wheel_z(&g_ride, sup, k) : pos[2];
-        int why = WWS_NOCOVER;
-        int cat = world_wheel_support(sc, wx, wy, wz, PHYS_RIDE_REACH_UP, down,
-                                      &hit[k], &cand[k], &why);
-        verdict[k] = why;
-        sup->valid[k] = cat != WSURF_NONE;
-        sup->z[k] = sup->valid[k] ? hit[k].z : wz;
-        sup->vz[k] = sup->valid[k] ? phys_ride_support_vz(hit[k].normal,vel,
-                                    old_heading,heading,ax[k],ay[k],1.0f/60.0f) : 0;
         if (sup->valid[k]) {
             /* how far outside its OWN window this contact was accepted: must
                never be positive, or the selector let in something unreachable */
@@ -941,15 +999,37 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
             if (over > g_ride_maxover) g_ride_maxover = over;
             float d = dz < 0 ? -dz : dz;
             if (d > g_ride_maxdelta) g_ride_maxdelta = d;
-            n++;
         }
-        else if (why == WWS_ABOVE) g_ride_rejhigh++;
-        else if (why == WWS_BELOW) g_ride_rejlow++;
+        else if (verdict[k] == WWS_ABOVE) g_ride_rejhigh++;
+        else if (verdict[k] == WWS_BELOW) g_ride_rejlow++;
         else g_ride_nocover++;
     }
     return n;
 }
-static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
+static PhysVehicle g_vehicle = { 1, 1, 1, 1, 1, 1 };   /* M121: this car */
+static N2PhysicsAttr g_vehicle_source;
+static int g_vehicle_source_valid;
+
+static float source_peak_kw(const N2PhysicsAttr *a,int level) {
+    float peak=0;level=level<0?0:level>3?3:level;
+    for(int i=0;i<9;i++) {
+        float rpm=a->idle_rpm+(a->limiter_rpm-a->idle_rpm)*(float)i/8.0f;
+        float torque=a->torque[i]+(level?a->torque_gain[level][i]:0);
+        float kw=torque*rpm*6.2831853f/60.0f;
+        if(kw>peak)peak=kw;
+    }
+    return peak;
+}
+
+static void publish_performance_source(const N2PhysicsAttr *a) {
+    g_dbg.perf_source_available=a!=NULL;
+    if(!a)return;
+    for(int level=0;level<4;level++) {
+        g_dbg.perf_peak_kw[level]=source_peak_kw(a,level);
+        g_dbg.perf_final_drive[level]=a->gearbox[level].final_drive;
+        g_dbg.perf_gears[level]=a->gearbox[level].gear_count;
+    }
+}
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
 
@@ -1699,12 +1779,14 @@ int main(int argc, char **argv) {
          --spawn start|X,Y  developer override for the automatic authored spawn
          --resident-sync  diagnostic control: prepare replacements synchronously
          --ai-drive-audit PREFIX  input-only sprint route audit; requires --event
+         --follow-roam-ai  follow the first free-roam AI's simulated body and wheels
          --resident-realtime  pace resident/AI drive audits at approximately 60 Hz
          --heading DEG    requested --world2 heading; fixed car heading for --shot evidence
          --shot-yaw DEG   fixed horizontal camera yaw for --shot (overrides --heading)
          --shot-pitch DEG fixed camera elevation for --shot (positive = above)
          --shot-empty     hide world batches for isolated vehicle captures
          --chase D,H      chase-camera distance/height in metres (e.g. 9,1.8)
+         --vehicle-quality low|medium|high  paint/glass detail and reflections
          --devui          open the ImGui developer menu at launch (make debug)
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
@@ -1750,6 +1832,7 @@ int main(int argc, char **argv) {
     const char *daudit = NULL;  /* --drive-audit PREFIX (M88): scripted interactive drive */
     const char *raudit = NULL;  /* --race-audit PREFIX (M89): menu -> Enter -> countdown -> race */
     const char *ai_drive_audit = NULL; /* input-only route follower; reuses RA evidence */
+    int follow_roam_ai = 0; /* ride along with the first simulated traffic car */
     N2Path ai_drive_path = {0}; AiDrive ai_drive = {0}; int ai_audit_complete = 0;
     int facecensus = 0;  /* --face-census (M131): wall-face vertical span histogram */
     int slaudit = 0;   /* --startline-audit (M91): every route waypoint x every ROAD layer */
@@ -1826,6 +1909,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vinyl") && i+1 < argc) vinyl_want = argv[++i];
         else if (!strcmp(argv[i], "--texture-detail") && i+1 < argc)
             g_dbg.tex_detail = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--vehicle-quality")) {
+            if(i+1>=argc){fprintf(stderr,"--vehicle-quality expects low, medium or high\n");return 2;}
+            const char *q=argv[++i];
+            if(!strcmp(q,"low"))g_dbg.vehicle_quality=0;
+            else if(!strcmp(q,"medium"))g_dbg.vehicle_quality=1;
+            else if(!strcmp(q,"high"))g_dbg.vehicle_quality=2;
+            else {fprintf(stderr,"--vehicle-quality expects low, medium or high\n");return 2;}
+        }
         else if (!strcmp(argv[i], "--daylight")) daylight = 1;
         else if (!strcmp(argv[i], "--sky") && i+1 < argc) {
             const char *s = argv[++i];
@@ -1918,6 +2009,7 @@ int main(int argc, char **argv) {
             }
             ai_drive_audit = argv[++i];
         }
+        else if (!strcmp(argv[i], "--follow-roam-ai")) follow_roam_ai = 1;
             else if (!strcmp(argv[i], "--face-census")) facecensus = 1;
         else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
@@ -2075,6 +2167,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--resident-audit requires one STREAM bundle\n");
         return 2;
     }
+    if (follow_roam_ai && (!world2 || want_event_id || sshot || poseshot ||
+                           world2_heading_set || raudit || daudit || ai_drive_audit)) {
+        fprintf(stderr,"--follow-roam-ai requires free roam in one STREAM bundle, "
+                       "without another drive controller or --heading\n");
+        return 2;
+    }
     if (resident_audit && want_event_id) {
         fprintf(stderr, "--resident-audit is free-roam only; --event is not supported\n");
         return 2;
@@ -2181,6 +2279,7 @@ int main(int argc, char **argv) {
     if (vcmpA) {   /* M121: same fixed input trace, two cars, flat ROAD. GL-free. */
         const char *nmv[2] = { vcmpA, vcmpB };
         PhysVehicle pv[2];
+        long pgl=0;unsigned char *pg=load_global_car_data(dataroot,&pgl);
         printf("MILESTONE: 121  vehicle comparison on flat ROAD (identical inputs)\n");
         for (int c = 0; c < 2; c++) {
             char gp2[1024]; snprintf(gp2, sizeof gp2, "%s/CARS/%s/GEOMETRY.BIN", dataroot, nmv[c]);
@@ -2192,16 +2291,31 @@ int main(int argc, char **argv) {
                 N2CarProfile cp; memset(&cp, 0, sizeof cp);
                 n2_car_profile(&cs, nmv[c], WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                                WHEEL_SEED_TRACKF, n2_car_brake_radius(gd2, 0, gl2), &cp);
-                VehicleWheelConfig wc = wheel_config_for(nmv[c], &cp, NULL, 0, &dmy);
+                VehicleWheelConfig wc = wheel_config_for(nmv[c], &cp, pg, pgl, &dmy);
                 float bl = cp.body[1]-cp.body[0], bw = cp.body[3]-cp.body[2],
                       bh = cp.body[5]-cp.body[4];
-                pv[c] = phys_vehicle_from_geometry(bl, bw, bh,
-                          wc.front_axle - wc.rear_axle, wc.front_track, cp.wheel_w);
+                N2PhysicsAttr pa;
+                int sourced=n2_global_physics_attr(pg,pgl,nmv[c],&pa);
+                pv[c] = sourced
+                    ? phys_vehicle_from_source(&pa,0,0,bh,wc.front_axle-wc.rear_axle,
+                                               wc.front_track,cp.wheel_w)
+                    : phys_vehicle_from_geometry(bl,bw,bh,wc.front_axle-wc.rear_axle,
+                                                 wc.front_track,cp.wheel_w);
                 printf("  %-10s body %.3f x %.3f x %.3f  wb %.3f track %.3f tyre %.3f\n",
                        nmv[c], bl, bw, bh, wc.front_axle - wc.rear_axle,
                        wc.front_track, cp.wheel_w);
-                printf("             factors accel %.4f brake %.4f steer %.4f lat %.4f\n",
-                       pv[c].accel, pv[c].brake, pv[c].steer, pv[c].lat);
+                printf("             factors accel %.4f brake %.4f steer %.4f lat %.4f "
+                       "pitch %.4f roll %.4f\n", pv[c].accel, pv[c].brake,
+                       pv[c].steer, pv[c].lat, pv[c].pitch_load, pv[c].roll_load);
+                printf("             source %s\n",sourced?"GLOBALB powertrain":"geometry fallback");
+                if(sourced) {
+                    printf("             power kW stock/L1/L2/L3");
+                    for(int level=0;level<4;level++)printf(" %.1f",source_peak_kw(&pa,level));
+                    printf("; gearbox");
+                    for(int level=0;level<4;level++)printf(" %d/%.3f",
+                        pa.gearbox[level].gear_count,pa.gearbox[level].final_drive);
+                    putchar('\n');
+                }
             }
             for (int k = 0; k < cs.count; k++) { free(cs.meshes[k].verts);
                 free(cs.meshes[k].idx); free(cs.meshes[k].vcol); }
@@ -2232,13 +2346,16 @@ int main(int argc, char **argv) {
             printf("  %-10s %10.3f %10.2f %12.2f %12.2f %10.5f\n", nmv[c],
                    t100 < 0 ? -1.0f : t100/60.0f, top, rad, yaw*57.29578f, slide);
         }
+        free(pg);
         printf("\n");
         return 0;
     }
-    if (fleetc) {   /* M121: measured geometry of every drivable car, GL-free, exit */
+    if (fleetc) {   /* M121: geometry and stock source coverage, GL-free, exit */
         enum { FC_MAXCARS = 128 };
         static char cl[FC_MAXCARS][64]; int sel2 = 0;
         int nc = res_list_cars(dataroot, cl, FC_MAXCARS, "", &sel2);
+        long pgl=0;unsigned char *pg=load_global_car_data(dataroot,&pgl);
+        int physics_records=0;
         printf("MILESTONE: 121  fleet geometry census  (%d cars)\n", nc);
         printf("  %-14s %7s %7s %7s %9s %7s %7s %8s %8s\n", "car", "len", "wid", "hgt",
                "volume", "wheelR", "wheelW", "axleWB", "trackF");
@@ -2257,8 +2374,10 @@ int main(int argc, char **argv) {
                                WHEEL_SEED_TRACKF, n2_car_brake_radius(gd2, 0, gl2), &cp);
                 float L = cp.body[1]-cp.body[0], W = cp.body[3]-cp.body[2],
                       H = cp.body[5]-cp.body[4];
-                VehicleWheelConfig wc = wheel_config_for(cl[i], &cp, NULL, 0, &sel2);
+                VehicleWheelConfig wc = wheel_config_for(cl[i], &cp, pg, pgl, &sel2);
                 float wb = wc.front_axle - wc.rear_axle;
+                N2PhysicsAttr pa;
+                physics_records += n2_global_physics_attr(pg,pgl,cl[i],&pa);
                 printf("  %-14s %7.3f %7.3f %7.3f %9.3f %7.3f %7.3f %8.3f %8.3f\n",
                        cl[i], L, W, H, L*W*H, cp.wheel_r, cp.wheel_w, wb, wc.front_track);
                 vol[n] = L*W*H; wbv[n] = wb; trk[n] = wc.front_track; twd[n] = cp.wheel_w; n++;
@@ -2277,6 +2396,8 @@ int main(int argc, char **argv) {
                        nmz[k], a[k][n/2], a[k][0], a[k][n-1], n);
             }
         }
+        printf("  GLOBALB powertrain/upgrade records %d/%d\n",physics_records,nc);
+        free(pg);
         return 0;
     }
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
@@ -3902,8 +4023,7 @@ int main(int argc, char **argv) {
     N2Scene car={0}; int ncar = 0; GpuMesh *cgm = NULL;
     int stock_wheel = -1;   /* representative of the complete stock wheel tier */
     float wheelT[4][16];                         /* 4 wheel placements (car-local) */
-    float wheelTAI[4][16];                       /* same, minus the player's steer (AI cars) */
-    float brakeT[4][16], brakeTAI[4][16];          /* hub travel/steer, no tyre spin */
+    float brakeT[4][16];                         /* hub travel/steer, no tyre spin */
     GpuMesh wheelmesh; int have_wheel = 0;       /* procedural tyre, built after GL init */
     for (int k=0;k<4;k++){ float I[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(wheelT[k],I,sizeof(I)); }
     float carbb[6] = {0,0,0,0,0,0};              /* body AABB min/max, for wheel placement */
@@ -3922,6 +4042,9 @@ int main(int argc, char **argv) {
     float heading0 = world2 && world2_heading_set
                    ? world2_heading_deg * 3.14159265f / 180.0f : 0.0f;
     if (cdata) {
+        long globlen=0; unsigned char *globdata=load_global_car_data(dataroot,&globlen);
+        N2Tpk globaltpk = globdata ? n2_tpk_open(globdata, globlen) : (N2Tpk){0};
+        if(globdata)nck+=n2_tpk_keys(globdata,globaltpk,ckeys+nck,512-nck);
         nkit_ids = n2_car_variant_numbers(cdata, clen, 1, kit_ids,
                                           (int)(sizeof kit_ids / sizeof kit_ids[0]));
         /* KIT00 is the stock anchor and is implicit even when the archive only
@@ -3934,7 +4057,8 @@ int main(int argc, char **argv) {
         printf("car kits: ");
         for (int q = 0; q < nkit_ids; q++) printf("KIT%02d%s", kit_ids[q], q+1<nkit_ids?" ":"");
         puts("");
-        ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
+        ncar = n2_load_car_colored(cdata, clen, &car, ckeys, nck, &carcfg,
+                                   ctdata && ctlen==0);
         /* Wheels are modelled once at the origin (the SolidObject transform is
            identity for every part — verified), so a lone wheel mesh renders
            buried in the body. Place it at 4 arch positions derived from the body
@@ -3965,29 +4089,36 @@ int main(int argc, char **argv) {
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
-        long globlen=0;
-        unsigned char *globdata=load_global_car_data(dataroot,&globlen);
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
-        /* M121: this car's handling comes from its own measurements -- body AABB,
-           GLOBALB axle line and the tyre mesh -- normalised against the fleet
-           medians, never from a hand-tuned per-car handling table. */
+        /* Source powertrain and steering plus measured geometry for lateral grip
+           and load transfer; missing records use the full geometry fallback. */
         {
             float bl = carbb[3]-carbb[0], bw = carbb[4]-carbb[1], bh = carbb[5]-carbb[2];
             float wb = g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle;
-            g_vehicle = phys_vehicle_from_geometry(bl, bw, bh, wb,
-                                                   g_dbg.wheel.front_track, carprof.wheel_w);
+            N2PhysicsAttr pa;
+            int physics_from_global=n2_global_physics_attr(globdata,globlen,carname,&pa);
+            g_vehicle_source_valid=physics_from_global;
+            if(physics_from_global)g_vehicle_source=pa;
+            publish_performance_source(physics_from_global?&g_vehicle_source:NULL);
+            g_vehicle = physics_from_global
+                ? phys_vehicle_from_source(&pa,0,0,bh,wb,g_dbg.wheel.front_track,carprof.wheel_w)
+                : phys_vehicle_from_geometry(bl,bw,bh,wb,g_dbg.wheel.front_track,carprof.wheel_w);
             printf("vehicle profile %-12s body %.3f x %.3f x %.3f = %.3f m3  wb %.3f  "
                    "track %.3f  tyre %.3f\n", carname, bl, bw, bh, bl*bw*bh, wb,
                    g_dbg.wheel.front_track, carprof.wheel_w);
-            printf("  fleet-normalised  volume %.4f  wheelbase %.4f  track %.4f  tyre %.4f\n",
+            printf("  geometry ratios   volume %.4f  wheelbase %.4f  track %.4f  tyre %.4f\n",
                    (bl*bw*bh)/PHYS_FLEET_VOLUME, wb/PHYS_FLEET_WHEELBASE,
                    g_dbg.wheel.front_track/PHYS_FLEET_TRACK, carprof.wheel_w/PHYS_FLEET_TYREW);
-            printf("  active factors    accel %.4f  brake %.4f  steer %.4f  lat %.4f\n",
-                   g_vehicle.accel, g_vehicle.brake, g_vehicle.steer, g_vehicle.lat);
+            printf("  active factors    accel %.4f  brake %.4f  steer %.4f  lat %.4f  "
+                   "pitch %.4f  roll %.4f\n", g_vehicle.accel, g_vehicle.brake,
+                   g_vehicle.steer, g_vehicle.lat,
+                   g_vehicle.pitch_load, g_vehicle.roll_load);
+            printf("  physics source    %s\n",
+                   physics_from_global?"GLOBALB powertrain record":"geometry fallback");
         }
         printf("wheel stance %-12s axle F%+.3f R%+.3f (wb %.3f)  track F%.3f R%.3f  ride %+.3f  [%s]\n",
                carprof.name, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
@@ -4002,7 +4133,6 @@ int main(int argc, char **argv) {
                carprof.hub_z, carprof.ride, carprof.wheelbase, carprof.track_f,
                carprof.clearance);
         wheelmesh = make_wheel(wR, wHW); have_wheel = 1;
-        N2Tpk globaltpk = globdata ? n2_tpk_open(globdata, globlen) : (N2Tpk){0};
         /* decode + upload each distinct texture actually bound by a mesh */
         for (int i = 0; i < ncar; i++) {
             uint32_t tk = car.meshes[i].texkey; if (!tk) continue;
@@ -4010,9 +4140,7 @@ int main(int argc, char **argv) {
             if (seen || nmap >= (int)(sizeof mapkey / sizeof mapkey[0])) continue;
             N2Tex ct;
             int loaded = ctdata && n2_load_car_tex_by_key(ctdata, ctlen, tk, &ct);
-            int mount = car.meshes[i].car_mount;
-            if (!loaded && globdata &&
-                (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE))
+            if (!loaded && globdata)
                 loaded = n2_tpk_decode(globdata, globlen, globaltpk, tk, &ct);
             if (loaded) {
                 mapkey[nmap] = tk; maptex[nmap] = upload_tpk_texture_to_gpu(&ct);
@@ -4084,6 +4212,24 @@ int main(int argc, char **argv) {
     N2Scene opponent_car=car;
     GpuMesh *opponent_cgm=cgm;
     const int opponent_ncar=ncar;
+    const int opponent_stock_wheel=stock_wheel;
+    const N2CarProfile opponent_profile=carprof;
+    const float opponent_floor=car_floor;
+    const VehicleWheelConfig opponent_wheel=g_dbg.wheel;
+    const N2CarConfig opponent_config=carcfg;
+    uint32_t opponent_mapkey[128]; GLuint opponent_maptex[128];
+    char opponent_mapalpha[128], opponent_mapmode[128];
+    const int opponent_nmap=nmap;
+    memcpy(opponent_mapkey,mapkey,(size_t)nmap*sizeof *mapkey);
+    memcpy(opponent_maptex,maptex,(size_t)nmap*sizeof *maptex);
+    memcpy(opponent_mapalpha,mapalpha,(size_t)nmap*sizeof *mapalpha);
+    memcpy(opponent_mapmode,mapmode,(size_t)nmap*sizeof *mapmode);
+    int opponent_map_separate=0;
+    GpuMesh opponent_wheelmesh={0};
+    if(opponent_stock_wheel>=0 && opponent_car.meshes[opponent_stock_wheel].vcol)
+        opponent_wheelmesh=make_wheel(opponent_profile.wheel_r,
+                                      fmaxf(0.04f,0.5f*opponent_profile.wheel_w));
+    float opponent_bloom[4][4];memcpy(opponent_bloom,bloomc,sizeof opponent_bloom);
     g_dbg.body_kit_ids=kit_ids;g_dbg.body_kit_count=nkit_ids;
     static N2PartMenu modification[N2_PART_COUNT];
     if(cdata)n2_mod_catalog(dataroot,cdata,clen,&car,modification);
@@ -4340,8 +4486,42 @@ int main(int argc, char **argv) {
     }
     char carlist[MAXCARS][64]; int selcar = 0;
     int ncars = res_list_cars(dataroot, carlist, MAXCARS, carname, &selcar);
+    /* Empty local texture packs identify the shipped low-detail traffic fleet.
+       Pick across its sorted roster so four roaming cars do not all share the
+       player's model. Each visual is loaded through the normal car path. */
+    char traffic_names[MAXCARS][64]={{0}}, racer_names[MAXCARS][64]={{0}};
+    int ntraffic_names=0, nracer_names=0;
+    for(int i=0;i<ncars;i++) {
+        char path[1024];
+        snprintf(path,sizeof path,"%s/CARS/%s/TEXTURES.BIN",dataroot,carlist[i]);
+        FILE *f=fopen(path,"rb");
+        if(!f)continue;
+        int empty=fseek(f,0,SEEK_END)==0 && ftell(f)==0;
+        fclose(f);
+        if(!empty && !strcmp(carlist[i],carname))continue;
+        char (*names)[64]=empty?traffic_names:racer_names;
+        int *n=empty?&ntraffic_names:&nracer_names;
+        int at=(*n)++;
+        while(at>0 && strcmp(carlist[i],names[at-1])<0) {
+            memcpy(names[at],names[at-1],sizeof names[0]);
+            at--;
+        }
+        snprintf(names[at],sizeof names[0],"%s",carlist[i]);
+    }
     char circlist[MAXCIRC][256]; int selcirc = 0;
     int ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
+    AiRoadNet roam_roads={0};
+    if(world2)ai_roads_load(&roam_roads,troot);
+    CarSwitchCandidate traffic[N_OPENWORLD_AI]={0};
+    GpuMesh traffic_wheelmesh[N_OPENWORLD_AI]={0};
+    int traffic_loaded=world2 && roam_roads.n;
+    if(traffic_loaded) {
+        load_traffic_visuals(dataroot,traffic_names,ntraffic_names,
+                             traffic,traffic_wheelmesh,N_AI,"traffic");
+        load_traffic_visuals(dataroot,racer_names,nracer_names,
+                             traffic+N_AI,traffic_wheelmesh+N_AI,
+                             N_OPENWORLD_AI-N_AI,"racer");
+    }
     /* honour an explicit --circuit only when it belongs to THIS region's own
        catalog; a foreign one is ignored rather than flinging the car into
        another bundle (M89). */
@@ -4378,13 +4558,51 @@ int main(int argc, char **argv) {
                       printf("RA   [%d]%s %s\n", i, i == selcirc ? "*" : " ", circlist[i]); }
 
     N2Path aipath = {0};
-    AiCar ais[N_AI]; int start_idx = 0;
+    AiCar ais[N_OPENWORLD_AI]={0}; AiTraffic traffic_routes[N_OPENWORLD_AI]={{0}}; int start_idx = 0;
+    AiTrafficWorld traffic_world={.scene=&scene,.obst=(const float (*)[4])obst,
+                                  .obstz=(const float (*)[2])obstz,
+                                  .obstsrc=obstsrc,.nobst=nobst};
+    memcpy(traffic_world.eye,spawn,sizeof spawn);
+    traffic_world.view[0]=cosf(heading0);
+    traffic_world.view[1]=sinf(heading0);
+    for(int k=0;k<N_OPENWORLD_AI;k++) {
+        const CarSwitchCandidate *v=&traffic[k];
+        ais[k].half_length=v->gpu?0.5f*(v->bb[3]-v->bb[0]):2.2f;
+        ais[k].half_width=v->gpu?0.5f*(v->bb[4]-v->bb[1]):1.0f;
+        ais[k].height=v->gpu?v->bb[5]-v->bb[2]:1.6f;
+        const VehicleWheelConfig *wc=v->gpu?&v->wheel:&g_dbg.wheel;
+        for(int w=0;w<4;w++) {
+            ais[k].support.ax[w]=w<2?wc->front_axle:wc->rear_axle;
+            ais[k].support.ay[w]=((w&1)?-.5f:.5f)*(w<2?wc->front_track:wc->rear_track);
+        }
+        float wb=wc->front_axle-wc->rear_axle;
+        ais[k].vehicle=v->has_physics
+            ? phys_vehicle_from_source(&v->physics,0,0,ais[k].height,wb,wc->front_track,v->profile.wheel_w)
+            : phys_vehicle_from_geometry(2*ais[k].half_length,2*ais[k].half_width,
+                ais[k].height,wb,wc->front_track,v->gpu?v->profile.wheel_w:carprof.wheel_w);
+    }
     /* load_circuit also REWRITES spawn/heading0 to the circuit start; a static
        capture must keep the region's own showcase spawn, so skip it entirely. */
-    int nai = (ncirc && !sstatic && !world2) ? load_circuit(dataroot, circlist[selcirc], &scene, &aipath,
-                                   ais, spawn, &heading0, &start_idx, densx, densy) : 0;
-    if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
-                    aipath.n, nai);
+    int ai_race = !world2, nai = 0;
+    if (ncirc && !sstatic)
+        nai = world2 ? load_roaming_circuit(dataroot,circlist[selcirc],&scene,
+                                             &aipath,ais,spawn,&start_idx)
+                     : load_circuit(dataroot,circlist[selcirc],&scene,&aipath,
+                                    ais,spawn,&heading0,&start_idx,densx,densy);
+    if (world2 && !sstatic)
+        nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,spawn,heading0);
+    if (follow_roam_ai && nai>0) {
+        memcpy(spawn,ais[0].pos,sizeof ais[0].pos);
+        heading0=ais[0].head;
+        printf("player follows traffic AI 0 for lane/render inspection\n");
+    }
+    if (nai) {
+        if(ai_race)printf("AI: %d circuit racers with lap system\n",nai);
+        else printf("AI: %d slow traffic, %d roaming racers on authored free-roam paths\n",
+                    nai<N_AI?nai:N_AI,nai>N_AI?nai-N_AI:0);
+    }
+    else if (world2 && !sstatic)
+        printf("AI: no supported free-roam path near this spawn; retrying as the player drives\n");
 
     /* --rail-band (M119): every near-vertical ROAD/TERRAIN face in the region,
        bucketed by height, with what the rail band admits. Static and geometry
@@ -5278,7 +5496,7 @@ int main(int argc, char **argv) {
     float paint[3] = { 0.70f, 0.70f, 0.75f };
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
+    if (ai_race && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -5293,13 +5511,15 @@ int main(int argc, char **argv) {
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
+    float landing_offset=0,landing_velocity=0;
     if (sstatic) {
         /* Documented static view: the ordinary chase pose, placed analytically
            at its converged position so the settle loop has nothing left to ease
            — eye = car - heading*chase_distance, raised by chase_height. */
         carpos[2] = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-        cam[0] = carpos[0] - cosf(heading0)*g_dbg.chase_distance;
-        cam[1] = carpos[1] - sinf(heading0)*g_dbg.chase_distance;
+        float chase=car_chase_distance(carbb,g_dbg.chase_distance);
+        cam[0] = carpos[0] - cosf(heading0)*chase;
+        cam[1] = carpos[1] - sinf(heading0)*chase;
         cam[2] = carpos[2] + g_dbg.chase_height;
     }
     {   /* report the drop the model actually permits, not just the request */
@@ -5587,6 +5807,10 @@ int main(int argc, char **argv) {
                         world_set_mode(&world, MODE_FREEROAM, -1);
                         world.city.race.active = 0;
                         vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                        ai_race=0;
+                        if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
+                            &scene,&aipath,ais,carpos,&start_idx);
+                        nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
                         race_state = 1; racetimer = 0;
                         printf("freeroam: whole %s bundle driveable from (%.3f %.3f %.3f)\n",
                                trackname, carpos[0], carpos[1], carpos[2]);
@@ -5666,7 +5890,9 @@ int main(int argc, char **argv) {
                             }
                             vel[0]=vel[1]=0; speed=0;
                         }
-                        race_state = 0; racetimer = 0;   /* -> 3-2-1 countdown */
+                        nai=ncirc?load_roaming_circuit(dataroot,circlist[selcirc],
+                            &scene,&aipath,ais,carpos,&start_idx):0;
+                        ai_race=1;race_state = 0; racetimer = 0;   /* -> 3-2-1 countdown */
                     }
                 }
             }
@@ -5685,6 +5911,10 @@ int main(int argc, char **argv) {
                 world_set_mode(&world, MODE_FREEROAM, -1);
                 world.city.race.active = 0;
                 vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                ai_race=0;
+                if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
+                    &scene,&aipath,ais,carpos,&start_idx);
+                nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
                 race_state = 1; racetimer = 0; frontend_open = 0;
                 printf("freeroam: whole %s bundle driveable from (%.3f %.3f %.3f)\n",
                        trackname, carpos[0], carpos[1], carpos[2]);
@@ -5728,20 +5958,26 @@ int main(int argc, char **argv) {
                         g_dbg.wheel = candidate.wheel; carWheelR = carprof.wheel_r;
                         float bl = carbb[3]-carbb[0], bw = carbb[4]-carbb[1];
                         float bh = carbb[5]-carbb[2];
-                        g_vehicle = phys_vehicle_from_geometry(bl, bw, bh,
-                            g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
-                            g_dbg.wheel.front_track, carprof.wheel_w);
+                        float wb=g_dbg.wheel.front_axle-g_dbg.wheel.rear_axle;
+                        g_vehicle_source_valid=candidate.has_physics;
+                        if(candidate.has_physics)g_vehicle_source=candidate.physics;
+                        g_dbg.perf_power_level=g_dbg.perf_transmission_level=0;
+                        publish_performance_source(candidate.has_physics?&g_vehicle_source:NULL);
+                        g_vehicle = candidate.has_physics
+                            ? phys_vehicle_from_source(&candidate.physics,0,0,bh,wb,
+                                  g_dbg.wheel.front_track,carprof.wheel_w)
+                            : phys_vehicle_from_geometry(bl,bw,bh,wb,
+                                  g_dbg.wheel.front_track,carprof.wheel_w);
+                        car_texture_map_clear(maptex,nmap,opponent_map_separate
+                            ? NULL : opponent_maptex,opponent_map_separate ? 0 : opponent_nmap);
+                        opponent_map_separate=1;
+                        nmap=0;
                         for (int i = 0; i < candidate.ntextures; i++) {
-                            int slot = -1;
-                            for (int j = 0; j < nmap; j++)
-                                if (mapkey[j] == candidate.tex_keys[i]) { slot = j; break; }
-                            if (slot < 0 && nmap < 128) slot = nmap++;
-                            if (slot >= 0) {
-                                if (maptex[slot]) glDeleteTextures(1, &maptex[slot]);
-                                mapkey[slot] = candidate.tex_keys[i]; maptex[slot] = candidate.textures[i];
-                                mapalpha[slot] = candidate.alpha[i]; mapmode[slot] = candidate.mode[i];
-                                candidate.textures[i] = 0;
-                            }
+                            mapkey[nmap]=candidate.tex_keys[i];
+                            maptex[nmap]=candidate.textures[i];
+                            mapalpha[nmap]=candidate.alpha[i];
+                            mapmode[nmap++]=candidate.mode[i];
+                            candidate.textures[i]=0;
                         }
                         /* The procedural tyre follows the newly measured radius. */
                         if (have_wheel) {
@@ -5830,6 +6066,9 @@ int main(int argc, char **argv) {
                     vmesh = wr->vista_mesh; wmbatch = wr->debug_batches;
                     obst = wr->obstacles; obstz = wr->obstacle_z;
                     obstsrc = wr->obstacle_src; nobst = wr->obstacle_count;
+                    traffic_world.obst=(const float (*)[4])obst;
+                    traffic_world.obstz=(const float (*)[2])obstz;
+                    traffic_world.obstsrc=obstsrc;traffic_world.nobst=nobst;
                     district_light_tex = 0;
                     for (int j = 0; j < ntmap; j++)
                         if (tmapkey[j] == N2_TEX_SFX_FLARE_GLOWA) {
@@ -5856,9 +6095,24 @@ int main(int argc, char **argv) {
                     heading0 = next_heading; heading = next_heading;
                     vel[0] = vel[1] = 0.0f; speed = 0.0f;
                     p_lap = p_prev = 0; g_ride_ready = 0;
-                    nai = 0; free(aipath.xy); aipath.xy = NULL; aipath.n = 0;
                     ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
                     selcirc = 0;
+                    ai_race = 0;
+                    if(ncirc)load_roaming_circuit(dataroot,circlist[0],&scene,
+                                      &aipath,ais,carpos,&start_idx);
+                    memcpy(traffic_world.eye,carpos,sizeof traffic_world.eye);
+                    traffic_world.view[0]=cosf(heading);
+                    traffic_world.view[1]=sinf(heading);
+                    nai = ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+                    if(roam_roads.n && !traffic_loaded) {
+                        load_traffic_visuals(dataroot,traffic_names,ntraffic_names,
+                                             traffic,traffic_wheelmesh,N_AI,"traffic");
+                        load_traffic_visuals(dataroot,racer_names,nracer_names,
+                                             traffic+N_AI,traffic_wheelmesh+N_AI,
+                                             N_OPENWORLD_AI-N_AI,"racer");
+                        traffic_loaded=1;
+                    }
+                    if(!ncirc){free(aipath.xy);aipath.xy=NULL;aipath.n=0;}
                     nsprint = selsprint = 0;
                     { const char *stem = strncmp(trackname, "STREAM", 6)
                                       ? trackname : trackname + 6;
@@ -6082,6 +6336,9 @@ int main(int argc, char **argv) {
                     wmbatch = wr->debug_batches;
                     obst = wr->obstacles; obstz = wr->obstacle_z;
                     obstsrc = wr->obstacle_src; nobst = wr->obstacle_count;
+                    traffic_world.obst=(const float (*)[4])obst;
+                    traffic_world.obstz=(const float (*)[2])obstz;
+                    traffic_world.obstsrc=obstsrc;traffic_world.nobst=nobst;
                     district_light_tex = 0;
                     for (int j = 0; j < ntmap; j++)
                         if (tmapkey[j] == N2_TEX_SFX_FLARE_GLOWA) {
@@ -6552,7 +6809,7 @@ int main(int argc, char **argv) {
               carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
-        else if (shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        else if (ai_race && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -6570,18 +6827,33 @@ int main(int argc, char **argv) {
             heading += da;
         }
         float ground_old[3]={carpos[0],carpos[1],carpos[2]}, ground_oldh=heading;
-        float dmag = 0.0f;
+        float dmag = 0.0f, load_long = 0.0f, load_lat = 0.0f;
         if (!sstatic && !capture_policy.freeze_motion) {
             if (race_auto) dmag = speed / 60.0f;
             else {
+                float oldvx = vel[0], oldvy = vel[1];
+                if(g_vehicle_source_valid)
+                    g_vehicle=phys_vehicle_from_source(&g_vehicle_source,
+                        g_dbg.perf_power_level,g_dbg.perf_transmission_level,
+                        carbb[5]-carbb[2],
+                        g_dbg.wheel.front_axle-g_dbg.wheel.rear_axle,
+                        g_dbg.wheel.front_track,carprof.wheel_w);
                 /* A short top-speed headroom gives the visual trigger a real
                    response while preserving the existing tune after the step. */
                 float saved_top = g_phys_tune.top_kmh;
                 if (nitro_active) g_phys_tune.top_kmh = saved_top * 1.18f;
-                dmag = phys_car_step(carpos, vel, &heading, &speed,
+                dmag = phys_drive_step(carpos, vel, &heading, &speed,
                                      throttle, steer_filtered, handbrake,
-                                     &surf_now, &g_vehicle);
+                                     &surf_now, &g_vehicle,g_ride_ready?&g_ride:NULL);
                 g_phys_tune.top_kmh = saved_top;
+                /* vel is metres/tick. Convert its one-tick change to m/s^2,
+                   then project it into the final car frame for suspension
+                   pitch/roll load transfer. */
+                float dvx=(vel[0]-oldvx)*PHYS_TICKRATE*PHYS_TICKRATE;
+                float dvy=(vel[1]-oldvy)*PHYS_TICKRATE*PHYS_TICKRATE;
+                float ch=cosf(heading), sh=sinf(heading);
+                load_long=dvx*ch+dvy*sh;
+                load_lat=-dvx*sh+dvy*ch;
             }
         }
         if (g_ride_ready && race_state==1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
@@ -6706,6 +6978,7 @@ int main(int argc, char **argv) {
                                     &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
             float zprev = g_ride.z;
+            phys_ride_apply_load(&g_ride, &g_vehicle, load_long, load_lat, 1.0f/60.0f);
             phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
             carpos[2] = g_ride.z;
             float dzf = g_ride.z - zprev; if (dzf < 0) dzf = -dzf;
@@ -7007,11 +7280,7 @@ int main(int argc, char **argv) {
         if (!sstatic && !capture_policy.freeze_motion && !race_auto && g_ride_ready) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
-            float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
-            float sp=sinf(g_ride.pitch), sr=sinf(g_ride.roll);
-            float u[3] = { -fx*sp - lx*sr, -fy*sp - ly*sr, 1.0f };
-            float ul=sqrtf(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
-            if (ul>1e-6f){ car_up[0]=u[0]/ul; car_up[1]=u[1]/ul; car_up[2]=u[2]/ul; }
+            phys_ride_up(&g_ride,heading,car_up);
             chassis_patch_ok = g_ride.contact_mask == 0xF;
         } else
         { float gn[3] = {car_up[0],car_up[1],car_up[2]};
@@ -7102,11 +7371,63 @@ int main(int argc, char **argv) {
             if (smoke[i].life <= 0) smoke[i]=smoke[--smoken], i--;
         }
 
-        /* AI opponents: each steers toward its next racing-line waypoint */
-        for (int k = 0; race_state == 1 && k < nai; k++)
-            ai_step(&ais[k], k, &aipath, &scene, start_idx,
-                    p_lap*aipath.n + p_prev);
-        if (race_state == 1 && aipath.n > 1) {   /* same lap logic for the player */
+        if(!ai_race) {
+            const float *eye=g_dbg.freecam?fc:cam;
+            memcpy(traffic_world.eye,eye,sizeof traffic_world.eye);
+            traffic_world.view[0]=g_dbg.freecam?cosf(fyaw):carpos[0]-cam[0];
+            traffic_world.view[1]=g_dbg.freecam?sinf(fyaw):carpos[1]-cam[1];
+            if(hypotf(traffic_world.view[0],traffic_world.view[1])<0.5f) {
+                traffic_world.view[0]=cosf(heading);
+                traffic_world.view[1]=sinf(heading);
+            }
+        }
+        /* Take all speed decisions from the same frame, then apply driver
+           inputs through the shared tyre/suspension/collision simulation. */
+        if(!ai_race && race_state==1)
+            for(int k=0;k<nai;k++)ai_traffic_follow(ais,traffic_routes,&roam_roads,k,nai);
+        for (int k = 0; race_state == 1 && k < nai; k++) {
+            if (ai_race && aipath.n > 1)
+                ai_step(&ais[k], k, &aipath, &scene, start_idx,
+                        p_lap*aipath.n + p_prev);
+            else if (!ai_race && traffic_routes[k].present) {
+                float oldx=ais[k].pos[0],oldy=ais[k].pos[1];
+                ai_traffic_step(&ais[k],&traffic_routes[k],&roam_roads,&traffic_world);
+                AiCar contacts[N_OPENWORLD_AI];int nc=0;
+                for(int j=0;j<nai;j++)if(j!=k && traffic_routes[j].present)contacts[nc++]=ais[j];
+                float hl=ais[k].half_length,hw=ais[k].half_width;
+                float bb[6]={-hl,-hw,0,hl,hw,ais[k].height};
+                phys_car_contacts(ais[k].pos,ais[k].vel,ais[k].spd,ais[k].head,bb,contacts,nc);
+                ais[k].spd=ais[k].vel[0]*cosf(ais[k].head)+ais[k].vel[1]*sinf(ais[k].head);
+                if(ais[k].target_speed>.02f && ais[k].ride.contact_mask &&
+                   hypotf(ais[k].pos[0]-oldx,ais[k].pos[1]-oldy)<.001f) {
+                    if(++traffic_routes[k].wait_ticks>180) {
+                        traffic_routes[k].to=-1;traffic_routes[k].stop_reason=6;
+                    }
+                } else traffic_routes[k].wait_ticks=0;
+            }
+        }
+        if (!ai_race && race_state == 1 && racetimer % 30 == 0)
+            for (int k=0;k<nai;k++)
+                if(traffic_routes[k].to<0 || (racetimer%120==0 &&
+                   hypotf(ais[k].pos[0]-carpos[0],ais[k].pos[1]-carpos[1])>420.0f)) {
+                    if(traffic_routes[k].present && !ai_traffic_offscreen(
+                       traffic_world.eye,traffic_world.view,ais[k].pos))continue;
+                    traffic_routes[k].present=0;
+                    ai_traffic_respawn(&roam_roads,&traffic_world,ais,traffic_routes,k,carpos,heading);
+                }
+        if (!ai_race && race_state == 1 && racetimer % 120 == 0 && nai<N_OPENWORLD_AI &&
+            ai_traffic_respawn(&roam_roads,&traffic_world,ais,traffic_routes,nai,carpos,heading))nai++;
+        if (follow_roam_ai && !ai_race && race_state == 1 && nai>0 &&
+            traffic_routes[0].present) {
+            memcpy(carpos,ais[0].pos,sizeof ais[0].pos);
+            heading=ais[0].head;speed=ais[0].spd;
+            g_ride=ais[0].ride;g_sup=ais[0].support;g_ride_ready=ais[0].ride_ready;
+            phys_ride_up(&g_ride,heading,car_up);steer_filtered=ais[0].steer;
+            nf[0]=fwd[0]=cosf(heading);nf[1]=fwd[1]=sinf(heading);
+            nr[0]=nf[1];nr[1]=-nf[0];
+            vel[0]=nf[0]*speed;vel[1]=nf[1]*speed;
+        }
+        if (ai_race && race_state == 1 && aipath.n > 1) { /* player lap */
             int prel = (n2_nearest_wp(&aipath, carpos[0], carpos[1]) - start_idx
                         + aipath.n) % aipath.n;
             if (p_prev > aipath.n*3/4 && prel < aipath.n/4) p_lap++;
@@ -7116,7 +7437,7 @@ int main(int argc, char **argv) {
         /* race state machine: countdown -> racing -> finished */
         racetimer++;
         if (race_state == 0 && racetimer >= COUNTDOWN) { race_state = 1; racetimer = 0; }
-        if (race_state == 1 && p_lap >= LAP_TARGET) {
+        if (ai_race && race_state == 1 && p_lap >= LAP_TARGET) {
             int ahead = 0, pp = p_lap*aipath.n + p_prev;
             for (int k = 0; k < nai; k++)
                 if (ais[k].lap*aipath.n + ais[k].prevrel > pp) ahead++;
@@ -7124,8 +7445,13 @@ int main(int argc, char **argv) {
             race_state = 2;
         }
 
-        /* car-to-car collision: push overlapping cars apart (circle test) */
-        { float thud = phys_car_contacts(carpos, vel, speed, ais, nai);
+        /* Cars stopped in view remain solid until they leave the camera. */
+        { AiCar contacts[N_OPENWORLD_AI];int ncontacts=0;
+          for(int k=0;k<nai;k++)
+              if((ai_race || traffic_routes[k].present) &&
+                 !(follow_roam_ai && !ai_race && k==0))contacts[ncontacts++]=ais[k];
+          float thud = phys_car_contacts(carpos, vel, speed, heading,
+                                        carbb, contacts, ncontacts);
           if (thud > g_hit) g_hit = thud; }
 
         /* M132-R capture freeze: latch the position production placed at the
@@ -7147,20 +7473,21 @@ int main(int argc, char **argv) {
         }
         /* camera: menu = slow orbit around the parked car; else chase cam */
         float want[3];
+        float chase=car_chase_distance(carbb,g_dbg.chase_distance);
         if (race_state == 3) {              /* orbit the parked car, framing the city around it */
             menuspin += 0.006f;
             want[0] = carpos[0] + cosf(menuspin)*16.0f;
             want[1] = carpos[1] + sinf(menuspin)*16.0f;
             want[2] = carpos[2] + 8.0f;
         } else if (shotyaw < 1e8f) {        /* --shot-yaw/pitch: fixed camera */
-            float horizontal = g_dbg.chase_distance * cosf(shotpitch);
+            float horizontal = chase * cosf(shotpitch);
             want[0] = carpos[0]-cosf(shotyaw)*horizontal;
             want[1] = carpos[1]-sinf(shotyaw)*horizontal;
             want[2] = carpos[2]+g_dbg.chase_height +
-                      sinf(shotpitch)*g_dbg.chase_distance;
+                      sinf(shotpitch)*chase;
         } else {                            /* chase: behind + above, tunable */
-            want[0] = carpos[0]-fwd[0]*g_dbg.chase_distance;
-            want[1] = carpos[1]-fwd[1]*g_dbg.chase_distance;
+            want[0] = carpos[0]-fwd[0]*chase;
+            want[1] = carpos[1]-fwd[1]*chase;
             want[2] = carpos[2]+g_dbg.chase_height;
         }
         /* exponential smoothing (fixed timestep): actual pos AND look-target each
@@ -7209,12 +7536,22 @@ int main(int argc, char **argv) {
                    ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
         if (zfar < 500.0f) zfar = 500.0f;
         mat_persp(0.9f, (float)W/H, znear, zfar, P);
-        mat_lookat(cam, look, V);
+        phys_landing_camera(&landing_offset,&landing_velocity,
+            g_ride_ready && !sstatic && !capture_policy.freeze_motion && !race_auto
+            ? g_ride.impact:0,1.0f/60.0f);
+        float view_cam[3]={cam[0],cam[1],cam[2]};
+        if(!g_dbg.freecam && race_state==1 && !sstatic && !capture_policy.freeze_motion) {
+            view_cam[2]+=landing_offset;
+            look[2]-=landing_offset;
+        }
+        mat_lookat(view_cam, look, V);
         mat_mul(P, V, MVP);
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
         glUniform1f(uUnlit, 0.0f); glUniform1f(uSpec, 0.0f);   /* world is matte */
         glUniform1f(uAmbient, g_dbg.ambient); glUniform1f(uDiffuse, g_dbg.diffuse);
-        glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* track = world space */
+        glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
+        glUniform3fv(rp.uCamPos,1,view_cam);
+        render_model(&rp,NULL);
 
         float lamp_model[16];
         mat_car(carpos,heading,car_up,car_body_ride,lamp_model);
@@ -7222,7 +7559,7 @@ int main(int argc, char **argv) {
         render_headlights(&rp,lamp_model,bloomc,long_beam,
                           long_beam?g_dbg.high_beam_pitch:g_dbg.low_beam_pitch,
                           long_beam?g_dbg.high_beam_range:g_dbg.low_beam_range,
-                          ncar && race_state!=3 && g_dbg.show_lights && headlights_on
+                          ncar && !follow_roam_ai && race_state!=3 && g_dbg.show_lights && headlights_on
                           ? g_dbg.headlight_gain*light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT]) : 0.0f);
         g_dbg.headlight_shadow_draws = g_dbg.headlight_shadows
             ? render_headlight_shadows(&rp,&headlight_shadows,wbatch,nbatch) : 0;
@@ -7571,8 +7908,7 @@ int main(int argc, char **argv) {
             glDepthMask(GL_TRUE);
             glUniform1f(uUnlit, 0.0f);
         }
-        glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
-                                            prelight; their attrib-3 default is black) */
+        glUniform1f(rp.uVColor, 0.0f);   /* per-car prelight is set by each car mesh */
         } else if (g_dbg.show_track) {   /* --- F3 debug view: prelight/normals/wire --- */
             /* draw every world batch with the debug shader (no distance cull),
                then restore the main program for the car/glow/HUD passes below. */
@@ -7582,7 +7918,7 @@ int main(int argc, char **argv) {
             ndrawn += nbatch; g_dbg.drawn += nbatch; wbdrawn += nbatch;
         }
 
-        glUniform1f(rp.uHeadGain,0.0f); /* subsequent geometry uses car-local coordinates */
+        glUniform1f(rp.uHeadGain,0.0f); /* player beams illuminate the world; vehicle receivers are separate work */
 
         /* Active race road closures. The navigation/collision barriers existed
            since Phase 71 but production rendered nothing at their coordinates;
@@ -7633,6 +7969,8 @@ int main(int argc, char **argv) {
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
             glUniform3f(uColor, 0.0f, 0.0f, 0.0f); glUniform1f(uAlpha, 0.5f);
             for (int c=0; c<=nai; c++) {
+                if((c==0 && follow_roam_ai) ||
+                   (c>0 && !ai_race && !traffic_routes[c-1].present))continue;
                 float *cp = c==0 ? carpos : ais[c-1].pos;
                 float gz2 = world_ground_z(&scene, cp[0], cp[1], cp[2]) + 0.03f;
                 /* footprint from the loaded body AABB rather than a fixed
@@ -7655,7 +7993,7 @@ int main(int argc, char **argv) {
                the edges, and sized from the same body AABB the shadow uses so
                it tracks the car's real footprint. Drawn after the shadow so it
                lights the ground the shadow just darkened. */
-            if (g_dbg.neon_on && g_dbg.neon_str > 0.001f) {
+            if (!follow_roam_ai && g_dbg.neon_on && g_dbg.neon_str > 0.001f) {
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
                 glDepthMask(GL_FALSE);
                 glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
@@ -7715,15 +8053,7 @@ int main(int argc, char **argv) {
             mat_car(carpos, heading, car_up, car_ride, WheelModel);
             mat_mul(MVP, WheelModel, MVPwheel);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
-            /* normals stay model-space, so counter-rotate the sun into car
-               space — otherwise the lit side turns with the car's heading.
-               The camera goes into model space the same way, for the
-               shader's reflection vector. */
-            { float ch=cosf(heading), sh=sinf(heading);
-              float dx=cam[0]-bodypos[0], dy=cam[1]-bodypos[1], dz=cam[2]-(bodypos[2]+ride);
-              glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
-                                 -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
-              glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
+            render_model(&rp,Model);
             /* rebuild the 4 wheel placements from the (live-tunable) fractions;
                the discs spin with road speed (visible via the radial rim tex) */
             { static float wang = 0.0f;
@@ -7775,14 +8105,11 @@ int main(int argc, char **argv) {
                      its axle, steering with the front hub without spinning the
                      caliper. Independent disc rotation needs a material/part split. */
                   float B[16]={s,0,0,0, 0,sy,0,0, 0,0,s,0, wp[k][0],wp[k][1],wzk,1};
-                  memcpy(brakeTAI[k],B,sizeof B); brakeTAI[k][14]=wz;
                   if (k<2) { B[0]=s*sc; B[1]=s*ss; B[4]=-sy*ss; B[5]=sy*sc; }
                   memcpy(brakeT[k],B,sizeof B);
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
                                wp[k][0],wp[k][1],wzk,1};
-                  { float Mai[16]; memcpy(Mai,M,sizeof Mai); Mai[14]=wz;
-                    memcpy(wheelTAI[k],Mai,sizeof Mai); }  /* AI: no player travel */
                   if (k < 2) {   /* front axle: rotZ(steer) * that, per column */
                       float m2[16]={ s*c*sc,  s*c*ss,  -s*sn, 0,
                                      -sy*ss,  sy*sc,    0,    0,
@@ -7791,7 +8118,20 @@ int main(int argc, char **argv) {
                       memcpy(M, m2, sizeof M);
                   }
                   memcpy(wheelT[k],M,sizeof(M)); } }
+            float wheelWorld[4][16],brakeWorld[4][16];
+            for(int k=0;k<4;k++) {
+                mat_mul(WheelModel,wheelT[k],wheelWorld[k]);
+                mat_mul(WheelModel,brakeT[k],brakeWorld[k]);
+            }
             float *pnt = g_dbg.paint_override ? g_dbg.paint : paint;
+            int brake_lights=(throttle < -0.1f && speed > 0.01f) || handbrake;
+            int tail_on=g_dbg.night_mode || brake_lights;
+            int vq=g_dbg.vehicle_quality<0?0:g_dbg.vehicle_quality>2?2:g_dbg.vehicle_quality;
+            static const float qspec[3]={.55f,1.0f,1.10f};
+            static const float qenv[3]={.20f,1.0f,1.35f};
+            static const float qcoat[3]={.15f,1.0f,1.25f};
+            static const float qglass[3]={.45f,1.0f,1.15f};
+            static const float qgloss[3]={10.0f,20.0f,32.0f};
             /* uUnlit/uSoft were left ON (1.0) by the shadow/headlight-glow/
                skid-mark billboards drawn just above (all three intentionally
                use the unlit flat-colour shader path for those FX quads) —
@@ -7805,7 +8145,7 @@ int main(int argc, char **argv) {
             if (g_dbg.car_cull) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
             /* per-mesh: each part wears its own bound texture (body/wheel/...);
                parts with no in-TPK texture get a sensible flat colour by class. */
-            for (int i = 0; i < ncar; i++) {
+            for (int i = 0; !follow_roam_ai && i < ncar; i++) {
                 int c = cgm[i].cat;
                 int mount = car.meshes[i].car_mount;
                 if (mount == N2_MOUNT_WHEEL) continue; /* complete tier drawn below */
@@ -7816,11 +8156,12 @@ int main(int argc, char **argv) {
                     (is_light       && !g_dbg.show_lights)|| (c==N2_CAR_TIRE && !g_dbg.show_tires) ||
                     ((c==N2_CAR_MISC||c==N2_CAR_MECH||c==N2_CAR_INTERIOR) && !g_dbg.show_misc)) continue;
                 if (c == N2_CAR_GLASS) continue;   /* translucent: blended pass below */
+                glUniform1f(rp.uVColor, car.meshes[i].vcol ? 2.0f : 0.0f);
                 /* A tail light is an assembly, not a lamp: only its lens slices
                    emit. The trim, chrome and clear cover around them are the
                    same object and used to glow with it. */
                 int emitting = c==N2_CAR_LIGHT ? n2_headlight_emitter(&car,i) && headlights_on
-                                              : c==N2_CAR_BRAKELIGHT && g_dbg.night_mode
+                                              : c==N2_CAR_BRAKELIGHT && tail_on
                                                 && n2_car_tail_lens(&car,i);
                 /* A lamp that is ON stays on the LIT path. uUnlit returns a
                    flat uColor and throws away the specular, the fresnel rim
@@ -7842,20 +8183,21 @@ int main(int argc, char **argv) {
                    reflection: it has to read as a dark space you look INTO.
                    A small non-zero spec keeps it on the shader's car lighting
                    branch (uSpec>0 gates it) rather than the world's. */
-                float specv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?g_dbg.body_spec
+                float specv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?g_dbg.body_spec*qspec[vq]
                             : is_light?0.45f : c==N2_CAR_MECH?0.05f
                             : c==N2_CAR_INTERIOR?0.04f : 0.0f;
                 if (cgm[i].trim) specv *= 0.4f;
                 glUniform1f(uSpec, specv);
-                glUniform1f(uGloss, cgm[i].trim ? 6.0f : 20.0f);
+                glUniform1f(uGloss,cgm[i].trim?6.0f:
+                    (c==N2_CAR_BODY||c==N2_CAR_MISC)?qgloss[vq]:20.0f);
                 /* clear coat only over painted panels: moulded trim, lenses,
                    tyres and the engine bay have no lacquer on them. */
                 glUniform1f(rp.uClearcoat,
                             (c==N2_CAR_BODY||c==N2_CAR_MISC) && !cgm[i].trim
-                            ? g_dbg.body_clearcoat : 0.0f);
+                            ? fminf(1.0f,g_dbg.body_clearcoat*qcoat[vq]) : 0.0f);
                 /* Chrome lamp housings reflect; mechanical and interior parts
                    keep their unpainted material response. */
-                glUniform1f(rp.uEnv, (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
+                glUniform1f(rp.uEnv, (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env*qenv[vq]
                                    : is_light?0.55f
                                    : (c==N2_CAR_MECH||c==N2_CAR_INTERIOR)?0.0f : 0.15f);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
@@ -7888,6 +8230,9 @@ int main(int argc, char **argv) {
                         glUniform3f(uColor,level,level,level);
                     glUniform1f(uUseTex,tex?1.0f:0.0f);
                     if(tex)glBindTexture(GL_TEXTURE_2D,tex);
+                } else if (c == N2_CAR_BRAKELIGHT && n2_car_tail_lens(&car,i)) {
+                    render_tail_lamp(&rp,tex,g_dbg.night_mode,brake_lights,nitro_active,
+                                     light_variant_gain(carcfg.parts[N2_PART_TAILLIGHT]));
                 } else if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
@@ -7931,33 +8276,6 @@ int main(int argc, char **argv) {
                            Known plastic and metal were handled above. */
                         glUniform3f(uColor,.055f,.055f,.058f);
                     }
-                    else if (c == N2_CAR_BRAKELIGHT) {
-                        /* lens glows hot while braking (S, rolling forward) or the
-                           handbrake (SPACE) is pulled; otherwise a dim red running
-                           light (still emissive, so it reads as "on" at night). */
-                        int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
-                        float gain = light_variant_gain(carcfg.parts[N2_PART_TAILLIGHT]);
-                        int hot = braking || nitro_active;
-                        float er = (hot ? 1.00f : 0.62f) * gain;
-                        float eg = (hot ? 0.16f : 0.05f) * gain;
-                        float eb = (hot ? 0.10f : 0.04f) * gain;
-                        if (emitting) {
-                            /* Moulded red plastic as the BASE, filament on top.
-                               The lens has no diffuse map in the shipped data --
-                               its authored keys resolve in no texture archive --
-                               so shading is the only thing that can tell a lens
-                               from a disc, and the base is what carries it. */
-                            glUniform3f(uColor, 0.17f, 0.020f, 0.016f);
-                            glUniform3f(rp.uEmissive, er, eg, eb);
-                            /* A lit lamp needs SOME highlight to show its
-                               curvature, but the shared car values (spec 0.45,
-                               env 0.55) add a warm near-white over the whole
-                               lens and turn a red lamp pink. Enough to catch
-                               the edge, not enough to bleach it. */
-                            glUniform1f(uSpec, 0.26f);
-                            glUniform1f(rp.uEnv, 0.16f);
-                        } else glUniform3f(uColor, er, eg, eb);
-                    }
                     else if (c == N2_CAR_TIRE)       glUniform3f(uColor, 0.05f, 0.05f, 0.06f);
                     else if (c == N2_CAR_MECH)       glUniform3f(uColor, 0.05f, 0.05f, 0.05f);  /* unpainted metal/plastic */
                     else if (c == N2_CAR_INTERIOR)   glUniform3f(uColor, 0.055f, 0.052f, 0.050f);  /* cabin trim */
@@ -7990,9 +8308,11 @@ int main(int argc, char **argv) {
                     for (int k=first;k<first+2;k++) {
                         float MB[16]; mat_mul(MVPwheel,brakeT[k],MB);
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
+                        render_model(&rp,brakeWorld[k]);
                         render_wheel_mesh(&rp, &cgm[i], tex, texmode); g_dbg.drawn++;
                     }
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                    render_model(&rp,Model);
                     if (g_dbg.car_cull) glEnable(GL_CULL_FACE);
                 } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
 #ifdef DEBUG_UI
@@ -8003,64 +8323,166 @@ int main(int argc, char **argv) {
 #endif
             }
             glUniform1f(uUnlit, 0.0f);
-            glUniform3f(rp.uEmissive, 0.0f, 0.0f, 0.0f); /* no lamp emission on AI/glass/wheels */
+            glUniform3f(rp.uEmissive, 0.0f, 0.0f, 0.0f);
+            glUniform1f(rp.uVColor, 0.0f);
             /* Finish opaque opponents before player glass/blended wheels: the
                latter do not write depth and cannot occlude a later opaque draw. */
             glDisable(GL_CULL_FACE);   /* opponents were already two-sided */
-            glUniform1f(uUseTex, 0.0f);
-            glUniform1f(rp.uDecal, 0.0f); /* no player badge/vinyl state on AI tyres */
-            glUniform1f(uSpec, 0.3f);     /* AIs: flat colour but glossy paint */
-            glUniform1f(rp.uEnv, 0.35f);
-            glUniform1f(rp.uClearcoat, 0.0f);
-            /* Preserve the gloss previously inherited after the glass pass. */
-            if (g_dbg.show_glass) glUniform1f(uGloss, 90.0f);
-            /* AI opponents — same body, each in its own colour */
+            /* AI rivals use the same parsed material categories as the player.
+               Their geometry is the initial car snapshot, so its stance and
+               wheel tier must stay paired with it after an in-process switch. */
             for (int k = 0; k < nai; k++) {
+                if(!ai_race && !traffic_routes[k].present)continue;
+                const CarSwitchCandidate *tv=!ai_race && traffic[k].gpu?&traffic[k]:NULL;
+                const N2Scene *draw_scene=tv?&tv->scene:&opponent_car;
+                GpuMesh *draw_gpu=tv?tv->gpu:opponent_cgm;
+                int draw_nmesh=tv?tv->nmesh:opponent_ncar;
+                int draw_stock_wheel=tv?tv->stock_wheel:opponent_stock_wheel;
+                N2CarProfile draw_profile=tv?tv->profile:opponent_profile;
+                float draw_floor=tv?car_body_floor(draw_scene,tv->bb[2]):opponent_floor;
+                VehicleWheelConfig draw_wheel=tv?tv->wheel:opponent_wheel;
+                N2CarConfig draw_config=tv?tv->config:opponent_config;
+                const uint32_t *draw_mapkey=tv?tv->tex_keys:opponent_mapkey;
+                const GLuint *draw_maptex=tv?tv->textures:opponent_maptex;
+                const char *draw_mapalpha=tv?tv->alpha:opponent_mapalpha;
+                const char *draw_mapmode=tv?tv->mode:opponent_mapmode;
+                int draw_nmap=tv?tv->ntextures:opponent_nmap;
+                GpuMesh *draw_wheelmesh=tv?&traffic_wheelmesh[k]:&opponent_wheelmesh;
                 float aup[3], aiz=ais[k].pos[2];
                 float AIModel[16], AIMVPc[16], AIWheelModel[16], AIWheelMVP[16];
-                world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
-                mat_car(ais[k].pos, ais[k].head, aup, ride, AIModel);   /* AI: same per-car ride */
+                float aiWheelT[4][16],aiBrakeT[4][16],aiWheelWorld[4][16],aiBrakeWorld[4][16];
+                float oscale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
+                float owheelride=draw_profile.ride*oscale;
+                float obodyride=body_ride_height(owheelride,draw_floor,g_dbg.body_drop);
+                float oradius=fmaxf(draw_profile.wheel_r*oscale,0.05f);
+                ais[k].wheel_angle=fmodf(ais[k].wheel_angle+ais[k].spd/oradius,6.2831853f);
+                float steer=ais[k].steer*.5f;
+                ai_wheel_matrices(&draw_wheel,oscale,ais[k].wheel_angle,steer,
+                                  ais[k].ride_ready?&ais[k].ride:NULL,
+                                  aiWheelT,aiBrakeT);
+                if(ais[k].ride_ready)phys_ride_up(&ais[k].ride,ais[k].head,aup);
+                else world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
+                mat_car(ais[k].pos, ais[k].head, aup, obodyride, AIModel);
                 mat_mul(MVP, AIModel, AIMVPc);
-                mat_car(ais[k].pos, ais[k].head, aup, car_ride, AIWheelModel);
+                mat_car(ais[k].pos, ais[k].head, aup, owheelride, AIWheelModel);
                 mat_mul(MVP, AIWheelModel, AIWheelMVP);
+                for(int w=0;w<4;w++){
+                    mat_mul(AIWheelModel,aiWheelT[w],aiWheelWorld[w]);
+                    mat_mul(AIWheelModel,aiBrakeT[w],aiBrakeWorld[w]);
+                }
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, AIMVPc);
-                { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
-                  float dx=cam[0]-ais[k].pos[0], dy=cam[1]-ais[k].pos[1];
-                  float dz=cam[2]-(ais[k].pos[2]+ride);
-                  glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
-                                     -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
-                  glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
-                glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
-                for (int i = 0; i < opponent_ncar; i++) {
-                    int mount=opponent_car.meshes[i].car_mount;
-                    if (mount==N2_MOUNT_WHEEL) continue;
+                render_model(&rp,AIModel);
+                for (int i = 0; i < draw_nmesh; i++) {
+                    int c=draw_gpu[i].cat;
+                    int mount=draw_scene->meshes[i].car_mount;
+                    int islight=c==N2_CAR_LIGHT||c==N2_CAR_BRAKELIGHT;
+                    if(mount==N2_MOUNT_WHEEL||c==N2_CAR_GLASS||
+                       n2_lamp_clear_cover(c,draw_gpu[i].car_material))continue;
+                    if((c==N2_CAR_BODY&&!g_dbg.show_body)||(islight&&!g_dbg.show_lights)||
+                       (c==N2_CAR_TIRE&&!g_dbg.show_tires)||
+                       ((c==N2_CAR_MISC||c==N2_CAR_MECH||c==N2_CAR_INTERIOR)&&!g_dbg.show_misc))continue;
+                    glUniform1f(rp.uVColor,draw_scene->meshes[i].vcol?2.0f:0.0f);
+                    GLuint tex=0;int hasalpha=0,texmode=N2_DRAW_OPAQUE;
+                    for(int j=0;j<draw_nmap;j++)if(draw_mapkey[j]==draw_gpu[i].texkey){
+                        tex=draw_maptex[j];hasalpha=draw_mapalpha[j];texmode=draw_mapmode[j];break;
+                    }
+                    uint32_t material=draw_gpu[i].car_material;
+                    int dark=n2_car_dark_trim(material),metal=n2_car_metal_trim(material);
+                    int heademit=c==N2_CAR_LIGHT&&g_dbg.night_mode&&
+                                 n2_headlight_emitter(draw_scene,i);
+                    glUniform1f(uUnlit,0.0f);glUniform1f(rp.uDecal,0.0f);
+                    glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]);glUniform1f(uGloss,qgloss[vq]);
+                    glUniform1f(rp.uEnv,.15f);glUniform1f(rp.uClearcoat,0.0f);
+                    glUniform3f(rp.uEmissive,0,0,0);
+                    glUniform3fv(uColor,1,ais[k].col);
+                    if((dark||metal)&&(c==N2_CAR_BODY||c==N2_CAR_MISC||(islight&&!heademit))){
+                        int chrome=material==N2_MAT_CHROME||material==N2_MAT_MAGCHROME;
+                        glUniform3f(uColor,dark?.030f:.38f,dark?.032f:.40f,dark?.035f:.42f);
+                        glUniform1f(uSpec,dark?.06f:chrome?.80f:.35f);
+                        glUniform1f(uGloss,dark?12.0f:chrome?90.0f:25.0f);
+                        glUniform1f(rp.uEnv,dark?.04f:chrome?.85f:.30f);
+                    }else if(c==N2_CAR_LIGHT){
+                        float gain=light_variant_gain(draw_config.parts[N2_PART_HEADLIGHT]);
+                        glUniform3f(uColor,heademit?.10f:.65f,heademit?.098f:.65f,heademit?.09f:.65f);
+                        if(heademit)glUniform3f(rp.uEmissive,gain,gain*.94f,gain*.82f);
+                        glUniform1f(rp.uEnv,.55f);
+                    }else if(c==N2_CAR_BRAKELIGHT&&n2_car_tail_lens(draw_scene,i)){
+                        render_tail_lamp(&rp,tex,g_dbg.night_mode,ais[k].braking,0,
+                            light_variant_gain(draw_config.parts[N2_PART_TAILLIGHT]));
+                    }else if(c==N2_CAR_BODY||c==N2_CAR_MISC){
+                        glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]*(draw_gpu[i].trim?.4f:1.0f));
+                        glUniform1f(uGloss,draw_gpu[i].trim?6.0f:qgloss[vq]);
+                        glUniform1f(rp.uEnv,.50f*g_dbg.body_env*qenv[vq]);
+                        glUniform1f(rp.uClearcoat,draw_gpu[i].trim?0.0f:
+                            fminf(1.0f,g_dbg.body_clearcoat*qcoat[vq]));
+                        if(tex&&hasalpha)glUniform1f(rp.uDecal,1.0f);
+                    }else if(!tex){
+                        if(c==N2_CAR_TIRE)glUniform3f(uColor,.05f,.05f,.06f);
+                        else if(c==N2_CAR_MECH)glUniform3f(uColor,.05f,.05f,.05f);
+                        else if(c==N2_CAR_INTERIOR)glUniform3f(uColor,.055f,.052f,.050f);
+                        else glUniform3f(uColor,.055f,.055f,.058f);
+                    }
+                    glUniform1f(uUseTex,tex?1.0f:0.0f);if(tex)glBindTexture(GL_TEXTURE_2D,tex);
                     if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
                         int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
-                        for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,brakeTAI[w],MB);
-                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&opponent_cgm[i]);g_dbg.drawn++;}
+                        for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,aiBrakeT[w],MB);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
+                            render_model(&rp,aiBrakeWorld[w]);
+                            render_wheel_mesh(&rp,&draw_gpu[i],tex,texmode);g_dbg.drawn++;}
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
-                    } else { draw_gpumesh(&opponent_cgm[i]); g_dbg.drawn++; }
+                        render_model(&rp,AIModel);
+                    } else { draw_gpumesh(&draw_gpu[i]); g_dbg.drawn++; }
                 }
-                if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
-                    glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
-                    for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(AIWheelMVP, wheelTAI[w], MVPw);
-                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&wheelmesh); }
-                    g_dbg.drawn += 4;
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
-                    glUniform1f(uUseTex, 0.0f);
-                    glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
+                if(g_dbg.show_tires){
+                    glUniform1f(rp.uVColor,0.0f);
+                    int authored=draw_stock_wheel>=0 &&
+                        !draw_scene->meshes[draw_stock_wheel].vcol;
+                    for(int i=0;authored&&i<draw_nmesh;i++){
+                        if(draw_scene->meshes[i].car_mount!=N2_MOUNT_WHEEL||
+                           draw_scene->meshes[i].tierid!=draw_scene->meshes[draw_stock_wheel].tierid)continue;
+                        GLuint tex=0;int mode=N2_DRAW_OPAQUE;
+                        for(int j=0;j<draw_nmap;j++)if(draw_mapkey[j]==draw_gpu[i].texkey){tex=draw_maptex[j];mode=draw_mapmode[j];break;}
+                        for(int w=0;w<4;w++){float MW[16];mat_mul(AIWheelMVP,aiWheelT[w],MW);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);render_model(&rp,aiWheelWorld[w]);
+                            render_wheel_mesh(&rp,&draw_gpu[i],tex,mode);g_dbg.drawn++;}
+                    }
+                    if(!authored&&have_wheel){
+                        glUniform1f(uUseTex,1.0f);glBindTexture(GL_TEXTURE_2D,texWheel);
+                        for(int w=0;w<4;w++){float MW[16];mat_mul(AIWheelMVP,aiWheelT[w],MW);
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);render_model(&rp,aiWheelWorld[w]);
+                            draw_gpumesh(draw_wheelmesh->vbo?draw_wheelmesh:&wheelmesh);
+                            g_dbg.drawn++;}
+                    }
                 }
+                /* Wheels leave their own transform bound; glass belongs to the body. */
+                glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
+                render_model(&rp,AIModel);
+                if(g_dbg.show_glass||g_dbg.show_lights){
+                    int order[draw_nmesh];int count=render_car_glass_order(draw_scene,AIMVPc,order);
+                    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);glUniform1f(uUseTex,0.0f);glUniform1f(rp.uDecal,0.0f);
+                    glUniform1f(rp.uFresnel,1.0f);glUniform1f(uGloss,90.0f);
+                    for(int q=0;q<count;q++){
+                        int i=order[q],window=draw_gpu[i].cat==N2_CAR_GLASS;
+                        if(window?!g_dbg.show_glass:!g_dbg.show_lights)continue;
+                        glUniform1f(uSpec,window?.85f*qglass[vq]:.70f);
+                        glUniform1f(rp.uEnv,window?.95f*qglass[vq]:.65f);
+                        glUniform1f(uAlpha,window?.46f:g_dbg.headlight_lens_alpha);
+                        if(window)glUniform3f(uColor,.020f,.024f,.032f);else glUniform3f(uColor,.30f,.32f,.34f);
+                        draw_gpumesh(&draw_gpu[i]);g_dbg.drawn++;
+                    }
+                    glUniform1f(uAlpha,1.0f);glUniform1f(rp.uFresnel,0.0f);
+                    glDepthMask(GL_TRUE);glDisable(GL_BLEND);
+                }
+                glUniform3f(rp.uEmissive,0,0,0);
+                glUniform1f(rp.uVColor,0.0f);
             }
             /* Opponents use their own matrices; restore player shader space. */
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
-            { float ch=cosf(heading), sh=sinf(heading);
-              float dx=cam[0]-bodypos[0], dy=cam[1]-bodypos[1], dz=cam[2]-(bodypos[2]+ride);
-              glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
-                                 -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
-              glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
+            render_model(&rp,Model);
             /* Windows and lamp covers share one back-to-front pass. Drawing
                in archive order let a far pane overwrite a nearer pane's tint. */
-            if(ncar>0 && (g_dbg.show_glass || g_dbg.show_lights)) {
+            if(!follow_roam_ai && ncar>0 && (g_dbg.show_glass || g_dbg.show_lights)) {
                 int order[ncar];int count=render_car_glass_order(&car,MVPc,order);
                 glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
                 glDisable(GL_CULL_FACE);glDepthMask(GL_FALSE);
@@ -8071,8 +8493,8 @@ int main(int argc, char **argv) {
                     int i=order[k],window=cgm[i].cat==N2_CAR_GLASS;
                     if(window?!g_dbg.show_glass:!g_dbg.show_lights)continue;
                     glUniform1f(uUnlit,0.0f);
-                    glUniform1f(uSpec,window?.85f:.70f);
-                    glUniform1f(rp.uEnv,window?.95f:.65f);
+                    glUniform1f(uSpec,window?.85f*qglass[vq]:.70f);
+                    glUniform1f(rp.uEnv,window?.95f*qglass[vq]:.65f);
                     glUniform1f(uAlpha,window?.46f:g_dbg.headlight_lens_alpha);
                     if(window)glUniform3f(uColor,.020f,.024f,.032f);
                     else glUniform3f(uColor,.30f,.32f,.34f);
@@ -8102,11 +8524,11 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (g_dbg.show_lights && (g_dbg.night_mode || headlights_on)) {
+            if (!follow_roam_ai && g_dbg.show_lights && (tail_on || headlights_on)) {
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
                 glDepthMask(GL_FALSE);
                 glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-                for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f || (b<2?!headlights_on:!g_dbg.night_mode)) continue;
+                for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f || (b<2?!headlights_on:!tail_on)) continue;
                     float lx=bloomc[b][0], ly=bloomc[b][1], lz=bloomc[b][2];
                     float wx=Model[0]*lx+Model[4]*ly+Model[8]*lz+Model[12];
                     float wy=Model[1]*lx+Model[5]*ly+Model[9]*lz+Model[13];
@@ -8165,7 +8587,8 @@ int main(int argc, char **argv) {
             /* Keep authored wheels and material routing at every speed.
                ponytail: no motion blur until it preserves the selected wheel;
                a generic disc loses its geometry, alpha and rubber materials. */
-            if (have_wheel && g_dbg.show_tires) {
+            if (!follow_roam_ai && have_wheel && g_dbg.show_tires) {
+                glUniform1f(rp.uVColor, 0.0f);
                 glUniform1f(rp.uDecal, 0.0f);
                 /* Draw every material slice of the selected source wheel tier,
                    including slices whose material is INTERIOR rather than TIRE. */
@@ -8174,7 +8597,8 @@ int main(int argc, char **argv) {
                    view; any other brand/style is an explicit modification and
                    must reach the rim-library path below. Previously this branch
                    ran for every style, so F6/ImGui changes were invisible. */
-                if (stock_wheel >= 0 && wheel_brand == 0 && wheel_style == 1) {
+                if (stock_wheel >= 0 && !car.meshes[stock_wheel].vcol &&
+                    wheel_brand == 0 && wheel_style == 1) {
                     for (int i=0;i<ncar;i++) {
                         if (car.meshes[i].car_mount != N2_MOUNT_WHEEL ||
                             car.meshes[i].tierid != car.meshes[stock_wheel].tierid) continue;
@@ -8187,7 +8611,7 @@ int main(int argc, char **argv) {
                         glUniform3f(uColor,0.05f,0.05f,0.06f);
                         if(stex) glBindTexture(GL_TEXTURE_2D,stex);
                         for(int k=0;k<4;k++){float MW[16];mat_mul(MVPwheel,wheelT[k],MW);
-                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);render_wheel_mesh(&rp,&cgm[i],stex,smode);}
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);render_model(&rp,wheelWorld[k]);render_wheel_mesh(&rp,&cgm[i],stex,smode);}
                         g_dbg.drawn+=4;
                     }
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
@@ -8201,7 +8625,8 @@ int main(int argc, char **argv) {
                    (that, not the texture, was the old green cast) and a strong
                    specular adds the chrome highlight over the diffuse.
                    uColor is ignored on the textured path (base = t.rgb). */
-                int geo = nwheelgm > 0;
+                int geo = nwheelgm > 0 && !(stock_wheel>=0 &&
+                    car.meshes[stock_wheel].vcol && wheel_brand==0 && wheel_style==1);
                 if (geo) {
                     /* Wheel archives are complete assemblies: every selected
                        tier in the shipped libraries carries its own TIRE,
@@ -8235,6 +8660,7 @@ int main(int argc, char **argv) {
                                 for (int k=0; k<4; k++) {
                                     float MW[16]; mat_mul(MVPwheel, wheelT[k], MW);
                                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MW);
+                                    render_model(&rp,wheelWorld[k]);
                                     render_wheel_mesh(&rp, &cgm[i], stex, smode);
                                 }
                                 g_dbg.drawn += 4;
@@ -8262,10 +8688,11 @@ int main(int argc, char **argv) {
                     for(int j=0;j<4*nwheelgm;j++) {
                         int k=order[j]/nwheelgm,i=order[j]%nwheelgm;
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[k]);
+                        render_model(&rp,wheelWorld[k]);
                         render_wheel_mesh(&rp,&wheelgm[i],rimtex,rimmode);
                     }
                 } else for(int k=0;k<4;k++) {
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[k]);draw_gpumesh(&wheelmesh);
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[k]);render_model(&rp,wheelWorld[k]);draw_gpumesh(&wheelmesh);
                 }
                 g_dbg.drawn += 4 * (geo ? nwheelgm : 1);
                 glUniform1f(rp.uRimTint, 0.0f);   /* rim paint is rim-only */
@@ -8275,31 +8702,14 @@ int main(int argc, char **argv) {
             glUniform1f(uUseTex, 0.0f);
             glUniform1f(uSpec, 0.3f);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
-            glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* back to world */
+            render_model(&rp,NULL);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
             glUniform3f(rp.uEmissive, 0.0f, 0.0f, 0.0f);   /* lamps-only */
         }
 
-        /* Tail lights for the AI field: red camera-facing glows at each rival's
-           rear at night.
-
-           The PLAYER is deliberately not in this loop. Its own pair is drawn by
-           the per-lens bloom in the car pass above, positioned on the authored
-           lens (bloomc) and tuned against it; drawing it here as well stacked a
-           second 0.9-alpha 1.1 m quad on top and washed the whole rear panel and
-           the ground pink.
-
-           Two rules this pass used to skip, and they are why a red taillight
-           blob sat over the windscreen when you looked at the car head-on:
-             - it is DEPTH-TESTED, so the body occludes its own glow; and
-             - it is culled against each car's own heading, so the halo fades in
-               as the camera comes round the back instead of being lit from every
-               angle. Same facing term as the player's lens bloom: vd points from
-               the camera to the light, and a rear cluster faces the camera only
-               while vd runs with the car's forward axis.
-           Night-gated for the same reason the player's rear bloom is: an
-           additive halo in daylight reads as a bug, not as a lamp. */
-        if (race_state != 3 && nai > 0 && g_dbg.show_lights && g_dbg.night_mode) {
+        /* Rival lamp halos use the decoded model anchors too. Rear lamps also
+           appear while braking in daylight; front lamps remain night-only. */
+        if (race_state != 3 && nai > 0 && g_dbg.show_lights) {
             float lz=sqrtf(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]); if(lz<1e-4f)lz=1;
             float ld[3]={look[0]/lz,look[1]/lz,look[2]/lz};
             float rt[3]={ld[1],-ld[0],0}; float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if(rl<1e-4f)rl=1;
@@ -8308,25 +8718,33 @@ int main(int argc, char **argv) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);   /* over its own lens, but still occluded */
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor, 1.0f, 0.12f, 0.06f);
-            for (int c=1; c<=nai; c++) {
-                float *cp = ais[c-1].pos;
-                float hd = ais[c-1].head;
-                float fx=cosf(hd), fy=sinf(hd), rx=-fy, ry=fx;
-                for (int side=-1; side<=1; side+=2) {
-                    float bx=cp[0]-fx*1.9f+rx*0.6f*side;
-                    float by=cp[1]-fy*1.9f+ry*0.6f*side;
-                    float bz=cp[2]+0.5f;
+            for (int c=0; c<nai; c++) {
+                if(!ai_race && !traffic_routes[c].present)continue;
+                const CarSwitchCandidate *tv=!ai_race && traffic[c].gpu?&traffic[c]:NULL;
+                const float (*lamps)[4]=tv?tv->bloom:opponent_bloom;
+                float ride=tv?tv->profile.ride:opponent_profile.ride;
+                float floor=tv?car_body_floor(&tv->scene,tv->bb[2]):opponent_floor;
+                float aup[3],z=ais[c].pos[2],model[16];
+                if(ais[c].ride_ready)phys_ride_up(&ais[c].ride,ais[c].head,aup);
+                else world_ground_pose(&scene,ais[c].pos[0],ais[c].pos[1],z,&z,aup);
+                float oscale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
+                mat_car(ais[c].pos,ais[c].head,aup,
+                    body_ride_height(ride*oscale,floor,g_dbg.body_drop),model);
+                for (int b=0;b<4;b++) {
+                    if(lamps[b][3]<.5f||(b<2?!g_dbg.night_mode:(!g_dbg.night_mode&&!ais[c].braking)))continue;
+                    float bx=model[0]*lamps[b][0]+model[4]*lamps[b][1]+
+                             model[8]*lamps[b][2]+model[12];
+                    float by=model[1]*lamps[b][0]+model[5]*lamps[b][1]+
+                             model[9]*lamps[b][2]+model[13];
+                    float bz=model[2]*lamps[b][0]+model[6]*lamps[b][1]+
+                             model[10]*lamps[b][2]+model[14];
                     float vd[3]={bx-cam[0], by-cam[1], bz-cam[2]};
                     float vl=sqrtf(vd[0]*vd[0]+vd[1]*vd[1]+vd[2]*vd[2]); if(vl<1e-3f) continue;
                     float hl=sqrtf(vd[0]*vd[0]+vd[1]*vd[1]); if(hl<1e-3f) continue;
-                    float facing=(vd[0]*fx+vd[1]*fy)/hl;   /* rear: camera behind,
-                                                              measured on the ground
-                                                              plane (see above) */
+                    float facing=-(vd[0]*model[0]+vd[1]*model[1])/hl*(b<2?1.0f:-1.0f);
                     if (facing<=0.0f) continue;
-                    /* nudge toward the camera so the halo sits over its lens */
-                    bx-=vd[0]/vl*0.08f; by-=vd[1]/vl*0.08f; bz-=vd[2]/vl*0.08f;
-                    float s=0.8f;
+                    bx-=vd[0]/vl*.33f;by-=vd[1]/vl*.33f;bz-=vd[2]/vl*.33f;
+                    float s=b<2?.5f:.85f;
                     float cxp=bx-(rt[0]+up[0])*s*0.5f,
                           cyp=by-(rt[1]+up[1])*s*0.5f,
                           czp=bz-(rt[2]+up[2])*s*0.5f;
@@ -8335,7 +8753,9 @@ int main(int argc, char **argv) {
                                  cxp,cyp,czp,1};
                     float MV[16]; mat_mul(MVP,M,MV);
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
-                    glUniform1f(uAlpha, 0.7f*facing*facing);
+                    if(b<2)glUniform3f(uColor,.90f,.82f,.55f);
+                    else glUniform3f(uColor,.90f,.08f,.05f);
+                    glUniform1f(uAlpha,(b<2?.55f:.70f)*facing*facing);
                     draw_gpumesh(&quad);
                     g_dbg.drawn++;
                 }
@@ -8457,7 +8877,7 @@ int main(int argc, char **argv) {
            the ImGui panel; the viewport HUD drawing itself is additionally
            gated so debug builds can hide it (same pattern as the menu HUD
            above — plain builds have no ImGui, so they always draw it). */
-        if (nai > 0 && race_state != 3) {
+        if (ai_race && nai > 0 && race_state != 3) {
             int myprog = p_lap*aipath.n + p_prev, ppos_mirror = 1;
             for (int k = 0; k < nai; k++)
                 if (ais[k].lap*aipath.n + ais[k].prevrel > myprog) ppos_mirror++;
@@ -8469,7 +8889,7 @@ int main(int argc, char **argv) {
 #else
         int draw_race_hud = g_devui;
 #endif
-        if (nai > 0 && race_state != 3 && draw_race_hud) {
+        if (ai_race && nai > 0 && race_state != 3 && draw_race_hud) {
             glDisable(GL_DEPTH_TEST);
             glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 0.0f);
             /* rank by monotonic progress = lap*loop + progress-along-loop */
@@ -8557,7 +8977,9 @@ int main(int argc, char **argv) {
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,M); glUniform3f(uColor,r,g,b); draw_gpumesh(&quad); \
                     g_dbg.drawn++; }while(0)
                 for (int i=0;i<aipath.n;i++) MMDOT(aipath.xy[i*2],aipath.xy[i*2+1], 0.004f, 0.4f,0.4f,0.46f);
-                for (int k=0;k<nai;k++) MMDOT(ais[k].pos[0],ais[k].pos[1], 0.010f, ais[k].col[0],ais[k].col[1],ais[k].col[2]);
+                for (int k=0;k<nai;k++)if(ai_race || traffic_routes[k].present)
+                    MMDOT(ais[k].pos[0],ais[k].pos[1], 0.010f,
+                           ais[k].col[0],ais[k].col[1],ais[k].col[2]);
                 MMDOT(carpos[0],carpos[1], 0.013f, 0.95f,0.15f,0.15f);
                 #undef MMDOT
             }
@@ -8659,6 +9081,12 @@ int main(int argc, char **argv) {
             g_dbg.mode_request = 0;
             world_race_stop(&world);
             world_set_mode(&world, g_dbg.want_mode, g_dbg.want_event);
+            if(g_dbg.want_mode==MODE_FREEROAM){
+                ai_race=0;
+                if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
+                    &scene,&aipath,ais,carpos,&start_idx);
+                nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+            }
             g_dbg.gps_n = 0;             /* the old route may cross a new barrier */
         }
         if (g_dbg.race_start_request) {
@@ -8666,7 +9094,12 @@ int main(int argc, char **argv) {
             if (world.city.active_ev >= 0)
                 world_race_start(&world, troot, world.city.active_ev, g_dbg.race_maxlaps_want);
         }
-        if (g_dbg.race_stop_request) { g_dbg.race_stop_request = 0; world_race_stop(&world); }
+        if (g_dbg.race_stop_request) {
+            g_dbg.race_stop_request=0;world_race_stop(&world);ai_race=0;
+            if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
+                &scene,&aipath,ais,carpos,&start_idx);
+            nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+        }
         /* GPS: solve a fresh route whenever the panel asks for a destination */
         {   static int gpath[8192];
             if (g_dbg.gps_request) {
@@ -9489,7 +9922,8 @@ int main(int argc, char **argv) {
                      car_up[0],car_up[1],car_up[2], asinf(f[2])*57.2958f, asinf(lft[2])*57.2958f,
                      acosf(car_up[2]>1?1:car_up[2])*57.2958f); }
             printf("wheels: radius %.3f m, %.0f RPM, steer %+.1f deg, %.0f km/h\n",
-                   g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg, g_dbg.kmh);
+                   g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg,
+                   PHYS_KMH(speed));
             {   float sc = g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f;
                 float rd = carprof.ride * sc;
                 printf("profile %-11s R %.3f%s  ride %.3f  hubZ %+.3f  wheelbase %.2f"
@@ -9498,6 +9932,38 @@ int main(int argc, char **argv) {
                        rd, carprof.hub_z, carprof.wheelbase, carprof.track_f,
                        rd + g_dbg.wheel.ride_y - g_dbg.wheel_radius,
                        rd + carprof.body[4]); }
+            if(!ai_race)for(int k=0;k<nai;k++)
+                printf("roaming AI %d: (%.1f, %.1f, %.1f)  %.0f km/h  travelled %.1f m  path %s (%d)  spawn attempts %u  heading %.2f wait %u  contact %x air %u impact %.2f\n",
+                       k,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],
+                       PHYS_KMH(ais[k].spd),traffic_routes[k].travelled,
+                       traffic_routes[k].to>=0?"active":"stopped",traffic_routes[k].stop_reason,
+                       traffic_routes[k].respawns,ais[k].head,traffic_routes[k].wait_ticks,
+                       ais[k].ride.contact_mask,traffic_routes[k].air_ticks,traffic_routes[k].max_impact);
+            if(!ai_race) {
+                int overlaps=0;float min_gap=1e30f;
+                for(int k=0;k<nai;k++)for(int j=k+1;j<nai;j++)
+                    if(traffic_routes[k].to>=0 && traffic_routes[j].to>=0 &&
+                       phys_ai_overlap(&ais[k],&ais[j]))overlaps++;
+                printf("roaming AI body overlaps: %d\n",overlaps);
+                for(int k=0;k<nai;k++)for(int j=0;j<nai;j++)
+                    if(j!=k && traffic_routes[k].to>=0 && traffic_routes[j].to>=0 &&
+                       fabsf(ais[k].pos[2]-ais[j].pos[2])<2.5f &&
+                       cosf(ais[k].head-ais[j].head)>0.8f) {
+                        float fx=cosf(ais[k].head),fy=sinf(ais[k].head);
+                        float dx=ais[j].pos[0]-ais[k].pos[0];
+                        float dy=ais[j].pos[1]-ais[k].pos[1];
+                        float ahead=dx*fx+dy*fy;
+                        if(ahead>0 && fabsf(dx*fy-dy*fx)<
+                           ais[k].half_width+ais[j].half_width+0.5f) {
+                            float gap=ahead-ais[k].half_length-ais[j].half_length;
+                            if(gap<min_gap)min_gap=gap;
+                        }
+                    }
+                if(min_gap<1e20f)printf("roaming AI closest same-lane bumper gap: %.1f m\n",min_gap);
+            }
+            if(follow_roam_ai && nai>0)
+                printf("player AI follow: %.1f m, lane offset %.2f m\n",
+                       traffic_routes[0].travelled,traffic_routes[0].lane_offset);
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }
@@ -9524,12 +9990,28 @@ int main(int argc, char **argv) {
     dbgui_shutdown();
 #endif
     free_scene_gpu(wheelgm, nwheelgm);
+    if(opponent_wheelmesh.vbo) {
+        glDeleteBuffers(1,&opponent_wheelmesh.vbo);
+        glDeleteBuffers(1,&opponent_wheelmesh.nbo);
+        glDeleteBuffers(1,&opponent_wheelmesh.ibo);
+    }
+    for(int k=0;k<N_OPENWORLD_AI;k++) {
+        if(traffic_wheelmesh[k].vbo) {
+            glDeleteBuffers(1,&traffic_wheelmesh[k].vbo);
+            glDeleteBuffers(1,&traffic_wheelmesh[k].nbo);
+            glDeleteBuffers(1,&traffic_wheelmesh[k].ibo);
+        }
+        car_switch_release(&traffic[k]);
+    }
+    ai_roads_free(&roam_roads);
     n2_free_scene(&wheellib);
     if (rimtex) glDeleteTextures(1, &rimtex);
     free(wldata); free(wtdata);
     if(cgm!=opponent_cgm){free_scene_gpu(cgm,ncar);n2_free_scene(&car);}
     free_scene_gpu(opponent_cgm,opponent_ncar);n2_free_scene(&opponent_car);
     for(int i=0;i<nmap;i++)glDeleteTextures(1,&maptex[i]);
+    if(opponent_map_separate)
+        for(int i=0;i<opponent_nmap;i++)glDeleteTextures(1,&opponent_maptex[i]);
     free(cdata);free(ctdata);
     world_resident_job_cancel(&resident_job); /* join before active-grid/GL teardown */
     world_resident_free(retired_resident);

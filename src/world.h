@@ -6,6 +6,7 @@
 #define OPENUG2_WORLD_H
 
 #include "nfsu2.h"
+#include "physics.h"
 #include "render.h"
 #include "debug.h"   /* ScriptedDef, for world_scripted_defs */
 #include "world_instance.h"
@@ -309,6 +310,12 @@ int world_ground_patch_normal(const N2Scene *s, float x, float y, float heading,
 int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
                         WGroundHit *hit, WGroundHit *cand, int *verdict);
+/* ax/ay are model-derived wheel offsets, filled before gathering. NULL ride
+ * seeds a placement; live vehicles query from each sprung wheel's position. */
+int world_ride_gather(const N2Scene *scene, const float pos[3], float heading,
+                      const float vel[2], float old_heading, const PhysRideState *ride,
+                      PhysRideSupport *support, WGroundHit hit[4],
+                      WGroundHit cand[4], int verdict[4]);
 
 /* Earliest above-to-below crossing of a ROAD/TERRAIN triangle by a segment.
  * Returns a movement fraction [0,1], 1 for no crossing. Both endpoints below

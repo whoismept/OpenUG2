@@ -5,11 +5,11 @@
 #define OPENUG2_PHYSICS_H
 
 #include "nfsu2.h"
-#include "ai.h"
+typedef struct AiCar AiCar;
 
 /* driving constants — car length axis = local X; world +Z up.
  * Real units: world coordinates are metres, physics ticks at 60 Hz, so
- * speeds are metres/tick. Tuned to NFSU2 driving: ~220 km/h top speed,
+ * speeds are metres/tick. Current arcade targets: ~220 km/h top speed,
  * 0-100 km/h in ~4 s, ~100-0 braking in ~3 s, long pull to top speed. */
 #define PHYS_TICKRATE 60.0f
 #define PHYS_MAXSPD   (61.0f/PHYS_TICKRATE)   /* 220 km/h cap (m/tick) */
@@ -22,7 +22,8 @@
 
 /* Live handling tuning (ImGui sliders). accel/brake/turn are multipliers on the
  * constants above (1.0 = stock); top_kmh is a hard forward-speed cap. Defaults
- * reproduce the tuned NFSU2 feel exactly, so phys_selftest still holds. */
+ * reproduce the current model, checked by phys_selftest. This is not the
+ * recovered retail handling solver. */
 typedef struct { float accel, brake, turn, top_kmh; } PhysTune;
 extern PhysTune g_phys_tune;
 
@@ -32,7 +33,7 @@ extern PhysTune g_phys_tune;
  * speed magnitude — the drift signal for skid marks / smoke / screech. */
 /* What the surface under the car does to the arcade model. Multipliers on the
  * constants above, except `drag` and `lat` which REPLACE PHYS_FRICTION and
- * PHYS_GRIP outright. The road profile is exactly the tuned NFSU2 feel, so
+ * PHYS_GRIP outright. The road profile uses the current arcade defaults, so
  * passing it (or NULL) reproduces the previous behaviour bit for bit. */
 typedef struct {
     float accel;    /* thrust multiplier */
@@ -44,28 +45,36 @@ typedef struct {
 extern const PhysSurface PHYS_SURF_ROAD;
 extern const PhysSurface PHYS_SURF_TERRAIN;
 
-/* What the CAR's own measured geometry does to the arcade model, as bounded
- * multipliers on the constants above. Built by phys_vehicle_from_geometry();
+/* Bounded per-car multipliers. Stock cars use their GLOBALB record; measured
+ * geometry supplies a fallback when that source record is absent or invalid.
  * NULL is a neutral car (all 1.0), which is what the self-tests use. */
 typedef struct {
-    float accel;   /* thrust multiplier      (mass proxy: body volume)      */
-    float brake;   /* braking multiplier     (same proxy)                   */
-    float steer;   /* steering authority     (axle wheelbase)               */
+    float accel;   /* thrust multiplier: source torque/mass or geometry     */
+    float brake;   /* braking multiplier: geometry fallback, otherwise 1   */
+    float steer;   /* steering authority: source response or wheelbase      */
     float lat;     /* lateral-retention mult (tyre width, track width)      */
+    float pitch_load; /* longitudinal load transfer (height / wheelbase)     */
+    float roll_load;  /* lateral load transfer      (height / track)         */
 } PhysVehicle;
 
 /* Fleet medians measured over all 44 drivable cars (--fleet-census, M121).
  * They are the normalisation basis, not per-car values. */
-#define PHYS_FLEET_VOLUME   11.8908f   /* m^3, body AABB L*W*H */
-#define PHYS_FLEET_WHEELBASE 2.7896f   /* m, front axle - rear axle */
-#define PHYS_FLEET_TRACK     1.5004f   /* m, front track */
-#define PHYS_FLEET_TYREW     0.2243f   /* m, tyre width */
+#define PHYS_FLEET_VOLUME   13.6194f   /* m^3, body AABB L*W*H */
+#define PHYS_FLEET_HEIGHT    1.5520f   /* m, body AABB height */
+#define PHYS_FLEET_WHEELBASE 2.6608f   /* m, front axle - rear axle */
+#define PHYS_FLEET_TRACK     1.5100f   /* m, front track */
+#define PHYS_FLEET_TYREW     0.2253f   /* m, tyre width */
 
 /* Derive one car's profile from measurements only: body volume as the mass and
  * inertia proxy, axle wheelbase for steering authority, tyre and track width for
  * lateral grip. Every factor is clamped, so a bus cannot invert the model. */
 PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
                                        float wheelbase, float track, float tyre_w);
+/* Primary profile from GLOBALB. Power and transmission levels are 0 (stock) to
+ * 3; geometry supplies the still-undecoded lateral/load-transfer fallback. */
+PhysVehicle phys_vehicle_from_source(const N2PhysicsAttr *a,int power_level,
+                                     int transmission_level,float body_hgt,float wheelbase,
+                                     float track,float tyre_w);
 
 /* Keyboard/gamepad steering response: fast enough to catch a corner, gradual
  * enough that one A/D frame cannot command instant full lock. */
@@ -171,13 +180,25 @@ float phys_ride_support_vz(const float normal[3], const float vel[2],
                           float old_heading, float heading, float ax, float ay, float dt);
 /* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
+/* Add the chassis response to tyre acceleration before phys_ride_step().
+ * Acceleration is in m/s^2 in the car frame: +longitudinal is forward and
+ * +lateral is left. Airborne cars receive no tyre load. */
+void phys_ride_apply_load(PhysRideState *r, const PhysVehicle *v,
+                          float longitudinal, float lateral, float dt);
 /* World Z of wheel k's contact point under the current body pose. */
 float phys_ride_wheel_z(const PhysRideState *r, const PhysRideSupport *s, int k);
+void phys_ride_up(const PhysRideState *ride, float heading, float up[3]);
+void phys_landing_camera(float *offset, float *velocity, float impact, float dt);
 
 /* sf == NULL is the road profile; vh == NULL is a neutral car. */
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
                     const PhysSurface *sf, const PhysVehicle *vh);
+/* Shared tyre authority: an airborne car carries momentum, not tyre forces. */
+float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
+                      float throttle, float steer, int handbrake,
+                      const PhysSurface *sf, const PhysVehicle *vh,
+                      const PhysRideState *ride);
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along
@@ -262,10 +283,10 @@ void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max);
 
-/* Circle-separate the player from each AI and the AIs from each other.
- * Player is pushed at half weight each way; a bump scrubs a little player
- * speed. Returns the collision thud amplitude for the audio (0 = no hit). */
+/* Resolve a moving vehicle against a snapshot of other oriented bodies.
+ * Returns the collision thud amplitude for the audio (0 = no hit). */
 float phys_car_contacts(float carpos[3], float vel[2], float speed,
-                        AiCar *ais, int nai);
+                        float heading, const float bb[6], AiCar *ais, int nai);
+int phys_ai_overlap(const AiCar *a, const AiCar *b);
 
 #endif

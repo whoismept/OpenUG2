@@ -14,36 +14,41 @@ static void n2_mod_option(N2PartMenu *menu,int value,const char *label) {
 }
 
 /* Enumerate object names, not arbitrary byte runs or guessed numeric ranges. */
+typedef struct { int library; N2PartMenu *menus; } N2ModWalk;
+static int n2_mod_catalog_chunk(const unsigned char *d,uint32_t tag,long p,long end,void *context) {
+    N2ModWalk *walk=(N2ModWalk *)context;
+    int library=walk->library;N2PartMenu *menus=walk->menus;
+    long size=end-p;
+    if(tag==0x80134010u) {
+        char name[64],label[48];n2_car_mesh_name(d,p,p+size,name);
+        int num=0;long at=0,n=0;int kind=n2_name_variant((unsigned char *)name,strlen(name),&num,&at,&n);
+        int slot=n2_car_part(name);
+        if(library)slot=library<=3?N2_PART_SPOILER:library==4?N2_PART_EXHAUST:N2_PART_SCOOP;
+        if(slot>=0 && kind && !strstr(name,"_CF") && !strstr(name,"WIDE") && !strstr(name,"KITW")) {
+            int value=(kind-1)*100+num+1;
+            N2CarConfig cfg={.body_kit=num,.hood_style=num};
+            if(!library || slot==N2_PART_EXHAUST)cfg.parts[slot]=value;
+            N2Scene probe={0};n2_walk_car(d,p-8,p+size,&probe,NULL,0,&cfg,0);
+            int renderable=probe.count>0;n2_free_scene(&probe);
+            if(!renderable)return 0; /* named empty placeholders */
+            if(library) {
+                int variant=strstr(name,"_DUAL")?1:strstr(name,"_OFFSET")?2:0;
+                value=library*1000+variant*100+num;
+                const char *type=library==1?"Coupe":library==2?"Hatch":library==3?"SUV":
+                                 library==4?"Tip":variant==1?"Dual":variant==2?"Offset":"Single";
+                snprintf(label,sizeof label,"Style %02d (%s)",num,type);
+            } else if(kind==1 && !num)snprintf(label,sizeof label,"Stock");
+            else snprintf(label,sizeof label,"%s %02d",kind==1?"Kit":"Style",num);
+            n2_mod_option(menus+slot,value,label);
+        }
+        return 0;
+    }
+    return (tag>>28)==8;
+}
 static void n2_mod_catalog_walk(const unsigned char *d,long beg,long end,
                                 int library,N2PartMenu menus[N2_PART_COUNT]) {
-    for(long o=beg;o+8<=end;) {
-        uint32_t tag=n2_u32(d+o),size=n2_u32(d+o+4);long p=o+8;
-        if((long)size>end-p)return;
-        if(tag==0x80134010u) {
-            char name[64],label[48];n2_car_mesh_name(d,p,p+size,name);
-            int num=0;long at=0,n=0;int kind=n2_name_variant((unsigned char *)name,strlen(name),&num,&at,&n);
-            int slot=n2_car_part(name);
-            if(library)slot=library<=3?N2_PART_SPOILER:library==4?N2_PART_EXHAUST:N2_PART_SCOOP;
-            if(slot>=0 && kind && !strstr(name,"_CF") && !strstr(name,"WIDE") && !strstr(name,"KITW")) {
-                int value=(kind-1)*100+num+1;
-                N2CarConfig cfg={.body_kit=num,.hood_style=num};
-                if(!library || slot==N2_PART_EXHAUST)cfg.parts[slot]=value;
-                N2Scene probe={0};n2_walk_car(d,o,p+size,&probe,NULL,0,&cfg);
-                int renderable=probe.count>0;n2_free_scene(&probe);
-                if(!renderable){o=p+size;continue;} /* named empty placeholders */
-                if(library) {
-                    int variant=strstr(name,"_DUAL")?1:strstr(name,"_OFFSET")?2:0;
-                    value=library*1000+variant*100+num;
-                    const char *type=library==1?"Coupe":library==2?"Hatch":library==3?"SUV":
-                                     library==4?"Tip":variant==1?"Dual":variant==2?"Offset":"Single";
-                    snprintf(label,sizeof label,"Style %02d (%s)",num,type);
-                } else if(kind==1 && !num)snprintf(label,sizeof label,"Stock");
-                else snprintf(label,sizeof label,"%s %02d",kind==1?"Kit":"Style",num);
-                n2_mod_option(menus+slot,value,label);
-            }
-        } else if(tag && tag>>28==8)n2_mod_catalog_walk(d,p,p+size,library,menus);
-        o=p+size;
-    }
+    N2ModWalk walk={library,menus};
+    asset_chunks_walk(d,beg,end,n2_mod_catalog_chunk,&walk);
 }
 
 static void n2_mod_catalog(const char *root,const unsigned char *data,long len,
@@ -96,7 +101,7 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
     snprintf(path,sizeof path,"%s/CARS/%s/GEOMETRY.BIN",root,n2_mod_libraries[lib]);
     unsigned char *d=n2_read_file(path,&bytes);if(!d)return 0;
     N2CarConfig cfg={.hood_style=style};cfg.parts[N2_PART_EXHAUST]=101+style;
-    N2Scene part={0};n2_walk_car(d,0,bytes,&part,NULL,0,&cfg);
+    N2Scene part={0};n2_walk_car(d,0,bytes,&part,NULL,0,&cfg,0);
     int kept=0;
     for(int i=0;i<part.count;i++) {
         N2Mesh *m=part.meshes+i;char name[64];long off=m->car_source;
