@@ -23,6 +23,18 @@ EngineSynthState g_engine = {
 volatile float g_road_vol = 0.0f;
 volatile float g_hit = 0.0f;
 volatile float g_skid = 0.0f;
+volatile float g_scrape = 0.0f;
+
+void audio_wall_contact(float inward_mps,float tangent_mps,float dt) {
+    static float cooldown=0;
+    cooldown=fmaxf(0,cooldown-fmaxf(0,dt));
+    g_scrape=inward_mps>0.001f ? .06f*fminf(1,fmaxf(0,tangent_mps)/12) : 0;
+    /* Small, repeated engine impulses against a wall are friction, not crashes. */
+    if(inward_mps>2.5f && cooldown<=0) {
+        g_hit=fmaxf(g_hit,fminf(.45f,(inward_mps-2.5f)*.025f));
+        cooldown=.18f;
+    }
+}
 
 /* piecewise-linear crossfade: full L at/below C_L, full H at/above C_H */
 void eng_band_weights(float rpm, float w[3]) {
@@ -378,13 +390,13 @@ int audio_load_engine_bank(const char *dataroot, int carbank) {
 
 static void audio_cb(void *ud, Uint8 *stream, int len) {
     (void)ud;
-    static float hit = 0.0f, lp = 0.0f;
+    static float hit = 0.0f, lp = 0.0f, hit_lp=0, scrape=0, scrape_lp=0;
     int16_t *out = (int16_t *)stream;
     int n = len / 2;                 /* mono S16 */
     static float hp = 0.0f; static double sq = 0.0;
     EngineSynthState *e = &g_engine;
     float target = e->target_rpm, load = e->load, master = e->master_volume;
-    float road = g_road_vol, skid = g_skid;
+    float road = g_road_vol, skid = g_skid, wall=g_scrape;
     if (g_hit > hit) hit = g_hit; g_hit = 0.0f;   /* latch a new collision */
     for (int i = 0; i < n; i++) {
         /* engine inertia: revs chase the target (~110ms), load a bit faster */
@@ -544,8 +556,10 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
         sq += 920.0/44100.0; if (sq >= 1.0) sq -= 1.0;
         float scr = ((nz - hp)*0.7f + (sq < 0.5 ? 0.15f : -0.15f)) * skid;
         /* collision: short noise burst that decays */
-        float thud = frand() * hit; hit *= 0.9985f;
-        float s = eng + env + scr + thud*0.8f;
+        hit_lp+=(frand()-hit_lp)*.08f;
+        float thud = hit_lp * hit; hit *= 0.9985f;
+        scrape+=(wall-scrape)*.0005f;scrape_lp+=(nz-scrape_lp)*.03f;
+        float s = eng + env + scr + thud*.8f + scrape_lp*scrape;
         int v = (int)(s * 11000.0f);
         if (v > 32767) v = 32767; if (v < -32768) v = -32768;
         out[i] = (int16_t)v;
@@ -555,6 +569,17 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
 /* asserts the crossfade math: pure bands at the centers, 50/50 at the
  * midpoints, and the weights always partition to 1. */
 void audio_selftest(void) {
+    g_hit=0;
+    audio_wall_contact(20,4,1);
+    assert(g_hit>.3f && g_scrape>0 && g_scrape<=.06f);
+    g_hit=0;audio_wall_contact(20,4,1.0f/60);
+    assert(g_hit==0); /* one sustained contact cannot restart a crash each tick */
+    for(int i=0;i<60;i++)audio_wall_contact(.15f,2,1.0f/60);
+    assert(g_hit==0 && g_scrape>0 && g_scrape<.02f);
+    audio_wall_contact(.15f,0,1.0f/60);assert(g_scrape==0);
+    audio_wall_contact(0,20,1.0f/60);assert(g_scrape==0);
+    audio_wall_contact(20,4,1);assert(g_hit>.3f);
+    audio_wall_contact(0,0,1);g_hit=0;
     float w[3];
     eng_band_weights(1000.0f, w); assert(w[0]==1.0f && w[1]==0.0f && w[2]==0.0f);
     eng_band_weights(1500.0f, w); assert(w[0]==1.0f);

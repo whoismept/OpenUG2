@@ -268,6 +268,19 @@ int render_road_reflections(const RProg *r,RoadReflections *s,
 #endif
 }
 
+void render_camera_ease(float eye[3],const float previous[3],const float desired[3],
+                        float stiffness,float ticks) {
+    if(!isfinite(ticks) || ticks<=0)return;
+    if(stiffness>=1){memcpy(eye,desired,3*sizeof *eye);return;}
+    double x=-log1p(-fmax(.02,stiffness))*ticks;
+    double blend=-expm1(-x);
+    /* Integrate the moving target too: endpoint-only easing makes following
+       distance change with FPS, most visibly at high vehicle speeds. */
+    double travel=x<1e-5?x*.5-x*x/6:1-blend/x;
+    for(int c=0;c<3;c++)eye[c]+=(float)(blend*(previous[c]-eye[c])+
+                                             travel*(desired[c]-previous[c]));
+}
+
 void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],float speed,float look[3]) {
     look[0]=cosf(yaw)*cosf(pitch);look[1]=sinf(yaw)*cosf(pitch);look[2]=sinf(pitch);
     float delta[3]={look[0]*move[0]+sinf(yaw)*move[1],
@@ -584,6 +597,47 @@ int render_rain(const RProg *r,GLuint *vbo,float time,float intensity,int qualit
     return 1;
 }
 
+int render_collision_walls(const RProg *r,GLuint *vbo,const float *faces,int count,
+                          const float color[3],const float mvp[16],int through) {
+    if(!faces || count<=0 || count>WALL_DEBUG_MAX_FACES)return 0;
+    if(!*vbo)glGenBuffers(1,vbo);
+    if(!*vbo)return 0;
+    static float edges[WALL_DEBUG_MAX_FACES*18];
+    for(int t=0;t<count;t++)for(int e=0;e<3;e++) {
+        memcpy(edges+t*18+e*6,faces+t*9+e*3,3*sizeof(float));
+        memcpy(edges+t*18+e*6+3,faces+t*9+(e+1)%3*3,3*sizeof(float));
+    }
+    const GLint loc[]={r->uUnlit,r->uEmissiveTex,r->uUseTex,r->uSoft,r->uAlpha,r->uVista,r->uUVCheck};
+    float saved[7],matrix[16],old_color[3];
+    for(int i=0;i<7;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    glGetUniformfv(r->prog,r->uMVP,matrix);glGetUniformfv(r->prog,r->uColor,old_color);
+    GLboolean depth=glIsEnabled(GL_DEPTH_TEST),blend=glIsEnabled(GL_BLEND),cull=glIsEnabled(GL_CULL_FACE),mask;
+    GLint sr,dr,sa,da;
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&sr);glGetIntegerv(GL_BLEND_DST_RGB,&dr);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&sa);glGetIntegerv(GL_BLEND_DST_ALPHA,&da);
+    if(through)glDisable(GL_DEPTH_TEST);else glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);glDisable(GL_CULL_FACE);glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(r->uUnlit,1);glUniform1f(r->uEmissiveTex,0);glUniform1f(r->uUseTex,0);
+    glUniform1f(r->uSoft,0);glUniform1f(r->uVista,0);glUniform1f(r->uUVCheck,0);
+    glUniform3fv(r->uColor,1,color);glUniformMatrix4fv(r->uMVP,1,GL_FALSE,mvp);
+    glBindBuffer(GL_ARRAY_BUFFER,*vbo);
+    glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)count*27*sizeof(float),NULL,GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)count*9*sizeof(float),faces);
+    glBufferSubData(GL_ARRAY_BUFFER,(GLintptr)count*9*sizeof(float),(GLsizeiptr)count*18*sizeof(float),edges);
+    glEnableVertexAttribArray(0);glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,0);
+    for(int a=1;a<4;a++)glDisableVertexAttribArray(a);
+    glUniform1f(r->uAlpha,.10f);glDrawArrays(GL_TRIANGLES,0,count*3);
+    glUniform1f(r->uAlpha,.85f);glDrawArrays(GL_LINES,count*3,count*6);
+    for(int i=0;i<7;i++)glUniform1f(loc[i],saved[i]);
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,matrix);glUniform3fv(r->uColor,1,old_color);
+    glDepthMask(mask);if(depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    if(!blend)glDisable(GL_BLEND);if(cull)glEnable(GL_CULL_FACE);
+    glBlendFuncSeparate(sr,dr,sa,da);
+    return 2;
+}
+
 static const char *VS =
     GLSL_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
@@ -751,18 +805,16 @@ static const char *FS =
     /* Two-sided glass reflects the viewer-facing side; a backwards normal
        otherwise forces Fresnel to 1 and makes the far window fully opaque. */
     "  if(uFresnel>0.5 && dot(N,V)<0.0) N=-N;\n"
-    /* World-anchored patches avoid texture seams and camera-following puddles.
+    /* Wet asphalt keeps a broad sheen; only sparse, nearly level patches
+       collect standing water. Keep the reflection normal steady: unfiltered
+       fine rain ripples alias at road distance and jump screen-space hits.
        ponytail: analytic sky/key-light fallback for offscreen geometry; use
        environment probes if reflections must survive outside the camera. */
     "  float wet=uWetness*smoothstep(0.55,0.9,N.z);\n"
     "  float puddle=0.0;\n"
     "  if(wet>0.001){\n"
     "    float pools=0.7*wetNoise(vPos.xy*0.24)+0.3*wetNoise(vPos.xy*0.73);\n"
-    "    puddle=wet*smoothstep(0.4,0.7,pools);\n"
-    "  }\n"
-    "  if(puddle>0.001 && uRainIntensity>0.0){\n"
-    "    vec2 ripple=sin(vPos.xy*16.0+uWeatherTime*vec2(7.0,-9.0));\n"
-    "    N=normalize(N+vec3(ripple*0.018*puddle*uRainIntensity,0.0));\n"
+    "    puddle=0.45*wet*smoothstep(0.66,0.85,pools)*smoothstep(0.94,0.99,N.z);\n"
     "  }\n"
     "  if(uRoadReflection>0.5){\n"
     "    if(uAlphaTest>0.5 && texture2D(uTex,vUV).a<0.5)discard;\n"
@@ -1311,6 +1363,7 @@ GpuMesh *upload_scene(N2Scene *s) {
     if (!gm) return NULL;
     for (int i = 0; i < s->count; i++) {
         N2Mesh *m = &s->meshes[i];
+        if (m->cat == N2_COLLISION) continue;
         N2Mesh rounded={0};
         if (n2_round_wheel_tyre(m,&rounded)) m=&rounded;
         float *nor = (float *)calloc(m->nverts * 3, sizeof(float));
@@ -1486,6 +1539,21 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
     }
 }
 
+static int batch_mesh_vertices(const N2Mesh *m,BatchedVertex *out) {
+    float *nor=calloc((size_t)m->nverts*3,sizeof *nor);if(!nor)return 0;
+    mesh_normals(m, nor);          /* per source mesh: no cross-mesh smoothing */
+    for (int v = 0; v < m->nverts; v++) {
+        BatchedVertex *o = &out[v]; const float *p = m->verts + v*5;
+        o->pos[0]=p[0]; o->pos[1]=p[1]; o->pos[2]=p[2];
+        o->uv[0]=p[3];  o->uv[1]=p[4];
+        o->normal[0]=nor[v*3]; o->normal[1]=nor[v*3+1]; o->normal[2]=nor[v*3+2];
+        if (m->vcol) { o->col[0]=m->vcol[v*4]; o->col[1]=m->vcol[v*4+1];
+                       o->col[2]=m->vcol[v*4+2]; o->col[3]=m->vcol[v*4+3]; }
+        else { o->col[0]=o->col[1]=o->col[2]=o->col[3]=255; }  /* neutral */
+    }
+    free(nor);return 1;
+}
+
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
 static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                        GLuint tex, N2Batch *b, int bidx, const char *audit,
@@ -1501,25 +1569,13 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     int vo = 0, io = 0;
     for (int k = i0; k < i1; k++) {
         const N2Mesh *m = &s->meshes[ent[k].idx];
-        float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
-        if (!nor) { free(bv); free(bi); return 0; }
-        mesh_normals(m, nor);          /* per source mesh: no cross-mesh smoothing */
-        for (int v = 0; v < m->nverts; v++) {
-            BatchedVertex *o = &bv[vo + v]; const float *p = m->verts + v*5;
-            o->pos[0]=p[0]; o->pos[1]=p[1]; o->pos[2]=p[2];
-            o->uv[0]=p[3];  o->uv[1]=p[4];
-            o->normal[0]=nor[v*3]; o->normal[1]=nor[v*3+1]; o->normal[2]=nor[v*3+2];
-            if (m->vcol) { o->col[0]=m->vcol[v*4]; o->col[1]=m->vcol[v*4+1];
-                           o->col[2]=m->vcol[v*4+2]; o->col[3]=m->vcol[v*4+3]; }
-            else { o->col[0]=o->col[1]=o->col[2]=o->col[3]=255; }  /* neutral */
-            for (int c = 0; c < 3; c++) {
-                if (p[c] < mn[c]) mn[c] = p[c];
-                if (p[c] > mx[c]) mx[c] = p[c];
-            }
+        if(!batch_mesh_vertices(m,bv+vo)){free(bv);free(bi);return 0;}
+        for(int v=0;v<m->nverts;v++)for(int c=0;c<3;c++) {
+            float p=m->verts[v*5+c];
+            mn[c]=fminf(mn[c],p);mx[c]=fmaxf(mx[c],p);
         }
         for (int t = 0; t < m->nidx; t++) bi[io + t] = (uint16_t)(m->idx[t] + vo);
         vo += m->nverts; io += m->nidx;
-        free(nor);
     }
     if (audit && audit[0] != '#') batch_audit_report(s, ent, i0, i1, bv, bi, bidx, audit);
     memset(b, 0, sizeof *b);
@@ -1530,6 +1586,20 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     if (glGetError() != GL_NO_ERROR) {
         glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
         memset(b, 0, sizeof *b); free(bv); free(bi); return 0;
+    }
+    for(int k=i0;k<i1;k++)b->nprops+=s->meshes[ent[k].idx].prop_id!=0;
+    if(b->nprops) {
+        b->props=calloc((size_t)b->nprops,sizeof *b->props);
+        if(!b->props) {
+            glDeleteBuffers(1,&b->vbo);glDeleteBuffers(1,&b->ibo);
+            memset(b,0,sizeof *b);free(bv);free(bi);return 0;
+        }
+        int vertex=0,prop=0;
+        for(int k=i0;k<i1;k++) {
+            const N2Mesh *m=s->meshes+ent[k].idx;
+            if(m->prop_id)b->props[prop++]=(PropBatchRange){ent[k].idx,vertex,m->prop_revision};
+            vertex+=m->nverts;
+        }
     }
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->wettable = s->meshes[ent[i0].idx].cat == N2_ROAD;
@@ -1604,7 +1674,7 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     int m = 0;
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
-        if (mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
+        if (mesh->cat == N2_SKY || mesh->cat == N2_GLOW || mesh->cat == N2_COLLISION) continue;
         GLuint tex = mtex[i];
         if (!tex && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
@@ -1740,11 +1810,36 @@ void render_batch_array_free(N2Batch **batches, int *count) {
         for (int i = 0; i < n; i++) {
             if ((*batches)[i].vbo) glDeleteBuffers(1, &(*batches)[i].vbo);
             if ((*batches)[i].ibo) glDeleteBuffers(1, &(*batches)[i].ibo);
+            free((*batches)[i].props);
         }
         free(*batches);
     }
     *batches = NULL;
     if (count) *count = 0;
+}
+
+int render_world_prop_updates(const N2Scene *scene,N2Batch *batches,int count,
+                             int (*update_mesh)(N2Mesh *)) {
+    int changed=0;
+    for(int k=0;k<count;k++)for(int j=0;j<batches[k].nprops;j++) {
+        N2Batch *b=batches+k;PropBatchRange *range=b->props+j;
+        if(range->mesh<0 || range->mesh>=scene->count)return -1;
+        N2Mesh *m=scene->meshes+range->mesh;
+        if(update_mesh)update_mesh(m);
+        if(range->revision==m->prop_revision)continue;
+        BatchedVertex *v=malloc((size_t)m->nverts*sizeof *v);
+        if(!v)return -1;
+        if(!batch_mesh_vertices(m,v)){free(v);return -1;}
+        glBindBuffer(GL_ARRAY_BUFFER,b->vbo);
+        glBufferSubData(GL_ARRAY_BUFFER,(long)range->vertex*sizeof *v,(long)m->nverts*sizeof *v,v);
+        if(glGetError()!=GL_NO_ERROR){free(v);return -1;}
+        for(int q=0;q<m->nverts;q++)for(int a=0;a<3;a++) {
+            b->bbox_min[a]=fminf(b->bbox_min[a],v[q].pos[a]);
+            b->bbox_max[a]=fmaxf(b->bbox_max[a],v[q].pos[a]);
+        }
+        free(v);range->revision=m->prop_revision;changed++;
+    }
+    return changed;
 }
 
 void draw_batch(const N2Batch *b) {

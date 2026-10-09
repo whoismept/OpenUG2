@@ -21,6 +21,7 @@ SafeMode.bat
 
 # --- Build output ---
 nfsu2
+race-log-*.csv
 build/
 scratchpad/
 *.o
@@ -65,3 +66,25 @@ docs/PROJECT_STATE.md
 docs/OPUS_TASK_TEMPLATE.md
 docs/superpowers/
 tools/capture_vehicle_shots.sh
+
+# Local map-authoring projects may include copied retail path coordinates.
+*.ug2map
+*.ug2col
+*.ug2col.tmp.*
+*.collision.txt
+*.ug2map.tmp.*
+*.collision.txt.tmp.*
+*.objects.txt
+*.ai.txt
+*.races.txt
+*.lights.txt
+*.shops.txt
+*.districts.txt
+*.edits.txt
+*.objects.txt.tmp.*
+*.ai.txt.tmp.*
+*.races.txt.tmp.*
+*.lights.txt.tmp.*
+*.shops.txt.tmp.*
+*.districts.txt.tmp.*
+*.edits.txt.tmp.*

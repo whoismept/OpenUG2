@@ -40,6 +40,7 @@ typedef struct {
     unsigned char col[4];     /* per-vertex RGBA prelight from the source stream
                                  (baked AO/lighting + terrain tint); 255=neutral */
 } BatchedVertex;              /* 36 B, interleaved */
+typedef struct { int mesh,vertex;unsigned revision; } PropBatchRange;
 
 typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
@@ -70,6 +71,8 @@ typedef struct {
                                  per-mesh mode table was supplied -- sky/glow/
                                  vista/diagnostic batches keep their own,
                                  separate, unrelated render treatment. */
+    PropBatchRange *props;
+    int nprops;
 } N2Batch;
 
 /* the one shader program + its uniform handles */
@@ -167,6 +170,10 @@ void free_car_shadow(CarShadow *s);
 void mat_ground_shadow(const float ground[3],const float normal[3],float m[16]);
 /* One simulation tick, normalized movement; independent of the player pose. */
 void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],float speed,float look[3]);
+/* Exact exponential follow for a target moving previous..desired this frame.
+   stiffness is the existing 60Hz tuning; ticks is elapsed seconds * 60. */
+void render_camera_ease(float eye[3],const float previous[3],const float desired[3],
+                        float stiffness,float ticks);
 
 /* Bounded highlights from authored district lamps; no scene mirror pass. */
 void render_wet_lights(const RProg *r,const N2LightSrc *lights,int count,
@@ -181,6 +188,11 @@ typedef struct { float pos[3], uv[2], fade; } RainVertex;
 int render_rain_exposed(const N2Scene *scene,const float (*bounds)[4],const float cam[3]);
 int render_rain_vertices(float time,float intensity,int quality,float aspect,RainVertex *out);
 int render_rain(const RProg *r,GLuint *vbo,float time,float intensity,int quality,float aspect);
+
+/* Diagnostic triangle fill + edges; caller supplies XYZ triples and owns vbo. */
+#define WALL_DEBUG_MAX_FACES 4096
+int render_collision_walls(const RProg *r,GLuint *vbo,const float *faces,int count,
+                          const float color[3],const float mvp[16],int through);
 
 /* world-space sun direction (night scene key light) */
 #define N2_SUN_X 0.4f
@@ -276,6 +288,9 @@ void upload_world_batches_cancel(WorldBatchUpload **job);
 int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                         const unsigned char *mtexmode);
 void render_batch_array_free(N2Batch **batches, int *count);
+/* Update only struck panels' existing VBO ranges; all passes share those buffers. */
+int render_world_prop_updates(const N2Scene *scene,N2Batch *batches,int count,
+                             int (*update_mesh)(N2Mesh *));
 void draw_batch(const N2Batch *b);
 GLuint   upload_tex(const N2Tex *t);
 /* Upload a decoded TPK texture, preferring a direct glCompressedTexImage2D of

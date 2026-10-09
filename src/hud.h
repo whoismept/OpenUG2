@@ -45,6 +45,9 @@ typedef struct {
     float car_heading;        /* radians, world +X = 0, CCW */
 
     /* --- mode --- */
+    int   race_kind;
+    float drift_score,drift_chain,engine_heat;
+    int shift_ready,engine_failed;
     int   racing;             /* 0 = free roam, 1 = in an event */
     int   circuit;            /* race only: 1 = laps, 0 = sprint (progress) */
     int   lap, laps;          /* circuit only */

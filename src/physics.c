@@ -21,6 +21,8 @@
 #define TURN_HISPD_DROP  0.55f
 
 PhysTune g_phys_tune = { 1.0f, 1.0f, 1.0f, 220.0f };   /* stock defaults */
+PhysPropImpactHook g_phys_prop_impact_hook;
+PhysWallBuriedHook g_phys_wall_buried_hook;
 
 /* Asphalt: current arcade defaults. */
 const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 1.00f };
@@ -322,6 +324,34 @@ PhysVehicle phys_vehicle_from_source(const N2PhysicsAttr *a,int power_level,
     return v;
 }
 
+float phys_manual_step(PhysManual *s,const N2PhysicsAttr *a,int power,int transmission,
+                       float radius,float speed,float throttle,int shift,float dt) {
+    if(!s || !a || !isfinite(radius) || radius<.05f || !isfinite(speed) ||
+       !isfinite(throttle) || !isfinite(dt) || dt<=0)return 0;
+    power=(int)pv_clamp(power,0,3);transmission=(int)pv_clamp(transmission,0,3);
+    const N2GearboxAttr *box=a->gearbox+transmission;
+    if(box->gear_count<1 || box->gear_count>6 || a->limiter_rpm<=a->idle_rpm ||
+       box->final_drive<=0 || box->forward[0]<=0)return 0;
+    if(s->gear<1)s->gear=1;if(s->gear>box->gear_count)s->gear=box->gear_count;
+    if(shift && s->shift<=0 && !s->failed) {
+        int gear=s->gear+(shift>0?1:-1);
+        if(gear>=1 && gear<=box->gear_count){s->gear=gear;s->shift=.15f;}
+    }
+    s->shift=fmaxf(0,s->shift-dt);
+    float ratio=box->forward[s->gear-1];if(!isfinite(ratio) || ratio<=0)return 0;
+    s->rpm=fmaxf(a->idle_rpm,fabsf(speed)*PHYS_TICKRATE*60/(6.283185307f*radius)*ratio*box->final_drive);
+    int over=s->rpm>=a->limiter_rpm;
+    s->heat=pv_clamp(s->heat+(over && throttle>0 ? dt/1.5f : -dt*.5f),0,1);
+    if(s->heat>=1)s->failed=1;
+    if(over || s->shift>0 || s->failed)return 0;
+    float sample=pv_clamp((s->rpm-a->idle_rpm)/(a->limiter_rpm-a->idle_rpm)*8,0,8);
+    int i=(int)sample,j=i<8?i+1:i;float t=sample-i,peak=0;
+    for(int k=0;k<9;k++)peak=fmaxf(peak,a->torque[k]+(power?a->torque_gain[power][k]:0));
+    float lo=a->torque[i]+(power?a->torque_gain[power][i]:0);
+    float hi=a->torque[j]+(power?a->torque_gain[power][j]:0);
+    return peak>0 ? pv_clamp((lo+(hi-lo)*t)/peak*ratio/box->forward[0],0,1.5f) : 0;
+}
+
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
                     const PhysSurface *sf, const PhysVehicle *vh) {
@@ -383,11 +413,35 @@ float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
                       float throttle, float steer, int handbrake,
                       const PhysSurface *sf, const PhysVehicle *vh,
                       const PhysRideState *ride) {
-    if (!ride || ride->contact_mask)
-        return phys_car_step(pos,vel,heading,speed,throttle,steer,handbrake,sf,vh);
+    if (!ride || ride->contact_mask) {
+        PhysSurface surface=sf?*sf:PHYS_SURF_ROAD;
+        /* A wall supplies the lateral constraint. Tyres must not continually
+           turn tangential momentum back into the blocked heading. Keep some
+           scrub so an angled car creeps along the wall under throttle. */
+        if(ride && !handbrake &&
+           (ride->wall_normal[0]*cosf(*heading)+ride->wall_normal[1]*sinf(*heading))*throttle<0)
+            surface.lat=.98f/(vh && vh->lat>0?vh->lat:1);
+        return phys_car_step(pos,vel,heading,speed,throttle,steer,handbrake,&surface,vh);
+    }
     pos[0]+=vel[0];pos[1]+=vel[1];
     *speed=vel[0]*cosf(*heading)+vel[1]*sinf(*heading);
     return fabsf(vel[0]*sinf(*heading)-vel[1]*cosf(*heading));
+}
+
+float phys_ride_wall_contact(PhysRideState *ride,const float before[2],const float after[2]) {
+    float dx=after[0]-before[0],dy=after[1]-before[1],removed=hypotf(dx,dy);
+    ride->wall_normal[0]=removed>1e-6f?dx/removed:0;
+    ride->wall_normal[1]=removed>1e-6f?dy/removed:0;
+    return removed*PHYS_TICKRATE;
+}
+
+float phys_ride_wall_response(PhysRideState *ride,const float before[2],float after[2]) {
+    float impulse=phys_ride_wall_contact(ride,before,after);
+    if(!ride->contact_mask && impulse>2.5f) {
+        after[0]+=.20f*(after[0]-before[0]);
+        after[1]+=.20f*(after[1]-before[1]);
+    }
+    return impulse;
 }
 
 void phys_selftest(void) {
@@ -670,11 +724,204 @@ static int embedded_prop_mesh(const N2Mesh *m) {
            strstr(m->sname,"_PROPS")!=NULL;
 }
 
+/* Fixed boundary roles come from each asset's own name; coordinates and car
+   identity are never classifiers. A planter uses its base, not its foliage. */
+typedef struct { float x,y,z0,z1; int mesh,post; } BoundaryBase;
+typedef struct { float x,y; } BoundaryPoint;
+static int boundary_point_cmp(const void *a,const void *b) {
+    const BoundaryPoint *p=a,*q=b;
+    return p->x<q->x?-1:p->x>q->x?1:p->y<q->y?-1:p->y>q->y;
+}
+static float boundary_cross(BoundaryPoint a,BoundaryPoint b,BoundaryPoint c) {
+    return (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+}
+static int boundary_base_cmp(const void *a,const void *b) {
+    const BoundaryBase *p=a,*q=b;
+    return p->x<q->x?-1:p->x>q->x?1:p->y<q->y?-1:p->y>q->y?1:p->mesh-q->mesh;
+}
+static void boundary_quad(N2Mesh *m,float ax,float ay,float az,
+                          float bx,float by,float bz) {
+    int v=m->wall_nverts,i=m->wall_nidx;
+    float height=m->wall_height>0?m->wall_height:2.5f;
+    float points[4][3]={{ax,ay,az},{bx,by,bz},{bx,by,bz+height},{ax,ay,az+height}};
+    for(int k=0;k<4;k++)memcpy(m->wall_verts+(v+k)*5,points[k],sizeof points[k]);
+    const int indices[6]={0,1,2,0,2,3};
+    for(int k=0;k<6;k++)m->wall_idx[i+k]=(uint16_t)(v+indices[k]);
+    m->wall_nverts+=4;m->wall_nidx+=6;
+}
+
+/* Use authored wall traces before falling back to a base hull. A hull of a
+   curved/concave hedge closes empty road between its ends. */
+static int boundary_wall_edge(const N2Mesh *m,int t,float a[3],float b[3]) {
+    const float *p[3]={m->verts+5*m->idx[t],m->verts+5*m->idx[t+1],
+                      m->verts+5*m->idx[t+2]};
+    float ux=p[1][0]-p[0][0],uy=p[1][1]-p[0][1],uz=p[1][2]-p[0][2];
+    float vx=p[2][0]-p[0][0],vy=p[2][1]-p[0][1],vz=p[2][2]-p[0][2];
+    float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+    float len=sqrtf(nx*nx+ny*ny+nz*nz);
+    if(len<1e-6f || fabsf(nz/len)>=.30f ||
+       phys_wall_face_height(p[0],p[1],p[2])<WALL_MIN_FACE_SPAN)return 0;
+    float longest=0;int edge=0;
+    for(int k=0;k<3;k++) {
+        float dx=p[k][0]-p[(k+1)%3][0],dy=p[k][1]-p[(k+1)%3][1];
+        if(dx*dx+dy*dy>longest){longest=dx*dx+dy*dy;edge=k;}
+    }
+    memcpy(a,p[edge],3*sizeof *a);memcpy(b,p[(edge+1)%3],3*sizeof *b);
+    /* Material slices share vertices: recover the lower endpoint at each XY,
+       retaining the source slope instead of levelling the entire boundary. */
+    for(int v=0;v<m->nverts;v++) {
+        const float *q=m->verts+5*v;
+        if(fabsf(q[0]-a[0])<.001f && fabsf(q[1]-a[1])<.001f)a[2]=fminf(a[2],q[2]);
+        if(fabsf(q[0]-b[0])<.001f && fabsf(q[1]-b[1])<.001f)b[2]=fminf(b[2],q[2]);
+    }
+    return 1;
+}
+
+int phys_prepare_boundaries(N2Scene *s) {
+    BoundaryBase *bases=malloc((size_t)s->count*sizeof *bases);
+    if(s->count && !bases)return 0;
+    int n=0;
+    for(int i=0;i<s->count;i++) {
+        N2Mesh *m=&s->meshes[i];
+        free(m->wall_verts);free(m->wall_idx);
+        m->wall_verts=NULL;m->wall_idx=NULL;m->wall_nverts=m->wall_nidx=0;
+        if(m->wall_policy==1 || (m->wall_policy==2 && m->wall_height==0))continue;
+        int post=strstr(m->sname,"PATHGUARD")!=NULL;
+        int planter=((strstr(m->sname,"PLANTER") || strstr(m->sname,"HEDGE") ||
+                      strstr(m->sname,"FLOWERS")) && !strstr(m->sname,"OVERHANG")) ||
+            !strncmp(m->sname,"TRN_MEDIAN",10) || strstr(m->sname,"GREENBARRIER") ||
+            strstr(m->sname,"HEDGEWALL") || strstr(m->sname,"BUSHBOTTOMWALL");
+        if((!post && !planter && m->wall_height<=0) || m->nverts<3)continue;
+        float x0=INFINITY,y0=INFINITY,z0=INFINITY,x1=-INFINITY,y1=-INFINITY,z1=-INFINITY;
+        for(int v=0;v<m->nverts;v++) {
+            float *p=m->verts+v*5;
+            x0=fminf(x0,p[0]);x1=fmaxf(x1,p[0]);
+            y0=fminf(y0,p[1]);y1=fmaxf(y1,p[1]);
+            z0=fminf(z0,p[2]);z1=fmaxf(z1,p[2]);
+        }
+        if(!isfinite(x0+y0+z0+x1+y1+z1))continue;
+        bases[n++]=(BoundaryBase){(x0+x1)*.5f,(y0+y1)*.5f,z0,z1,i,post};
+    }
+    qsort(bases,n,sizeof *bases,boundary_base_cmp);
+    /* Material slices share a whole object's vertices. Keep one boundary per
+       occurrence even when the parser emitted several draw meshes for it. */
+    int unique=0;
+    for(int i=0;i<n;i++) {
+        int duplicate=0;
+        for(int j=unique-1;j>=0 && bases[j].x>=bases[i].x-.001f;j--) {
+            if(fabsf(bases[j].y-bases[i].y)<.001f &&
+               fabsf(bases[j].z0-bases[i].z0)<.001f &&
+               !strcmp(s->meshes[bases[j].mesh].sname,s->meshes[bases[i].mesh].sname)) {
+                duplicate=1;break;
+            }
+        }
+        if(!duplicate)bases[unique++]=bases[i];
+    }
+    for(int i=0;i<unique;i++) {
+        BoundaryBase *b=&bases[i];N2Mesh *m=&s->meshes[b->mesh];
+        int faces=0;float a[3],q[3];
+        if(!b->post)for(int t=0;t+2<m->nidx;t+=3)
+            faces+=boundary_wall_edge(m,t,a,q);
+        if(faces>16000)continue; /* Keep source faces if a 16-bit proxy cannot fit. */
+        if(faces>0) {
+            m->wall_verts=calloc((size_t)faces*4*5,sizeof *m->wall_verts);
+            m->wall_idx=malloc((size_t)faces*6*sizeof *m->wall_idx);
+            if(!m->wall_verts || !m->wall_idx){free(bases);return 0;}
+            for(int t=0;t+2<m->nidx;t+=3)if(boundary_wall_edge(m,t,a,q))
+                boundary_quad(m,a[0],a[1],a[2],q[0],q[1],q[2]);
+            continue;
+        }
+        BoundaryPoint *p=malloc((size_t)m->nverts*sizeof *p);
+        BoundaryPoint *h=malloc((size_t)(2*m->nverts+1)*sizeof *h);
+        if(!p || !h){free(p);free(h);free(bases);return 0;}
+        int np=0,nh=0;
+        for(int v=0;v<m->nverts;v++)if(m->verts[v*5+2]<=b->z0+.60f)
+            p[np++]=(BoundaryPoint){m->verts[v*5],m->verts[v*5+1]};
+        qsort(p,np,sizeof *p,boundary_point_cmp);
+        for(int k=0;k<np;k++) {
+            while(nh>=2 && boundary_cross(h[nh-2],h[nh-1],p[k])<=0)nh--;
+            h[nh++]=p[k];
+        }
+        int lower=nh;
+        for(int k=np-2;k>=0;k--) {
+            while(nh>lower && boundary_cross(h[nh-2],h[nh-1],p[k])<=0)nh--;
+            h[nh++]=p[k];
+        }
+        if(nh>1)nh--;
+        free(p);
+        if(nh<(m->wall_height>0?2:3) || nh>16000){free(h);continue;}
+        /* Two row neighbours at most; short links do not close road openings.
+           The X-sorted sweep bounds neighbour work to a local strip. */
+        int near[2]={-1,-1};float dmin[2]={3.5f*3.5f,3.5f*3.5f};
+        if(b->post)for(int pass=0;pass<2;pass++) {
+            for(int j=0;j<unique;j++) {
+                BoundaryBase *q=&bases[j];
+                if(q->x<b->x-3.5f)continue;if(q->x>b->x+3.5f)break;
+                if(j==i || !q->post || fabsf(q->z0-b->z0)>.75f ||
+                   strcmp(m->sname,s->meshes[q->mesh].sname))continue;
+                float dx=q->x-b->x,dy=q->y-b->y,dd=dx*dx+dy*dy;
+                if(dd<.04f || dd>=dmin[pass])continue;
+                if(pass && near[0]>=0) {
+                    BoundaryBase *a=&bases[near[0]];
+                    if(dx*(a->x-b->x)+dy*(a->y-b->y)>-.25f*sqrtf(dd*dmin[0]))continue;
+                }
+                near[pass]=j;dmin[pass]=dd;
+            }
+            if(near[0]<0)break;
+        }
+        m->wall_verts=calloc((size_t)(nh+2)*4*5,sizeof *m->wall_verts);
+        m->wall_idx=malloc((size_t)(nh+2)*6*sizeof *m->wall_idx);
+        if(!m->wall_verts || !m->wall_idx){free(h);free(bases);return 0;}
+        for(int k=0;k<nh;k++) {
+            BoundaryPoint a=h[k],q=h[(k+1)%nh];
+            boundary_quad(m,a.x,a.y,b->z0,q.x,q.y,b->z0);
+        }
+        for(int k=0;k<2;k++)if(near[k]>=0) {
+            BoundaryBase *q=&bases[near[k]];
+            boundary_quad(m,b->x,b->y,b->z0,q->x,q->y,q->z0);
+        }
+        free(h);
+    }
+    free(bases);return 1;
+}
+
+static int wall_face_geometry(const float *A,const float *B,const float *C,
+        float face_min,float face_max,float n[3],float *zlo,float *zhi) {
+    float e1[3],e2[3];
+    for(int a=0;a<3;a++){e1[a]=B[a]-A[a];e2[a]=C[a]-A[a];}
+    n[0]=e1[1]*e2[2]-e1[2]*e2[1];n[1]=e1[2]*e2[0]-e1[0]*e2[2];n[2]=e1[0]*e2[1]-e1[1]*e2[0];
+    float L=sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+    if(L<1e-9f || fabsf(n[2]/L)>=.30f)return 0;
+    *zlo=fminf(A[2],fminf(B[2],C[2]));*zhi=fmaxf(A[2],fmaxf(B[2],C[2]));
+    if(*zhi-*zlo<face_min || *zhi-*zlo>face_max)return 0;
+    return face_min<=0 || phys_wall_face_height(A,B,C)>=face_min;
+}
+
+int phys_wall_debug_face(const N2Mesh *m,int triangle,float face_min,float out[9]) {
+    if(!m || !out || triangle<0 || m->prop_broken || n2_world_effect_only(m) || n2_world_body_disabled(m))return 0;
+    const float *verts=m->wall_verts?m->wall_verts:m->verts;
+    const uint16_t *idx=m->wall_verts?m->wall_idx:m->idx;
+    int nidx=m->wall_verts?m->wall_nidx:m->nidx,nv=m->wall_verts?m->wall_nverts:m->nverts;
+    if(!verts || !idx || triangle>=nidx/3)return 0;
+    idx+=triangle*3;
+    if(idx[0]>=nv || idx[1]>=nv || idx[2]>=nv)return 0;
+    if(embedded_prop_mesh(m))face_min=fmaxf(face_min,WALL_MIN_FACE_SPAN);
+    const float *a=verts+idx[0]*5,*b=verts+idx[1]*5,*c=verts+idx[2]*5;
+    float normal[3],lo,hi;
+    if(!wall_face_geometry(a,b,c,face_min,INFINITY,normal,&lo,&hi))return 0;
+    memcpy(out,a,3*sizeof(float));memcpy(out+3,b,3*sizeof(float));memcpy(out+6,c,3*sizeof(float));
+    return 1;
+}
+
 static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
                     float qx, float qy, float r, float cz0, float cz1,
                     float face_min,float face_max,PhysWallContact *out) {
     if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
+    if(m->prop_broken || n2_world_effect_only(m) || n2_world_body_disabled(m))return 0;
+    const float *verts=m->wall_verts?m->wall_verts:m->verts;
+    const uint16_t *idx=m->wall_verts?m->wall_idx:m->idx;
+    int nidx=m->wall_verts?m->wall_nidx:m->nidx;
     /* These meshes can contain curbs as well as walls. Reject thin faces by
        thickness rather than by their elevation change along a slope. */
     if(embedded_prop_mesh(m))face_min=fmaxf(face_min,WALL_MIN_FACE_SPAN);
@@ -686,24 +933,14 @@ static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
        Z clipping keeps edges inside the triangle's XY bounds. */
     float lx0=fminf(px,qx)-r-0.01f, lx1=fmaxf(px,qx)+r+0.01f;
     float ly0=fminf(py,qy)-r-0.01f, ly1=fmaxf(py,qy)+r+0.01f;
-    for (int t = 0; t + 2 < m->nidx; t += 3) {
-        const float *A = m->verts + m->idx[t]*5;
-        const float *B = m->verts + m->idx[t+1]*5;
-        const float *C = m->verts + m->idx[t+2]*5;
+    for (int t = 0; t + 2 < nidx; t += 3) {
+        const float *A = verts + idx[t]*5;
+        const float *B = verts + idx[t+1]*5;
+        const float *C = verts + idx[t+2]*5;
         if ((A[0]<lx0&&B[0]<lx0&&C[0]<lx0) || (A[0]>lx1&&B[0]>lx1&&C[0]>lx1) ||
             (A[1]<ly0&&B[1]<ly0&&C[1]<ly0) || (A[1]>ly1&&B[1]>ly1&&C[1]>ly1)) continue;
-        float e1[3], e2[3], n[3];
-        for (int a = 0; a < 3; a++) { e1[a] = B[a]-A[a]; e2[a] = C[a]-A[a]; }
-        n[0]=e1[1]*e2[2]-e1[2]*e2[1]; n[1]=e1[2]*e2[0]-e1[0]*e2[2];
-        n[2]=e1[0]*e2[1]-e1[1]*e2[0];
-        float L = sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if (L < 1e-9f) continue;
-        if (fabsf(n[2]/L) >= 0.30f) continue;                 /* not a wall face */
-        float zlo = A[2], zhi = A[2];
-        if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
-        if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
-        if (zhi-zlo < face_min || zhi-zlo > face_max) continue;
-        /* A low curb can gain metres along a hill without becoming a rail. */
-        if (face_min>0 && phys_wall_face_height(A,B,C)<face_min) continue;
+        float n[3],zlo,zhi;
+        if(!wall_face_geometry(A,B,C,face_min,face_max,n,&zlo,&zhi))continue;
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
         const float *P[8] = { A, B, C };
         int np = 3;
@@ -728,6 +965,8 @@ static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
             if(px!=qx || py!=qy)
                 d2=cw_segment_pair(px,py,qx,qy,p0,p1,&hx,&hy,&sx,&sy);
             if (d2 > r2) continue;
+            if(g_phys_wall_buried_hook && g_phys_wall_buried_hook(s,
+                (px+qx)*.5f,(py+qy)*.5f,cz0,sx,sy,zhi))continue;
             touched = 1;
             /* closest feature wins; ties go to the lower triangle index, so the
                choice is the same on every run regardless of float noise */
@@ -794,7 +1033,9 @@ static int cw_resolve_one(int o, float *pos, float *vel, const float obst[][4],
                   const float obz[][2], float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
                   PhysWallContact *log, int maxlog, const int *hits,
-                  float ax,float ay,float bx,float by) {
+                  float ax,float ay,float bx,float by,int preview) {
+        if(preview && scene && src && src[o]>=0 && src[o]<scene->count &&
+           scene->meshes[src[o]].prop_id)return 0;
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
         if (pos[0]+fmaxf(ax,bx)<=x0 || pos[0]+fminf(ax,bx)>=x1 ||
             pos[1]+fmaxf(ay,by)<=y0 || pos[1]+fminf(ay,by)>=y1) return 0;
@@ -807,7 +1048,16 @@ static int cw_resolve_one(int o, float *pos, float *vel, const float obst[][4],
                                   pos[0]+bx,pos[1]+by,r,cz0,cz1,0,INFINITY,&c))
                 return 0;
             float vn = vel[0]*c.nx + vel[1]*c.ny;
-            if (c.pen <= 0.0f && vn >= 0.0f) return 0;   /* touching, not colliding:
+            if(!preview && scene->meshes[src[o]].prop_id && g_phys_prop_impact_hook) {
+                int impact=g_phys_prop_impact_hook(scene,src[o],-vn*PHYS_TICKRATE,c.nx,c.ny);
+                if(impact==2)return 0; /* resident reload of an already fallen panel */
+                if(impact) {
+                    vel[0]*=.9f;vel[1]*=.9f;
+                    if(log && *hits<maxlog)log[*hits]=c;
+                    return 1;
+                }
+            }
+            if (c.pen <= 1e-4f && vn >= -1e-6f) return 0; /* sub-mm rounding at world scale:
                                                             a car resting against a
                                                             face is not a response */
             if (c.pen > 0.0f) { pos[0] += c.nx * c.pen; pos[1] += c.ny * c.pen; }
@@ -887,7 +1137,7 @@ static int cw_resolve(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
                   PhysWallContact *log, int maxlog,
-                  float ax,float ay,float bx,float by) {
+                  float ax,float ay,float bx,float by,int preview) {
     int hits = 0, from = 0;
     if (g_cwi.start && (const float (*)[4])obst == g_cwi.obst &&
         (const float (*)[2])obz == g_cwi.obz && nobst == g_cwi.n) {
@@ -911,14 +1161,14 @@ static int cw_resolve(float *pos, float *vel, const float obst[][4],
         from = nobst;                        /* no linear tail unless pushed far */
         for (int k=0;k<nc;k++) {
             int o=g_cwi.cand[k];
-            if (!cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by))
+            if (!cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by,preview))
                 continue;
             hits++;
             if (fabsf(pos[0]-sx) >= CWI_MARGIN || fabsf(pos[1]-sy) >= CWI_MARGIN) { from=o+1; break; }
         }
     }
     for (int o = from; o < nobst; o++)
-        if (cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by))
+        if (cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by,preview))
             hits++;
     return hits;
 }
@@ -926,7 +1176,7 @@ static int cw_resolve(float *pos, float *vel, const float obst[][4],
 int collide_walls(float *pos,float *vel,const float obst[][4],
         const float obz[][2],int nobst,float r,float z0,float z1,
         const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog) {
-    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,0,0,0,0);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,0,0,0,0,0);
 }
 
 int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
@@ -935,7 +1185,16 @@ int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
     float r,ax,ay,bx,by;
     if(!scene || !src || !cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by))
         return collide_walls(pos,vel,obst,obz,nobst,1.3f,z0,z1,scene,src,log,maxlog);
-    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,ax,ay,bx,by);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,log,maxlog,ax,ay,bx,by,0);
+}
+
+int collide_body_walls_preview(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src) {
+    float r,ax,ay,bx,by;
+    if(!scene || !src || !cw_body_shape(heading,bb,&r,&ax,&ay,&bx,&by))
+        return cw_resolve(pos,vel,obst,obz,nobst,1.3f,z0,z1,scene,src,NULL,0,0,0,0,0,1);
+    return cw_resolve(pos,vel,obst,obz,nobst,r,z0,z1,scene,src,NULL,0,ax,ay,bx,by,1);
 }
 
 int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6],
@@ -946,7 +1205,7 @@ int collide_body_mesh_wall(float *pos,float *vel,float heading,const float bb[6]
     if(!cw_shape_feature(scene,mesh,pos[0]+ax,pos[1]+ay,pos[0]+bx,pos[1]+by,
                          r,z0,z1,face_min,face_max,&hit)) return 0;
     float vn=vel[0]*hit.nx+vel[1]*hit.ny;
-    if(hit.pen<=0 && vn>=0) return 0;
+    if(hit.pen<=1e-4f && vn>=-1e-6f) return 0;
     if(hit.pen>0){pos[0]+=hit.nx*hit.pen;pos[1]+=hit.ny*hit.pen;}
     if(vn<0){vel[0]-=vn*hit.nx;vel[1]-=vn*hit.ny;}
     if(contact)*contact=hit;
@@ -1008,7 +1267,10 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max) {
     int nobst = 0;
     for (int i = 0; i < s->count && nobst < max; i++) {
-        int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
+        const N2Mesh *mesh=&s->meshes[i];
+        if(n2_world_effect_only(mesh) || n2_world_body_disabled(mesh))continue;
+        int sc = mesh->wall_verts?N2_SC_WALL:mesh->scen;
+        int baked_props=embedded_prop_mesh(mesh);
         int prop_check = 0;
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
             if (sc == N2_SC_TERRAIN && !baked_props) continue;
@@ -1022,7 +1284,9 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
         } else if (s->meshes[i].cat != N2_OTHER) continue;   /* unnamed fallback */
         if (s->meshes[i].nverts < 3) continue;
         float ox0=1e30f,oy0=1e30f,oz0=1e30f, ox1=-1e30f,oy1=-1e30f,oz1=-1e30f;
-        for (int v=0;v<s->meshes[i].nverts;v++){ float *p=s->meshes[i].verts+v*5;
+        int nv=mesh->wall_verts?mesh->wall_nverts:mesh->nverts;
+        const float *verts=mesh->wall_verts?mesh->wall_verts:mesh->verts;
+        for (int v=0;v<nv;v++){ const float *p=verts+v*5;
             if(p[0]<ox0)ox0=p[0]; if(p[0]>ox1)ox1=p[0];
             if(p[1]<oy0)oy0=p[1]; if(p[1]>oy1)oy1=p[1];
             if(p[2]<oz0)oz0=p[2]; if(p[2]>oz1)oz1=p[2]; }
@@ -1032,7 +1296,8 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
          * geometric narrow phase distinguish those from a sub-0.30 m seam.
          * Keep the 2.5 m heuristic for props/unclassified meshes only. */
         if (!scen_is_wall(sc) && !baked_props && oz1-oz0 < WALL_MIN_HEIGHT) continue;
-        if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
+        /* Authored walls remain solid regardless of how long the mesh is. */
+        if (!scen_is_wall(sc) && (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN)) continue;
         if (prop_check) {   /* ponytail: thin street furniture passes through until dynamic knockdown exists */
             float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;
             if (smin < PROP_SOLID_SPAN) continue;

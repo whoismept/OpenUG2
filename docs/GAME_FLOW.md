@@ -1,10 +1,12 @@
 # Bayview: career, shops and progression
 
-Research reference for OpenUG2, 15 September 2026. This is the requested gameplay
+Research reference for OpenUG2, 15 September 2026; event research updated
+6 October 2026. This is the requested gameplay
 reference, not a claim that career mode has been implemented. The desktop/console
 Underground 2 campaign is the baseline; handheld versions are outside this scope.
 North American starter availability is used below, with regional differences
-identified explicitly. Sources describe observable gameplay, not implementation
+identified explicitly. The requested event baseline covers **both North American
+and European PC editions**. Sources describe observable gameplay, not implementation
 code. No original dialogue, artwork or binary data is reproduced here.
 
 ## Current OpenUG2 boundary
@@ -82,7 +84,7 @@ event records, not the order of files in a STREAM bundle.
 The manual distinguishes these modes and provides map/GPS and SMS navigation.
 It also describes visual rating as a progression requirement and vinyls as four
 ordered, individually recolourable layers.
-[EA PC manual, printed pp. 4–7](https://oldgamesdownload.com/wp-content/uploads/manuals/need-for-speed-underground-2_win_manual_en_5rt.pdf).
+[EA PC manual, printed pp. 4–7](https://manuals.plus/m/50c5d562cd775b55ee19afa2a587773422301f1bc5e6cd34f9c8fbb590f8d586.pdf).
 
 URL tournament standings use accumulated finishing points. Street X and drift
 disable nitrous. Drag uses lane changes and manual shifts; major impacts or
@@ -98,6 +100,166 @@ races, URL rounds/tournaments, outruns and photo events need distinct completion
 records; one generic `races_won` value cannot safely implement all these gates.
 The exact retail points table, tie resolution, timing limits and reward amounts
 remain to be verified before implementing each mode.
+
+### Event mechanics, HUD and camera reference
+
+Here, **stage/phase means retail career Stage 1–5**, not an OpenUG2 development
+milestone. The table describes the normal single-player modes; a story duel,
+Quick Race option or vehicle restriction can change an individual event.
+Lap counts belong to the event, not a fixed constant for the whole mode.
+
+| Mode | Objective and competitors | Traffic / nitrous | Presentation and distinctive behavior |
+| --- | --- | --- | --- |
+| Circuit | Finish all laps first; normally player + 3 rivals. | Traffic present / NOS allowed. | Position, current/total laps and lap timing. Direction, legal shortcuts and successive finish-line crossings matter. [Circuit reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Circuit) |
+| Sprint | First to the destination; normally player + 3 rivals. | Traffic present / NOS allowed. | Position and route completion instead of a repeating lap count. [Sprint reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Sprint) |
+| Drag | Reach the finish with manual shifts, even when normal driving uses automatic transmission. | Traffic on road courses / NOS allowed. | Lane-following steering with player lane changes; enlarged RPM, heat and NOS display. Shift feedback distinguishes early, good, perfect and over-rev shifts. Traffic/barrier impacts or prolonged over-rev can eliminate a driver. [Drag reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Drag), [HUD/steering reference](https://en.wikipedia.org/wiki/Need_for_Speed%3A_Underground_2#Gameplay) |
+| Enclosed drift | Highest banked drift score; player + 3 visible rivals. | No ambient traffic / NOS disabled. | Score, active chain, multiplier and opponent scores replace finish-position priority. Barrier-adjacent bonus zones reward controlled slides; a crash loses the active unbanked chain. [Drift reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Drift) |
+| Downhill drift | Highest drift score along a point-to-point mountain course. | Traffic present / NOS disabled. | Player drives alone against rival target scores. Roadside and traffic proximity affect scoring; reaching the finish is not sufficient to win. Same drift family, different course and opponent presentation. [Downhill reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Drift) |
+| Street X | First over the finish after the required laps; player + 3 rivals. | No ambient traffic / NOS disabled. | Tight enclosed tracks, repeated braking and close contact; ordinary lap/position information without an available nitrous control. [Street X reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Street_X) |
+| URL | Dedicated lap races; player + 5 rivals. A tournament winner is decided by cumulative finishing points across its heats. | No ambient traffic / NOS allowed. | Lap/position information during a heat, then heat results and overall standings. One heat win is not necessarily a tournament win. [URL reference](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Underground_Racing_League), [tournament reference](https://en.wikipedia.org/wiki/Need_for_Speed%3A_Underground_2#Gameplay) |
+
+The manual lists the six main race categories separately from Free Run and permits
+camera/HUD options. It does not give mode-specific camera heights, distances,
+FOV or damping. **The requested drift camera difference is recorded, but exact PC
+camera behavior remains unmeasured**; it must be checked against enclosed and
+downhill drift separately. The same applies to drag HUD placement/scaling in both
+PC editions. Asset names do not establish camera parameters.
+[EA PC manual, printed pp. 3–4 and 7](https://manuals.plus/m/50c5d562cd775b55ee19afa2a587773422301f1bc5e6cd34f9c8fbb590f8d586.pdf).
+
+The drift reference describes multiplier and bonus-zone behavior, but these are
+not recovered scoring equations. A secondary account reports a 30-second grace
+period when opponents finish before the player on enclosed courses. Its exact
+trigger, score banking at expiry and applicability to downhill events require
+PC observation. Drag shift windows likewise cannot be a universal 9,000 RPM:
+the firsthand guide itself reports car-dependent exceptions.
+[Drift finish timing](https://en.wikipedia.org/wiki/Need_for_Speed%3A_Underground_2#Gameplay),
+[shift-window caution, Drag Races section](https://gamefaqs.gamespot.com/ps2/920467-need-for-speed-underground-2/faqs/34283).
+
+### Career-stage event availability
+
+All five ordinary race categories already appear in Stage 1. URL joins from
+Stage 2; downhill drift uses Jackson Heights roads, introduced with Stage 3.
+Later stages reuse earlier districts and layouts. They do not replace the city
+with a separate map for each mode.
+[Stage inventory and downhill location](https://gamefaqs.gamespot.com/ps2/920467-need-for-speed-underground-2/faqs/34283).
+
+| Career stage | Newly accessible free-roam district | Circuit | Sprint | Drift* | Drag | Street X | URL | Reported total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Introduction | Borrowed-car opening | 2 | 1 | 0 | 0 | 0 | 0 | 3 |
+| 1 | City Core | 1 | 1 | 1 | 1 | 1 | 0 | 5 |
+| 2 | Beacon Hill | 14 | 5 | 6 | 5 | 5 | 3 | 38 |
+| 3 | Jackson Heights | 14 | 8 | 10 | 8 | 8 | 5 | 53 |
+| 4 | Coal Harbor East | 22 | 11 | 7 | 12 | 9 | 7 | 68 |
+| 5 | Coal Harbor West | 27 | 10 | 12 | 6 | 6 | 9 | 70 |
+
+These are the **walkthrough's reported inventory counts**, not required wins or
+unique course counts. Its totals combine downhill/enclosed drift and vehicle
+variants; sponsor-choice coverage and URL heat-versus-event counting are not
+validated against PC profiles. Do not use this table as an unlock-counter table
+or add all its rows to assert a verified campaign total.
+[Firsthand walkthrough, Career Mode / Important Info](https://gamefaqs.gamespot.com/ps2/920467-need-for-speed-underground-2/faqs/34283).
+
+Stage 1's named examples are listed above. The missing sprint entry remains
+unverified. For URL, Airport Circuit Tracks 1 and 3 have explicit Stage 3 labels
+in the course catalog. A PC walkthrough description places Bayview Speedway
+Tracks 4 and 3 in a Stage 4 tournament, and Tracks 2, 4 and 1 in a Stage 5
+tournament. These examples demonstrate reuse, **not a complete unlock order**.
+Exact Stage 2 heat layouts and the first appearance of every later layout remain
+open; no stage is assigned just because a track is located at Coal Harbor.
+[Airport Track 1](https://nfs.fandom.com/wiki/Airport_Circuit_Track_1),
+[Airport Track 3](https://nfs.fandom.com/wiki/Airport_Circuit_Track_3),
+[PC Stage 4 tournament description](https://www.youtube.com/watch?v=NC3i4mE_16k),
+[PC Stage 5 tournament description](https://www.youtube.com/watch?v=veHcYI0Yq-g).
+The video descriptions were accessible; their footage was not inspected in this
+research pass, so they do not verify lap counts, HUD positions or tournament ties.
+
+### Courses and venue families
+
+This is a **named-course reference**, not a decoded career-event database.
+Locations are catalogued starting areas; a course may cross other districts.
+Career invitation/marker location, loaded scene, route direction and heat
+configuration are separate properties. In particular, the guide places
+Industrial Park Track 2 in Stage 1 although its venue is catalogued at Coal Harbor;
+Bayview Bridge also appears before unrestricted Beacon Hill exploration.
+
+| Mode | Catalogued starting area / venue | Documented layouts |
+| --- | --- | --- |
+| Circuit | City Core | 12th & Arbutus, Broad Street, Freemont, Freeway East, Freeway West, Garibaldi Run, Grandview Station, Jackpot, Lower Eastside, Outer Ring, Providencia, Resort Loop, Scenic Ride, University Hill, Woodbine Park |
+| Circuit | Beacon Hill | Ambassador Ridge, City Hall, Marine & 25th, Palm Highway, Park Drive, Shoreside, Switchback |
+| Circuit | Jackson Heights | Bayview Summit, Bellavista, Observatory |
+| Circuit | Coal Harbor | Bayview Concrete, Boxcar, Dockside, Phoenix Steel, Smokestack |
+| Circuit | Airport | Bayview International |
+
+[Circuit course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Circuit).
+
+| Mode | Catalogued starting area / venue | Documented layouts |
+| --- | --- | --- |
+| Sprint | City Core | Bayview Plaza, Black Tusk, Broadway & Granville, Cypress Bowl, Grouse Grind, South Junction, Tailgate, Upper Deck, Wall Center |
+| Sprint | Beacon Hill | Palm Hill, Palomino & 16th, Rockridge Cross, The Chief |
+| Sprint | Jackson Heights | Blackcomb Way, Eagleridge Estates, Marathon, Rollercoaster |
+| Sprint | Coal Harbor | 2nd & Bellevue, Port Authority, Waste Management |
+| Sprint | Airport | Domestic Arrivals, Terminal & 2nd |
+
+[Sprint course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Sprint).
+The Prima guide additionally names **Sentinel Hill**; its omission from that wiki
+table is a coverage discrepancy, not evidence that the course should be removed.
+[Prima, Sprint Racing chapter](https://www.scribd.com/document/343113449/Need-for-Speed-Underground-2-Prima-Official-Guide).
+
+| Mode | Catalogued starting area / venue | Documented layouts |
+| --- | --- | --- |
+| Drag | City Core | North Freeway, Tunnel Construction |
+| Drag | Beacon Hill | Bayview Bridge |
+| Drag | Coal Harbor | Airport Freeway, Central Station, Coastal Express, Switching Yard |
+| Drag | Airport runway | Runway 9, Runway 15, South Runway |
+| Drag | Dedicated tuning course | Speedway Drag Tune; distinguish this from career race instances |
+
+[Drag course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Drag).
+
+| Mode | Venue | Documented layouts |
+| --- | --- | --- |
+| Enclosed drift | City Core stadium | Stadium Drift 1–5 |
+| Enclosed drift | City Core parkade | Parkade Drift 1–6 |
+| Downhill drift | Jackson Heights | Capilano Heights, City Lights, Hillside Manor, Hollyburn Ridge, Lighthouse, Powerline |
+
+[Drift course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Drift).
+
+| Mode | Venue | Documented layouts |
+| --- | --- | --- |
+| Street X | Industrial park, catalogued at Coal Harbor | Industrial Park Track 1–4 |
+| Street X | City Core parkade | Parkade Track 1–4 |
+| URL | Bayview International Airport | Airport Circuit Track 1–6 |
+| URL | Bayview Speedway, catalogued at Coal Harbor | Bayview Speedway Track 1–5 |
+
+[Street X course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Street_X),
+[URL course catalog](https://nfs.fandom.com/wiki/Need_for_Speed%3A_Underground_2/Underground_Racing_League).
+Direction variants, tuning-only layouts and multiple career instances prevent
+equating these names with a count of local `Paths*.bin` files.
+
+### Other event distinctions and PC regional scope
+
+Outrun is a moving free-roam challenge, not a fixed sprint course. Special events
+include timed travel for photo opportunities or unique rewards. Hidden and sponsor
+races qualify an existing race type; SUV eligibility is another qualifier. Their
+completion/reward records therefore need separate identities even when they share
+a physical route. Quick Race unlocks are also separate from career invitations.
+[Outrun/special/hidden/SUV reference](https://gamefaqs.gamespot.com/gamecube/920466-need-for-speed-underground-2/faqs/35414).
+
+Both requested PC regions use the common mode reference above. The checked
+sources do **not** establish different race rules between them, nor prove every
+career event record is identical. Regional vehicles and URL-linked car unlock
+reports differ; retain their regional qualification in the dealer tables below.
+Published car-unlock lists also disagree on stage-local versus lifetime URL
+numbering. Those ordinals cannot identify a race route, tournament heat or
+region-unlock trigger.
+[PC unlock reports and regional qualifications](https://gamefaqs.gamespot.com/pc/920469-need-for-speed-underground-2/cheats).
+
+Still unverified: every course's first career appearance in each PC region,
+career-instance IDs and directions, event-authored laps/rivals/difficulty,
+URL heat order/points/ties/final invitation conditions, exact drift equations,
+drag lanes/shift windows/heat thresholds and both modes' camera/HUD measurements.
+The existing district table below remains the campaign reference; it must not be
+replaced with a rule that any URL win opens the next area. Original PC event
+records or unmodified profiles/observations are needed to close these gaps.
 
 ## District and career progression
 

@@ -283,6 +283,19 @@ static void traffic_density_test(void) {
     world.view[0]=1;world.traffic_target=3;
     for(int round=0;round<8;round++)ai_traffic_update(&roads,&world,cars,routes,player,0);
     for(int k=0;k<N_OPENWORLD_AI;k++)assert(routes[k].present==(k<3 || ai_traffic_is_racer(k)));
+    world.ambient_only=1;world.traffic_target=16;
+    assert(ai_traffic_spawn(&roads,&world,cars,routes,player,0)==N_OPENWORLD_AI);
+    for(int k=0;k<N_OPENWORLD_AI;k++)assert(routes[k].present==!ai_traffic_is_racer(k));
+    /* Front-side streets can spawn outside the view; hiding a car preserves it. */
+    float front_xy[]={20,180,20,210,20,240};int front_next[]={1,2,-1};
+    AiRoadNet front={.xy=front_xy,.next=front_next,.n=3};
+    memset(routes,0,sizeof routes);
+    assert(ai_traffic_respawn(&front,&world,cars,routes,0,player,0));
+    assert(cars[0].pos[0]>0 && ai_traffic_offscreen(world.eye,world.view,cars[0].pos));
+    AiCar hidden=cars[0];cars[0].render_visible=0;
+    ai_traffic_update(&front,&world,cars,routes,player,0);
+    assert(routes[0].present && !memcmp(hidden.pos,cars[0].pos,sizeof hidden.pos));
+    world.ambient_only=0;
     /* An unavailable slot cannot prevent retries for the rest of the pool. */
     player[0]=10000;ai_traffic_spawn(&roads,&world,cars,routes,player,0);
     unsigned attempts=routes[0].respawns;
@@ -694,6 +707,19 @@ int main(void) {
         rival.pos[0]=0;rival.pos[1]=0;rival.t=1;rival.spd=PHYS_MAXSPD;
         ai_step(&rival,0,&loop,&empty,0,0);
         assert(rival.braking); /* corner deceleration drives the rear lamps */
+    }
+    /* A lateral race target uses the tangent at the lookahead point, even
+       when it has crossed a corner. Exercise both travel directions. */
+    {
+        float cornerxy[]={0,0,6,0,6,20};N2Path corner={cornerxy,3};AiDrive ahead;
+        float start[]={4,0,0};assert(ai_drive_init(&ahead,&corner,start,0));
+        ai_drive_step(&ahead,start,0,.1f);
+        assert(ahead.target[0]==6 && ahead.target[1]>0);
+        assert(fabsf(cosf(ahead.target_heading))<.00001f && sinf(ahead.target_heading)>.99999f);
+        start[0]=6;start[1]=2;assert(ai_drive_init(&ahead,&corner,start,-1.570796327f));
+        ai_drive_step(&ahead,start,-1.570796327f,.1f);
+        assert(ahead.direction==-1 && ahead.target[0]<6 && ahead.target[1]==0);
+        assert(cosf(ahead.target_heading)<-.99999f && fabsf(sinf(ahead.target_heading))<.00001f);
     }
     for(int i=0;i<4;i++)for(int r=0;r<2;r++)drive_curve(i*1.570796327f,r);
     {   /* The road query index must return exactly what the linear scan does,

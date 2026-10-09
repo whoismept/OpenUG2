@@ -45,15 +45,15 @@
 #include "frontend/frontend_draw.h"
 #endif
 
-/* debug tunables — defaults match the previously hard-coded constants, so a
- * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
+/* Shared gameplay tunables; `make debug` adds their ImGui controls. */
 DbgState g_dbg = {
     .body_kit_request = -1, .mod_request_slot = -1, .vinyl_request = -1,
     .freecam = 0, .speed = 0.6f,
     .traffic_target=N_AI, .traffic_max=N_TRAFFIC_MAX,
     .heat_local=1, .heat_height=1, .heat_span=300.0f,
+    .wall_range=60, .wall_through=1, .wall_height=1,
     .chase_distance = 4.0f, .chase_height = 2.0f, .chase_stiffness = 0.22f,
-    .race_maxlaps_want = 2,
+    .race_maxlaps_want = 2, .race_pace=110, .race_log_auto=1,
     /* .wheel (VehicleWheelConfig) is filled per car at load by wheel_config_for()
        -- an explicit table entry or a body-box fallback -- so no default here. */
     .wheel_scale = 1.0f,
@@ -1094,6 +1094,46 @@ done:
     { float dx=p[0]-q[0], dy=p[1]-q[1], dz=p[2]-q[2]; return dx*dx+dy*dy+dz*dz; }
 }
 
+static void collision_debug_draw(const RProg *r,GLuint *vbo,const N2Scene *scene,
+        const float (*bounds)[4],const int *sources,int nobst,const float centre[3],
+        const float player[3],const float mvp[16]) {
+    memset(g_dbg.wall_faces,0,sizeof g_dbg.wall_faces);g_dbg.wall_truncated=0;
+    if(!g_dbg.wall_show || !scene || !bounds)return;
+    static float faces[3][WALL_DEBUG_MAX_FACES*9];
+    float range=fmaxf(25,fminf(200,g_dbg.wall_range));int o=0;
+    for(int i=0;i<scene->count;i++) {
+        /* The obstacle collection is in source mesh order. */
+        while(sources && o<nobst && sources[o]<i)o++;
+        const N2Mesh *m=scene->meshes+i;
+        int ground=m->cat==N2_ROAD || m->cat==N2_TERRAIN;
+        if(!ground && (!sources || o>=nobst || sources[o]!=i))continue;
+        const float *bb=bounds[i];
+        float dx=fmaxf(0,fmaxf(bb[0]-centre[0],centre[0]-bb[2]));
+        float dy=fmaxf(0,fmaxf(bb[1]-centre[1],centre[1]-bb[3]));
+        if(dx*dx+dy*dy>range*range)continue;
+        int kind=m->wall_verts?2:ground?1:0;
+        int nidx=m->wall_verts?m->wall_nidx:m->nidx;
+        for(int t=0;t<nidx/3;t++) {
+            float v[9];
+            if(!phys_wall_debug_face(m,t,ground?WALL_MIN_FACE_SPAN:0,v))continue;
+            float lo[3],hi[3];
+            for(int a=0;a<3;a++) {
+                lo[a]=fminf(v[a],fminf(v[a+3],v[a+6]));
+                hi[a]=fmaxf(v[a],fmaxf(v[a+3],v[a+6]));
+            }
+            dx=fmaxf(0,fmaxf(lo[0]-centre[0],centre[0]-hi[0]));
+            dy=fmaxf(0,fmaxf(lo[1]-centre[1],centre[1]-hi[1]));
+            if(dx*dx+dy*dy>range*range ||
+               (g_dbg.wall_height && (hi[2]<player[2]-4 || lo[2]>player[2]+4)))continue;
+            if(g_dbg.wall_faces[kind]==WALL_DEBUG_MAX_FACES){g_dbg.wall_truncated=1;continue;}
+            memcpy(faces[kind]+9*g_dbg.wall_faces[kind]++,v,sizeof v);
+        }
+    }
+    static const float colors[3][3]={{.1f,.85f,1},{1,.55f,.08f},{1,.15f,.75f}};
+    for(int k=0;k<3;k++)g_dbg.drawn+=render_collision_walls(r,vbo,faces[k],
+        g_dbg.wall_faces[k],colors[k],mvp,g_dbg.wall_through);
+}
+
 static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
                        const float vel[2], float old_heading,
                        const VehicleWheelConfig *wc, PhysRideSupport *sup,
@@ -1279,21 +1319,23 @@ static int race_place_on_grid(const World *w, const N2Scene *sc,
        travel (260 m from gate 0 versus 1953 m for the far-end grid). */
     const WGate *g0 = &w->city.race.gate[0];
     int best = -1; float bestd = 1e30f, bestz = 0;
-    for (int pass = 0; pass < 2 && best < 0; pass++)
-        for (int i = 0; i < w->city.race.ngrid; i++) {
-            float gz = w->city.race.grid[i][2];
-            int cat = world_ground_at(sc, w->city.race.grid[i][0], w->city.race.grid[i][1],
-                                      w->city.race.grid[i][2], &gz);
-            if (cat == WSURF_NONE) continue;
-            if (pass == 0) {   /* first pass: the slot must sit on its own layer */
-                float dz = gz - w->city.race.grid[i][2]; if (dz < 0) dz = -dz;
-                if (cat != WSURF_ROAD || dz > 1.0f) continue;
-            }
-            float dx = w->city.race.grid[i][0] - g0->x, dy = w->city.race.grid[i][1] - g0->y;
-            float d2 = dx*dx + dy*dy;
-            if (d2 < bestd) { bestd = d2; best = i; bestz = gz; }
+    for (int i = 0; i < w->city.race.ngrid; i++) {
+        float gz = w->city.race.grid[i][2];
+        if(!world_race_grid_ground(sc,&w->city.ev[w->city.race.ev],w->city.race.grid[i],&gz))continue;
+        float dx = w->city.race.grid[i][0] - g0->x, dy = w->city.race.grid[i][1] - g0->y;
+        float d2 = dx*dx + dy*dy;
+        if (d2 < bestd) { bestd = d2; best = i; bestz = gz; }
+    }
+    if (best < 0) {
+        /* Seed residency from the shipped grid; caller must retry with the
+           loaded neighborhood before releasing the countdown. */
+        for(int i=0;i<w->city.race.ngrid;i++) {
+            float d=hypotf(w->city.race.grid[i][0]-g0->x,w->city.race.grid[i][1]-g0->y);
+            if(d<bestd){bestd=d;best=i;}
         }
-    if (best < 0) return 0;
+        if(best>=0)memcpy(carpos,w->city.race.grid[best],3*sizeof(float));
+        return 0;
+    }
     carpos[0] = w->city.race.grid[best][0];
     carpos[1] = w->city.race.grid[best][1];
     carpos[2] = bestz;                       /* the layer under the slot */
@@ -1943,6 +1985,7 @@ int main(int argc, char **argv) {
          --hud-preview    --hud plus labelled sample values for readouts with
                           no live system yet (nitrous tank, boost, money)
          --devui          open the ImGui developer menu at launch (make debug)
+         --collision-walls show current collision wall candidate faces in 3D
          --instance-audit print instance/world/support diagnostics and exit GL-free */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     int render_width = 1920, render_height = 1080;
@@ -2142,6 +2185,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--devui")) g_devui = 1;
+        else if (!strcmp(argv[i], "--collision-walls")) g_dbg.wall_show = 1;
         else if (!strcmp(argv[i], "--tier") && i+1 < argc) {
             const char *t = argv[++i];
             if      (!strcmp(t, "baseline")) tier = 0;
@@ -3032,7 +3076,7 @@ int main(int argc, char **argv) {
             ok ? idpaths_ok++ : idpaths_bad++;
             snprintf(bun, sizeof bun, "STREAM%s.BUN", e->reg);
             printf("  %4d %6d %-8s %-26s %5d %5d %6u %6u %8s %-20s %s\n",
-                   i, e->id, e->circuit ? "circuit" : "sprint",
+                   i, e->id, n2_race_name(e->info.kind),
                    r >= 0 && er[r].cat[0] ? er[r].cat + (int)strlen(troot) + 1 : "?",
                    e->npoly, e->len100m, b4, b6, ok ? "exists" : "MISSING", bun,
                    "dir stem only");
@@ -3109,6 +3153,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    world_collision_init();
     static World world;
     WorldResident *active_resident = NULL, *candidate_resident = NULL;
     WorldResident *retired_resident = NULL;
@@ -3501,6 +3546,7 @@ int main(int argc, char **argv) {
     RProg rp = render_program();
     HeadlightShadows headlight_shadows = {0};
     GLuint rain_vbo = 0;
+    GLuint wall_debug_vbo = 0;
     RoadReflections road_reflections = {0};
     CarEnvironment car_environment={0};
     CarShadow player_shadow={0},opponent_shadow={0};
@@ -4778,10 +4824,10 @@ int main(int argc, char **argv) {
         for (int i = 0; i < world.city.nev && nsprint < WORLD_MAXEVENT; i++)
             if (!strcmp(world.city.ev[i].reg, stem)) sprintev[nsprint++] = i;
         if (!ncirc && nsprint)
-            printf("sprint events available: %d (menu: [ / ]) -- selected id %d "
+            printf("race events available: %d (menu: [ / ]) -- selected id %d "
                    "(%s, %d outline points)\n", nsprint,
                    world.city.ev[sprintev[0]].id,
-                   world.city.ev[sprintev[0]].circuit ? "circuit" : "sprint",
+                   n2_race_name(world.city.ev[sprintev[0]].info.kind),
                    world.city.ev[sprintev[0]].npoly);
     }
     if (raudit) { printf("RA circuit list for %s (bbox filter mn %.0f %.0f mx %.0f %.0f):\n",
@@ -4790,7 +4836,7 @@ int main(int argc, char **argv) {
                       printf("RA   [%d]%s %s\n", i, i == selcirc ? "*" : " ", circlist[i]); }
 
     N2Path aipath = {0};
-    AiCar ais[N_OPENWORLD_AI]={0}; AiTraffic traffic_routes[N_OPENWORLD_AI]={{0}}; int start_idx = 0;
+    AiCar ais[N_WORLD_AI]={0}; AiTraffic traffic_routes[N_OPENWORLD_AI]={{0}}; int start_idx = 0;
     AiTrafficWorld traffic_world={.scene=&scene,.obst=(const float (*)[4])obst,
                                   .obstz=(const float (*)[2])obstz,
                                   .obstsrc=obstsrc,.nobst=nobst,.traffic_target=g_dbg.traffic_target};
@@ -4809,14 +4855,22 @@ int main(int argc, char **argv) {
             ais[k].support.ay[w]=((w&1)?-.5f:.5f)*(w<2?wc->front_track:wc->rear_track);
         }
         float wb=wc->front_axle-wc->rear_axle;
+        ais[k].has_powertrain=v->has_physics;
+        if(v->has_physics)ais[k].powertrain=v->physics;
+        ais[k].tyre_radius=v->profile.wheel_r;
         ais[k].vehicle=v->has_physics
             ? phys_vehicle_from_source(&v->physics,0,0,ais[k].height,wb,wc->front_track,v->profile.wheel_w)
             : phys_vehicle_from_geometry(2*ais[k].half_length,2*ais[k].half_width,
                 ais[k].height,wb,wc->front_track,v->gpu?v->profile.wheel_w:carprof.wheel_w);
     }
+    AiCar ai_templates[N_OPENWORLD_AI];memcpy(ai_templates,ais,sizeof ai_templates);
+    AiRace race_drivers[N_RACE_AI]={0};
+    PhysManual drag_gear={0};AiDrive drag_line={0};
+    float drag_lane=0,drag_lanes[WORLD_MAXGRID];int drag_lanen=0,drag_shift=0,drag_change=0;
+    int race_prepare_pending=world.city.race.active;
     /* load_circuit also REWRITES spawn/heading0 to the circuit start; a static
        capture must keep the region's own showcase spawn, so skip it entirely. */
-    int ai_race = !world2, nai = 0;
+    int ai_race = !world2, nai = 0, race_traffic_count=0;
     if (ncirc && !sstatic)
         nai = world2 ? load_roaming_circuit(dataroot,circlist[selcirc],&scene,
                                              &aipath,ais,spawn,&start_idx)
@@ -5753,7 +5807,7 @@ int main(int argc, char **argv) {
     float paint[3] = { 0.70f, 0.70f, 0.75f };
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (ai_race && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
+    if (ai_race && !world.city.race.active && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -5800,6 +5854,9 @@ int main(int argc, char **argv) {
 #else
     int race_state = 1;
 #endif
+    if(race_prepare_pending && !sstatic && !capture_policy.freeze_motion) {
+        ai_race=1;nai=0;race_state=0;
+    }
     int racetimer = 0, finish_place = 0;
 #ifdef OPENUG2_MENU
     Fe frontend;
@@ -5841,6 +5898,7 @@ int main(int argc, char **argv) {
     WResidentBuildArgs resident_args = {
         troot, trackname, runtime_scenery_event, sky_profile, resident_policy
     };
+    int resident_scenery_applied=runtime_scenery_event;
     float failed_resident_cell[2] = {NAN, NAN};
     int resident_route_frame = 0, resident_route_swaps = 0;
     int resident_route_pending = 0, resident_route_failed = 0;
@@ -5922,12 +5980,31 @@ int main(int argc, char **argv) {
     WResidentJob *resident_job = NULL;
     unsigned resident_wait_frames = 0;
     long pf_frame = 0;
+    PhysClock sim_clock={0};
+    Uint64 sim_counter=SDL_GetPerformanceCounter();
+    const double sim_frequency=(double)SDL_GetPerformanceFrequency();
+    const int deterministic_sim=shot || raudit || daudit || resident_route_audit || resident_drive_audit;
+    float throttle=0,player_wheel_angle=0;int handbrake=0,nitro_active=0;
+    /* One-tick display delay: interpolate only copies, never gameplay state. */
+    AiCar pose_before={0},pose_now={0};
+    AiCar ai_pose_before[N_WORLD_AI]={0},ai_pose_now[N_WORLD_AI]={0};
+    int pose_ready=0,ai_pose_present[N_WORLD_AI]={0};
+    unsigned ai_pose_generation[N_WORLD_AI]={0};
+    float shake_before=0,shake_now=0;
+    float camera_want_before[3]={0},camera_target_before[3]={0};
+    int camera_history_mode=-1;
     int heat_ticks=0,heat_running=0;
     char heat_context[160]={0};
+    RaceLog race_log={0};g_dbg.race_log=&race_log;
+    unsigned log_serial=0;int log_event=-1;
     while (running) {
         pf_mark(PF_FRAME_TOP);
         uint32_t resident_frame_begin = SDL_GetTicks();
         Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
+        double frame_seconds=(resident_frame_counter-sim_counter)/sim_frequency;
+        sim_counter=resident_frame_counter;
+        float frame_scale=deterministic_sim?1:(float)fmin(frame_seconds*PHYS_TICKRATE,8);
+        int sim_reset=0;
         if (retired_resident) {
             uint32_t begin = SDL_GetTicks();
             /* ponytail: work quota, not a hard millisecond deadline. Keep GL
@@ -5970,6 +6047,21 @@ int main(int argc, char **argv) {
                 g_devui = !g_devui;
                 printf("developer overlay: %s (toggle: 1)\n", g_devui ? "on" : "off");
                 continue;
+            }
+            int text_input=0;
+#ifdef DEBUG_UI
+            text_input=g_devui && dbgui_want_text();
+#endif
+            if(e.type==SDL_KEYDOWN && !e.key.repeat && !text_input) {
+                SDL_Keycode key=e.key.keysym.sym;
+                if(key==SDLK_PERIOD || key==SDLK_KP_PERIOD){g_dbg.race_log_mark=1;continue;}
+                if(race_state==1 && !g_dbg.freecam && world.city.race.active &&
+                   world.city.race.kind==N2_RACE_DRAG &&
+                   (key==SDLK_q || key==SDLK_e || key==SDLK_a || key==SDLK_d || key==SDLK_LEFT || key==SDLK_RIGHT)) {
+                    if(key==SDLK_q || key==SDLK_e)drag_shift=key==SDLK_e?1:-1;
+                    else drag_change=(key==SDLK_a || key==SDLK_LEFT)?1:-1;
+                    continue;
+                }
             }
 #ifdef DEBUG_UI
             if (g_devui) {
@@ -6132,13 +6224,13 @@ int main(int argc, char **argv) {
                            footprint (M91). Take the first waypoint AHEAD of it
                            whose own road layer passes the footprint, wall and
                            headroom tests, and start the lap there. */
-                        if (!aipath.n && nsprint > 0) {
+                        if (world.city.race.active || (!aipath.n && nsprint > 0)) {
                             /* No closed circuit here: arm the selected shipped
                                event through the same world_race_start() the
                                --event path uses, then place the player with the
                                same grid rule. Gates, corridor, barriers, HUD and
                                world_race_update all come from that call. */
-                            int ev = sprintev[selsprint];
+                            int ev = world.city.race.active?world.city.race.ev:sprintev[selsprint];
                             int ng = world_race_start(&world, troot, ev, want_laps);
                             if (ng > 0 && race_place_on_grid(&world, &scene, carpos, &heading)) {
                                 printf("sprint armed: event %d, %d gates\n",
@@ -6180,8 +6272,9 @@ int main(int argc, char **argv) {
                             }
                             vel[0]=vel[1]=0; speed=0;
                         }
-                        nai=ncirc?load_roaming_circuit(dataroot,circlist[selcirc],
-                            &scene,&aipath,ais,carpos,&start_idx):0;
+                        race_prepare_pending=world.city.race.active;
+                        nai=race_prepare_pending?0:(ncirc?load_roaming_circuit(dataroot,circlist[selcirc],
+                            &scene,&aipath,ais,carpos,&start_idx):0);
                         ai_race=1;race_state = 0; racetimer = 0;   /* -> 3-2-1 countdown */
                     }
                 }
@@ -6192,8 +6285,8 @@ int main(int argc, char **argv) {
         if (frontend_open) {
             const Uint8 *fks = SDL_GetKeyboardState(NULL);
             int held = fks[SDL_SCANCODE_DOWN] ? 1 : fks[SDL_SCANCODE_UP] ? -1 : 0;
-            fe_held(&frontend, held, 1.0f/60.0f);
-            fe_update(&frontend, 1.0f/60.0f);
+            fe_held(&frontend, held, frame_scale/PHYS_TICKRATE);
+            fe_update(&frontend, frame_scale/PHYS_TICKRATE);
             FeAction action = fe_poll_action(&frontend);
             if (action == FE_ACTION_QUIT) running = 0;
             else if (action == FE_ACTION_RACE_SELECT) frontend_open = 0;
@@ -6216,6 +6309,7 @@ int main(int argc, char **argv) {
            navigation/event catalog first, then atomically swap the active
            pointers. A failed load leaves the current drive untouched. */
         if (pending_car >= 0) {
+            sim_reset=1;
             int requested = pending_car;
             pending_car = -1;
             if (requested >= 0 && requested < ncars && requested != selcar) {
@@ -6301,6 +6395,7 @@ int main(int argc, char **argv) {
             }
         }
         if (pending_track >= 0) {
+            sim_reset=1;
             int requested = pending_track;
             pending_track = -1;
             if (requested >= 0 && requested < ntrack && requested != seltrack) {
@@ -6321,7 +6416,7 @@ int main(int argc, char **argv) {
                     candidate_resident = NULL;
                 }
                 int ok = fabsf(PHYS_KMH(speed)) <= 1.0f &&
-                    prepare_map_switch(troot, next_track, runtime_scenery_event,
+                    prepare_map_switch(troot, next_track, scenery_preview_set?scenery_event:-1,
                                        sky_profile, &resident_policy,
                                        &next_resident, next_spawn, &next_heading);
                 if (ok) ok = world_city_load(&next_city, &next_resident->world,
@@ -6339,6 +6434,7 @@ int main(int argc, char **argv) {
                     world.neighborhood = active_resident->world;
                     world.city = next_city;
                     world_city_free(&old_city);
+                    world_props_reset();
                     if (retired_resident) world_resident_free(retired_resident);
                     retired_resident = old_resident;
                     scene = active_resident->world.scene;
@@ -6377,6 +6473,7 @@ int main(int argc, char **argv) {
                     if (nvista) vista_far *= 2.5f;
                     trackname = next_track; seltrack = requested;
                     resident_args.trackname = trackname;
+                    resident_args.scenery_event=resident_scenery_applied=scenery_preview_set?scenery_event:-1;
                     memcpy(spawn, next_spawn, sizeof spawn);
                     memcpy(carpos, next_spawn, sizeof carpos);
                     world2_spawn_xy[0] = next_spawn[0];
@@ -6389,7 +6486,8 @@ int main(int argc, char **argv) {
                     p_lap = p_prev = 0; g_ride_ready = 0;
                     ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
                     selcirc = 0;
-                    ai_race = 0;
+                    ai_race = 0;race_prepare_pending=0;race_state=1;racetimer=0;
+                    memcpy(ais,ai_templates,sizeof ai_templates);
                     if(ncirc)load_roaming_circuit(dataroot,circlist[0],&scene,
                                       &aipath,ais,carpos,&start_idx);
                     memcpy(traffic_world.eye,carpos,sizeof traffic_world.eye);
@@ -6525,12 +6623,25 @@ int main(int argc, char **argv) {
         int resident_enabled = world2 && (race_state == 0 || race_state == 1) &&
             (!shot || daudit || resident_drive_audit) && !sstatic &&
             (!capture_policy.freeze_motion || resident_route_audit || resident_drive_audit);
+        int wanted_scenery=world.city.mode==MODE_RACE_EVENT && world.city.active_ev>=0
+            ?world.city.ev[world.city.active_ev].id:runtime_scenery_event;
+        if(world.city.mode==MODE_FREEROAM && !scenery_preview_set)wanted_scenery=-1;
+        if(resident_enabled && wanted_scenery!=resident_args.scenery_event) {
+            world_resident_job_cancel(&resident_job);
+            world_resident_free(candidate_resident);candidate_resident=NULL;
+            failed_resident_cell[0]=failed_resident_cell[1]=NAN;
+            resident_args.scenery_event=wanted_scenery;
+        }
         float target[2] = {0, 0};
         int resident_wanted = resident_enabled &&
                 world_resident_target(&resident_policy, carpos[0], carpos[1],
                                       active_resident->center[0],
                                       active_resident->center[1], target);
-        int background = race_state != 0 && (!raudit || (ai_drive_audit && resident_realtime)) && !resident_sync && !resident_route_audit &&
+        if(resident_enabled && resident_scenery_applied!=resident_args.scenery_event) {
+            if(!resident_wanted)memcpy(target,active_resident->center,sizeof target);
+            resident_wanted=1;
+        }
+        int background = resident_scenery_applied==resident_args.scenery_event && race_state != 0 && (!raudit || (ai_drive_audit && resident_realtime)) && !resident_sync && !resident_route_audit &&
                          (!shot || (resident_drive_audit && resident_realtime));
         if (candidate_resident && (!resident_wanted || !background ||
             candidate_resident->center[0] != target[0] ||
@@ -6605,6 +6716,7 @@ int main(int argc, char **argv) {
                     uint32_t activate_begin = SDL_GetTicks();
                     world_resident_activate(&active_resident,
                                             &candidate_resident);
+                    resident_scenery_applied=resident_args.scenery_event;
                     world.neighborhood = active_resident->world;
                     m94_generation=active_resident->generation;
                     ra_have_ground=0; /* old mesh indices belong to the old resident */
@@ -6822,6 +6934,117 @@ int main(int argc, char **argv) {
             heatmap_clear(&g_dbg.heatmap);heat_ticks=0;g_dbg.heat_clear=0;
             snprintf(heat_context,sizeof heat_context,"%s",heat_current);
         }
+        if(race_prepare_pending && race_state==0 && !resident_job && !candidate_resident) {
+            sim_reset=1;drag_shift=drag_change=0;race_prepare_pending=0;g_dbg.race_error[0]=0;
+            if(!race_place_on_grid(&world,&scene,carpos,&heading)) {
+                snprintf(g_dbg.race_error,sizeof g_dbg.race_error,"This course has no usable starting grid in the loaded area.");
+                fprintf(stderr,"race start rejected: no supported grid in the loaded neighborhood\n");
+                world_race_stop(&world);world_set_mode(&world,MODE_FREEROAM,-1);
+                ai_race=0;race_state=1;memcpy(ais,ai_templates,sizeof ai_templates);
+                ss_nearest_surface(&scene,carpos[0],carpos[1],carpos,&heading);
+                nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+            } else {
+                AiCar player={.pos={carpos[0],carpos[1],carpos[2]},.head=heading,
+                    .half_length=(carbb[3]-carbb[0])*.5f,.half_width=(carbb[4]-carbb[1])*.5f,
+                    .height=carbb[5]-carbb[2]};
+                for(int k=0;k<N_RACE_AI;k++)ais[k]=ai_templates[ai_event_visual(k)];
+                nai=ai_race_prepare(troot,&world.city.ev[world.city.race.ev],&world.city.race,
+                                    &traffic_world,&aipath,ais,race_drivers,&player);
+                const WEvent *event=&world.city.ev[world.city.race.ev];
+                int wanted=event->info.kind==N2_RACE_URL?5:3;
+                if(aipath.n<2 || (!event->info.downhill && nai!=wanted)) {
+                    if(aipath.n<2)snprintf(g_dbg.race_error,sizeof g_dbg.race_error,"This course's route is not available yet.");
+                    else snprintf(g_dbg.race_error,sizeof g_dbg.race_error,"This course needs %d opponents; only %d starting slots are usable.",wanted,nai);
+                    fprintf(stderr,"race start rejected: event %d has no usable course or complete grid (%d/%d opponents)\n",
+                            event->id,nai,wanted);
+                    world_race_stop(&world);world_set_mode(&world,MODE_FREEROAM,-1);
+                    ai_race=0;race_state=1;free(aipath.xy);aipath=(N2Path){0};
+                    memcpy(ais,ai_templates,sizeof ai_templates);
+                    nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+                } else {
+                    heading=ai_course_heading(&aipath,carpos);
+                    drag_gear=(PhysManual){.gear=1,.rpm=g_vehicle_source_valid?g_vehicle_source.idle_rpm:800};drag_line=(AiDrive){0};
+                    if(world.city.race.kind==N2_RACE_DRAG && aipath.n>1) {
+                        ai_drive_join(&drag_line,&aipath,carpos,heading,race_drivers[0].drive.error_limit);
+                        drag_lane=ai_course_lateral(&aipath,carpos);drag_lanen=0;
+                        for(int slot=0;slot<world.city.race.ngrid;slot++) {
+                            const float *g=world.city.race.grid[slot];float z;
+                            if(hypotf(g[0]-carpos[0],g[1]-carpos[1])>60 ||
+                               !world_race_grid_ground(&scene,&world.city.ev[world.city.race.ev],g,&z))continue;
+                            float lane=ai_course_lateral(&aipath,g);int duplicate=0;
+                            for(int j=0;j<drag_lanen;j++)if(fabsf(drag_lanes[j]-lane)<.5f)duplicate=1;
+                            if(!duplicate)drag_lanes[drag_lanen++]=lane;
+                        }
+                        printf("Drag controls: W throttle, S brake, A/D or arrows change lane once, E upshift, Q downshift\n");
+                    }
+                    ai_race=1;racetimer=0;speed=vel[0]=vel[1]=0;g_ride_ready=0;
+                    race_traffic_count=0;traffic_world.ambient_only=1;
+                    race_log_stop(&race_log);
+                    if(g_dbg.race_log_auto)g_dbg.race_log_start=1;
+                    if(race_has_traffic(event->info.kind,event->info.downhill)) {
+                        memcpy(ais+N_RACE_AI,ai_templates,sizeof ai_templates);
+                        memcpy(traffic_world.eye,carpos,sizeof traffic_world.eye);
+                        traffic_world.view[0]=cosf(heading);traffic_world.view[1]=sinf(heading);
+                        race_traffic_count=ai_traffic_spawn(&roam_roads,&traffic_world,
+                            ais+N_RACE_AI,traffic_routes,carpos,heading);
+                    }
+                }
+            }
+        }
+        if(!ai_race || !world.city.race.active)race_traffic_count=0;
+        traffic_world.ambient_only=ai_race && world.city.race.active;
+        traffic_world.race_pace=g_dbg.race_pace;
+        int draw_nai=race_traffic_count?N_RACE_AI+race_traffic_count:nai;
+        traffic_world.ambient=ais+N_RACE_AI;traffic_world.ambient_routes=traffic_routes;
+        traffic_world.ambient_count=race_traffic_count;
+        int current_log_event=world.city.race.active?world.city.ev[world.city.race.ev].id:-1;
+        if(race_log.file && log_event>=0 && log_event!=current_log_event)race_log_stop(&race_log);
+        if(g_dbg.race_log_start) {
+            g_dbg.race_log_start=0;
+            char path[1024],stamp[40];time_t now=time(NULL);struct tm *date=localtime(&now);
+            if(date)strftime(stamp,sizeof stamp,"%Y%m%d-%H%M%S",date);
+            else snprintf(stamp,sizeof stamp,"%ld",(long)now);
+            char *base=SDL_GetBasePath();
+            int event=world.city.race.active?world.city.ev[world.city.race.ev].id:0;
+            int length=snprintf(path,sizeof path,"%srace-log-%s-event-%d-%u.csv",base?base:"",stamp,event,++log_serial);
+            SDL_free(base);
+            if(length>0 && length<(int)sizeof path && race_log_start(&race_log,path)) {
+                log_event=current_log_event;
+                race_log_write(&race_log,"OPENUG2_RACE_LOG,1,60Hz simulation,10Hz samples\n");
+                race_log_write(&race_log,"SESSION,%d,%d,%d,%.1f,%d,",event,world.city.race.kind,
+                    world.city.race.active?world.city.ev[world.city.race.ev].info.downhill:0,
+                    g_dbg.race_pace,g_dbg.traffic_target);
+                race_log_text(&race_log,trackname);race_log_write(&race_log,",");
+                race_log_text(&race_log,carname);race_log_write(&race_log,"\n");
+                race_log_write(&race_log,"PLAYER columns: tick,seconds,event,state,gate,lap,x,y,z,heading,kmh,throttle,steer,wheels,groundZ,surface,walls,vehicleHit,frameMs,dragLane,gear,rpm,failed,asset\n");
+                race_log_write(&race_log,"CAR columns: tick,id,role,x,y,z,heading,kmh,targetKmh,wheels,visible,segment,error,blocked,failed,gate,respawns,stopReason\n");
+                race_log_flush(&race_log);
+            } else if(length<0 || length>=(int)sizeof path)
+                snprintf(race_log.status,sizeof race_log.status,"Log path is too long");
+        }
+        if(g_dbg.race_log_mark) {
+            g_dbg.race_log_mark=0;
+            if(race_log.file) {
+                WGroundHit hit={0};int cat=world_ground_hit(&scene,carpos[0],carpos[1],carpos[2],&hit);
+                RaceLogMark mark={.pos={carpos[0],carpos[1],carpos[2]},.speed=PHYS_KMH(speed),
+                    .event=world.city.race.active?world.city.ev[world.city.race.ev].id:0,.gate=world.city.race.next};
+                snprintf(mark.asset,sizeof mark.asset,"%s",cat!=WSURF_NONE && hit.mesh>=0 && hit.mesh<scene.count?scene.meshes[hit.mesh].sname:"");
+                snprintf(mark.note,sizeof mark.note,"%s",g_dbg.race_log_note);
+                race_log_mark(&race_log,&mark);
+                for(int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes)) {
+                    int racer=ai_race && k<nai;
+                    race_log_write(&race_log,"MARKCAR,%ld,%ld,%d,%s,%.3f,%.3f,%.3f,%.5f,%.2f,%.2f,%d,%d,%.3f,%d\n",
+                        race_log.marks,race_log.tick,k,racer?"opponent":"traffic",ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],
+                        ais[k].head,PHYS_KMH(ais[k].spd),PHYS_KMH(ais[k].target_speed),ais[k].ride.contact_mask,
+                        racer?race_drivers[k].drive.segment:traffic_routes[ai_actor_slot(k,ai_race)].from,
+                        racer?race_drivers[k].drive.error:traffic_routes[ai_actor_slot(k,ai_race)].lane_offset,
+                        racer?race_drivers[k].blocked:0);
+                }
+                race_log_flush(&race_log);
+            } else snprintf(race_log.status,sizeof race_log.status,"Start recording before marking a problem");
+        }
+        if(g_dbg.race_log_flush){g_dbg.race_log_flush=0;race_log_flush(&race_log);}
+        if(g_dbg.race_log_stop){g_dbg.race_log_stop=0;race_log_stop(&race_log);}
         int heat_active=g_dbg.heat_record && race_state==1 &&
                         !sstatic && !capture_policy.freeze_motion;
         if(heat_active != heat_running) {
@@ -6829,13 +7052,57 @@ int main(int argc, char **argv) {
         }
         heat_running=heat_active;
         g_ai_contact_hook=heat_active?traffic_heat_contact:NULL;
-        float throttle = 0.0f;
-        if (race_state == 1 && !g_dbg.freecam) {
+        /* Inputs and rendering remain per frame; vehicle motion, contacts,
+           race timers and effects advance together at PHYS_TICKRATE. */
+        if(sim_reset){sim_clock=(PhysClock){0};frame_seconds=0;sim_counter=SDL_GetPerformanceCounter();}
+        int sim_steps=deterministic_sim?1:phys_clock_steps(&sim_clock,frame_seconds);
+        int pf_spawns=0;
+        float sim_wheel_scale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
+        float car_ride=carprof.ride*sim_wheel_scale;
+        float car_body_ride=body_ride_height(car_ride,car_floor,g_dbg.body_drop);
+        int beam_keys=1,driving_keys=!g_dbg.freecam;
+#ifdef DEBUG_UI
+        beam_keys=!dbgui_want_keyboard();
+        driving_keys=driving_keys && !(g_devui && dbgui_want_text());
+#endif
+        int beam_high=g_dbg.headlight_mode==1 || (beam_keys && ks[SDL_SCANCODE_L]);
+        int beam_flash=beam_keys && ks[SDL_SCANCODE_J];
+        int headlights_on=(g_dbg.night_mode && (g_dbg.headlight_mode!=2 || beam_high)) || beam_flash;
+        int race_nos_allowed = !world.city.race.active || world.city.race.ev<0 ||
+            (world.city.ev[world.city.race.ev].info.kind!=N2_RACE_STREETX &&
+             world.city.ev[world.city.race.ev].info.kind!=N2_RACE_DRIFT);
+        AiCar live_pose={.pos={carpos[0],carpos[1],carpos[2]},.vel={vel[0],vel[1]},.head=heading,.spd=speed,
+            .wheel_angle=player_wheel_angle,.steer=steer_filtered,.ride=g_ride,.ride_ready=g_ride_ready};
+        /* Loads, grid placement and debug moves can happen outside ticks. */
+        int pose_snap=!pose_ready || sim_reset || memcmp(live_pose.pos,pose_now.pos,sizeof live_pose.pos) ||
+           live_pose.head!=pose_now.head || live_pose.ride_ready!=pose_now.ride_ready;
+        if(pose_snap) {
+            pose_before=live_pose;shake_before=shake_now=landing_offset;
+        }
+        pose_now=live_pose;
+        for(int k=0;k<draw_nai;k++) {
+            if(!pose_ready || sim_reset || memcmp(ais[k].pos,ai_pose_now[k].pos,sizeof ais[k].pos) ||
+               ais[k].head!=ai_pose_now[k].head || ais[k].half_length!=ai_pose_now[k].half_length ||
+               ais[k].half_width!=ai_pose_now[k].half_width)ai_pose_before[k]=ais[k];
+            ai_pose_now[k]=ais[k];
+        }
+        pose_ready=1;
+        for(int sim_tick=0;sim_tick<sim_steps;sim_tick++) {
+        int pose_nai=draw_nai;
+        pose_before=pose_now;shake_before=landing_offset;
+        for(int k=0;k<draw_nai;k++) {
+            ai_pose_before[k]=ai_pose_now[k];
+            ai_pose_present[k]=ai_actor_present(k,ai_race,nai,traffic_routes);
+            int slot=ai_actor_slot(k,ai_race);
+            ai_pose_generation[k]=slot>=0?traffic_routes[slot].respawns:0;
+        }
+        throttle=0.0f;
+        if (race_state == 1 && driving_keys) {
             if      (ks[SDL_SCANCODE_W] || (shot && !sstatic && !capture_policy.freeze_motion && !perf_still)) throttle =  1.0f;
             else if (ks[SDL_SCANCODE_S])         throttle = -1.0f;
         }
-        float steer = g_dbg.freecam?0:(ks[SDL_SCANCODE_A]?1.f:0.f) - (ks[SDL_SCANCODE_D]?1.f:0.f);
-        int handbrake = (race_state==1 && !g_dbg.freecam && ks[SDL_SCANCODE_SPACE]);
+        float steer = !driving_keys?0:(ks[SDL_SCANCODE_A]?1.f:0.f) - (ks[SDL_SCANCODE_D]?1.f:0.f);
+        handbrake = (race_state==1 && driving_keys && ks[SDL_SCANCODE_SPACE]);
         /* Auto-drive (camera-spring test): steady throttle + smooth sine steer fed
            straight into the physics, so the car throws itself through an S-curve
            hands-free. Interactive only -- gated on !shot so it never fights the
@@ -6985,18 +7252,10 @@ int main(int argc, char **argv) {
         /* L holds high beam (short beam is the default); J flashes both lamps
            for the open-world racer invitation signal. N is the compact nitro
            trigger used by the visual pass below. */
-        int beam_keys = 1;
-#ifdef DEBUG_UI
-        beam_keys = !dbgui_want_keyboard();
-#endif
-        int beam_high = g_dbg.headlight_mode==1 || (beam_keys && ks[SDL_SCANCODE_L]);
-        int beam_flash = beam_keys && ks[SDL_SCANCODE_J];
-        int headlights_on = (g_dbg.night_mode && (g_dbg.headlight_mode!=2 || beam_high)) || beam_flash;
-        int nitro_active = race_state == 1 &&
+        nitro_active = race_nos_allowed && race_state == 1 &&
                            ks[SDL_SCANCODE_N] && throttle > 0.1f && speed > 0.02f;
         float nitro_target = nitro_active ? 1.0f : 0.0f;
         nitro_fx += (nitro_target - nitro_fx) * 0.18f;
-        steer_filtered=phys_steer_response(steer_filtered,steer);
         /* Surface-aware handling (M114): query the selected centre contact layer,
            then EASE the active profile toward that surface's
            profile over ~0.15 s. Blending the profile (not the velocity) means
@@ -7016,90 +7275,26 @@ int main(int argc, char **argv) {
             float *d = (float *)&surf_now; const float *t = (const float *)tgt;
             for (int c = 0; c < 5; c++) d[c] += (t[c] - d[c]) * SURF_BLEND;
         }
+        int drag_active=world.city.race.active && world.city.race.kind==N2_RACE_DRAG;
+        if(drag_active)steer=0; /* held keys cannot steer freely during drag */
+        if(drag_active && race_state==1 && !g_dbg.freecam && drag_line.path==&aipath && !drag_line.failed) {
+            drag_line.stalled=0;ai_drive_step(&drag_line,carpos,heading,speed);
+            AiCar body={.pos={carpos[0],carpos[1],carpos[2]},.head=heading,.spd=speed,
+                .half_length=(carbb[3]-carbb[0])*.5f,.half_width=(carbb[4]-carbb[1])*.5f,.height=carbb[5]-carbb[2]};
+            drag_lane=ai_drag_lane_target(&traffic_world,&body,&drag_line,drag_lane,drag_lanes,drag_lanen,drag_change);
+            if(!drag_line.failed && !drag_line.finished) {
+                float h=drag_line.target_heading;
+                float x=drag_line.target[0]-sinf(h)*drag_line.direction*drag_lane;
+                float y=drag_line.target[1]+cosf(h)*drag_line.direction*drag_lane;
+                float error=atan2f(y-carpos[1],x-carpos[0])-heading;
+                steer=fmaxf(-1,fminf(1,atan2f(sinf(error),cosf(error))/.5f));
+            }
+        }
+        steer_filtered=phys_steer_response(steer_filtered,steer);
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
         g_phys_tune.turn = g_dbg.tune_turn;   g_phys_tune.top_kmh = g_dbg.tune_top;
-        /* Race autopilot (--shot only): walk the car along the corridor-masked
-           A* route to the armed gate so a headless run drives the real course
-           and the checkpoint logic sees real positions. Kinematic on purpose —
-           the same role as the --circuit demo autopilot below, and the physics
-           drive is separately pinned on this track (the default --circuit start
-           snap lands the car inside geometry, so collide_walls holds it at
-           0 km/h; pre-existing, not the race system). */
-        static int rpath[8192]; static int rpn = 0, rp_gate = -1, rp_at = 0;
-        int race_auto = shot && !sstatic && !capture_policy.freeze_motion &&
-                        world.city.race.active && !world.city.race.finished;
-        if (race_auto) {
-            if (rp_gate != world.city.race.next) {
-                int s = world_nav_nearest(&world, carpos[0], carpos[1]);
-                int gnode = world.city.race.gate[world.city.race.next].node;
-                rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
-                if (rpn <= 1 && world.city.mode == MODE_RACE_EVENT) {
-                    /* the corridor mask can disconnect the spawn/previous node
-                       from this gate; without a route the car would beeline
-                       straight through the city. Re-route on the UNMASKED road
-                       graph (fully connected) so it always stays on asphalt. */
-                    int mode = world.city.mode; world.city.mode = MODE_FREEROAM;
-                    rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
-                    world.city.mode = mode;
-                }
-                if (rtrace) {
-                    const WGate *G = &world.city.race.gate[world.city.race.next];
-                    float gz4 = 0;
-                    int c4 = world_ground_at(&scene, G->x, G->y, carpos[2], &gz4);
-                    printf("RT retarget: next=%d/%d  gate(%.3f %.3f) node %d  "
-                           "car(%.3f %.3f) start-node %d  route %d nodes  "
-                           "gate-support %s z %.3f  lap %d cleared %d\n",
-                           world.city.race.next, world.city.race.ngate, G->x, G->y, gnode,
-                           carpos[0], carpos[1], s, rpn,
-                           c4 == WSURF_ROAD ? "ROAD" : c4 == WSURF_TERRAIN ? "TERRAIN"
-                                                                           : "NONE", gz4,
-                           world.city.race.lap, world.city.race.cleared);
-                    if (rpn > 1)
-                        printf("RT   route ends at node %d (%.3f %.3f), gate node "
-                               "%d (%.3f %.3f)\n", rpath[rpn-1],
-                               world.city.nav[rpath[rpn-1]*2], world.city.nav[rpath[rpn-1]*2+1],
-                               gnode, world.city.nav[gnode*2], world.city.nav[gnode*2+1]);
-                }
-                rp_gate = world.city.race.next; rp_at = 0;
-            }
-            const WGate *ng = &world.city.race.gate[world.city.race.next];
-            float gdx = ng->x - carpos[0], gdy = ng->y - carpos[1];
-            float dx, dy;
-            if (gdx*gdx + gdy*gdy < 9.0f*9.0f) {
-                /* almost on the gate: drive straight through on the current
-                   heading so the crossing always registers (no node stalling). */
-                dx = cosf(heading); dy = sinf(heading);
-            } else {
-                float tx = ng->x, ty = ng->y;
-                if (rpn > 1) {                     /* follow the A* route in */
-                    /* hug each node (advance at 3 m) so the aim tracks the road
-                       polyline rather than cutting toward the distant gate */
-                    if (rp_at < rpn - 1) {
-                        float ax = world.city.nav[rpath[rp_at]*2]   - carpos[0];
-                        float ay = world.city.nav[rpath[rp_at]*2+1] - carpos[1];
-                        if (ax*ax + ay*ay < 9.0f) rp_at++;
-                    }
-                    tx = world.city.nav[rpath[rp_at]*2]; ty = world.city.nav[rpath[rp_at]*2+1];
-                }
-                dx = tx - carpos[0]; dy = ty - carpos[1];
-            }
-            float d = sqrtf(dx*dx + dy*dy);
-            if (d > 1e-3f) {
-                float step = 1.2f;                 /* ~72 m/s at 60 Hz */
-                carpos[0] += dx/d*step; carpos[1] += dy/d*step;
-                heading = atan2f(dy, dx);
-                speed = step * 60.0f;
-            }
-            /* clamp Z to the nearest road/terrain surface, eased so a gap in an
-               elevated deck descends smoothly instead of teleporting */
-            { float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-              float dz = gz - carpos[2];
-              if (dz >  1.5f) dz =  1.5f; if (dz < -1.5f) dz = -1.5f;
-              carpos[2] += dz; }
-            world_race_update(&world, carpos[0], carpos[1]);
-        }
-        else if (ai_race && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        if (ai_race && !world.city.race.active && shot && !sstatic && !capture_policy.freeze_motion && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -7119,32 +7314,37 @@ int main(int argc, char **argv) {
         float ground_old[3]={carpos[0],carpos[1],carpos[2]}, ground_oldh=heading;
         float dmag = 0.0f, load_lat = 0.0f;
         if (!sstatic && !capture_policy.freeze_motion) {
-            if (race_auto) dmag = speed / 60.0f;
-            else {
-                float oldvx = vel[0], oldvy = vel[1];
-                if(g_vehicle_source_valid)
-                    g_vehicle=phys_vehicle_from_source(&g_vehicle_source,
-                        g_dbg.perf_power_level,g_dbg.perf_transmission_level,
-                        carbb[5]-carbb[2],
-                        g_dbg.wheel.front_axle-g_dbg.wheel.rear_axle,
-                        g_dbg.wheel.front_track,carprof.wheel_w);
-                /* A short top-speed headroom gives the visual trigger a real
-                   response while preserving the existing tune after the step. */
-                float saved_top = g_phys_tune.top_kmh;
-                if (nitro_active) g_phys_tune.top_kmh = saved_top * 1.18f;
-                dmag = phys_drive_step(carpos, vel, &heading, &speed,
-                                     throttle, steer_filtered, handbrake,
-                                     &surf_now, &g_vehicle,g_ride_ready?&g_ride:NULL);
-                g_phys_tune.top_kmh = saved_top;
-                /* vel is metres/tick. Convert its one-tick change to m/s^2,
-                   then project it into the final car frame for visual lean. */
-                float dvx=(vel[0]-oldvx)*PHYS_TICKRATE*PHYS_TICKRATE;
-                float dvy=(vel[1]-oldvy)*PHYS_TICKRATE*PHYS_TICKRATE;
-                float ch=cosf(heading), sh=sinf(heading);
-                load_lat=-dvx*sh+dvy*ch;
+            float oldvx = vel[0], oldvy = vel[1];
+            if(g_vehicle_source_valid)
+                g_vehicle=phys_vehicle_from_source(&g_vehicle_source,
+                    g_dbg.perf_power_level,g_dbg.perf_transmission_level,
+                    carbb[5]-carbb[2],
+                    g_dbg.wheel.front_axle-g_dbg.wheel.rear_axle,
+                    g_dbg.wheel.front_track,carprof.wheel_w);
+            float drag_gain=1;
+            if(drag_active && race_state==1 && g_vehicle_source_valid) {
+                drag_gain=phys_manual_step(&drag_gear,&g_vehicle_source,g_dbg.perf_power_level,
+                    g_dbg.perf_transmission_level,carprof.wheel_r*g_dbg.wheel_scale,
+                    speed,throttle,drag_shift,1/PHYS_TICKRATE);
+                if(drag_gain<=0 && throttle>0)throttle=0;
             }
+            PhysVehicle driven=g_vehicle;if(drag_active)driven.accel*=drag_gain;
+            /* A short top-speed headroom gives the visual trigger a real
+               response while preserving the existing tune after the step. */
+            float saved_top = g_phys_tune.top_kmh;
+            if (nitro_active) g_phys_tune.top_kmh = saved_top * 1.18f;
+            dmag = phys_drive_step(carpos, vel, &heading, &speed,
+                                 throttle, steer_filtered, handbrake,
+                                 &surf_now, &driven,g_ride_ready?&g_ride:NULL);
+            g_phys_tune.top_kmh = saved_top;
+            /* vel is metres/tick. Convert its one-tick change to m/s^2,
+               then project it into the final car frame for visual lean. */
+            float dvx=(vel[0]-oldvx)*PHYS_TICKRATE*PHYS_TICKRATE;
+            float dvy=(vel[1]-oldvy)*PHYS_TICKRATE*PHYS_TICKRATE;
+            float ch=cosf(heading), sh=sinf(heading);
+            load_lat=-dvx*sh+dvy*ch;
         }
-        if (g_ride_ready && race_state==1 && !race_auto && !sstatic && !capture_policy.freeze_motion) {
+        if (g_ride_ready && race_state==1 && !sstatic && !capture_policy.freeze_motion) {
             WGroundHit h;
             float fraction=ground_motion_limit(&scene,&g_ride,&g_sup,ground_old,ground_oldh,
                                                carpos,&heading,vel,&h);
@@ -7164,7 +7364,9 @@ int main(int argc, char **argv) {
            the throttle for 150ms and let the revs sag (idles during the
            countdown, since throttle is locked out until GO). */
         { float sp = (speed < 0 ? -speed : speed) / PHYS_MAXSPD;
-          eng_gearbox_step(sp, throttle, 1.0f/60.0f, &gear, &shift_t);
+          if(drag_active && g_vehicle_source_valid) {
+              gear=drag_gear.gear;g_engine.target_rpm=drag_gear.rpm;g_engine.load=fmaxf(0,throttle);
+          } else eng_gearbox_step(sp, throttle, 1.0f/60.0f, &gear, &shift_t);
           g_engine.master_volume = (race_state==0 ? 0.16f : 0.16f + sp*0.5f);
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
         float fwd[3] = { nf[0], nf[1], 0 };
@@ -7172,9 +7374,6 @@ int main(int argc, char **argv) {
         /* Body collision envelope at the exact gameplay contact. The renderer
            uses the same contact and body ride; wheels use car_ride unchanged so
            a per-car body drop never moves the tyre off the road. */
-        float car_ride = carprof.ride
-                       * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
-        float car_body_ride = body_ride_height(car_ride,car_floor,g_dbg.body_drop);
         float car_body_drop = car_ride-car_body_ride;
         float car_z0 = carpos[2] + car_body_ride + carbb[2];
         float car_z1 = carpos[2] + car_body_ride + carbb[5];
@@ -7182,10 +7381,16 @@ int main(int argc, char **argv) {
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
         PhysWallContact wc[8]; int nwc = 0;
         float vpre[2] = { vel[0], vel[1] };
-        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion &&
-            (nwc = collide_body_walls(carpos, vel, heading, carbb, obst, obstz, nobst,
-                                 car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
-            g_hit = 0.5f; da_walls++; ra_walls++;
+        WRailHit rh={.mesh=-1};int rpushed=0;
+        if(race_state==1 && !sstatic && !capture_policy.freeze_motion) {
+            float dz=g_ride_ready && !g_ride.contact_mask
+                     ?(g_ride.vz-PHYS_RIDE_G/PHYS_TICKRATE)/PHYS_TICKRATE:0;
+            nwc=world_body_walls_move(&scene,ground_old,carpos,vel,heading,carbb,
+                car_z0,car_z1,dz,obst,obstz,nobst,obstsrc,wc,8,
+                (raudit || daudit)?&rh:NULL,&rpushed);
+        }
+        if(nwc>0) {
+            da_walls++; ra_walls++;
             if (daudit && da_walls == 1 && nwc > 0) {
                 int mi = wc[0].mesh;
                 printf("DA FIRST WALL mesh=%d tri=%d name=%s normal=(%+.3f,%+.3f) "
@@ -7214,15 +7419,10 @@ int main(int argc, char **argv) {
             } }
         float heat_world_before[3]={m94_prex,m94_prey,m94_prez};
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
-        { WRailHit rh; rh.mesh = -1;
-          int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion) &&
-                        world_body_wall_push(&scene,carpos,vel,heading,carbb,
-                                             car_z0,car_z1,
-                                             (raudit || daudit) ? &rh : NULL);
+        {
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
           if (rpushed) {
-            g_hit = 0.5f;
             da_rails++; ra_rails++;
             if (daudit && da_rails == 1 && rh.mesh >= 0)
                 printf("DA FIRST RAIL mesh=%d tri=%d name=%s at=(%.3f,%.3f,%.3f) "
@@ -7232,15 +7432,11 @@ int main(int argc, char **argv) {
                        rh.zhi-rh.zlo, rh.edged);
           }
         }
-        /* race blockades: only solid while a race event is active (Phase 71) */
-        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion && world_barrier_push(&world, carpos, 1.3f)) {
-            vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
-        }
+        float wall_impulse=phys_ride_wall_response(&g_ride,vpre,vel);
+        audio_wall_contact(wall_impulse,hypotf(vel[0],vel[1])*PHYS_TICKRATE,1.0f/60);
+        if(wall_impulse>0)speed=vel[0]*cosf(heading)+vel[1]*sinf(heading);
         if(heat_active && !follow_roam_ai)
             traffic_heat_contact(heat_world_before,carpos,HEAT_WORLD);
-        /* checkpoint / lap tracking, after the pushes so it sees the final XY */
-        if (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion)
-            world_race_update(&world, carpos[0], carpos[1]);
         /* Stable contact pose: select ONE triangle using the same reference-Z
            rule for height, surface class and normal. The previous four-wheel
            experiment could combine four different stacked layers, making the
@@ -7264,7 +7460,7 @@ int main(int argc, char **argv) {
            climb toward it at 0.5 m per frame. */
         static WGroundHit ride_hit[4], ride_cand[4]; static int ride_reason[4];
         int ride_nsup = 0;
-        if (!sstatic && !capture_policy.freeze_motion && !race_auto) {
+        if (!sstatic && !capture_policy.freeze_motion) {
             ride_nsup = ride_gather(&scene, carpos, heading, vel, ground_oldh, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
@@ -7276,7 +7472,7 @@ int main(int argc, char **argv) {
             if (dzf > g_ride_maxdz) g_ride_maxdz = dzf;
             if (!g_ride.contact_mask) g_ride_air++;
             if (g_ride.impact > g_ride_maximpact) g_ride_maximpact = g_ride.impact;
-        } else if (ground_cat != WSURF_NONE && !race_auto) carpos[2] = gz;
+        } else if (ground_cat != WSURF_NONE) carpos[2] = gz;
         (void)ride_nsup;
         if (raudit) {   /* observe the production state, after every push */
             float adz = da_dz < 0 ? -da_dz : da_dz;
@@ -7568,7 +7764,7 @@ int main(int argc, char **argv) {
            to cover the centre this frame. This is rigid-body road alignment,
            not the later per-wheel suspension system. */
         int chassis_patch_ok=0;
-        if (!sstatic && !capture_policy.freeze_motion && !race_auto && g_ride_ready) {
+        if (!sstatic && !capture_policy.freeze_motion && g_ride_ready) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
             phys_ride_up(&g_ride,heading,car_up);
@@ -7662,7 +7858,7 @@ int main(int argc, char **argv) {
             if (smoke[i].life <= 0) smoke[i]=smoke[--smoken], i--;
         }
 
-        if(!ai_race) {
+        {
             const float *eye=cam;
             memcpy(traffic_world.eye,eye,sizeof traffic_world.eye);
             traffic_world.view[0]=carpos[0]-cam[0];
@@ -7684,7 +7880,14 @@ int main(int argc, char **argv) {
         }
         pf_mark(PF_AI_FOLLOW);
         for (int k = 0; race_state == 1 && k < nai; k++) {
-            if (ai_race && aipath.n > 1)
+            if(ai_race && world.city.race.active && aipath.n>1) {
+                AiCar player={.pos={carpos[0],carpos[1],carpos[2]},.head=heading,.spd=speed,
+                    .half_length=(carbb[3]-carbb[0])*.5f,.half_width=(carbb[4]-carbb[1])*.5f,
+                    .height=carbb[5]-carbb[2]};
+                ai_race_step(ais,race_drivers,k,nai,
+                    world.city.ev[world.city.race.ev].circuit,&traffic_world,&player);
+            }
+            else if (ai_race && aipath.n > 1)
                 ai_step(&ais[k], k, &aipath, &scene, start_idx,
                         p_lap*aipath.n + p_prev);
             else if (!ai_race && traffic_routes[k].present) {
@@ -7698,32 +7901,65 @@ int main(int argc, char **argv) {
                 } else traffic_routes[k].wait_ticks=0;
             }
         }
+        if(race_state==1 && race_traffic_count) {
+            AiCar player={.pos={carpos[0],carpos[1],carpos[2]},.head=heading,.spd=speed,
+                .half_length=(carbb[3]-carbb[0])*.5f,.half_width=(carbb[4]-carbb[1])*.5f,.height=carbb[5]-carbb[2]};
+            for(int k=0;k<race_traffic_count;k++)if(traffic_routes[k].present)
+                ai_traffic_follow(ais+N_RACE_AI,traffic_routes,&roam_roads,k,race_traffic_count,&player);
+            for(int k=0;k<race_traffic_count;k++)if(traffic_routes[k].present) {
+                AiCar *car=ais+N_RACE_AI+k;float oldx=car->pos[0],oldy=car->pos[1];
+                ai_traffic_step(car,traffic_routes+k,&roam_roads,&traffic_world);
+                if(car->target_speed>.02f && car->ride.contact_mask && hypotf(car->pos[0]-oldx,car->pos[1]-oldy)<.001f) {
+                    if(++traffic_routes[k].wait_ticks>180){traffic_routes[k].to=-1;traffic_routes[k].stop_reason=6;}
+                } else traffic_routes[k].wait_ticks=0;
+            }
+        }
         pf_mark(PF_AI_STEP);
         /* Solve player and traffic together: a later pair can re-open an earlier
            contact. Stopped cars in view remain solid. */
+        float race_contact=0;
         if(race_state==1) {
           AiCar player={.pos={carpos[0],carpos[1],carpos[2]},.vel={vel[0],vel[1]},
               .spd=speed,.head=heading,.half_length=(carbb[3]-carbb[0])*.5f,
               .half_width=(carbb[4]-carbb[1])*.5f,.height=carbb[5]-carbb[2],
               .mass=g_vehicle_source_valid?g_vehicle_source.mass_tonnes:0,
               .ride=g_ride,.support=g_sup,.ride_ready=g_ride_ready};
-          AiCar *contacts[N_OPENWORLD_AI+1];int count=0;
+          AiCar *contacts[N_WORLD_AI+1];int count=0;
           if(!follow_roam_ai)contacts[count++]=&player;
           for(int k=0;k<nai;k++)
               if(ai_race || traffic_routes[k].present)contacts[count++]=&ais[k];
+          for(int k=0;k<race_traffic_count;k++)if(traffic_routes[k].present)
+              contacts[count++]=ais+N_RACE_AI+k;
           float thud=ai_car_contacts(contacts,count,&traffic_world,
                                     follow_roam_ai?NULL:&player);
+          race_contact=thud;
           if(thud>g_hit)g_hit=thud;
           memcpy(carpos,player.pos,sizeof player.pos);memcpy(vel,player.vel,sizeof player.vel);
           speed=player.spd;g_ride=player.ride;g_sup=player.support;
         }
+        /* Score and gates see the final pose, including vehicle contacts. */
+        if(race_state==1 && !sstatic && !capture_policy.freeze_motion) {
+            if(world.city.race.active && world.city.race.kind==N2_RACE_DRIFT)
+                race_drift_step(&world.city.race.drift,vel,heading,
+                    hypotf(carpos[0]-ground_old[0],carpos[1]-ground_old[1]),
+                    g_ride_ready && g_ride.contact_mask!=0,nwc || rpushed || race_contact>0,1/PHYS_TICKRATE);
+            world_race_update(&world,carpos[0],carpos[1]);
+        }
 
         pf_mark(PF_AI_CONTACT);
-        int pf_spawns=0;
+        if(race_state==1 && !sstatic && !capture_policy.freeze_motion)
+            world_props_step(1/PHYS_TICKRATE);
         if(!ai_race && race_state==1 && racetimer%30==0) {
             nai=ai_traffic_update(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
             pf_spawns=1;
         }
+        if(ai_race && world.city.race.active && race_state==1 && racetimer%30==0 &&
+           race_has_traffic(world.city.race.kind,world.city.ev[world.city.race.ev].info.downhill)) {
+            race_traffic_count=ai_traffic_update(&roam_roads,&traffic_world,ais+N_RACE_AI,
+                traffic_routes,carpos,heading);pf_spawns=1;
+        }
+        draw_nai=race_traffic_count?N_RACE_AI+race_traffic_count:nai;
+        traffic_world.ambient_count=race_traffic_count;
         if(g_ai_audit_hook && !ai_race && race_state==1) {
             AiCar audit_player={.pos={carpos[0],carpos[1],carpos[2]},.vel={vel[0],vel[1]},
                 .spd=speed,.head=heading,.half_length=(carbb[3]-carbb[0])*.5f,
@@ -7733,23 +7969,25 @@ int main(int argc, char **argv) {
         }
         if(heat_active && ++heat_ticks>=15) {
             heat_ticks=0;heatmap_begin(&g_dbg.heatmap,.25f);
-            for(int k=0;k<nai;k++)if(ai_race || traffic_routes[k].present) {
-                int from=ai_race?-1:traffic_routes[k].from;
-                int to=ai_race?-1:traffic_routes[k].to;
+            for(int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes)) {
+                int slot=ai_actor_slot(k,ai_race);
+                int from=slot<0?-1:traffic_routes[slot].from;
+                int to=slot<0?-1:traffic_routes[slot].to;
                 if(from<0 || from>=roam_roads.n || to<0 || to>=roam_roads.n)from=to=-1;
                 const float *a=from>=0?roam_roads.xy+2*from:ais[k].pos;
                 const float *b=to>=0?roam_roads.xy+2*to:ais[k].pos;
-                heatmap_car(&g_dbg.heatmap,k,ai_race?0:traffic_routes[k].respawns,
+                heatmap_car(&g_dbg.heatmap,k,slot<0?0:traffic_routes[slot].respawns,
                     from,to,a,b,ais[k].pos,hypotf(ais[k].vel[0],ais[k].vel[1])*PHYS_TICKRATE,
-                    ai_race || ai_traffic_is_racer(k),.25f);
+                    slot<0 || (!ai_race && ai_traffic_is_racer(slot)),.25f);
             }
             heatmap_end(&g_dbg.heatmap);
         }
         pf_mark(PF_AI_SPAWN);
         g_dbg.traffic_active=g_dbg.traffic_racers=0;
-        g_dbg.traffic_available=!ai_race && roam_roads.n>0 && race_state==1;
-        if(!ai_race)for(int k=0;k<nai;k++)if(traffic_routes[k].present) {
-            if(ai_traffic_is_racer(k))g_dbg.traffic_racers++;
+        g_dbg.traffic_available=roam_roads.n>0 && race_state==1 && (!ai_race || (world.city.race.active &&
+            race_has_traffic(world.city.race.kind,world.city.ev[world.city.race.ev].info.downhill)));
+        for(int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes)) {
+            if(ai_race?k<nai:ai_traffic_is_racer(k))g_dbg.traffic_racers++;
             else g_dbg.traffic_active++;
         }
         if (follow_roam_ai && !ai_race && race_state == 1 && nai>0 &&
@@ -7762,7 +8000,7 @@ int main(int argc, char **argv) {
             nr[0]=nf[1];nr[1]=-nf[0];
             vel[0]=nf[0]*speed;vel[1]=nf[1]*speed;
         }
-        if (ai_race && race_state == 1 && aipath.n > 1) { /* player lap */
+        if (ai_race && !world.city.race.active && race_state == 1 && aipath.n > 1) { /* player lap */
             int prel = (n2_nearest_wp(&aipath, carpos[0], carpos[1]) - start_idx
                         + aipath.n) % aipath.n;
             if (p_prev > aipath.n*3/4 && prel < aipath.n/4) p_lap++;
@@ -7771,13 +8009,68 @@ int main(int argc, char **argv) {
 
         /* race state machine: countdown -> racing -> finished */
         racetimer++;
-        if (race_state == 0 && racetimer >= COUNTDOWN) { race_state = 1; racetimer = 0; }
-        if (ai_race && race_state == 1 && p_lap >= LAP_TARGET) {
+        if (race_state == 0 && !race_prepare_pending && racetimer >= COUNTDOWN) {
+            race_state = 1; racetimer = 0;
+            world_race_begin(&world.city.race,carpos[0],carpos[1]);
+        }
+        int drag_failure=race_drag_failure(drag_gear.failed,wall_impulse,race_contact);
+        if(drag_active && race_state==1 && drag_failure) {
+            world.city.race.failed=drag_failure;world.city.race.finished=1;
+            race_state=2;finish_place=nai+1;
+        }
+        if(ai_race && race_state==1 && world.city.race.active && world.city.race.finished) {
+            finish_place=1;
+            for(int k=0;k<nai;k++) {
+                if(world.city.race.kind==N2_RACE_DRIFT) {
+                    const RaceDrift *d=&race_drivers[k].progress.drift;
+                    if(d->bank+d->chain>world.city.race.drift.bank)finish_place++;
+                } else if(race_drivers[k].progress.finished)finish_place++;
+            }
+            race_state=2;
+        }
+        if (ai_race && !world.city.race.active && race_state == 1 && p_lap >= LAP_TARGET) {
             int ahead = 0, pp = p_lap*aipath.n + p_prev;
             for (int k = 0; k < nai; k++)
                 if (ais[k].lap*aipath.n + ais[k].prevrel > pp) ahead++;
             finish_place = ahead + 1;
             race_state = 2;
+        }
+
+        if(race_log.file) {
+            race_log.tick++;
+            if(nwc || race_contact>0)race_log_write(&race_log,"CONTACT,%ld,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                race_log.tick,nwc,wall_impulse,race_contact,carpos[0],carpos[1],carpos[2]);
+            for(int q=0;q<nwc && q<8;q++) {
+                const PhysWallContact *hit=wc+q;
+                race_log_write(&race_log,"WALL,%ld,%d,%d,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,",
+                    race_log.tick,hit->mesh,hit->tri,hit->cx,hit->cy,hit->nx,hit->ny,hit->pen,hit->span);
+                race_log_text(&race_log,hit->mesh>=0 && hit->mesh<scene.count?scene.meshes[hit->mesh].sname:"");
+                race_log_write(&race_log,"\n");
+            }
+            if(race_log.tick%6==0 || race_state==2) {
+                WGroundHit hit={0};int cat=world_ground_hit(&scene,carpos[0],carpos[1],carpos[2],&hit);
+                int event=world.city.race.active?world.city.ev[world.city.race.ev].id:0;
+                race_log_write(&race_log,"PLAYER,%ld,%.3f,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.5f,%.2f,%.3f,%.3f,%d,%.3f,%d,%d,%.3f,%.3f,%.3f,%d,%.1f,%d,",
+                    race_log.tick,race_log.tick/PHYS_TICKRATE,event,race_state,world.city.race.next,world.city.race.lap,
+                    carpos[0],carpos[1],carpos[2],heading,PHYS_KMH(speed),throttle,steer,g_ride.contact_mask,
+                    hit.z,cat,nwc,race_contact,frame_seconds*1000,drag_lane,drag_gear.gear,drag_gear.rpm,world.city.race.failed);
+                race_log_text(&race_log,cat!=WSURF_NONE && hit.mesh>=0 && hit.mesh<scene.count?scene.meshes[hit.mesh].sname:"");
+                race_log_write(&race_log,"\n");
+                for(int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes)) {
+                    int slot=ai_actor_slot(k,ai_race),racer=ai_race && k<nai;
+                    const AiRace *driver=racer?race_drivers+k:NULL;
+                    race_log_write(&race_log,"CAR,%ld,%d,%s,%.3f,%.3f,%.3f,%.5f,%.2f,%.2f,%d,%d,%d,%.3f,%d,%d,%d,%u,%d\n",
+                        race_log.tick,k,racer?"opponent":"traffic",ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],
+                        ais[k].head,PHYS_KMH(ais[k].spd),PHYS_KMH(ais[k].target_speed),ais[k].ride.contact_mask,
+                        ais[k].render_visible,driver?driver->drive.segment:traffic_routes[slot].from,
+                        driver?driver->drive.error:traffic_routes[slot].lane_offset,driver?driver->blocked:0,
+                        driver?driver->drive.failed:0,driver?driver->progress.next:0,
+                        slot>=0?traffic_routes[slot].respawns:0,slot>=0?traffic_routes[slot].stop_reason:0);
+                }
+                race_log.samples++;
+            }
+            if(race_log.tick%60==0)race_log_flush(&race_log);
+            if(race_state==2){race_log_write(&race_log,"RESULT,%ld,%d,%d\n",race_log.tick,finish_place,world.city.race.failed);race_log_stop(&race_log);}
         }
 
         /* M132-R capture freeze: latch the position production placed at the
@@ -7797,49 +8090,106 @@ int main(int argc, char **argv) {
                                   ra_f, carpos[0], carpos[1], carpos[2]); }
             carpos[0]=posepin[0]; carpos[1]=posepin[1]; carpos[2]=posepin[2];
         }
+        phys_landing_camera(&landing_offset,&landing_velocity,
+            g_ride_ready && !sstatic && !capture_policy.freeze_motion
+            ? g_ride.impact:0,1/PHYS_TICKRATE);
+        player_wheel_angle=fmodf(player_wheel_angle+speed/
+            fmaxf(carprof.wheel_r*sim_wheel_scale,.05f),6.2831853f);
+        for(int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes)) {
+            float radius=ais[k].tyre_radius>0?ais[k].tyre_radius:opponent_profile.wheel_r;
+            ais[k].wheel_angle=fmodf(ais[k].wheel_angle+ais[k].spd/
+                fmaxf(radius*sim_wheel_scale,.05f),6.2831853f);
+        }
+        if(race_state!=3)for(int i=0;i<skidn;i++)skid[i][6]-=.0018f;
+        /* Consume edge inputs once, including after zero-tick render frames. */
+        drag_shift=drag_change=0;
+        pose_now=(AiCar){.pos={carpos[0],carpos[1],carpos[2]},.vel={vel[0],vel[1]},.head=heading,.spd=speed,
+            .wheel_angle=player_wheel_angle,.steer=steer_filtered,.ride=g_ride,.ride_ready=g_ride_ready};
+        /* Use the actual angular travel, even when a fast wheel turns > pi
+           or its bounded phase wraps through zero during this tick. */
+        pose_before.wheel_angle=player_wheel_angle-speed/fmaxf(carprof.wheel_r*sim_wheel_scale,.05f);
+        shake_now=landing_offset;
+        for(int k=0;k<draw_nai;k++) {
+            ai_pose_now[k]=ais[k];
+            float radius=ais[k].tyre_radius>0?ais[k].tyre_radius:opponent_profile.wheel_r;
+            ai_pose_before[k].wheel_angle=ais[k].wheel_angle-ais[k].spd/fmaxf(radius*sim_wheel_scale,.05f);
+            int slot=ai_actor_slot(k,ai_race);
+            if(k>=pose_nai || !ai_pose_present[k] || (slot>=0 &&
+                (!traffic_routes[slot].present || ai_pose_generation[k]!=traffic_routes[slot].respawns)))
+                ai_pose_before[k]=ai_pose_now[k]; /* births/respawns snap, never sweep through the world */
+        }
+        }
+        float render_alpha=deterministic_sim || sstatic || capture_policy.freeze_motion
+            ?1:(float)(sim_clock.remainder*PHYS_TICKRATE);
+        AiCar render_player,render_ais[N_WORLD_AI];
+        ai_render_pose(&render_player,&pose_before,&pose_now,render_alpha);
+        for(int k=0;k<draw_nai;k++)ai_render_pose(&render_ais[k],&ai_pose_before[k],&ai_pose_now[k],render_alpha);
+        float render_up[3]={car_up[0],car_up[1],car_up[2]};
+        if(!deterministic_sim && render_player.ride_ready && !sstatic && !capture_policy.freeze_motion)
+            phys_ride_up(&render_player.ride,render_player.head,render_up);
+        float render_landing=shake_before+render_alpha*(shake_now-shake_before);
+
         /* camera: menu = slow orbit around the parked car; else chase cam */
         float want[3];
         float chase=car_chase_distance(carbb,g_dbg.chase_distance);
         if (race_state == 3) {              /* orbit the parked car, framing the city around it */
-            menuspin += 0.006f;
-            want[0] = carpos[0] + cosf(menuspin)*16.0f;
-            want[1] = carpos[1] + sinf(menuspin)*16.0f;
-            want[2] = carpos[2] + 8.0f;
+            menuspin += 0.006f*frame_scale;
+            want[0] = render_player.pos[0] + cosf(menuspin)*16.0f;
+            want[1] = render_player.pos[1] + sinf(menuspin)*16.0f;
+            want[2] = render_player.pos[2] + 8.0f;
         } else if (shotyaw < 1e8f) {        /* --shot-yaw/pitch: fixed camera */
             float horizontal = chase * cosf(shotpitch);
-            want[0] = carpos[0]-cosf(shotyaw)*horizontal;
-            want[1] = carpos[1]-sinf(shotyaw)*horizontal;
-            want[2] = carpos[2]+g_dbg.chase_height +
+            want[0] = render_player.pos[0]-cosf(shotyaw)*horizontal;
+            want[1] = render_player.pos[1]-sinf(shotyaw)*horizontal;
+            want[2] = render_player.pos[2]+g_dbg.chase_height +
                       sinf(shotpitch)*chase;
         } else {                            /* chase: behind + above, tunable */
-            want[0] = carpos[0]-fwd[0]*chase;
-            want[1] = carpos[1]-fwd[1]*chase;
-            want[2] = carpos[2]+g_dbg.chase_height;
+            float view_heading=render_player.head;
+            if(world.city.race.active && world.city.race.kind==N2_RACE_DRIFT && hypotf(render_player.vel[0],render_player.vel[1])>.03f) {
+                float angle=atan2f(render_player.vel[1],render_player.vel[0])-render_player.head;
+                view_heading+=.6f*atan2f(sinf(angle),cosf(angle));
+            }
+            want[0] = render_player.pos[0]-cosf(view_heading)*chase;
+            want[1] = render_player.pos[1]-sinf(view_heading)*chase;
+            want[2] = render_player.pos[2]+g_dbg.chase_height;
         }
         int free_active=g_dbg.freecam && race_state!=3 && shotyaw>=1e8f;
         int orbit_active=!free_active && (mlook || perf_orbit!=0.0f) && race_state!=3 && shotyaw>=1e8f;
         if(orbit_active && orbit_was_active && perf_orbit!=0.0f)orbit_yaw+=perf_orbit;
         if(orbit_active) {
             if(!orbit_was_active) {
-                orbit_yaw=atan2f(carpos[1]-cam[1],carpos[0]-cam[0])-heading;
+                orbit_yaw=atan2f(render_player.pos[1]-cam[1],render_player.pos[0]-cam[0])-render_player.head;
                 orbit_pitch=.2f;
             }
-            float yaw=heading+orbit_yaw;
-            want[0]=carpos[0]-cosf(yaw)*chase*cosf(orbit_pitch);
-            want[1]=carpos[1]-sinf(yaw)*chase*cosf(orbit_pitch);
-            want[2]=carpos[2]+g_dbg.chase_height+chase*sinf(orbit_pitch);
+            float yaw=render_player.head+orbit_yaw;
+            want[0]=render_player.pos[0]-cosf(yaw)*chase*cosf(orbit_pitch);
+            want[1]=render_player.pos[1]-sinf(yaw)*chase*cosf(orbit_pitch);
+            want[2]=render_player.pos[2]+g_dbg.chase_height+chase*sinf(orbit_pitch);
         }
         orbit_was_active=orbit_active;
-        /* exponential smoothing (fixed timestep): actual pos AND look-target each
-           ease toward their ideal by `stiffness`/frame -- the target lag is what
-           gives the spring/swing feel through corners. */
+        /* Normalize the chase spring to elapsed time, independently of FPS. */
         float k = g_dbg.chase_stiffness; if (k < 0.02f) k = 0.02f; if (k > 1.0f) k = 1.0f;
+        k=1-powf(1-k,frame_scale);
         if (orbit_active || shotyaw < 1e8f) k = 1.0f;   /* capture pose must be exact, not eased */
-        if(!free_active)for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*k;
         static float camtgt[3]; static int camtgt_init = 0;
-        float idealtgt[3] = { carpos[0], carpos[1], carpos[2]+1.5f };  /* car centre, slightly up */
+        float idealtgt[3] = { render_player.pos[0], render_player.pos[1], render_player.pos[2]+1.5f };  /* car centre, slightly up */
         if (!camtgt_init) { camtgt[0]=idealtgt[0]; camtgt[1]=idealtgt[1]; camtgt[2]=idealtgt[2]; camtgt_init=1; }
-        for (int c=0;c<3;c++) camtgt[c] += (idealtgt[c]-camtgt[c])*k;
+        int camera_mode=free_active?3:orbit_active?2:race_state==3?1:0;
+        if(pose_snap || camera_history_mode!=camera_mode) {
+            memcpy(camera_want_before,want,sizeof want);
+            memcpy(camera_target_before,idealtgt,sizeof idealtgt);
+        }
+        if(deterministic_sim) { /* Keep existing fixed-tick captures/audits exact. */
+            if(!free_active)for(int c=0;c<3;c++)cam[c]+=(want[c]-cam[c])*k;
+            for(int c=0;c<3;c++)camtgt[c]+=(idealtgt[c]-camtgt[c])*k;
+        } else {
+            float stiffness=orbit_active || shotyaw<1e8f?1:g_dbg.chase_stiffness;
+            if(!free_active)render_camera_ease(cam,camera_want_before,want,stiffness,frame_scale);
+            render_camera_ease(camtgt,camera_target_before,idealtgt,stiffness,frame_scale);
+        }
+        memcpy(camera_want_before,want,sizeof want);
+        memcpy(camera_target_before,idealtgt,sizeof idealtgt);
+        camera_history_mode=camera_mode;
         float look[3] = { camtgt[0]-cam[0], camtgt[1]-cam[1], camtgt[2]-cam[2] };
         if(free_active!=free_was_active) {
             if(free_active) {
@@ -7857,7 +8207,7 @@ int main(int argc, char **argv) {
             if(g_devui && dbgui_want_keyboard())memset(move,0,sizeof move);
 #endif
             render_free_camera(cam,free_yaw,free_pitch,move,
-                g_dbg.speed*(ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]?3:1),look);
+                g_dbg.speed*frame_scale*(ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]?3:1),look);
         }
 
 
@@ -7891,18 +8241,15 @@ int main(int argc, char **argv) {
                    ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
         if (zfar < 500.0f) zfar = 500.0f;
         mat_persp(0.9f, (float)W/H, znear, zfar, P);
-        phys_landing_camera(&landing_offset,&landing_velocity,
-            g_ride_ready && !sstatic && !capture_policy.freeze_motion && !race_auto
-            ? g_ride.impact:0,1.0f/60.0f);
         float view_cam[3]={cam[0],cam[1],cam[2]};
         if(!free_active && !orbit_active && race_state==1 && !sstatic && !capture_policy.freeze_motion) {
-            view_cam[2]+=landing_offset;
-            look[2]-=landing_offset;
+            view_cam[2]+=render_landing;
+            look[2]-=render_landing;
         }
         if(!free_active && race_state!=3 && shotyaw>=1e8f && !sstatic && !poseshot) {
             /* Above-roof anchor lets a wall pull the eye in without putting it
                inside the vehicle. Test after easing/shake, before projection. */
-            float anchor[3]={carpos[0],carpos[1],carpos[2]+car_body_ride+carbb[5]+.3f};
+            float anchor[3]={render_player.pos[0],render_player.pos[1],render_player.pos[2]+car_body_ride+carbb[5]+.3f};
             float shake=view_cam[2]-cam[2];
             view_cam[2]=fmaxf(view_cam[2],anchor[2]);
             world_camera_clip(&scene,(const float (*)[4])world.neighborhood.mbb,
@@ -7914,19 +8261,28 @@ int main(int argc, char **argv) {
         }
         mat_lookat(view_cam, look, V);
         mat_mul(P, V, MVP);
+        if(world2) {
+            int updates=render_world_prop_updates(&scene,wbatch,nbatch,world_prop_update_mesh);
+            int glows=render_world_prop_updates(&scene,glowbatch,nglow,world_prop_update_mesh);
+            static int reported=0;
+            if((updates<0 || glows<0) && !reported) {
+                fprintf(stderr,"prop rendering: pending panel update failed; will retry\n");reported=1;
+            }
+        }
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
         /* One conservative whole-vehicle visibility decision per car for this
            final camera, shared by the shadow, body, wheel, glass and lamp
            passes. Render-only: simulation, contacts and spawn never read it. */
         g_dbg.traffic_visible=0;
-        for (int k = 0; k < nai; k++) {
-            const CarSwitchCandidate *vv=!ai_race && traffic[ai_traffic_visual(k)].gpu?&traffic[ai_traffic_visual(k)]:NULL;
+        for (int k = 0; k < draw_nai; k++) {
+            int visual=ai_actor_visual(k,ai_race,nai,world.city.race.active);
+            const CarSwitchCandidate *vv=(!ai_race || world.city.race.active) && traffic[visual].gpu?&traffic[visual]:NULL;
             float vbb[6];
             if(vv)memcpy(vbb,vv->bb,sizeof vbb);
             else for(int a=0;a<3;a++){vbb[a]=opponent_profile.body[a*2];vbb[a+3]=opponent_profile.body[a*2+1];}
-            float vc[3],vr=car_view_sphere(vbb,ais[k].pos,ais[k].head,vc);
-            ais[k].render_visible=g_dbg.traffic_cull_off || sphere_in_view(MVP,vc,vr);
-            if((ai_race || traffic_routes[k].present) && sphere_in_view(MVP,vc,vr))g_dbg.traffic_visible++;
+            float vc[3],vr=car_view_sphere(vbb,render_ais[k].pos,render_ais[k].head,vc);
+            ais[k].render_visible=render_ais[k].render_visible=g_dbg.traffic_cull_off || sphere_in_view(MVP,vc,vr);
+            if((ai_actor_present(k,ai_race,nai,traffic_routes)) && sphere_in_view(MVP,vc,vr))g_dbg.traffic_visible++;
         }
         glUniform1f(uUnlit, 0.0f); glUniform1f(uSpec, 0.0f);   /* world is matte */
         glUniform1f(uAmbient, g_dbg.ambient); glUniform1f(uDiffuse, g_dbg.diffuse);
@@ -7935,15 +8291,15 @@ int main(int argc, char **argv) {
         render_wet_lights(&rp,world.neighborhood.lights,world.neighborhood.nlights,view_cam,
             g_dbg.night_mode && g_dbg.road_wetness>0 ? g_dbg.light_gain : 0,g_dbg.weather_quality);
         render_model(&rp,NULL);
-        float probe_pos[3]={carpos[0],carpos[1],carpos[2]+car_body_ride+(carbb[2]+carbb[5])*.5f};
+        float probe_pos[3]={render_player.pos[0],render_player.pos[1],render_player.pos[2]+car_body_ride+(carbb[2]+carbb[5])*.5f};
         int environment_draws=render_car_environment(&rp,&car_environment,wbatch,
             g_dbg.show_track && !g_debug_mode && !g_dbg.show_uv_checker?nbatch:0,
             skybatch,nsky,probe_pos,g_dbg.vehicle_quality);
 
-        float lamp_model[16],body_up[3]={car_up[0],car_up[1],car_up[2]};
-        if(g_ride_ready && (follow_roam_ai || (!sstatic && !capture_policy.freeze_motion && !race_auto)))
-            phys_ride_body_up(&g_ride,heading,body_up);
-        mat_car(carpos,heading,body_up,car_body_ride,lamp_model);
+        float lamp_model[16],body_up[3]={render_up[0],render_up[1],render_up[2]};
+        if(render_player.ride_ready && (follow_roam_ai || (!sstatic && !capture_policy.freeze_motion)))
+            phys_ride_body_up(&render_player.ride,render_player.head,body_up);
+        mat_car(render_player.pos,render_player.head,body_up,car_body_ride,lamp_model);
         int long_beam=beam_high || beam_flash;
         render_headlights(&rp,lamp_model,bloomc,long_beam,
                           long_beam?g_dbg.high_beam_pitch:g_dbg.low_beam_pitch,
@@ -8078,7 +8434,7 @@ int main(int argc, char **argv) {
                 { float vtop = -1e30f;
                   for (int q = 0; q < vm->nverts; q++)
                       if (vm->verts[q*5+2] > vtop) vtop = vm->verts[q*5+2];
-                  if (vtop < carpos[2] - VISTA_BURIED_M) vistaburied++; }
+                  if (vtop < render_player.pos[2] - VISTA_BURIED_M) vistaburied++; }
                 /* TRUE surface distance: closest point on any triangle of this
                    mesh to the camera. The vertex-only test this replaces could
                    not reject a sheet whose corners are far away but whose
@@ -8311,12 +8667,9 @@ int main(int argc, char **argv) {
 
         glUniform1f(rp.uHeadGain,0.0f); /* player beams illuminate the world; vehicle receivers are separate work */
 
-        /* Active race road closures. The navigation/collision barriers existed
-           since Phase 71 but production rendered nothing at their coordinates;
-           only the debug minimap showed a red tick, so a real collision looked
-           like an invisible wall. Draw a lightweight neon barricade across each
-           nearby closed road. Geometry comes from the exact WBarrier used by
-           world_barrier_push -- no second placement rule. */
+        /* Inferred route closures are visual guides only. Their approximate
+           positions/widths must not create collision across the real course.
+           Authored meshes still use the ordinary body collision solver. */
         if (world.city.mode == MODE_RACE_EVENT && world.city.nbar > 0 && race_state != 3) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
@@ -8324,10 +8677,10 @@ int main(int argc, char **argv) {
             glUniform3f(uColor, 1.0f, 0.10f, 0.03f); glUniform1f(uAlpha,0.78f);
             for (int bi=0; bi<world.city.nbar; bi++) {
                 const WBarrier *b=&world.city.bar[bi];
-                float qx=b->x-carpos[0], qy=b->y-carpos[1];
+                float qx=b->x-render_player.pos[0], qy=b->y-render_player.pos[1];
                 if (qx*qx+qy*qy > 180.0f*180.0f) continue;
                 float px=-b->dy, py=b->dx;
-                float bz=world_ground_z(&scene,b->x,b->y,carpos[2]);
+                float bz=world_ground_z(&scene,b->x,b->y,render_player.pos[2]);
                 /* two luminous cross-bars, 18 m wide */
                 for (int h=0; h<2; h++) {
                     float z=bz+(h?1.05f:0.35f), H=0.18f, Wb=18.0f;
@@ -8359,17 +8712,18 @@ int main(int argc, char **argv) {
             glDepthMask(GL_FALSE);
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,0.0f);
             glUniform3f(uColor, 0.0f, 0.0f, 0.0f); glUniform1f(uAlpha, 0.5f);
-            for (int c=0; g_dbg.vehicle_quality<=0 && c<=nai; c++) {
+            for (int c=0; g_dbg.vehicle_quality<=0 && c<=draw_nai; c++) {
                 if((c==0 && follow_roam_ai) ||
-                   (c>0 && !ai_race && !traffic_routes[c-1].present) ||
-                   (c>0 && !ais[c-1].render_visible))continue;
-                float *cp = c==0 ? carpos : ais[c-1].pos;
+                   (c>0 && !ai_actor_present(c-1,ai_race,nai,traffic_routes)) ||
+                   (c>0 && !render_ais[c-1].render_visible))continue;
+                float *cp = c==0 ? render_player.pos : render_ais[c-1].pos;
                 WGroundHit ground;
                 if(world_ground_hit(&scene,cp[0],cp[1],cp[2],&ground)==WSURF_NONE)continue;
                 const float *bb=carbb;
                 float opponent_bb[6];
                 if(c>0) {
-                    if(!ai_race && traffic[ai_traffic_visual(c-1)].gpu)bb=traffic[ai_traffic_visual(c-1)].bb;
+                    int visual=ai_race && world.city.race.active?ai_event_visual(c-1):ai_traffic_visual(c-1);
+                    if((!ai_race || world.city.race.active) && traffic[visual].gpu)bb=traffic[visual].bb;
                     else {
                         for(int a=0;a<3;a++) {
                             opponent_bb[a]=opponent_profile.body[a*2];
@@ -8379,7 +8733,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 float gp[3]={cp[0],cp[1],ground.z},M[16];
-                mat_car_footprint(gp,c==0?heading:ais[c-1].head,ground.normal,
+                mat_car_footprint(gp,c==0?render_player.head:render_ais[c-1].head,ground.normal,
                                   bb,1.10f,1.35f,.03f,M);
                 float MV[16]; mat_mul(MVP,M,MV);
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad);
@@ -8399,9 +8753,9 @@ int main(int argc, char **argv) {
                 glDepthMask(GL_FALSE);
                 glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
                 glUniform3f(uColor, g_dbg.neon_col[0], g_dbg.neon_col[1], g_dbg.neon_col[2]);
-                float gp[3]={carpos[0],carpos[1],carpos[2]},up[3],M[16];
+                float gp[3]={render_player.pos[0],render_player.pos[1],render_player.pos[2]},up[3],M[16];
                 world_ground_pose(&scene,gp[0],gp[1],gp[2],&gp[2],up);
-                mat_car_footprint(gp,heading,up,carbb,1.45f,1.9f,.02f,M);
+                mat_car_footprint(gp,render_player.head,up,carbb,1.45f,1.9f,.02f,M);
                 float MV[16]; mat_mul(MVP,M,MV);
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
                 glUniform1f(uAlpha, g_dbg.neon_str);
@@ -8421,7 +8775,6 @@ int main(int argc, char **argv) {
             glUniform3f(uColor, 0.04f, 0.04f, 0.05f);
             for (int i = 0; i < skidn; i++) {
                 float *s = skid[i];                          /* ax,ay,az, bx,by,bz, life */
-                if (race_state != 3) s[6] -= 0.0018f;        /* ~9s to fade (frozen on menu) */
                 if (s[6] <= 0.0f) continue;
                 float dx=s[3]-s[0], dy=s[4]-s[1];            /* segment direction */
                 float len2=sqrtf(dx*dx+dy*dy); if(len2<1e-4f) continue;
@@ -8438,19 +8791,19 @@ int main(int argc, char **argv) {
             glUniform1f(uAlpha, 1.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
-        /* car: solid-shaded, positioned + banked to the road (up = car_up) */
+        /* car: solid-shaded, positioned + banked to the road (up = render_up) */
         if (ncar) {
             float Model[16], MVPc[16], WheelModel[16], MVPwheel[16];
             /* Wheel contact ride is this car's own measured tyre radius. Body
                ride may sit slightly lower for a per-car stock suspension tune;
-               both use the exact gameplay contact with no render-only Z lag. */
+               both use the same interpolated contact and suspension snapshot. */
             float ride = car_body_ride;   /* body collision envelope uses this ride */
-            float bodypos[3] = { carpos[0], carpos[1], carpos[2] };
-            mat_car(bodypos, heading, body_up, ride, Model);
+            float bodypos[3] = { render_player.pos[0], render_player.pos[1], render_player.pos[2] };
+            mat_car(bodypos, render_player.head, body_up, ride, Model);
             mat_mul(MVP, Model, MVPc);
             /* Wheels never inherit the body spring/drop: their hub stays one
-               scaled tyre radius above the exact gameplay contact. */
-            mat_car(carpos, heading, car_up, car_ride, WheelModel);
+               scaled tyre radius above the displayed contact plane. */
+            mat_car(render_player.pos, render_player.head, render_up, car_ride, WheelModel);
             mat_mul(MVP, WheelModel, MVPwheel);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
             render_model(&rp,Model);
@@ -8462,24 +8815,22 @@ int main(int argc, char **argv) {
                  rolls slower than a compact at the same speed). */
               float wR = carprof.wheel_r
                        * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
-              /* w = v/r per tick: speed is m/tick and this runs once per tick, so
-                 the angle step is exactly speed/wR rad (the earlier *1/60 made the
-                 tread crawl ~60x too slow -- ~3 rad/s instead of ~205 at 220 km/h). */
+              /* Normal wheel rotation is integrated with the simulation. */
               static float vsteer = 0.0f;
-              /* Visual steer follows the same filtered input as the physics and
-                 eases it once more toward a ~28 degree wheel lock. Rotation is
+              /* Visual steer uses the already filtered/interpolated pose with
+                 a ~28 degree wheel lock. Rotation is
                  about the wheel's own centre (the mesh is modelled at the origin and
                  the arch position lives in the translation column), so steering and
                  spin can't swing it out of the arch. Demo mode drives both from a
                  clock (free spin + sine steer) so the matrices can be verified with
                  the car parked. */
               if (g_dbg.wheel_demo) {
-                  static float dt = 0.0f; dt += 0.03f;
-                  wang += 0.18f;                                   /* free continuous spin */
-                  vsteer += (sinf(dt) * 0.5f - vsteer) * 0.25f;    /* +/-0.5 rad oscillation */
+                  static float dt = 0.0f; dt += 0.03f*frame_scale;
+                  wang += 0.18f*frame_scale;                                   /* free continuous spin */
+                  vsteer += (sinf(dt) * 0.5f - vsteer) * (1-powf(.75f,frame_scale));    /* +/-0.5 rad oscillation */
               } else {
-                  wang += speed / wR;
-                  vsteer += (steer_filtered*0.50f - vsteer) * 0.25f;
+                  wang = render_player.wheel_angle;
+                  vsteer = render_player.steer*0.50f;
               }
               wang = fmodf(wang, 6.2831853f);
               float c = cosf(wang), sn = sinf(wang);
@@ -8500,7 +8851,7 @@ int main(int argc, char **argv) {
                      grounded wheel stays on its contact while the sprung body
                      heaves, pitches and rolls above it. A single shared height
                      would float or sink tyres on every bump. */
-                  float wzk = wz + (g_ride_ready && !sstatic && !capture_policy.freeze_motion ? g_ride.compression[k] : 0.0f);
+                  float wzk = wz + (render_player.ride_ready && !sstatic && !capture_policy.freeze_motion ? render_player.ride.compression[k] : 0.0f);
                   /* Disc + caliper are one authored part. Keep the assembly at
                      its axle, steering with the front hub without spinning the
                      caliper. Independent disc rotation needs a material/part split. */
@@ -8524,8 +8875,8 @@ int main(int argc, char **argv) {
                 mat_mul(WheelModel,brakeT[k],brakeWorld[k]);
             }
             WGroundHit shadow_ground;
-            if(!follow_roam_ai && world_ground_hit(&scene,carpos[0],carpos[1],carpos[2],&shadow_ground)!=WSURF_NONE) {
-                float gp[3]={carpos[0],carpos[1],shadow_ground.z};
+            if(!follow_roam_ai && world_ground_hit(&scene,render_player.pos[0],render_player.pos[1],render_player.pos[2],&shadow_ground)!=WSURF_NONE) {
+                float gp[3]={render_player.pos[0],render_player.pos[1],shadow_ground.z};
                 const N2Scene *rims=nwheelgm>0 && (wheel_brand!=0 || wheel_style!=1)?&wheellib:NULL;
                 int casts=render_car_shadow(&rp,&player_shadow,&car,cgm,stock_wheel,rims,wheelgm,
                     Model,(const float (*)[16])wheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
@@ -8747,9 +9098,10 @@ int main(int argc, char **argv) {
             /* AI rivals use the same parsed material categories as the player.
                Their geometry is the initial car snapshot, so its stance and
                wheel tier must stay paired with it after an in-process switch. */
-            for (int k = 0; k < nai; k++) {
-                if(!ai_race && !traffic_routes[k].present)continue;
-                const CarSwitchCandidate *tv=!ai_race && traffic[ai_traffic_visual(k)].gpu?&traffic[ai_traffic_visual(k)]:NULL;
+            for (int k = 0; k < draw_nai; k++) {
+                if(!ai_actor_present(k,ai_race,nai,traffic_routes))continue;
+                int visual=ai_actor_visual(k,ai_race,nai,world.city.race.active);
+                const CarSwitchCandidate *tv=(!ai_race || world.city.race.active) && traffic[visual].gpu?&traffic[visual]:NULL;
                 const N2Scene *draw_scene=tv?&tv->scene:&opponent_car;
                 GpuMesh *draw_gpu=tv?tv->gpu:opponent_cgm;
                 int draw_nmesh=tv?tv->nmesh:opponent_ncar;
@@ -8763,35 +9115,33 @@ int main(int argc, char **argv) {
                 const char *draw_mapalpha=tv?tv->alpha:opponent_mapalpha;
                 const char *draw_mapmode=tv?tv->mode:opponent_mapmode;
                 int draw_nmap=tv?tv->ntextures:opponent_nmap;
-                GpuMesh *draw_wheelmesh=tv?&traffic_wheelmesh[ai_traffic_visual(k)]:&opponent_wheelmesh;
-                float aup[3], aiz=ais[k].pos[2];
+                GpuMesh *draw_wheelmesh=tv?&traffic_wheelmesh[visual]:&opponent_wheelmesh;
+                float aup[3], aiz=render_ais[k].pos[2];
                 float AIModel[16], AIMVPc[16], AIWheelModel[16], AIWheelMVP[16];
                 float aiWheelT[4][16],aiBrakeT[4][16],aiWheelWorld[4][16],aiBrakeWorld[4][16];
                 float oscale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
                 float owheelride=draw_profile.ride*oscale;
                 float obodyride=body_ride_height(owheelride,draw_floor,g_dbg.body_drop);
-                float oradius=fmaxf(draw_profile.wheel_r*oscale,0.05f);
-                ais[k].wheel_angle=fmodf(ais[k].wheel_angle+ais[k].spd/oradius,6.2831853f);
-                if(!ais[k].render_visible)continue;   /* wheel spin kept current above */
-                float steer=ais[k].steer*.5f;
-                ai_wheel_matrices(&draw_wheel,oscale,ais[k].wheel_angle,steer,
-                                  ais[k].ride_ready?&ais[k].ride:NULL,
+                if(!render_ais[k].render_visible)continue;   /* wheel spin kept current above */
+                float steer=render_ais[k].steer*.5f;
+                ai_wheel_matrices(&draw_wheel,oscale,render_ais[k].wheel_angle,steer,
+                                  render_ais[k].ride_ready?&render_ais[k].ride:NULL,
                                   aiWheelT,aiBrakeT);
-                if(ais[k].ride_ready)phys_ride_up(&ais[k].ride,ais[k].head,aup);
-                else world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
-                mat_car(ais[k].pos, ais[k].head, aup, owheelride, AIWheelModel);
+                if(render_ais[k].ride_ready)phys_ride_up(&render_ais[k].ride,render_ais[k].head,aup);
+                else world_ground_pose(&scene,render_ais[k].pos[0],render_ais[k].pos[1],render_ais[k].pos[2],&aiz,aup);
+                mat_car(render_ais[k].pos, render_ais[k].head, aup, owheelride, AIWheelModel);
                 mat_mul(MVP, AIWheelModel, AIWheelMVP);
-                if(ais[k].ride_ready)phys_ride_body_up(&ais[k].ride,ais[k].head,aup);
-                mat_car(ais[k].pos, ais[k].head, aup, obodyride, AIModel);
+                if(render_ais[k].ride_ready)phys_ride_body_up(&render_ais[k].ride,render_ais[k].head,aup);
+                mat_car(render_ais[k].pos, render_ais[k].head, aup, obodyride, AIModel);
                 mat_mul(MVP, AIModel, AIMVPc);
                 for(int w=0;w<4;w++){
                     mat_mul(AIWheelModel,aiWheelT[w],aiWheelWorld[w]);
                     mat_mul(AIWheelModel,aiBrakeT[w],aiBrakeWorld[w]);
                 }
                 WGroundHit shadow_ground;
-                if(world_ground_hit(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&shadow_ground)!=WSURF_NONE) {
-                    float gp[3]={ais[k].pos[0],ais[k].pos[1],shadow_ground.z};
-                    CarShadow *cache=tv?&traffic[ai_traffic_visual(k)].shadow:&opponent_shadow;
+                if(world_ground_hit(&scene,render_ais[k].pos[0],render_ais[k].pos[1],render_ais[k].pos[2],&shadow_ground)!=WSURF_NONE) {
+                    float gp[3]={render_ais[k].pos[0],render_ais[k].pos[1],shadow_ground.z};
+                    CarShadow *cache=tv?&traffic[visual].shadow:&opponent_shadow;
                     int casts=render_car_shadow(&rp,cache,draw_scene,draw_gpu,draw_stock_wheel,NULL,NULL,
                         AIModel,(const float (*)[16])aiWheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
                     if(casts>0)g_dbg.drawn+=casts;
@@ -8820,7 +9170,7 @@ int main(int argc, char **argv) {
                     glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]);glUniform1f(uGloss,qgloss[vq]);
                     glUniform1f(rp.uEnv,.15f);glUniform1f(rp.uClearcoat,0.0f);
                     glUniform3f(rp.uEmissive,0,0,0);
-                    glUniform3fv(uColor,1,ais[k].col);
+                    glUniform3fv(uColor,1,render_ais[k].col);
                     if((dark||metal)&&(c==N2_CAR_BODY||c==N2_CAR_MISC||(islight&&!heademit))){
                         int chrome=material==N2_MAT_CHROME||material==N2_MAT_MAGCHROME;
                         glUniform3f(uColor,dark?.030f:.38f,dark?.032f:.40f,dark?.035f:.42f);
@@ -8833,7 +9183,7 @@ int main(int argc, char **argv) {
                         if(heademit)glUniform3f(rp.uEmissive,gain,gain*.94f,gain*.82f);
                         glUniform1f(rp.uEnv,.55f);
                     }else if(c==N2_CAR_BRAKELIGHT&&n2_car_tail_lens(draw_scene,i)){
-                        render_tail_lamp(&rp,tex,g_dbg.night_mode,ais[k].braking,0,
+                        render_tail_lamp(&rp,tex,g_dbg.night_mode,render_ais[k].braking,0,
                             light_variant_gain(draw_config.parts[N2_PART_TAILLIGHT]));
                     }else if(c==N2_CAR_BODY||c==N2_CAR_MISC){
                         glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]*(draw_gpu[i].trim?.4f:1.0f));
@@ -9139,7 +9489,7 @@ int main(int argc, char **argv) {
         /* Rival lamp halos use the decoded model anchors too. Rear lamps also
            appear while braking in daylight; front lamps remain night-only. */
         pf_mark(PF_MID_DRAW);
-        if (race_state != 3 && nai > 0 && g_dbg.show_lights) {
+        if (race_state != 3 && draw_nai > 0 && g_dbg.show_lights) {
             float lz=sqrtf(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]); if(lz<1e-4f)lz=1;
             float ld[3]={look[0]/lz,look[1]/lz,look[2]/lz};
             float rt[3]={ld[1],-ld[0],0}; float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if(rl<1e-4f)rl=1;
@@ -9148,20 +9498,21 @@ int main(int argc, char **argv) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);   /* over its own lens, but still occluded */
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            for (int c=0; c<nai; c++) {
-                if((!ai_race && !traffic_routes[c].present) || !ais[c].render_visible)continue;
-                const CarSwitchCandidate *tv=!ai_race && traffic[ai_traffic_visual(c)].gpu?&traffic[ai_traffic_visual(c)]:NULL;
+            for (int c=0; c<draw_nai; c++) {
+                if((!ai_actor_present(c,ai_race,nai,traffic_routes)) || !render_ais[c].render_visible)continue;
+                int visual=ai_actor_visual(c,ai_race,nai,world.city.race.active);
+                const CarSwitchCandidate *tv=(!ai_race || world.city.race.active) && traffic[visual].gpu?&traffic[visual]:NULL;
                 const float (*lamps)[4]=tv?tv->bloom:opponent_bloom;
                 float ride=tv?tv->profile.ride:opponent_profile.ride;
                 float floor=tv?tv->body_floor:opponent_floor;
-                float aup[3],z=ais[c].pos[2],model[16];
-                if(ais[c].ride_ready)phys_ride_body_up(&ais[c].ride,ais[c].head,aup);
-                else world_ground_pose(&scene,ais[c].pos[0],ais[c].pos[1],z,&z,aup);
+                float aup[3],z=render_ais[c].pos[2],model[16];
+                if(render_ais[c].ride_ready)phys_ride_body_up(&render_ais[c].ride,render_ais[c].head,aup);
+                else world_ground_pose(&scene,render_ais[c].pos[0],render_ais[c].pos[1],z,&z,aup);
                 float oscale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
-                mat_car(ais[c].pos,ais[c].head,aup,
+                mat_car(render_ais[c].pos,render_ais[c].head,aup,
                     body_ride_height(ride*oscale,floor,g_dbg.body_drop),model);
                 for (int b=0;b<4;b++) {
-                    if(lamps[b][3]<.5f||(b<2?!g_dbg.night_mode:(!g_dbg.night_mode&&!ais[c].braking)))continue;
+                    if(lamps[b][3]<.5f||(b<2?!g_dbg.night_mode:(!g_dbg.night_mode&&!render_ais[c].braking)))continue;
                     float bx=model[0]*lamps[b][0]+model[4]*lamps[b][1]+
                              model[8]*lamps[b][2]+model[12];
                     float by=model[1]*lamps[b][0]+model[5]*lamps[b][1]+
@@ -9285,6 +9636,10 @@ int main(int argc, char **argv) {
                 g_dbg.rain_intensity*lens,g_dbg.weather_quality,(float)W/fmaxf(H,1));
         }
 
+        collision_debug_draw(&rp,&wall_debug_vbo,&scene,
+            (const float (*)[4])world.neighborhood.mbb,obstsrc,nobst,
+            g_dbg.freecam?cam:render_player.pos,render_player.pos,MVP);
+
         /* HUD: race-position leaderboard — one colour bar per car, ordered by
            progress along the racing line (leader on top); player bar wider. */
         /* race telemetry (position/lap/speed) always mirrored to g_dbg for
@@ -9292,11 +9647,17 @@ int main(int argc, char **argv) {
            gated so debug builds can hide it (same pattern as the menu HUD
            above — plain builds have no ImGui, so they always draw it). */
         if (ai_race && nai > 0 && race_state != 3) {
-            int myprog = p_lap*aipath.n + p_prev, ppos_mirror = 1;
-            for (int k = 0; k < nai; k++)
-                if (ais[k].lap*aipath.n + ais[k].prevrel > myprog) ppos_mirror++;
-            g_dbg.race_pos = ppos_mirror; g_dbg.race_cars = nai + 1;
-            g_dbg.race_lap = p_lap<LAP_TARGET?p_lap+1:LAP_TARGET; g_dbg.race_laps = LAP_TARGET;
+            float myprog=world.city.race.active?world_race_progress_value(&world.city.race,carpos[0],carpos[1]):p_lap*aipath.n+p_prev;
+            int ppos_mirror=1;
+            for (int k = 0; k < nai; k++) {
+                if(world.city.race.active && world.city.race.kind==N2_RACE_DRIFT) {
+                    const RaceDrift *other=&race_drivers[k].progress.drift,*mine=&world.city.race.drift;
+                    if(other->bank+other->chain>mine->bank+mine->chain)ppos_mirror++;
+                } else if ((world.city.race.active?world_race_progress_value(&race_drivers[k].progress,ais[k].pos[0],ais[k].pos[1]):ais[k].lap*aipath.n+ais[k].prevrel)>myprog) ppos_mirror++;
+            }
+            g_dbg.race_pos = race_state==2?finish_place:ppos_mirror; g_dbg.race_cars = nai + 1;
+            g_dbg.race_lap=world.city.race.active?(world.city.race.lap>0?world.city.race.lap:1):(p_lap<LAP_TARGET?p_lap+1:LAP_TARGET);
+            g_dbg.race_laps=world.city.race.active?world.city.race.maxlaps:LAP_TARGET;
         } else g_dbg.race_cars = 0;   /* not racing: ImGui readout hides itself */
 #ifdef DEBUG_UI
         int draw_race_hud = g_devui && !g_dbg.hud_hide_menu;
@@ -9309,12 +9670,12 @@ int main(int argc, char **argv) {
             glDisable(GL_DEPTH_TEST);
             glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 0.0f);
             /* rank by monotonic progress = lap*loop + progress-along-loop */
-            int nc = nai + 1, ord[N_AI+1], prog[N_AI+1], pl[N_AI+1];
-            float col[N_AI+1][3];
-            prog[0] = p_lap*aipath.n + p_prev; pl[0]=1;
+            int nc = nai + 1, ord[N_RACE_AI+1], prog[N_RACE_AI+1], pl[N_RACE_AI+1];
+            float col[N_RACE_AI+1][3];
+            prog[0] = world.city.race.active?1000*world_race_progress_value(&world.city.race,carpos[0],carpos[1]):p_lap*aipath.n+p_prev; pl[0]=1;
             col[0][0]=0.85f; col[0][1]=0.12f; col[0][2]=0.12f;
             for (int k=0;k<nai;k++){
-                prog[k+1]=ais[k].lap*aipath.n + ais[k].prevrel;
+                prog[k+1]=world.city.race.active?1000*world_race_progress_value(&race_drivers[k].progress,ais[k].pos[0],ais[k].pos[1]):ais[k].lap*aipath.n+ais[k].prevrel;
                 memcpy(col[k+1], ais[k].col, sizeof col[0]); pl[k+1]=0;
             }
             for (int i=0;i<nc;i++) ord[i]=i;
@@ -9393,7 +9754,7 @@ int main(int argc, char **argv) {
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,M); glUniform3f(uColor,r,g,b); draw_gpumesh(&quad); \
                     g_dbg.drawn++; }while(0)
                 for (int i=0;i<aipath.n;i++) MMDOT(aipath.xy[i*2],aipath.xy[i*2+1], 0.004f, 0.4f,0.4f,0.46f);
-                for (int k=0;k<nai;k++)if(ai_race || traffic_routes[k].present)
+                for (int k=0;k<draw_nai;k++)if(ai_actor_present(k,ai_race,nai,traffic_routes))
                     MMDOT(ais[k].pos[0],ais[k].pos[1], 0.010f,
                            ais[k].col[0],ais[k].col[1],ais[k].col[2]);
                 MMDOT(carpos[0],carpos[1], 0.013f, 0.95f,0.15f,0.15f);
@@ -9414,7 +9775,8 @@ int main(int argc, char **argv) {
 #else
         int draw_menu_hud = g_devui;
 #endif
-        if (hud) draw_menu_hud = 0;
+        if (hud) draw_menu_hud=world.city.race.active &&
+            (race_state==0 || race_state==2 || (race_state==1 && racetimer<24));
         if (race_state == 3 && draw_menu_hud) {
             /* car selector (Left/Right): a tight row of pips, chosen lit white */
             float cw = 0.02f, cx0 = -((ncars-1)*cw)/2.0f;
@@ -9463,18 +9825,17 @@ int main(int argc, char **argv) {
             draw_gpumesh(&quad);
             g_dbg.drawn++;
         } else if (draw_menu_hud && race_state == 0) {  /* 3-2-1 / GO, big and centred */
-            if (racetimer >= COUNTDOWN-24) {
-                glUniform3f(uColor,0.2f,0.95f,0.3f);
-                draw_text(&quad, uMVP, "GO", -text_width("GO",0.13f)/2, 0.44f, 0.13f, 0.17f);
-            } else {
-                char b[4]; snprintf(b,sizeof b,"%d", 3 - racetimer/60);
-                glUniform3f(uColor,0.95f,0.25f,0.15f);
-                draw_text(&quad, uMVP, b, -text_width(b,0.13f)/2, 0.44f, 0.13f, 0.17f);
-            }
+            char b[4]; snprintf(b,sizeof b,"%d", 3 - racetimer/60);
+            glUniform3f(uColor,0.95f,0.25f,0.15f);
+            draw_text(&quad, uMVP, b, -text_width(b,0.026f)/2, 0.35f, 0.026f, 0.038f);
+        } else if(draw_menu_hud && ai_race && race_state==1 && racetimer<24) {
+            glUniform3f(uColor,0.2f,0.95f,0.3f);
+            draw_text(&quad,uMVP,"GO",-text_width("GO",0.026f)/2,0.35f,0.026f,0.038f);
         } else if (draw_menu_hud && race_state == 2) {  /* finished: FINISH + place */
             glUniform3f(uColor,0.95f,0.8f,0.2f);
             draw_text(&quad, uMVP, "FINISH", -text_width("FINISH",0.07f)/2, 0.36f, 0.07f, 0.10f);
-            char b[16]; snprintf(b,sizeof b,"P%d/%d", finish_place, nai+1);
+            char b[32];if(world.city.race.failed)snprintf(b,sizeof b,"%s",world.city.race.failed==1?"ENGINE BLOWN":"WRECKED");
+            else snprintf(b,sizeof b,"P%d/%d", finish_place, nai+1);
             glUniform3f(uColor,1,1,1);
             draw_text(&quad, uMVP, b, -text_width(b,0.05f)/2, 0.14f, 0.05f, 0.075f);
         }
@@ -9499,20 +9860,30 @@ int main(int argc, char **argv) {
             world_race_stop(&world);
             world_set_mode(&world, g_dbg.want_mode, g_dbg.want_event);
             if(g_dbg.want_mode==MODE_FREEROAM){
-                ai_race=0;
+                ai_race=0;race_prepare_pending=0;race_state=1;racetimer=0;
+                memcpy(ais,ai_templates,sizeof ai_templates);
                 if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
                     &scene,&aipath,ais,carpos,&start_idx);
                 nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
+            } else {
+                ai_race=0;nai=0;race_prepare_pending=0;race_state=1;racetimer=0;
             }
             g_dbg.gps_n = 0;             /* the old route may cross a new barrier */
         }
         if (g_dbg.race_start_request) {
             g_dbg.race_start_request = 0;
-            if (world.city.active_ev >= 0)
-                world_race_start(&world, troot, world.city.active_ev, g_dbg.race_maxlaps_want);
+            if (world.city.active_ev >= 0 && world_race_start(&world,troot,
+                world.city.active_ev,g_dbg.race_maxlaps_want)>0) {
+                race_place_on_grid(&world,&scene,carpos,&heading);
+                race_prepare_pending=1;ai_race=1;nai=0;
+                race_state=0;racetimer=0;speed=vel[0]=vel[1]=0;g_ride_ready=0;
+            }
         }
         if (g_dbg.race_stop_request) {
-            g_dbg.race_stop_request=0;world_race_stop(&world);ai_race=0;
+            g_dbg.race_stop_request=0;world_race_stop(&world);
+            world_set_mode(&world,MODE_FREEROAM,-1);
+            ai_race=0;race_prepare_pending=0;race_state=1;racetimer=0;
+            memcpy(ais,ai_templates,sizeof ai_templates);
             if(ncirc)load_roaming_circuit(dataroot,circlist[selcirc],
                 &scene,&aipath,ais,carpos,&start_idx);
             nai=ai_traffic_spawn(&roam_roads,&traffic_world,ais,traffic_routes,carpos,heading);
@@ -9580,10 +9951,10 @@ int main(int argc, char **argv) {
                    not a purchasable part yet, and has no tank model.
                  - a turbo is NOT fitted, because no boost system exists at
                    all. The dial is removed, not greyed out. */
-            hs.have_nos = 1;
+            hs.have_nos = race_nos_allowed;
             hs.have_turbo = 0;
             if (hud_fitted_set) {     /* developer override, display only */
-                hs.have_nos = (unsigned char)hud_fitted_nos;
+                hs.have_nos = (unsigned char)(hud_fitted_nos && race_nos_allowed);
                 hs.have_turbo = (unsigned char)hud_fitted_turbo;
             }
             hs.have_nitro_tank = 0;   /* no capacity/depletion system exists */
@@ -9595,18 +9966,26 @@ int main(int argc, char **argv) {
                the legacy circuit-AI mode. Reading only ai_race leaves the HUD
                in free-roam dress during a perfectly real armed event. */
             const WRace *wr = &world.city.race;
-            int event_race = wr->active && !wr->finished;
+            int event_race = wr->active;
             hs.racing = (event_race || (ai_race && race_state != 3)) ? 1 : 0;
             if (hs.racing) {
                 int ev = world.city.active_ev;
                 hs.circuit = (ev >= 0 && ev < world.city.nev)
                            ? world.city.ev[ev].circuit : 1;
+                if(event_race) {
+                    hs.race_kind=wr->kind;hs.drift_score=wr->drift.bank;hs.drift_chain=wr->drift.chain;
+                    if(wr->kind==N2_RACE_DRAG && g_vehicle_source_valid) {
+                        hs.rpm=drag_gear.rpm;hs.rpm_redline=g_vehicle_source.redline_rpm;hs.gear=drag_gear.gear;
+                        hs.engine_heat=drag_gear.heat;hs.engine_failed=wr->failed==1;
+                        hs.shift_ready=drag_gear.rpm>=g_vehicle_source.redline_rpm;
+                    }
+                }
                 if (event_race) {
                     /* laps and gates come from the authored event */
                     hs.lap  = wr->lap < 1 ? 1 : wr->lap;
                     hs.laps = wr->maxlaps > 0 ? wr->maxlaps : 1;
-                    hs.sprint_progress = wr->ngate > 0
-                        ? (float)wr->cleared / (float)wr->ngate : 0.0f;
+                    hs.sprint_progress=wr->finished?1:(wr->ngate>1
+                        ?fminf(1,world_race_progress_value(wr,carpos[0],carpos[1])/(wr->ngate-1)):0);
                 } else {
                     hs.lap = p_lap < LAP_TARGET ? p_lap + 1 : LAP_TARGET;
                     hs.laps = LAP_TARGET;
@@ -9616,24 +9995,25 @@ int main(int argc, char **argv) {
                 hs.position = g_dbg.race_pos; hs.cars = g_dbg.race_cars;
                 hs.route_next = -1;
                 if (event_race && wr->ngate > 1) {
-                    /* An authored event's route IS its gate ring; aipath only
-                       exists for the legacy circuit-AI mode and is empty here,
-                       which is why the race minimap was blank. */
+                    /* Use the validated event course; gates remain the fallback
+                       for events whose branch topology is not decoded. */
                     static float gatexy[WORLD_MAXGATE * 2];
                     int ng = wr->ngate < WORLD_MAXGATE ? wr->ngate : WORLD_MAXGATE;
                     for (int gi = 0; gi < ng; gi++) {
                         gatexy[gi*2]   = wr->gate[gi].x;
                         gatexy[gi*2+1] = wr->gate[gi].y;
                     }
-                    hs.route_xy = gatexy; hs.route_n = ng;
+                    hs.route_xy = aipath.n>1 && nai>0?aipath.xy:gatexy;
+                    hs.route_n = aipath.n>1 && nai>0?aipath.n:ng;
                     hs.route_loop = hs.circuit;
-                    if (wr->next >= 0 && wr->next < ng) hs.route_next = wr->next;
+                    if (wr->next >= 0 && wr->next < ng) hs.route_next=hs.route_xy==gatexy?wr->next
+                        :n2_nearest_wp(&aipath,wr->gate[wr->next].x,wr->gate[wr->next].y);
                     /* zoom the panel out far enough to hold the whole route:
                        a 260 m window shows almost none of a 5 km circuit */
                     float far2 = 0.0f;
-                    for (int gi = 0; gi < ng; gi++) {
-                        float ddx = gatexy[gi*2] - carpos[0];
-                        float ddy = gatexy[gi*2+1] - carpos[1];
+                    for (int gi = 0; gi < hs.route_n; gi++) {
+                        float ddx = hs.route_xy[gi*2] - carpos[0];
+                        float ddy = hs.route_xy[gi*2+1] - carpos[1];
                         float d2 = ddx*ddx + ddy*ddy;
                         if (d2 > far2) far2 = d2;
                     }
@@ -10555,6 +10935,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    race_log_stop(&race_log);g_dbg.race_log=NULL;
 #ifdef DEBUG_UI
     dbgui_shutdown();
 #endif
@@ -10572,6 +10953,12 @@ int main(int argc, char **argv) {
             glDeleteBuffers(1,&traffic_wheelmesh[k].ibo);
         }
         car_switch_release(&traffic[k]);
+    }
+    if((shot || raudit) && ai_race && world.city.race.active) {
+        for(int k=0;k<nai;k++)printf("EVENT AI %d pos=(%.2f %.2f %.2f) speed=%.2f "
+            "gate=%d/%d error=%.3f finished=%d failed=%d\n",k,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],
+            PHYS_KMH(ais[k].spd),race_drivers[k].progress.next,race_drivers[k].progress.ngate,
+            race_drivers[k].drive.error,race_drivers[k].progress.finished,race_drivers[k].drive.failed);
     }
     g_ai_contact_hook=NULL;
     ai_roads_free(&roam_roads);
@@ -10602,6 +10989,8 @@ int main(int argc, char **argv) {
         final_status=1;
     }
     world_city_free(&world.city);
+    world_props_reset();
+    free(aipath.xy);
     free(ai_drive_path.xy);
     if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);
@@ -10614,6 +11003,7 @@ int main(int argc, char **argv) {
     free_car_environment(&car_environment);
     free_car_shadow(&player_shadow);free_car_shadow(&opponent_shadow);
     if(rain_vbo)glDeleteBuffers(1,&rain_vbo);
+    if(wall_debug_vbo)glDeleteBuffers(1,&wall_debug_vbo);
     free_headlight_shadows(&headlight_shadows);
     clear_car_vinyl();
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();

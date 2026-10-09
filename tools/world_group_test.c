@@ -78,6 +78,33 @@ int main(void) {
         assert(!wg_selection_open(&bt,4702,&sel_probe));
     }
 
+    /* Career and demo-only closures must not block an isolated retail race.
+       Keep active race/shared placements and leave free-roam policy intact. */
+    const char *isolated_closures[]={"BARRIERS_CAREER0","BARRIERS_CAREER4","BARRIERS_DEMO"};
+    for(int closure=0;closure<3;closure++) {
+        fixture(ov,g);
+        const char *closure_names[]={isolated_closures[closure],"BARRIERS_1"};
+        for(int k=0;k<2;k++) {
+            unsigned char *record=g+56*k;memset(record+8,0,32);
+            strcpy((char *)record+8,closure_names[k]);uint32_t hash=0xffffffffu;
+            for(const char *c=closure_names[k];*c;c++)hash=hash*33u+(unsigned char)*c;
+            u32(record+40,hash);
+        }
+        assert(wg_open(ov,sizeof ov,g,sizeof g,&t));
+        assert(wg_selection_open(&t,1,&sel_probe));
+        assert(wg_selection_visible(&sel_probe,17,3)); /* active/shared */
+        assert(!wg_selection_visible(&sel_probe,18,7)); /* non-race closure only */
+        free(sel_probe.items);
+        assert(wg_selection_open(&t,-1,&sel_probe));
+        assert(wg_selection_visible(&sel_probe,17,3) && wg_selection_visible(&sel_probe,18,7));
+        free(sel_probe.items);memset(&sel_probe,0,sizeof sel_probe);
+    }
+    assert(!wg_isolated_closure("BARRIERS_CAREER") && !wg_isolated_closure("BARRIERS_CAREER4X"));
+    assert(wg_isolated_closure("BARRIERS_CAREER0") && !wg_isolated_closure("BARRIERS_CAREER65536"));
+    assert(wg_isolated_closure("BARRIERS_DEMO") && !wg_isolated_closure("BARRIERS_DEMO_X"));
+    assert(!wg_isolated_closure("SMOKEABLE") && !wg_isolated_closure("BARRIERS_UNKNOWN"));
+    fixture(ov,g);assert(wg_open(ov,sizeof ov,g,sizeof g,&t));
+
     assert(!wg_visit(&t,NULL,NULL));
     /* Every truncation must fail before any consumer can use a partial table. */
     for(size_t n=0;n<sizeof g;n++)assert(!wg_open(ov,sizeof ov,g,n,&t));

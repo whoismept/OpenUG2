@@ -12,6 +12,18 @@ typedef struct AiCar AiCar;
  * speeds are metres/tick. Current arcade targets: ~220 km/h top speed,
  * 0-100 km/h in ~4 s, ~100-0 braking in ~3 s, long pull to top speed. */
 #define PHYS_TICKRATE 60.0f
+
+/* Render frames may execute zero or several fixed simulation ticks. Bound
+ * catch-up after a stalled frame; preserve the fractional tick for the next.
+ * ponytail: at most eight ticks per frame, longer stalls discard excess time. */
+typedef struct { double remainder; } PhysClock;
+static inline int phys_clock_steps(PhysClock *clock,double elapsed) {
+    if(!isfinite(elapsed) || elapsed<=0)return 0;
+    clock->remainder+=fmin(elapsed,8.0/(double)PHYS_TICKRATE);
+    int steps=(int)floor(clock->remainder*PHYS_TICKRATE+1e-9);
+    clock->remainder=fmax(0,clock->remainder-steps/(double)PHYS_TICKRATE);
+    return steps;
+}
 #define PHYS_MAXSPD   (61.0f/PHYS_TICKRATE)   /* 220 km/h cap (m/tick) */
 #define PHYS_ACCEL    (7.0f/(PHYS_TICKRATE*PHYS_TICKRATE)) /* 7 m/s^2 peak thrust */
 #define PHYS_FRICTION 0.99886f /* rolling+air drag; equilibrium lands at MAXSPD */
@@ -56,6 +68,14 @@ typedef struct {
     float pitch_load; /* longitudinal load transfer (height / wheelbase)     */
     float roll_load;  /* lateral load transfer      (height / track)         */
 } PhysVehicle;
+
+typedef struct { int gear,failed; float rpm,heat,shift; } PhysManual;
+/* Manual drag drivetrain, using the active car's decoded gearbox and curve.
+   Returns a thrust multiplier; zero while shifting/on the limiter/failed.
+   Heat timing and thrust calibration are provisional, not retail recovery. */
+float phys_manual_step(PhysManual *state,const N2PhysicsAttr *source,int power_level,
+                       int transmission_level,float radius,float speed,float throttle,
+                       int shift_delta,float dt);
 
 /* Fleet medians measured over all 44 drivable cars (--fleet-census, M121).
  * They are the normalisation basis, not per-car values. */
@@ -150,6 +170,7 @@ typedef struct {
     int   air_frames;            /* consecutive frames with no contact at all   */
     float impact;                /* |vz| at the frame contact was regained, m/s */
     float lift;                  /* penetration guard applied this frame, m     */
+    float wall_normal[2];        /* last wall impulse's outward XY normal, or 0 */
 } PhysRideState;
 
 /* One frame of support, gathered by the caller from the world. ax/ay are the
@@ -195,11 +216,20 @@ void phys_landing_camera(float *offset, float *velocity, float impact, float dt)
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
                     const PhysSurface *sf, const PhysVehicle *vh);
-/* Shared tyre authority: an airborne car carries momentum, not tyre forces. */
+/* Shared tyre authority: airborne cars carry momentum; grounded wall contact
+   retains tangential motion under throttle instead of scrubbing it away. */
 float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
                       float throttle, float steer, int handbrake,
                       const PhysSurface *sf, const PhysVehicle *vh,
                       const PhysRideState *ride);
+/* Refresh after world-wall resolution, not car/car impulses. Returns removed
+   inward speed in m/s; zero clears last frame's wall contact. */
+float phys_ride_wall_contact(PhysRideState *ride,const float before[2],const float after[2]);
+/* Airborne impacts rebound; gentle grounded contact keeps its tangent. */
+float phys_ride_wall_response(PhysRideState *ride,const float before[2],float after[2]);
+/* Build continuous fixed-post rows and planter-base boundaries from placed
+   geometry. Call once after placement/dedup, before collision collection. */
+int phys_prepare_boundaries(N2Scene *scene);
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along
@@ -248,6 +278,10 @@ typedef struct {
 #define WALL_MIN_FACE_SPAN 0.30f
 /* Vertical thickness across a face, excluding its grade along the road. */
 float phys_wall_face_height(const float a[3], const float b[3], const float c[3]);
+/* Read-only narrow-phase candidate geometry, including generated boundaries.
+ * Contact-height clipping, buried-face rejection and mesh union span still
+ * depend on the querying body; drawing a candidate is not proof of a contact. */
+int phys_wall_debug_face(const N2Mesh *mesh,int triangle,float face_min,float out[9]);
 
 /* Narrow phase. Returns 1 and fills *out (may be NULL) with the CLOSEST
  * contacted feature on mesh mi, 0 if that mesh presents no wall here. */
@@ -267,6 +301,20 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
 int collide_body_walls(float *pos,float *vel,float heading,const float bb[6],
         const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
         const N2Scene *scene,const int *src,PhysWallContact *log,int maxlog);
+/* Read-only planning: interactive panels are approachable, solid walls remain. */
+int collide_body_walls_preview(float *pos,float *vel,float heading,const float bb[6],
+        const float obst[][4],const float obz[][2],int nobst,float z0,float z1,
+        const N2Scene *scene,const int *src);
+/* World owns prop state; 0 = solid, 1 = new impact, 2 = already fallen.
+   The standalone wall solver remains usable without this hook. */
+typedef int (*PhysPropImpactHook)(const N2Scene *scene,int mesh,float inward_speed,
+                                 float nx,float ny);
+extern PhysPropImpactHook g_phys_prop_impact_hook;
+/* World support can hide a foundation below the body's continuous road layer.
+   Standalone collision keeps authored faces when no support query is bound. */
+typedef int (*PhysWallBuriedHook)(const N2Scene *scene,float body_x,float body_y,
+                                 float body_z,float face_x,float face_y,float face_top);
+extern PhysWallBuriedHook g_phys_wall_buried_hook;
 /* Resolve one mesh's near-vertical faces against the same body capsule. The
  * face-height range lets the road system admit low rails while rejecting both
  * surface seams and tall terrain walls. */

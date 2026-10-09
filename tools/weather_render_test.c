@@ -99,6 +99,46 @@ static void paint_shine_test(const RProg *r,GpuMesh *quad) {
     puts("paint shine: source color/range, moving view, front-facing coat and off/low checks PASS");
 }
 
+static void wet_patch_test(const RProg *r,GpuMesh *quad) {
+    /* Grazing view and black asphalt isolate the sky contribution: bright
+       pixels indicate standing water rather than the uniform wet sheen. */
+    float clip[]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
+    float model[16];mat_trans(-100,-100,0,model);model[0]=model[5]=200;
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,clip);
+    render_model(r,model);glUniform3f(r->uCamPos,0,-100000,1);
+    glUniform3f(r->uColor,0,0,0);glUniform3f(r->uFogColor,1,1,1);
+    glUniform1f(r->uAmbient,0);glUniform1f(r->uDiffuse,0);
+    glUniform1f(r->uFogDensity,0);glUniform1f(r->uRainIntensity,1);
+    glUniform1f(r->uWeatherTime,0);
+    unsigned char first[64*64*4],next[64*64*4],pixel_value[4];
+    pixel(r,quad,1,1,pixel_value);
+    glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,first);
+    glUniform1f(r->uWeatherTime,1.0f/60);
+    pixel(r,quad,1,1,pixel_value);
+    glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,next);
+    int pools=0,changes=0;
+    for(int i=0;i<64*64;i++) {
+        pools+=first[i*4]>66;
+        changes+=memcmp(first+i*4,next+i*4,3)!=0;
+    }
+    printf("wet patches: %d/%d standing-water pixels, %d changed after 1/60 s\n",pools,64*64,changes);
+    fflush(stdout);
+    assert(pools>0 && pools<64*64/8);
+    assert(!memcmp(first,next,sizeof first));
+    /* A one-pixel camera pan must sample the same world patch, not regenerate it. */
+    clip[12]-=2.0f/64;
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,clip);
+    pixel(r,quad,1,1,pixel_value);
+    glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,next);
+    for(int y=0;y<64;y++)for(int x=0;x<63;x++)
+        assert(abs(next[(y*64+x)*4]-first[(y*64+x+1)*4])<=1);
+    render_model(r,NULL);clip[12]=-1;
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,clip);
+    glUniform3f(r->uFogColor,0,0,0);glUniform3f(r->uColor,.3f,.3f,.3f);
+    glUniform1f(r->uAmbient,.5f);glUniform1f(r->uDiffuse,.5f);
+    glUniform1f(r->uRainIntensity,1);glUniform1f(r->uWeatherTime,0);glUniform1f(r->uWetness,0);
+}
+
 static void car_render_test(const RProg *r) {
     float eye[]={3,4,5},move[]={1,1,0},look[3];
     render_free_camera(eye,0,0,move,2,look);
@@ -235,6 +275,43 @@ static void reflection_test(const RProg *r) {
         if(before[i*4]>=29 && before[i*4]<=32 && after[i*4]>before[i*4]+3 && after[i*4+2]>before[i*4+2]+3)hits++;
     }
     printf("road reflection: %d colored receiver pixels\n",hits);assert(hits>10);
+    /* Rain belongs to the lens overlay; the same reflected scene must not
+       tear into a new pattern as the weather clock advances. */
+    glActiveTexture(GL_TEXTURE0);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glUniform3f(r->uColor,.12f,.12f,.12f);draw_batch(&batches[map[0]]);
+    glUniform3f(r->uColor,1,.02f,1);draw_batch(&batches[map[1]]);
+    glUniform1f(r->uWeatherTime,1.0f/60);
+    assert(render_road_reflections(r,&refl,batches,count,cam,mvp,p,1,2)==1);
+    glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,before);
+    assert(!memcmp(before,after,sizeof before));
+    /* A solid wall's reflection must stay continuous as the camera moves.
+       Analytic ray/plane intersections select pixels well inside its edges. */
+    for(int frame=0;frame<8;frame++) {
+        int quality=1+frame%2;
+        cam[0]=frame*.07f;cam[1]=-4+frame*.15f;
+        mat_lookat(cam,look,v);mat_mul(p,v,mvp);
+        glUniformMatrix4fv(r->uMVP,1,GL_FALSE,mvp);glUniform3fv(r->uCamPos,1,cam);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glUniform3f(r->uColor,.12f,.12f,.12f);draw_batch(&batches[map[0]]);
+        glUniform3f(r->uColor,1,.02f,1);draw_batch(&batches[map[1]]);
+        glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,before);
+        assert(render_road_reflections(r,&refl,batches,count,cam,mvp,p,1,quality)==1);
+        glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,after);
+        int expected=0,found=0;
+        float length=sqrtf(1+.15f*.15f),ly=1/length,lz=-.15f/length;
+        for(int y=0;y<64;y++)for(int x=0;x<64;x++) {
+            int i=y*64+x;if(before[i*4]<29 || before[i*4]>32)continue;
+            float dx=(2*(x+.5f)/64-1)/p[0],up=(2*(y+.5f)/64-1)/p[5];
+            float dy=ly-lz*up,dz=lz+ly*up;if(dz>=0)continue;
+            float t=-cam[2]/dz,gx=cam[0]+dx*t,gy=cam[1]+dy*t;
+            float hit=(8-gy)/dy,hx=gx+dx*hit,hz=-dz*hit;
+            if(hit<=0 || fabsf(hx)>2.5f || hz<.5f || hz>4.5f)continue;
+            expected++;found+=after[i*4]>before[i*4]+3 && after[i*4+2]>before[i*4+2]+3;
+        }
+        printf("moving reflection %d (quality %d): %d/%d interior pixels\n",frame,quality,found,expected);
+        fflush(stdout);assert(expected>20 && found>=expected*.95f);
+    }
     /* Remove the wall in the next frame. Empty sky must not become a hit,
        and the old wall must not remain in the copied scene textures. */
     glActiveTexture(GL_TEXTURE0);glClearColor(0,1,0,1);
@@ -254,6 +331,38 @@ static void reflection_test(const RProg *r) {
     assert(!glIsTexture(color) && !glIsTexture(depth) && !refl.width);
     render_batch_array_free(&batches,&count);
     glActiveTexture(GL_TEXTURE0);glViewport(0,0,64,64);
+}
+
+static void collision_wall_render_test(const RProg *r) {
+    const float faces[]={-.8f,-.8f,0,.8f,-.8f,0,0,.8f,0},color[]={.1f,.85f,1};
+    const float identity[]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    const float clip[]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
+    GLuint vbo=0;unsigned char pixels[64*64*4];
+    for(int through=0;through<2;through++) {
+        glViewport(0,0,64,64);glClearColor(0,0,0,0);glClearDepth(0);
+        glDepthMask(GL_TRUE);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);glEnable(GL_CULL_FACE);glDisable(GL_BLEND);
+        glBlendFuncSeparate(GL_ONE,GL_ZERO,GL_ZERO,GL_ONE);
+        glUniform1f(r->uUnlit,0);glUniform1f(r->uSoft,0);glUniform1f(r->uAlpha,.6f);
+        glUniform3f(r->uColor,.2f,.3f,.4f);glUniformMatrix4fv(r->uMVP,1,GL_FALSE,clip);
+        assert(render_collision_walls(r,&vbo,faces,1,color,identity,through)==2);
+        glReadPixels(0,0,64,64,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+        int lit=0;for(int i=0;i<64*64;i++)lit+=pixels[i*4+2]>0;
+        assert(through?lit>100:lit==0);
+        assert(glIsEnabled(GL_DEPTH_TEST) && glIsEnabled(GL_CULL_FACE) && !glIsEnabled(GL_BLEND));
+        GLboolean mask;glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);assert(mask);
+        float matrix[16],value,restored[3];glGetUniformfv(r->prog,r->uMVP,matrix);
+        assert(!memcmp(matrix,clip,sizeof matrix));
+        glGetUniformfv(r->prog,r->uUnlit,&value);assert(value==0);
+        glGetUniformfv(r->prog,r->uAlpha,&value);assert(value==.6f);
+        glGetUniformfv(r->prog,r->uColor,restored);assert(restored[0]==.2f && restored[1]==.3f && restored[2]==.4f);
+        GLint blend;glGetIntegerv(GL_BLEND_SRC_RGB,&blend);assert(blend==GL_ONE);
+        glGetIntegerv(GL_BLEND_DST_ALPHA,&blend);assert(blend==GL_ONE);
+        assert(glGetError()==GL_NO_ERROR);
+    }
+    assert(!render_collision_walls(r,&vbo,faces,0,color,identity,1));
+    glDeleteBuffers(1,&vbo);glClearDepth(1);
+    puts("collision drawing: depth/through views, visible faces/edges and preserved GL state PASS");
 }
 
 int main(void) {
@@ -303,6 +412,7 @@ int main(void) {
     glUniform1f(r.uWeatherTime,29);pixel(&r,&quad,0,1,wet);
     assert(!memcmp(dry,wet,4)); /* dry path unaffected by weather time */
     paint_shine_test(&r,&quad);
+    wet_patch_test(&r,&quad);
 
     GLuint rain=0;float cam[]={0,-5,3},look[]={0,1,-.1f},p[16],v[16],mvp[16];
     mat_persp(1.4f,1,.1f,60,p);mat_lookat(cam,look,v);mat_mul(p,v,mvp);
@@ -330,6 +440,7 @@ int main(void) {
     glDeleteBuffers(1,&rain);glDeleteBuffers(1,&quad.vbo);glDeleteBuffers(1,&quad.nbo);glDeleteBuffers(1,&quad.ibo);
     reflection_test(&r);
     car_render_test(&r);
+    collision_wall_render_test(&r);
     glDeleteProgram(r.prog);SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(win);SDL_Quit();
     puts("weather: screen droplets/aspect, camera cover, conservative culling, wet materials/reflections and GL state passed");
     return 0;

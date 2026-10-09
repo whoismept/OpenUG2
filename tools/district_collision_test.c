@@ -41,9 +41,175 @@ static void make_vertical_panel(N2Scene *scene, N2Mesh *mesh,
     scene->count = scene->cap = 1;
 }
 
+static void test_collision_debug_faces(void) {
+    N2Scene scene;N2Mesh mesh;float verts[20],out[9];uint16_t idx[6];
+    make_vertical_panel(&scene,&mesh,verts,idx,N2_SC_WALL,4);
+    N2Mesh before=mesh;float saved[20];memcpy(saved,verts,sizeof saved);
+    assert(phys_wall_debug_face(&mesh,0,0,out));
+    assert(!memcmp(out,verts,3*sizeof(float)) && out[8]==4);
+    assert(cw_probe_contact(&scene,0,.5f,0,1,0,1.5f));
+    assert(!memcmp(&before,&mesh,sizeof mesh) && !memcmp(saved,verts,sizeof saved));
+    assert(!phys_wall_debug_face(&mesh,-1,0,out) && !phys_wall_debug_face(&mesh,2,0,out));
+    /* Generated collision geometry must replace the original mesh in the view. */
+    float generated[20];memcpy(generated,verts,sizeof generated);
+    for(int v=0;v<4;v++)generated[v*5]+=10;
+    mesh.wall_verts=generated;mesh.wall_idx=idx;mesh.wall_nverts=4;mesh.wall_nidx=6;
+    assert(phys_wall_debug_face(&mesh,0,0,out) && out[0]==10);
+    assert(cw_probe_contact(&scene,0,10.5f,0,1,0,1.5f));
+    mesh.prop_broken=1;assert(!phys_wall_debug_face(&mesh,0,0,out));mesh.prop_broken=0;
+    mesh.wall_verts=NULL;mesh.wall_idx=NULL;
+    for(int v=0;v<4;v++){verts[v*5]=v>1?.15f:0;verts[v*5+2]=0;}
+    assert(!phys_wall_debug_face(&mesh,0,0,out)); /* floor, not a wall */
+    make_vertical_panel(&scene,&mesh,verts,idx,N2_SC_TERRAIN,.15f);
+    verts[5+2]+=10;verts[10+2]+=10;
+    assert(!phys_wall_debug_face(&mesh,0,WALL_MIN_FACE_SPAN,out)); /* graded curb */
+    float p[3]={.5f,0,0},vel[2]={0},bb[6]={-1,-1,0,1,1,1.5f};
+    assert(!collide_body_mesh_wall(p,vel,0,bb,0,12,&scene,0,WALL_MIN_FACE_SPAN,INFINITY,NULL));
+    idx[0]=100;assert(!phys_wall_debug_face(&mesh,0,0,out));
+}
+
 static int collect_one(N2Scene *scene, float obst[1][4], int src[1],
                        float obz[1][2]) {
     return phys_collect_walls(scene, obst, src, obz, 1);
+}
+
+static void test_powered_wall_slide(void) {
+    N2Scene scene;N2Mesh mesh;float verts[20],obst[1][4],obz[1][2];
+    uint16_t idx[6];int src[1];
+    make_vertical_panel(&scene,&mesh,verts,idx,N2_SC_WALL,3);
+    for(int v=0;v<4;v++)verts[v*5+1]*=50;
+    assert(collect_one(&scene,obst,src,obz)==1);
+    const float bb[]={-1.97f,-.94f,0,1.97f,.94f,1.37f};
+    for(int side=-1;side<=1;side+=2) {
+        float progress[2]={0};
+        for(int improved=0;improved<2;improved++) {
+            float h=side>0?3.14159265f-.18f:.18f;
+            float extent=.94f+1.03f*fabsf(cosf(h));
+            float p[]={side*extent,0,0},vel[2]={0},speed=0;
+            PhysRideState ride={.contact_mask=15};
+            for(int tick=0;tick<360;tick++) {
+                phys_drive_step(p,vel,&h,&speed,1,0,0,NULL,NULL,&ride);
+                float before[]={vel[0],vel[1]};
+                collide_body_walls(p,vel,h,bb,obst,obz,1,.1f,1.37f,&scene,src,NULL,0);
+                if(improved)phys_ride_wall_contact(&ride,before,vel);
+                speed=vel[0]*cosf(h)+vel[1]*sinf(h);
+                assert(side*p[0]>=extent-1e-4f && vel[1]>=0);
+            }
+            progress[improved]=p[1];
+            if(improved) {
+                /* Handbrake still holds; steering away releases the constraint. */
+                for(int tick=0;tick<120;tick++)phys_drive_step(p,vel,&h,&speed,1,0,1,NULL,NULL,&ride);
+                assert(hypotf(vel[0],vel[1])<1e-6f);
+                h=side>0?0:3.14159265f;
+                phys_drive_step(p,vel,&h,&speed,1,0,0,NULL,NULL,&ride);
+                assert(side*vel[0]>0);
+                float before[]={vel[0],vel[1]};
+                assert(phys_ride_wall_contact(&ride,before,vel)==0);
+                assert(ride.wall_normal[0]==0 && ride.wall_normal[1]==0);
+            }
+        }
+        printf("powered wall slide side%d: %.3f -> %.3f metres in 6s\n",side,progress[0],progress[1]);
+        assert(progress[1]>3 && progress[1]>progress[0]*3 && progress[1]<12);
+    }
+}
+
+static void test_fixed_boundaries(void) {
+    N2Mesh meshes[6]={0};float verts[6][12*5]={{0}};uint16_t idx[6]={0,1,2,0,2,3};
+    N2Scene scene={meshes,6,6};
+    for(int i=0;i<6;i++) {
+        N2Mesh *m=&meshes[i];m->verts=verts[i];m->nverts=8;m->idx=idx;m->nidx=6;
+        m->cat=N2_OTHER;m->scen=N2_SC_WALL;strcpy(m->sname,"XO_PATHGUARDC_1A_00");
+        float y=i==4?10:i==5?2:2*i;
+        for(int v=0;v<8;v++) {
+            verts[i][v*5]=(v&1)?.15f:-.15f;
+            verts[i][v*5+1]=y+((v&2)?.15f:-.15f);
+            verts[i][v*5+2]=(v&4)?1:0;
+            if(i==5)verts[i][v*5+2]+=5; /* same XY on another level */
+        }
+    }
+    /* Duplicate material slice at one placement must not add another row. */
+    memcpy(verts[3],verts[1],sizeof verts[3]);
+    assert(phys_prepare_boundaries(&scene));
+    assert(meshes[1].wall_verts && !meshes[3].wall_verts);
+    float obst[6][4],obz[6][2];int src[6];
+    int n=phys_collect_walls(&scene,obst,src,obz,6);assert(n==6);
+    /* Old individual posts leave a 1.7m gap; the continuous row fills it. */
+    for(int side=-1;side<=1;side+=2) {
+        float pos[]={side*.3f,1,1.5f},vel[]={-side*.5f,.2f};
+        assert(collide_walls(pos,vel,obst,obz,n,.5f,1.5f,2.4f,&scene,src,NULL,0));
+        printf("boundary side%d pos%g,%g vel%g,%g\n",side,pos[0],pos[1],vel[0],vel[1]);fflush(stdout);
+        assert(side*pos[0]>=.499f && fabsf(vel[0])<1e-6f && fabsf(vel[1]-.2f)<1e-6f);
+        PhysRideState air={0};float before[]={-side*.5f,.2f};
+        /* Response preserves tangent and rebounds out of the wall. */
+        float impulse=phys_ride_wall_response(&air,before,vel);
+        assert(impulse>20 && side*vel[0]>.09f && fabsf(vel[1]-.2f)<1e-6f);
+        PhysRideState ground={.contact_mask=15};vel[0]=0;
+        phys_ride_wall_response(&ground,before,vel);assert(vel[0]==0);
+    }
+    float gap[]={0,7,0},v[2]={0};
+    assert(!collide_walls(gap,v,obst,obz,n,.5f,0,1.3f,&scene,src,NULL,0));
+    float above[]={0,1,3},vv[2]={-.5f,0};
+    assert(!collide_walls(above,vv,obst,obz,n,.5f,3,4.3f,&scene,src,NULL,0));
+    for(int i=0;i<6;i++){free(meshes[i].wall_verts);free(meshes[i].wall_idx);}
+
+    /* Plant foliage extends far beyond its masonry base; only the base blocks. */
+    N2Mesh planter={.verts=verts[0],.nverts=12,.idx=idx,.nidx=6,
+                    .cat=N2_OTHER,.scen=N2_SC_TREE};
+    strcpy(planter.sname,"XT_PLANTERROUNDPALM_1A_00");scene=(N2Scene){&planter,1,1};
+    for(int k=0;k<12;k++) {
+        float size=k<8?1:10;
+        verts[0][k*5]=(k&1)?size:-size;
+        verts[0][k*5+1]=(k&2)?size:-size;
+        verts[0][k*5+2]=k<4?0:k<8?.5f:8;
+    }
+    assert(phys_prepare_boundaries(&scene));
+    assert(phys_collect_walls(&scene,obst,src,obz,6)==1);
+    assert(obst[0][0]==-1 && obst[0][2]==1 && obz[0][1]==2.5f);
+    float p[]={1.2f,0,1.6f},u[]={-.2f,0};
+    assert(collide_walls(p,u,obst,obz,1,.5f,1.6f,2.9f,&scene,src,NULL,0));
+    p[0]=5;p[1]=0;
+    assert(!collide_walls(p,u,obst,obz,1,.5f,0,1.4f,&scene,src,NULL,0));
+    /* The same footprint rule covers hedges and flower-bed asset families. */
+    strcpy(planter.sname,"XT_HEDGEMUL_A_1A_AP_00");
+    assert(phys_prepare_boundaries(&scene) && planter.wall_verts);
+    assert(phys_collect_walls(&scene,obst,src,obz,6)==1 && obst[0][2]==1);
+    strcpy(planter.sname,"XT_BUSHREDFLOWERS_1A_RB_00");
+    assert(phys_prepare_boundaries(&scene) && planter.wall_verts);
+    assert(phys_collect_walls(&scene,obst,src,obz,6)==1 && obst[0][2]==1);
+    free(planter.wall_verts);free(planter.wall_idx);
+}
+
+/* A concave authored wall must keep its opening. A hull across its base
+ * vertices invents a diagonal barrier through the empty courtyard/road. */
+static void test_concave_boundary_outline(void) {
+    float verts[40]={-6,-6,0,0,0, -6,6,0,0,0, -6,6,.8f,0,0, -6,-6,.8f,0,0,
+                     -6,-6,0,0,0, 6,-6,0,0,0, 6,-6,.8f,0,0, -6,-6,.8f,0,0};
+    uint16_t idx[]={0,1,2,0,2,3,4,5,6,4,6,7};
+    N2Mesh m={.verts=verts,.nverts=8,.idx=idx,.nidx=12,
+              .cat=N2_TERRAIN,.scen=N2_SC_TERRAIN};
+    strcpy(m.sname,"TRN_TEST_HEDGEWALL");N2Scene scene={&m,1,1};
+    assert(phys_prepare_boundaries(&scene) && m.wall_verts);
+    assert(!cw_probe_contact(&scene,0,0,0,1,.1f,1.5f));
+    /* The actual outline still stops both bumpers and airborne bodies. */
+    const float bb[]={-2,-1,0,2,1,1.5f};
+    for(int reverse=0;reverse<2;reverse++)for(int air=0;air<2;air++) {
+        float p[]={-4.1f,0,0},v[]={-.1f,.2f};
+        assert(collide_body_mesh_wall(p,v,reverse*3.14159265f,bb,
+            air?1.5f:.1f,air?2.4f:1.5f,&scene,0,.3f,INFINITY,NULL));
+        assert(p[0]>=-4.0001f && fabsf(v[0])<1e-6f && fabsf(v[1]-.2f)<1e-6f);
+    }
+    free(m.wall_verts);free(m.wall_idx);
+}
+
+static void test_long_authored_wall(void) {
+    N2Scene scene;N2Mesh mesh;float verts[20],obst[1][4],obz[1][2];
+    uint16_t idx[6];int src[1];
+    make_vertical_panel(&scene,&mesh,verts,idx,N2_SC_WALL,3);
+    for(int v=0;v<4;v++)verts[v*5+1]*=100;
+    assert(collect_one(&scene,obst,src,obz)==1);
+    float p[]={.5f,0,0},vel[]={-.2f,.1f};
+    assert(collide_walls(p,vel,obst,obz,1,1,.1f,1.5f,&scene,src,NULL,0));
+    assert(p[0]>=.9999f && vel[0]==0 && vel[1]==.1f);
 }
 
 static void test_body_ends_stay_on_wall_side(void) {
@@ -332,6 +498,9 @@ static void test_wall_index_matches_linear(void) {
 }
 
 int main(void) {
+    test_concave_boundary_outline();
+    test_powered_wall_slide();
+    test_long_authored_wall();
     test_authored_barriers_and_baked_walls();
     test_sloping_curb_is_not_a_rail();
     N2Scene scene;
@@ -398,6 +567,8 @@ int main(void) {
     }
     assert(collect_one(&scene, obst, src, obz) == 1);
 
+    test_collision_debug_faces();
+    test_fixed_boundaries();
     test_wall_contact_uses_car_height();
     test_five_vertex_height_slice();
     test_body_ends_stay_on_wall_side();

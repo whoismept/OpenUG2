@@ -5,7 +5,9 @@
 #ifndef OPENUG2_DEBUG_H
 #define OPENUG2_DEBUG_H
 #include "car_config.h"
+#include "race.h"
 #include "traffic_heatmap.h"
+#include "race_log.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,6 +29,7 @@ typedef struct {
     int   id;                       /* 4001.. — also the Paths<id>.bin number */
     char  reg[8];                   /* owning region stem, e.g. "L4RA" */
     int   circuit;                  /* 1 = closed lap circuit, 0 = point-to-point sprint */
+    N2EventInfo info;               /* mode/name from GLOBALB; unknown stays explicit */
     int   npoly;                    /* valid outline points; poly[npoly-1] == poly[0] */
     int   len100m;                  /* coarse course-length hint, units of 100 m */
     float poly[WORLD_EVPOLY][2];    /* closed track-outline polygon, world XY */
@@ -58,6 +61,9 @@ typedef struct {
 
 /* Live race progression for the active event. */
 typedef struct {
+    int   kind;                      /* source race mode */
+    int   failed;                    /* drag: 1 engine, 2 collision */
+    RaceDrift drift;
     int   active;                    /* 1 = a race is being tracked */
     int   ev;                        /* index into World.ev */
     int   lap, maxlaps;              /* lap 0 = not yet over the start line */
@@ -94,6 +100,8 @@ typedef struct {
     TrafficHeatmap heatmap;
     int heat_record,heat_clear,heat_layer,heat_local,heat_height,heat_racers;
     float heat_span; /* local map width in metres */
+    int wall_show,wall_through,wall_height,wall_faces[3],wall_truncated;
+    float wall_range; /* collision candidate inspection radius */
     int traffic_target, traffic_max; /* requested ambient count; engine limit */
     int traffic_active, traffic_racers, traffic_available; /* live readouts */
     int traffic_cull_off; /* diagnostic: draw every AI car even when outside the view */
@@ -243,6 +251,11 @@ typedef struct {
     const WRace *race;                   /* live checkpoint/lap state (world.race) */
     int   race_maxlaps_want;             /* panel writes, engine picks up on start */
     int   race_start_request, race_stop_request;
+    char race_error[160];
+    float race_pace;
+    RaceLog *race_log;
+    int race_log_auto, race_log_start, race_log_stop, race_log_mark, race_log_flush;
+    char race_log_note[128];
 
     /* --- current city zone (engine writes each frame) --- */
     char  zone_name[24];        /* area code the car is inside, "" if none */
@@ -295,6 +308,7 @@ void dbgui_init(struct SDL_Window *win, void *glctx);
 void dbgui_event(const union SDL_Event *e);
 int  dbgui_want_mouse(void);          /* 1 = panel is grabbing the mouse */
 int  dbgui_want_keyboard(void);
+int  dbgui_want_text(void);
 void dbgui_frame(void);               /* build the panel from g_dbg */
 void dbgui_render(void);              /* draw it (call last, before SwapWindow) */
 void dbgui_shutdown(void);

@@ -638,6 +638,9 @@ static void test_builder_authored_model_keys(void) {
         assert(stats.lod_fallbacks == (c >= 1 && c <= 3));
         assert(stats.unkeyed_models == (c == 5));
         if (scene.count) {
+            uint32_t key=cases[c].width==3.0f?0x30303030:
+                         cases[c].width==2.0f?0x20202020:0x10101010;
+            assert(scene.meshes[0].world_model_key==key);
             assert(near(scene.meshes[0].verts[5], cases[c].width));
             assert(scene.meshes[0].nidx == 3 && scene.meshes[0].idx[2] == 2);
             assert(near(scene.meshes[0].verts[8], 0.75f));
@@ -843,6 +846,7 @@ static void test_scenery_event_assembly(void) {
     const char *bundles[]={"STREAML4RA"};
     const struct {int event,count;unsigned rows;} cases[]={
         {0,5,31},{-1,2,12},{7,4,15},{8,4,30},{-1,2,12}};
+    uint64_t identities[5]={0};
     for(int i=0;i<5;i++){
         N2Scene scene={0},vista={0};WInstStats stats;
         assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
@@ -855,6 +859,11 @@ static void test_scenery_event_assembly(void) {
             int row=(int)lroundf(scene.meshes[j].verts[0]/10);
             assert(row>=0&&row<5);seen|=1u<<row;
             assert(scene.meshes[j].nidx==3 && scene.meshes[j].texkey==0x1234);
+            assert(scene.meshes[j].placement_id);
+            if(identities[row])assert(identities[row]==scene.meshes[j].placement_id);
+            identities[row]=scene.meshes[j].placement_id;
+            for(int other=0;other<5;other++)if(other!=row && identities[other])
+                assert(identities[row]!=identities[other]);
         }
         assert(seen==cases[i].rows);
         float ob[5][4],oz[5][2];int src[5];
@@ -1434,6 +1443,8 @@ static void test_common_key_submesh_resolution(void) {
     assert(scene.count == 2 && vista.count == 0);
     assert(scene.meshes[0].mat_exact == 1 && scene.meshes[0].texkey == slot0);
     assert(scene.meshes[1].mat_exact == 1 && scene.meshes[1].texkey == slot1);
+    assert(scene.meshes[0].placement_id &&
+           scene.meshes[0].placement_id==scene.meshes[1].placement_id);
     free_scene(&scene); free_scene(&vista);
 
     remove(common_path); remove(companion_path); remove(stream_path);

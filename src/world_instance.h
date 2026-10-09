@@ -17,6 +17,8 @@ typedef struct {
     uint16_t flags;
     /* Populated by the section walker from 0x34102, not from 0x34103. */
     uint32_t model_keys[3];
+    uint32_t placement_id; /* section/row, independent of the selected LOD */
+    unsigned char knockdown;
     float bounds_min[3], bounds_max[3];
     float matrix[16];
 } WInstPlacement;

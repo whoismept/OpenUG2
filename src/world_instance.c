@@ -255,10 +255,8 @@ static int winst_proto_has_own_matrix(const WInstLibrary *library,
     return 1;
 }
 
-/* The U2 object header's stored name starts at +0xa4 after filler. Searching
- * binary matrix/bounds bytes for an ASCII-looking run can manufacture a name
- * before reaching it (e.g. the recovered tree models). Keep the legacy reader
- * for short/unknown layouts; model identity never depends on this display name. */
+/* Shared name decoding handles the bounded authored header field. The model
+ * key is independent of that display name and owns instance lookup. */
 static uint32_t winst_model_identity(const unsigned char *data, long begin,
                                      long end, char *name, int cap) {
     n2_mesh_name(data, begin, end, name, cap);
@@ -269,21 +267,7 @@ static uint32_t winst_model_identity(const unsigned char *data, long begin,
     long pad = n2_skip_filler(header, (int)info[0].size);
     long length = info[0].size - pad;
     header += pad;
-    uint32_t key = length >= 0x14 ? n2_u32(header + 0x10) : 0;
-    if (cap <= 0 || length <= 0xa4) return key;
-    long n = 0;
-    while (0xa4 + n < length) {
-        unsigned char c = header[0xa4 + n];
-        if (!c) break;
-        if (!(c == '_' || (c >= 'A' && c <= 'Z') ||
-              (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return key;
-        n++;
-    }
-    if (!n || 0xa4 + n == length) return key;
-    if (n >= cap) n = cap - 1;
-    memcpy(name, header + 0xa4, (size_t)n);
-    name[n] = 0;
-    return key;
+    return length >= 0x14 ? n2_u32(header + 0x10) : 0;
 }
 
 static void winst_collect_model(WInstLibrary *library, const unsigned char *data,
@@ -397,6 +381,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         }
     }
     for (int i = 0; i < local.count; i++) {
+        local.meshes[i].world_model_key = model_key;
         local.meshes[i].scen = (unsigned char)scen;
         snprintf(local.meshes[i].sname, sizeof local.meshes[i].sname, "%.31s", name);
     }
@@ -753,6 +738,12 @@ static int winst_visit_section(const WInstSection *section,
         type_name[32] = 0;
         for (int lod = 0; lod < 3; lod++)
             placement.model_keys[lod] = n2_u32(type + 0x20 + lod * 4);
+        const WGSelected *role=wg_selection_find(scenery,(unsigned)section->region_id,(unsigned)i);
+        /* Narrow OpenUG2 eligibility policy, not decoded retail impact flags. */
+        placement.knockdown=role && (role->membership&WG_KNOCKDOWN) &&
+            strlen(type_name)>=8 && !strncmp(type_name,"XO_",3) &&
+            n2_icontains((const unsigned char *)type_name+3,5,"FENCE");
+        placement.placement_id=((uint32_t)section->region_id<<16)|(unsigned)i;
         if (visit && !visit(&placement, type_name, userdata)) return 0;
     }
     return 1;
@@ -896,6 +887,7 @@ typedef struct {
     N2Scene *scene;
     N2Scene *vista;
     WInstStats *stats;
+    uint32_t source;
 } WInstBuildVisit;
 
 static int winst_build_visit(const WInstPlacement *placement,
@@ -915,6 +907,11 @@ static int winst_build_visit(const WInstPlacement *placement,
         if (ground && !proto->instanced) continue;
         if (!winst_place_mesh(dst, mesh, placement->matrix, type_name,
                              build->stats)) return 0;
+        if(build->source) {
+            N2Mesh *placed=dst->meshes+dst->count-1;
+            placed->placement_id=((uint64_t)build->source<<32)|placement->placement_id;
+            if(placement->knockdown)placed->prop_id=placed->placement_id;
+        }
         if (ground && build->stats) build->stats->instanced_ground_meshes++;
     }
     return 1;
@@ -1211,20 +1208,22 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
      * must not fail the build: L4RB 4201/4202/4203 and L4RC 4341 are raceable
      * events with no group of their own. Everything else still fails closed. */
     int effective_event = scenery_event;
-    if (scenery_event) {
+    {
         const char *stem = !strncmp(local_stats.bundle,"STREAM",6)
                          ? local_stats.bundle+6 : local_stats.bundle;
         long len=0;unsigned char *data=winst_read_named(track_root,stem,&len);
         WGTable table;
         int valid=data && wg_open_file(data,(size_t)len,&table);
         if(valid && !wg_event_group_present(&table,scenery_event))effective_event=0;
-        valid=valid && (!effective_event ||
-                        wg_selection_open(&table,effective_event,&scenery));
+        valid=valid && wg_selection_open(&table,effective_event,&scenery);
         free(data); /* selection owns copied membership, not borrowed bytes */
-        if(!valid)goto cleanup;
-        if(effective_event) {
-            if(!winst_check_scenery(bundle_data,0,bundle_len,0,&scenery))goto cleanup;
-            for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)goto cleanup;
+        if(valid) {
+            valid=winst_check_scenery(bundle_data,0,bundle_len,0,&scenery);
+            for(size_t i=0;i<scenery.count;i++)if(!scenery.items[i].checked)valid=0;
+        }
+        if(!valid) {
+            free(scenery.items);memset(&scenery,0,sizeof scenery);
+            if(scenery_event)goto cleanup;
         }
     }
     local_stats.scenery_effective = effective_event;
@@ -1273,7 +1272,10 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     if (!winst_place_ground_prototypes(&library, &built_scene, &built_vista,
                                        &local_stats)) goto cleanup;
 
-    WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats };
+    const char *stem=!strncmp(local_stats.bundle,"STREAM",6)?local_stats.bundle+6:local_stats.bundle;
+    uint32_t source=0;
+    if(strlen(stem)==4)for(int k=0;k<4;k++)source|=(uint32_t)winst_fold_char((unsigned char)stem[k])<<(8*k);
+    WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats, source };
     WInstWalk collect;
     memset(&collect, 0, sizeof collect);
     /* Companion polygons locate home and choose this one bundle, but are not a
@@ -1286,7 +1288,7 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     collect.visit = winst_build_visit;
     collect.userdata = &visit;
     collect.stats = &local_stats;
-    collect.scenery = effective_event ? &scenery : NULL;
+    collect.scenery = &scenery;
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;

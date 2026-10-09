@@ -188,6 +188,11 @@ static void test_sprint_reports_progress_not_fabricated_laps(void) {
     /* and lap 0 (not yet over the line) shows as the first lap, not "0" */
     s.lap = 0; hud_status_text(&s, buf, sizeof buf);
     assert(!strcmp(buf, "LAP 1/2"));
+    s.race_kind=N2_RACE_DRIFT;s.drift_score=1234;s.drift_chain=56;
+    hud_status_text(&s,buf,sizeof buf);assert(!strcmp(buf,"SCORE 1234  +56"));
+    s.race_kind=N2_RACE_DRAG;s.engine_heat=.5f;s.shift_ready=1;
+    hud_status_text(&s,buf,sizeof buf);assert(!strcmp(buf,"HEAT 50 PCT SHIFT"));
+    s.engine_failed=1;hud_status_text(&s,buf,sizeof buf);assert(!strcmp(buf,"ENGINE BLOWN"));
     printf("  sprints show progress, never fabricated laps           PASS\n");
 }
 

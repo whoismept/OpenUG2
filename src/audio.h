@@ -79,6 +79,8 @@ extern EngineSynthState g_engine;
 extern volatile float g_road_vol;   /* tyre/wind noise, scales with speed */
 extern volatile float g_hit;        /* collision thud amplitude (main sets, cb decays) */
 extern volatile float g_skid;       /* tyre-screech volume while drifting */
+extern volatile float g_scrape;     /* quiet, continuous world-wall friction */
+void audio_wall_contact(float inward_mps,float tangent_mps,float dt);
 
 /* RPM crossfade weights for the 3 bands (pure function, used by the synth
  * and the selftest). */
@@ -109,6 +111,6 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname);
 
 /* Open + start the synth device. Returns 0 if unavailable (engine runs silent). */
 SDL_AudioDeviceID audio_init(void);
-void audio_selftest(void);   /* asserts the band-crossfade math */
+void audio_selftest(void);   /* band crossfade, gearbox and wall sound controls */
 
 #endif

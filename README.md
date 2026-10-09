@@ -31,9 +31,13 @@ pipeline works, but only selected content has been verified end to end.
 
 ### Current development screenshots
 
-Recent runtime captures of vehicle detail, texture filtering, the modification
-UI and world lighting. These show work in progress; fountain animation, sea
-quality and shop-light visibility still need further work.
+Recent captures of racing, the map editor, vehicle detail, texture filtering,
+the modification UI and world lighting. These show work in progress; AI passing,
+HUD presentation, fountain animation, sea quality and shop lighting still need work.
+
+| Native map editor | Circuit race — 4K capture |
+| --- | --- |
+| ![Map editor overlooking Bayview, with AI paths and editing controls](docs/screenshots/map-editor.png) | ![MIATA in Circuit 4083 with prototype race HUD at 3840×2160](docs/screenshots/race-circuit-4k.png) |
 
 | City plaza | Red shop vinyl selection |
 | --- | --- |
@@ -96,10 +100,19 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
   points through steering and speed targets. Player and AI share suspension,
   airborne momentum and landing response; the camera reacts to landing impact.
   Spawns require road support, clearance and an off-screen location.
-- **Racing** — closed-circuit loading and AI racing-line opponents work on the
-  verified L4RA route. L4RB sprint event 4201 starts on its shipped supported
-  grid and its three checkpoints can complete end to end under the route
-  driver.
+- **Racing** — source event types, grids, continuous courses, ordered checkpoints
+  and laps drive physics-based opponents. Circuit, sprint, drag, drift, Street X
+  and URL have distinct prototype rules; road events retain ambient traffic.
+  Drag uses discrete lane changes/manual shifts and drift uses measured slip.
+  Event decoding does not guarantee every course can finish.
+- **Map editor** — a separate native ImGui tool edits collision boundaries,
+  objects, AI paths, races, lighting, shops and districts, with viewport handles,
+  undo/redo and review exports. Reviewed collision corrections are compiled into
+  the game; arbitrary editor projects are not loaded by gameplay. See
+  [`tools/MAP_EDITOR.md`](tools/MAP_EDITOR.md).
+- **Timing and diagnostics** — driving and contacts advance at a fixed 60 Hz,
+  with interpolated rendering and chase-camera movement. The ImGui Race Log
+  records telemetry; `.` marks a problem and saves its nearby actor snapshot.
 - **World visibility** — production uses the `ordinary` tier, whose view range
   follows the active fog (about 933 m with the current settings). Developer UI
   and provisional HUD elements are hidden by default and toggled with `1`.
@@ -114,10 +127,11 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
 - Traffic junction selection, route-end queues and collision impulses remain
   provisional. Short deterministic drives pass, but long-session traffic flow
   and retail handling fidelity are not yet established.
-- Only selected L4RA/L4RB content is gameplay-tested. Other region bundles and
-  eight remaining L4RB sprint events still need systematic coverage.
-- Sprint AI opponents, the in-game driving/race HUD semantics and a
-  production-quality front end are missing.
+- Race coverage is incomplete. Some routes still stop under normal collision,
+  and the passing planner can make opponents weave between sides. Fitted-car,
+  player/traffic interaction and full-career verification remain open.
+- The opt-in driving/race HUD and event rules are prototypes; a
+  production-quality front end and career progression remain missing.
 - Some race-specific `ZCV_`/`ZCS_` set-dressing definitions are decoded without
   a proven world-placement or mesh-linkage rule.
 - The experimental `--tier full` panorama pass still exposes opaque authored
@@ -140,11 +154,13 @@ a design at launch. Changing cars clears the vinyl and loads that car’s catalo
   render as solid black wedges hanging off the buildings: their
   `SFX_LIGHT_BEAMA` texture does not decode from the offset its record names,
   and an untextured world batch is now skipped instead of drawn as a flat grey
-  slab. Recovering that texture's real data offset is still open. Road-closure lights
-  still need material/group attribution, and the NFSU2-style wet/rainy asphalt
-  path is not yet implemented.
-- Open-world collision attribution still needs to classify overlapping or
-  duplicate instance meshes before any collision threshold is changed.
+  slab. Recovering that texture's real data offset is still open. Road-closure
+  lights still need material/group attribution. Wet-road sheen, sparse puddles,
+  reflections and screen rain droplets are implemented, with further fidelity
+  and performance work remaining.
+- Collision support and attribution still need whole-map driving validation.
+  Reviewed STREAML4RA model-wide corrections retain visuals and ground; their
+  exact local boundaries need revalidation for different asset editions.
 - The northern mountain-road route needs a source-level visibility audit; after
   that, the selected-route direction arrow must be recovered from authored
   route/HUD data rather than guessed from the diagnostic map.

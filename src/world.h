@@ -176,6 +176,7 @@ int world_set_mode(World *w, int mode, int evidx);
  * the 0x34146 start grid, so both decodes agree on where the start line is.
  *
  * Returns the gate count (gate 0 = start/finish, 1.. = checkpoints). */
+int world_race_grid_ground(const N2Scene *scene,const WEvent *event,const float grid[3],float *z);
 int world_race_start(World *w, const char *troot, int evidx, int maxlaps);
 
 /* Feed the car's XY once per frame. Only the single armed gate can be cleared,
@@ -183,13 +184,14 @@ int world_race_start(World *w, const char *troot, int evidx, int maxlaps);
  * so corner-cutting and standing on a gate both fail to score. Returns 1 on the
  * frame a gate is cleared. */
 int world_race_update(World *w, float x, float y);
+/* The starting gun begins lap one; initial grid placement need not recross
+   gate zero. Player and opponents subsequently use the same ordered gates. */
+int world_race_bind_course(WRace *race,const N2Path *course,float half_width);
+void world_race_begin(WRace *race,float x,float y);
+int world_race_progress_update(WRace *race,int circuit,float x,float y);
+float world_race_progress_value(const WRace *race,float x,float y);
 
 void world_race_stop(World *w);
-
-/* Resolve car-circle overlap with the finite active race-barrier segments.
- * Either side is solid; no far-side recovery teleport. Z is untouched.
- * No-op in freeroam. Returns 1 if it pushed. */
-int world_barrier_push(const World *w, float *pos, float r);
 
 /* Load trackname ("ALL" = every STREAM*.BUN under troot, else one region)
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the
@@ -197,6 +199,8 @@ int world_barrier_push(const World *w, float *pos, float r);
 int world_load(World *w, const char *troot, const char *trackname);
 int world_load_ex(World *w, const char *troot, const char *trackname,
                   const WLoadOptions *options);
+/* Enable compiled gameplay corrections before loading/starting resident workers. */
+void world_collision_init(void);
 
 int world_neighborhood_load(WorldNeighborhood *neighborhood,
                             const char *troot, const char *trackname,
@@ -207,6 +211,11 @@ int world_city_load(WorldCity *city,
 
 void world_neighborhood_free(WorldNeighborhood *neighborhood);
 void world_city_free(WorldCity *city);
+/* Knockdown state survives resident swaps; reset only on a committed map change. */
+extern float g_world_prop_impact_kmh; /* calibrated fallback, not a decoded retail value */
+void world_props_step(float dt);
+void world_props_reset(void);
+int world_prop_update_mesh(N2Mesh *mesh);
 
 int  world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
                              const float (*mbb)[4]);
@@ -344,6 +353,13 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
  * contacted face and clips the face to the body's actual height. */
 int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
                          const float bb[6],float z0,float z1,WRailHit *hit);
+/* Sweep ordinary player/AI movement through both wall sets in short steps.
+   dz is predicted airborne travel this tick; Z integration remains the ride
+   solver's job. Returns building contacts, with terrain contacts separately. */
+int world_body_walls_move(const N2Scene *s,const float old[3],float pos[3],
+        float vel[2],float heading,const float bb[6],float z0,float z1,float dz,
+        const float obst[][4],const float obz[][2],int nobst,const int *src,
+        PhysWallContact *contacts,int max_contacts,WRailHit *rail,int *rail_count);
 /* Non-mutating circle probe for spawn validation, using the same height-clipped
    road/terrain faces as gameplay, including tall retaining walls. */
 int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r);

@@ -28,7 +28,7 @@ endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c
-HDRS := src/traffic_heatmap.h src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
+HDRS := src/world_collision_rules.h src/world_collision.h src/race_log.h src/race.h src/traffic_heatmap.h src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -69,7 +69,7 @@ build/%.o: $(IMGUI_DIR)/%.cpp
 build/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c $< -o $@
-build/debugui.o: src/debugui.cpp src/debug.h src/car_config.h src/traffic_heatmap.h
+build/debugui.o: src/debugui.cpp src/race_log.h src/race.h src/debug.h src/car_config.h src/traffic_heatmap.h
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c src/debugui.cpp -o $@
 
@@ -127,6 +127,11 @@ ground-motion-test: tools/ground_motion_test.c src/ground_motion.h src/world.c s
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ground_motion_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ground_motion_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/ground_motion_test
 
+world-collision-test: tools/world_collision_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/world_collision_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/world_collision_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/world_collision_test
+
 traffic-heatmap-test: tools/traffic_heatmap_test.c src/traffic_heatmap.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/traffic_heatmap_test.c -o build/traffic_heatmap_test -lm
@@ -136,6 +141,28 @@ ai-drive-test: tools/ai_drive_test.c src/ai.c src/world.c src/resource.c src/wor
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ai_drive_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ai_drive_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/ai_drive_test
+
+fence-impact-test: tools/fence_impact_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/fence_impact_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/fence_impact_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/fence_impact_test
+
+.PHONY: fence-impact-test
+
+race-log-test: tools/race_log_test.c src/race_log.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/race_log_test.c -o build/race_log_test
+	./build/race_log_test
+
+race-ai-test: tools/race_ai_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/race_ai_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/race_ai_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/race_ai_test
+
+# Local asset check: optional --drive [event-id] runs normal physics/contact.
+race-events-check: tools/race_events_check.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/race_events_check.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/race_events_check $(SDL_LIBS) $(GL_LIBS) -lz -lm
 
 world-group-test: tools/world_group_test.c src/world_group_reader.h
 	@mkdir -p build
@@ -280,7 +307,7 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
+.PHONY: race-ai-test race-events-check run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
 
 .PHONY: headlight-render-test
 headlight-render-test: tools/headlight_render_test.c src/render.c src/render.h src/nfsu2.h
@@ -295,3 +322,25 @@ weather-render-test: tools/weather_render_test.c src/render.c src/render.h src/n
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/weather_render_test.c src/render.c -o build/weather_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/weather_render_test
 .PHONY: weather-render-test
+
+# Standalone native ImGui map authoring; original archives stay read-only.
+EDITOR_SRC := src/render.c src/physics.c src/ai.c src/resource.c src/world.c src/world_instance.c
+EDITOR_OBJ := $(EDITOR_SRC:src/%.c=build/editor/%.o)
+build/editor/%.o: src/%.c $(HDRS) $(GEN)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c $< -o $@
+build/map_editor.o: tools/map_editor.cpp tools/map_editor_document.h tools/map_editor_gizmo.h tools/map_editor_collision.h $(HDRS)
+	@mkdir -p build
+	$(CXX) -O2 -std=c++14 -Wall -Wextra -Wno-unused-function $(SDL_CFLAGS) -Isrc -I$(IMGUI_DIR) -c $< -o $@
+build/map_editor: $(EDITOR_OBJ) build/map_editor.o $(filter-out build/debugui.o,$(IMGUI_OBJ))
+	$(CXX) -O2 $^ -o $@ $(SDL_LIBS) $(GL_LIBS) -lz -lm
+map-editor: build/map_editor
+map-editor-test: map-editor-collision-test tools/map_editor_test.cpp tools/map_editor_document.h tools/map_editor_gizmo.h
+	@mkdir -p build
+	$(CXX) -O2 -std=c++14 -Wall -Wextra tools/map_editor_test.cpp -o build/map_editor_test
+	./build/map_editor_test
+map-editor-collision-test: tools/map_editor_collision_test.cpp tools/map_editor_collision.h tools/map_editor_gizmo.h tools/map_editor_document.h
+	@mkdir -p build
+	$(CXX) -O2 -std=c++14 -Wall -Wextra tools/map_editor_collision_test.cpp -o build/map_editor_collision_test
+	./build/map_editor_collision_test
+.PHONY: map-editor map-editor-test map-editor-collision-test

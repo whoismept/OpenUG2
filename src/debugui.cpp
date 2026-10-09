@@ -36,6 +36,7 @@ extern "C" void dbgui_event(const union SDL_Event *e) {
 }
 extern "C" int dbgui_want_mouse(void)    { return ImGui::GetIO().WantCaptureMouse; }
 extern "C" int dbgui_want_keyboard(void) { return ImGui::GetIO().WantCaptureKeyboard; }
+extern "C" int dbgui_want_text(void) { return ImGui::GetIO().WantTextInput; }
 
 static ImU32 heat_colour(float value) {
     value=fmaxf(0,fminf(1,value));
@@ -218,6 +219,36 @@ extern "C" void dbgui_frame(void) {
     g_dbg.want_car = -1; g_dbg.want_track = -1;
 
     if (ImGui::BeginTabBar("MasterInspectorTabs")) {
+    if(ImGui::BeginTabItem("Race Log")) {
+        RaceLog *log=g_dbg.race_log;
+        bool automatic=g_dbg.race_log_auto!=0;
+        if(ImGui::Checkbox("Record each race automatically",&automatic))g_dbg.race_log_auto=automatic;
+        ImGui::TextWrapped("Press . once where a problem occurs. It saves the exact location, ground asset, race progress and nearby vehicle states. Recording continues with the panel closed.");
+        ImGui::InputText("Problem note",g_dbg.race_log_note,sizeof g_dbg.race_log_note);
+        if(log) {
+            ImGui::Text("%s | %ld samples | %ld marks",log->file?"Recording":"Stopped",log->samples,log->marks);
+            if(ImGui::Button("Start recording"))g_dbg.race_log_start=1;
+            ImGui::SameLine();
+            if(ImGui::Button("Mark problem (.)"))g_dbg.race_log_mark=1;
+            ImGui::SameLine();
+            if(ImGui::Button("Finish and save"))g_dbg.race_log_stop=1;
+            if(ImGui::Button("Flush to file"))g_dbg.race_log_flush=1;
+            ImGui::SameLine();
+            if(ImGui::Button("Copy file path"))ImGui::SetClipboardText(log->path);
+            ImGui::TextWrapped("%s",log->path[0]?log->path:"A file will be created beside the executable when recording starts.");
+            ImGui::TextWrapped("%s",log->status);
+            ImGui::BeginChild("RaceProblemMarks",ImVec2(0,220),true);
+            long first=log->marks>64?log->marks-64:0;
+            for(long j=first;j<log->marks;j++) {
+                const RaceLogMark *m=&log->recent[j%64];
+                ImGui::Text("#%ld %.2fs event%d gate%d (%.2f, %.2f, %.2f) %.1f km/h",j+1,m->tick/60.0,m->event,m->gate,m->pos[0],m->pos[1],m->pos[2],m->speed);
+                ImGui::TextWrapped("%s | %s",m->asset,m->note);
+            }
+            ImGui::EndChild();
+            ImGui::TextDisabled("The file retains every mark; this panel shows the latest 64.");
+        }
+        ImGui::EndTabItem();
+    }
 
     /* ---- Tab 1: Vehicle & Wheels ---- */
     if (ImGui::BeginTabItem("Modification")) {
@@ -576,7 +607,7 @@ extern "C" void dbgui_frame(void) {
                     g_dbg.traffic_active,g_dbg.traffic_target,g_dbg.traffic_racers,
                     g_dbg.traffic_visible);
         ImGui::TextWrapped("Applies live. Cars spawn on clear roads out of view; excess cars leave when out of view. Roaming racers are unchanged.");
-        if(!g_dbg.traffic_available)ImGui::TextDisabled("Available during open-world driving with road paths.");
+        if(!g_dbg.traffic_available)ImGui::TextDisabled("Available in open world and road races; closed venues exclude traffic.");
         ImGui::Checkbox("Show UV Checker", (bool *)&g_dbg.show_uv_checker);
         ImGui::Separator();
         if (ImGui::CollapsingHeader("Scenery Semantics (asset names, 0x134011)", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -705,6 +736,17 @@ extern "C" void dbgui_frame(void) {
 
     /* ---- Tab 5: Navigation & Races ---- */
     if (ImGui::BeginTabItem("Navigation & Races")) {
+    ImGui::SeparatorText("Collision walls (3D)");
+    ImGui::Checkbox("Show collision walls",(bool *)&g_dbg.wall_show);
+    if(g_dbg.wall_show) {
+        ImGui::SliderFloat("Wall radius",&g_dbg.wall_range,25,200,"%.0f m");
+        ImGui::Checkbox("Show through scenery",(bool *)&g_dbg.wall_through);
+        ImGui::Checkbox("Walls near player height (+/-4 m)",(bool *)&g_dbg.wall_height);
+        ImGui::TextWrapped("Cyan: object walls (%d faces). Orange: road/terrain walls (%d). Pink: generated barrier/planter boundaries (%d).",
+            g_dbg.wall_faces[0],g_dbg.wall_faces[1],g_dbg.wall_faces[2]);
+        ImGui::TextWrapped("Candidate faces at their current heights. Body height, buried faces and contact span determine actual collisions. This view does not change physics.");
+        if(g_dbg.wall_truncated)ImGui::TextColored(ImVec4(1,.6f,.1f,1),"Face limit reached; reduce the radius.");
+    }
     heatmap_controls();
     /* The real drivable road network parsed
        from the per-region ROUTES path files (chunk 0x34148), drawn top-down
@@ -848,6 +890,8 @@ extern "C" void dbgui_frame(void) {
        Events come from the shipped 0x3414c catalog; picking one masks the A*
        graph to that event's corridor and makes its road closures solid. ---- */
     if (ImGui::CollapsingHeader("Race & Track Manager", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Opponent pace",&g_dbg.race_pace,40,180,"%.0f km/h");
+        ImGui::TextDisabled("Corners, traffic and fitted vehicle limits reduce this pace.");
         int mode = g_dbg.mode;
         if (ImGui::RadioButton("Freeroam Mode", mode == MODE_FREEROAM)) {
             g_dbg.want_mode = MODE_FREEROAM; g_dbg.want_event = -1; g_dbg.mode_request = 1;
@@ -856,12 +900,13 @@ extern "C" void dbgui_frame(void) {
         ImGui::TextDisabled(mode == MODE_RACE_EVENT
             ? "race event active" : "whole city drivable, no barriers");
 
-        ImGui::Text("%d race events parsed (chunk 0x3414c)", g_dbg.ev_count);
+        ImGui::Text("%d race layouts in this region", g_dbg.ev_count);
+        if(g_dbg.race_error[0])ImGui::TextWrapped("%s",g_dbg.race_error);
         if (mode == MODE_RACE_EVENT && g_dbg.active_ev >= 0) {
             const WEvent &e = g_dbg.ev[g_dbg.active_ev];
             ImGui::TextColored(ImVec4(1.0f,0.85f,0.3f,1.0f),
                 "event %d  %s  %s  ~%d00 m  |  %d barriers, %d links masked",
-                e.id, e.reg, e.circuit ? "CIRCUIT" : "SPRINT", e.len100m,
+                e.id, e.reg, n2_race_name(e.info.kind), e.len100m,
                 g_dbg.bar_count, g_dbg.masked_links);
         }
         /* --- live race HUD (Phase 72) --- */
@@ -874,7 +919,10 @@ extern "C" void dbgui_frame(void) {
             ImGui::Text("next gate: %s%d of %d   |   %d start-grid slots",
                         R->next == 0 ? "START/FINISH #" : "checkpoint #",
                         R->next, R->ngate - 1, R->ngrid);
-            if (R->finished) ImGui::TextColored(ImVec4(0.4f,1.0f,0.5f,1.0f), "RACE FINISHED");
+            if(R->kind==N2_RACE_DRIFT)ImGui::Text("Drift score: %.0f  chain: +%.0f",R->drift.bank,R->drift.chain);
+            if(R->kind==N2_RACE_DRAG)ImGui::TextDisabled("W/S throttle/brake, A/D or arrows change one lane, E/Q shift up/down");
+            if (R->finished) ImGui::TextColored(ImVec4(0.4f,1.0f,0.5f,1.0f),
+                R->failed==1?"ENGINE BLOWN":R->failed==2?"WRECKED":"RACE FINISHED");
             if (ImGui::Button("Stop race")) g_dbg.race_stop_request = 1;
             ImGui::SameLine();
             if (ImGui::Button("Restart")) g_dbg.race_start_request = 1;
@@ -882,21 +930,27 @@ extern "C" void dbgui_frame(void) {
             ImGui::Separator();
             if (ImGui::Button("Start race")) g_dbg.race_start_request = 1;
             ImGui::SameLine();
-            ImGui::SetNextItemWidth(110);
-            ImGui::SliderInt("laps", &g_dbg.race_maxlaps_want, 1, 8);
+            if (g_dbg.active_ev>=0 && g_dbg.ev[g_dbg.active_ev].circuit) {
+                ImGui::SetNextItemWidth(110);
+                ImGui::SliderInt("laps", &g_dbg.race_maxlaps_want, 1, 8);
+            }
         }
 
+        static int race_filter=0;
+        ImGui::Combo("Race type",&race_filter,"All\0Circuit\0Sprint\0Drag\0Drift\0Street X\0URL\0");
         if (ImGui::BeginListBox("##events", ImVec2(-1, 180))) {
             for (int i = 0; i < g_dbg.ev_count; i++) {
                 const WEvent &e = g_dbg.ev[i];
+                if(race_filter && e.info.kind!=race_filter)continue;
                 char lbl[96];
                 snprintf(lbl, sizeof lbl, "%d  %-4s  %-7s  ~%d00 m  (%d nodes)",
-                         e.id, e.reg, e.circuit ? "circuit" : "sprint",
+                         e.id, e.reg, n2_race_name(e.info.kind),
                          e.len100m, e.node1 - e.node0);
                 if (ImGui::Selectable(lbl, mode == MODE_RACE_EVENT && i == g_dbg.active_ev)) {
                     g_dbg.want_mode = MODE_RACE_EVENT; g_dbg.want_event = i;
                     g_dbg.mode_request = 1;
                 }
+                if (ImGui::IsItemHovered() && e.info.name[0]) ImGui::SetTooltip("%s", e.info.name);
             }
             ImGui::EndListBox();
         }

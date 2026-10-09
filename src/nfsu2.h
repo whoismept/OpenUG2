@@ -14,6 +14,7 @@
 
 /* One drawable submesh: interleaved [px,py,pz,u,v] verts + u16 triangle list. */
 enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
+       N2_COLLISION = 5, /* local invisible authored wall; never a draw mesh */
        /* car mesh classes, from material name */
        N2_CAR_BODY = 10, N2_CAR_GLASS = 11, N2_CAR_LIGHT = 12,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16,
@@ -24,6 +25,7 @@ enum { N2_MOUNT_BODY = 0, N2_MOUNT_WHEEL, N2_MOUNT_FRONT_BRAKE, N2_MOUNT_REAR_BR
 
 enum { N2_SKY_SUNRISE = 0, N2_SKY_SUNSET = 1, N2_SKY_NIGHT = 2 };
 #define N2_TEX_SFX_FLARE_GLOWA 0x17e5ebd2u
+#define N2_TEX_SFX_LIGHT_BEAMA 0x2e95ce7cu
 
 /* The shipped SKYDOME object is authored with the sunrise pair. Retail also
  * ships matching sunset/night dome+cap pairs in LOC4; choosing a profile
@@ -94,9 +96,40 @@ typedef struct {
     unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
     unsigned char car_part; /* independent modification slot + 1, or zero */
     unsigned char car_under; /* hood underside, retained beneath replacement skins */
+    /* Optional gameplay boundary derived after world placement. Rendering and
+       ground queries retain the original mesh. Owned by this scene member. */
+    float *wall_verts;
+    uint16_t *wall_idx;
+    int wall_nverts, wall_nidx;
+    uint32_t world_model_key; /* source model identity, independent of truncated names */
+    unsigned char wall_policy; /* 0 original, 1 removed, 2 replacement only */
+    float wall_height; /* model-wide replacement height; zero for exact local edits */
+    /* Source-marked knockdown panel; all material slices share the placement id. */
+    uint64_t placement_id; /* All world placement slices, including fixed scenery. */
+    uint64_t prop_id;
+    float prop_angle;
+    unsigned prop_revision;
+    unsigned char prop_broken;
 } N2Mesh;
 
+static int n2_world_body_disabled(const N2Mesh *m) {
+    return m->wall_policy == 1 || (m->wall_policy == 2 && !m->wall_verts);
+}
+static uint64_t n2_world_source_id(const N2Mesh *m) {
+    if (m->placement_id) return m->placement_id;
+    uint64_t h = UINT64_C(1469598103934665603);
+    const void *data[] = {m->sname, &m->texkey, m->verts, m->idx};
+    size_t sizes[] = {sizeof m->sname, sizeof m->texkey,
+        (size_t)m->nverts * 5 * sizeof(float), (size_t)m->nidx * sizeof(uint16_t)};
+    for (int k = 0; k < 4; k++) {
+        const unsigned char *p = (const unsigned char *)data[k];
+        for (size_t n = 0; n < sizes[k]; n++) { h ^= p[n]; h *= UINT64_C(1099511628211); }
+    }
+    return h ? h : 1;
+}
+
 #include "car_config.h"
+#include "race.h"
 
 /* KIT00 supplies the base car; KITnn and independent STYLEnn choices replace
  * selected families. N2CarConfig lives in car_config.h so ImGui can share it.
@@ -112,6 +145,8 @@ typedef struct {
  * world-space bbox, then uses this to distinguish different material slices
  * that share one source vertex pool and happen to have equal counts. */
 static int n2_mesh_content_cmp(const N2Mesh *a, const N2Mesh *b) {
+    /* Coincident placements with different impact ownership are not duplicates. */
+    if (a->prop_id != b->prop_id) return a->prop_id < b->prop_id ? -1 : 1;
     if (a->texkey != b->texkey) return a->texkey < b->texkey ? -1 : 1;
     if (a->nidx != b->nidx) return a->nidx < b->nidx ? -1 : 1;
     if (a->nverts != b->nverts) return a->nverts < b->nverts ? -1 : 1;
@@ -192,6 +227,13 @@ static int n2_world_draw_mode(const N2Mesh *m, int authored) {
     return m && m->mat_exact ? authored : N2_DRAW_OPAQUE;
 }
 
+/* SFX_LIGHT_BEAMA is an additive light shaft (source descriptor 7,2,2,0),
+   not a physical shop fixture. Require exact submesh material ownership;
+   a guessed whole-object texture must never remove its solid geometry. */
+static int n2_world_effect_only(const N2Mesh *m) {
+    return m && m->mat_exact && m->texkey == N2_TEX_SFX_LIGHT_BEAMA;
+}
+
 /* Keep conservative whole-object fallbacks out of batches owned by an exact
  * material range, even when both currently resolve to OPAQUE. Provenance is
  * part of the batch contract so later material state cannot leak across it. */
@@ -218,6 +260,19 @@ static uint32_t n2_u32(const unsigned char *p) {
 /* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
 static int n2_skip_filler(const unsigned char *p, int n) {
     int i = 0; while (i < n && p[i] == 0x11) i++; return i;
+}
+
+/* The marker can also be the first bytes of a vertex float. Choose the
+   filler boundary when up to three float bytes were consumed. Do not reinterpret
+   empty/all-filler or incompatible layouts. Other leaf
+   formats keep their existing padding rules. */
+static int n2_vertex_filler(const unsigned char *p, int n, int stride) {
+    int pad=n2_skip_filler(p,n);
+    if(pad<n) {
+        int extra=(stride-(n-pad)%stride)%stride;
+        if(extra<=3 && extra<=pad)pad-=extra;
+    }
+    return pad;
 }
 
 /* Shipped district point-light source (0x135003, 96-byte records). This is
@@ -320,6 +375,30 @@ static void n2_find_leaves(const unsigned char *d, long beg, long end,
     asset_chunks_walk(d,beg,end,n2_leaf_chunk,&walk);
 }
 
+/* Retail track definitions: recursive GLOBALB 0x34201, 296-byte records.
+   The race flags at +148 distinguish modes independently of outline closure. */
+static int n2_event_info(const unsigned char *data,long len,int id,N2EventInfo *out) {
+    if(!data || len<8 || !out)return 0;
+    N2Leaf leaves[8];int count=0;
+    n2_find_leaves(data,0,len,0x34201u,leaves,&count,8);
+    for(int l=0;l<count;l++) {
+        if(leaves[l].size%296)continue;
+        for(long at=leaves[l].off;at<leaves[l].off+leaves[l].size;at+=296) {
+            const unsigned char *b=data+at;
+            if(n2_u32(b+140)!=(uint32_t)id || !memchr(b,0,64))continue;
+            uint32_t flags=n2_u32(b+148), length=n2_u32(b+152);
+            if(length>100000)continue;
+            N2EventInfo info={0};memcpy(info.name,b,64);info.flags=flags;info.length=(int)length;
+            info.kind=flags&8192 ? N2_RACE_URL : flags&2048 ? N2_RACE_STREETX :
+                flags&8 ? N2_RACE_DRIFT : flags&2 ? N2_RACE_DRAG :
+                flags&1 ? N2_RACE_CIRCUIT : flags&4 ? N2_RACE_SPRINT : N2_RACE_UNKNOWN;
+            info.downhill=info.kind==N2_RACE_DRIFT && n2_u32(b+128)==1;
+            *out=info;return 1;
+        }
+    }
+    return 0;
+}
+
 /* substring search within an unterminated byte run */
 static int n2_contains(const unsigned char *hay, long n, const char *needle) {
     long m = (long)strlen(needle);
@@ -356,11 +435,28 @@ enum { N2_SC_NONE = 0, N2_SC_TERRAIN, N2_SC_BUILDING, N2_SC_PROP,
        N2_SC_TREE, N2_SC_WALL, N2_SC_STRUCT, N2_SC_OTHER };
 static int n2_scen_class(const char *nm);
 
+/* U2's validated object-header name, after filler. Binary matrix/bounds
+   bytes before this field must not supply identity or surface semantics. */
+static const unsigned char *n2_header_name(const unsigned char *p,long bytes,long *length) {
+    long start=0;while(start<bytes && p[start]==0x11)start++;
+    if(bytes-start<=0xa4)return NULL;
+    start+=0xa4;long end=start;
+    while(end<bytes && p[end]) {
+        unsigned char c=p[end];
+        if(!(c=='_' || (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9')))return NULL;
+        end++;
+    }
+    if(end==start || end==bytes)return NULL;
+    *length=end-start;return p+start;
+}
+
 static int n2_mesh_category(const unsigned char *d, long beg, long end) {
     N2Leaf mat[4]; int nm = 0;
     n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
     for (int k = 0; k < nm; k++) {
         const unsigned char *p = d + mat[k].off; long s = mat[k].size;
+        long length;const unsigned char *name=n2_header_name(p,s,&length);
+        if(name){p=name;s=length;} /* short/unknown headers retain legacy scanning */
         /* neon signs, bulbs, lens flares: real light *emitters*, distinct
          * from opaque fixtures (StreetLightCbWALL, LightPoleB, TrafficLightC
          * are the pole/housing mesh — matching bare LIGHT/LAMP would also
@@ -383,6 +479,12 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                        camera/depth-write-off sky pass. */
                     if ((L == 7 && !memcmp(n, "SKYDOME", 7)) ||
                         (L >= 4 && !memcmp(n, "SKY_", 4))) return N2_SKY;
+                    char sn[40]; int cl = (int)(L < 39 ? L : 39);
+                    memcpy(sn,n,(size_t)cl);sn[cl]=0;int sc=n2_scen_class(sn);
+                    /* ROAD in roadside furniture is not pavement. Inserting
+                       those props into the ground grid also turns small signs
+                       into fixed rails, bypassing the existing prop policy. */
+                    if(sc==N2_SC_PROP || sc==N2_SC_TREE)return N2_OTHER;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
@@ -402,6 +504,9 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                        TRN_GRASS_, TRN_TRAINTRACKS_ and every unknown ground stay
                        terrain. */
                     if (L >= 12 && !memcmp(n, "TRN_CONCRETE", 12)) return N2_ROAD;
+                    /* Authored drag grids also sit on paved parking lots.
+                       These are driveable pavement, not off-road terrain. */
+                    if (L >= 15 && !memcmp(n, "TRN_PARKINGLOT_", 15)) return N2_ROAD;
                     /* Ground whose asset name does not spell "TERRAIN". L4RB's
                        ground is TRN_RDP_RUNWAY_/TRN_GRASS_/TRN_CONCRETE_/
                        TRN_FOUNDATION_/TRN_TRAINTRACKS_, so the literal test left
@@ -414,9 +519,7 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                        semantic classifier the loader already tags meshes with
                        instead of adding another name rule; ROAD and SKY keep
                        their precedence above. */
-                    { char sn[40]; int cl = (int)(L < 39 ? L : 39);
-                      memcpy(sn, n, (size_t)cl); sn[cl] = 0;
-                      if (n2_scen_class(sn) == N2_SC_TERRAIN) return N2_TERRAIN; }
+                    if (sc == N2_SC_TERRAIN) return N2_TERRAIN;
                     return N2_OTHER;
                 }
                 i = j;
@@ -438,7 +541,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                         const float *mtx, long istart, long icount, unsigned char draw_mode) {
     const unsigned char *vb = d + vtx.off;
     int vlen = (int)vtx.size;
-    int pad = n2_skip_filler(vb, vlen);
+    int pad = n2_vertex_filler(vb, vlen, stride);
     int body = vlen - pad;
     if (body <= 0 || body % stride) return;
     int n = body / stride;
@@ -662,6 +765,9 @@ static int n2_obj_matrix(const unsigned char *d, long beg, long end, float *m) {
  * ZPM 166, PAN 51, UC 43, XV 32. */
 static int n2_scen_class(const char *nm) {
     if (!nm || !nm[0]) return N2_SC_NONE;
+    /* Drift's painted floor markers overlap the paved track, sometimes 2 cm
+       below it. They render normally but cannot replace physical road support. */
+    if (!strncmp(nm,"TRN_",4) && strstr(nm,"_DRIFTMARKER")) return N2_SC_OTHER;
     if (!strncmp(nm, "TRN", 3) || !strncmp(nm, "PAN", 3)) return N2_SC_TERRAIN;
     if (!strncmp(nm, "XB",  2)) return N2_SC_BUILDING;   /* buildings/barriers */
     if (!strncmp(nm, "XO", 2)) {
@@ -686,11 +792,17 @@ static const char *n2_scen_name(int sc) {
 /* Asset name of a track mesh object, from its own 0x134011 chunk. */
 static void n2_mesh_name(const unsigned char *d, long beg, long end,
                          char *out, int cap) {
+    if(cap<=0)return;
     out[0] = 0;
     N2Leaf mt[4]; int nm = 0;
     n2_find_leaves(d, beg, end, 0x00134011u, mt, &nm, 4);
     for (int k = 0; k < nm; k++) {
         const unsigned char *p = d + mt[k].off; long s = mt[k].size;
+        long length;const unsigned char *name=n2_header_name(p,s,&length);
+        if(name) {
+            int n=(int)(length<cap-1?length:cap-1);
+            memcpy(out,name,(size_t)n);out[n]=0;return;
+        }
         for (long i = 0; i + 4 < s; i++) {
             int ch = p[i];
             if ((ch>='A'&&ch<='Z') || (ch>='a'&&ch<='z')) {
@@ -734,7 +846,7 @@ static int n2_obj_geom(const unsigned char *d, long beg, long end,
     /* two passes over each pair: positions first (bbox), then triangles */
     for (int k = 0; k < pairs; k++) {
         const unsigned char *vb = d + vtx[k].off;
-        int pad = n2_skip_filler(vb, (int)vtx[k].size), body = (int)vtx[k].size - pad;
+        int pad = n2_vertex_filler(vb, (int)vtx[k].size, 24), body = (int)vtx[k].size - pad;
         if (body <= 0 || body % 24) continue;
         int n = body / 24; const unsigned char *rec = vb + pad;
         float *wp = (float *)malloc((size_t)n * 3 * sizeof(float));
@@ -914,7 +1026,7 @@ static void n2_m102_note(int why, const char *anm, int cat, int nslot, int nsub,
     r->bb[0]=r->bb[2]=r->bb[4]= 1e30f;
     r->bb[1]=r->bb[3]=r->bb[5]=-1e30f;
     const unsigned char *vb = d + v0.off; int vlen = (int)v0.size;
-    int pad = n2_skip_filler(vb, vlen);
+    int pad = n2_vertex_filler(vb, vlen, 24);
     const unsigned char *rec = vb + pad; int n = (vlen - pad) / 24;
     for (int i = 0; i < n; i++) {
         float px, py, pz;
@@ -1228,7 +1340,7 @@ static void n2_aabb_local(const unsigned char *d, N2Leaf v, float *mn, float *mx
                           int *nvert, long *vtxoff) {
     mn[0]=mn[1]=mn[2]=1e30f; mx[0]=mx[1]=mx[2]=-1e30f; *nvert = 0;
     const unsigned char *vb = d + v.off;
-    int pad = n2_skip_filler(vb, (int)v.size), body = (int)v.size - pad;
+    int pad = n2_vertex_filler(vb, (int)v.size, 24), body = (int)v.size - pad;
     *vtxoff = v.off + pad;
     if (body <= 0 || body % 24) return;
     int n = body / 24; const unsigned char *rec = vb + pad;
@@ -1796,7 +1908,7 @@ static void n2_car_source_name(const unsigned char *d,long len,
     n2_car_mesh_name(d,off,off+size,out);
 }
 static void n2_car_select_roof(const unsigned char *d,long len,N2Scene *s) {
-    char *drop=calloc((size_t)(s->count?s->count:1),1);
+    char *drop=(char *)calloc((size_t)(s->count?s->count:1),1);
     if(!drop)return;
     for(int i=0;i<s->count;i++) {
         const N2Mesh *m=s->meshes+i;
@@ -2390,7 +2502,8 @@ static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
     int ns=have[0]+have[1];if(!ns)return -1;
     N2Mesh *placed=(N2Mesh *)calloc((size_t)ne*ns,sizeof *placed);
     if(!placed)return -1;
-    int n=0;
+    int n=0,used=0,original=s->count,total=s->count+ne*(ns-1);
+    N2Mesh *grown=NULL;
     for(int side=0;side<2;side++)if(have[side]) {
         const float *m=socket[side];
         for(int i=0;i<s->count;i++)if(s->meshes[i].car_source==exhaust_source) {
@@ -2407,11 +2520,9 @@ static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
         }
     }
     /* Prepare every copy before replacing any source slice. */
-    int total=s->count+ne*(ns-1);
-    N2Mesh *grown=(N2Mesh *)realloc(s->meshes,(size_t)total*sizeof *grown);
+    grown=(N2Mesh *)realloc(s->meshes,(size_t)total*sizeof *grown);
     if(!grown)goto failed;
     s->meshes=grown;s->cap=total;
-    int used=0,original=s->count;
     for(int i=0;i<original;i++)if(s->meshes[i].car_source==exhaust_source) {
         free(s->meshes[i].verts);free(s->meshes[i].idx);free(s->meshes[i].vcol);
         s->meshes[i]=placed[used++];
@@ -2689,6 +2800,7 @@ static int n2_car_prepare_wheels(N2Scene *s) {
 static void n2_free_scene(N2Scene *s) {
     for (int i = 0; i < s->count; i++) {
         free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol);
+        free(s->meshes[i].wall_verts); free(s->meshes[i].wall_idx);
     }
     free(s->meshes); memset(s, 0, sizeof(*s));
 }
@@ -2855,7 +2967,7 @@ static float n2_car_brake_radius(const unsigned char *d, long beg, long end) {
                 n2_find_leaves(d, ds, ds+s, 0x00134B01u, v, &nv, 64);
                 if (nv > 0) {
                     const unsigned char *vb = d + v[0].off; int vl = (int)v[0].size;
-                    int pad = n2_skip_filler(vb, vl), body = vl - pad;
+                    int pad = n2_vertex_filler(vb, vl, 36), body = vl - pad;
                     if (body > 0 && body % 36 == 0) {
                         int n = body/36; const unsigned char *rec = vb + pad;
                         float x0=1e30f,x1=-1e30f,z0=1e30f,z1=-1e30f;

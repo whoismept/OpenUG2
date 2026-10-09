@@ -10,9 +10,107 @@
 #include "world.h"
 #include "physics.h"
 #include "resource.h"
+#include "world_collision_rules.h"
+
+static const WCollisionEdits *collision_edits;
+void world_collision_init(void) {
+    collision_edits=&city_collision_edits;
+    printf("built-in collision corrections: %d rules for %s\n",collision_edits->count,collision_edits->map);
+}
 
 static void grid_build(World *w);
 static void nav_build_adj(World *w);
+
+typedef struct { uint64_t id;float pivot[3],direction[2],angle; } Knockdown;
+/* ponytail: one active city and a linear list of struck panels; a city-owned
+   index is needed only if independent worlds or large debris populations appear. */
+static Knockdown *knockdowns;
+static int nknockdowns,knockdown_cap;
+float g_world_prop_impact_kmh=12;
+
+static Knockdown *world_prop_find(uint64_t id) {
+    for(int k=0;k<nknockdowns;k++)if(knockdowns[k].id==id)return knockdowns+k;
+    return NULL;
+}
+
+static int world_prop_impact(const N2Scene *scene,int mesh,float speed,float nx,float ny) {
+    if(!isfinite(speed) || !isfinite(nx) || !isfinite(ny))return 0;
+    uint64_t id=scene->meshes[mesh].prop_id;
+    Knockdown *p=world_prop_find(id);int struck=p==NULL;
+    if(struck) {
+        if(speed<=0 || !isfinite(g_world_prop_impact_kmh) || speed*3.6f<g_world_prop_impact_kmh)return 0;
+        if(nknockdowns==knockdown_cap) {
+            int cap=knockdown_cap?knockdown_cap*2:16;
+            Knockdown *grown=realloc(knockdowns,(size_t)cap*sizeof *grown);
+            if(!grown){fprintf(stderr,"prop impact: cannot retain panel state\n");return 0;}
+            knockdowns=grown;knockdown_cap=cap;
+        }
+        p=knockdowns+nknockdowns++;*p=(Knockdown){.id=id,.direction={-nx,-ny}};
+        /* Edge-contact normals need not face across the panel. Its largest
+           upright face supplies the tipping axis; contact chooses the side. */
+        float area=0;
+        for(int k=0;k<scene->count;k++)if(scene->meshes[k].prop_id==id) {
+            const N2Mesh *m=scene->meshes+k;
+            for(int t=0;t+2<m->nidx;t+=3) {
+                if(m->idx[t]>=m->nverts || m->idx[t+1]>=m->nverts || m->idx[t+2]>=m->nverts)continue;
+                const float *a=m->verts+5*m->idx[t],*b=m->verts+5*m->idx[t+1],*c=m->verts+5*m->idx[t+2];
+                float ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+                float vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+                float x=uy*vz-uz*vy,y=uz*vx-ux*vz,z=ux*vy-uy*vx,n=hypotf(x,y);
+                if(n>area && fabsf(z)<=.2f*n) {
+                    area=n;p->direction[0]=x/n;p->direction[1]=y/n;
+                }
+            }
+        }
+        if(p->direction[0]*nx+p->direction[1]*ny>0) {
+            p->direction[0]=-p->direction[0];p->direction[1]=-p->direction[1];
+        }
+        float lo[3]={INFINITY,INFINITY,INFINITY},hi[3]={-INFINITY,-INFINITY,-INFINITY};
+        for(int k=0;k<scene->count;k++)if(scene->meshes[k].prop_id==id) {
+            const N2Mesh *m=scene->meshes+k;
+            for(int v=0;v<m->nverts;v++)for(int a=0;a<3;a++) {
+                lo[a]=fminf(lo[a],m->verts[5*v+a]);hi[a]=fmaxf(hi[a],m->verts[5*v+a]);
+            }
+        }
+        p->pivot[0]=(lo[0]+hi[0])*.5f;p->pivot[1]=(lo[1]+hi[1])*.5f;
+        float depth=0;
+        for(int k=0;k<scene->count;k++)if(scene->meshes[k].prop_id==id) {
+            const N2Mesh *m=scene->meshes+k;
+            for(int v=0;v<m->nverts;v++)depth=fmaxf(depth,
+                (m->verts[5*v]-p->pivot[0])*p->direction[0]+(m->verts[5*v+1]-p->pivot[1])*p->direction[1]);
+        }
+        p->pivot[2]=lo[2]+depth; /* fallen thickness stays above the original base */
+    }
+    for(int k=0;k<scene->count;k++)if(scene->meshes[k].prop_id==id)scene->meshes[k].prop_broken=1;
+    return struck?1:2;
+}
+
+void world_props_step(float dt) {
+    if(!isfinite(dt) || dt<=0)return;
+    /* ponytail: a kinematic fall, not loose rigid-body debris; replace when
+       prop mass/impact parameters and debris-ground contact are decoded. */
+    for(int k=0;k<nknockdowns;k++)knockdowns[k].angle=fminf(1.570796327f,knockdowns[k].angle+dt*5.235987756f);
+}
+
+void world_props_reset(void) {
+    free(knockdowns);knockdowns=NULL;nknockdowns=knockdown_cap=0;
+}
+
+int world_prop_update_mesh(N2Mesh *m) {
+    if(!m || !m->prop_id)return 0;
+    Knockdown *p=world_prop_find(m->prop_id);if(!p)return 0;
+    if(m->prop_angle==p->angle && m->prop_revision)return 0;
+    float angle=p->angle-m->prop_angle,c=cosf(angle),s=sinf(angle);
+    for(int v=0;v<m->nverts;v++) {
+        float *x=m->verts+v*5;
+        float d=(x[0]-p->pivot[0])*p->direction[0]+(x[1]-p->pivot[1])*p->direction[1];
+        float z=x[2]-p->pivot[2],move=d*c+z*s-d;
+        x[0]+=p->direction[0]*move;x[1]+=p->direction[1]*move;
+        x[2]=p->pivot[2]+z*c-d*s;
+    }
+    m->prop_angle=p->angle;m->prop_broken=1;m->prop_revision++;
+    return 1;
+}
 
 static void world_scene_free(N2Scene *scene) {
     if (!scene) return;
@@ -20,6 +118,8 @@ static void world_scene_free(N2Scene *scene) {
         free(scene->meshes[i].verts);
         free(scene->meshes[i].idx);
         free(scene->meshes[i].vcol);
+        free(scene->meshes[i].wall_verts);
+        free(scene->meshes[i].wall_idx);
     }
     free(scene->meshes);
     memset(scene, 0, sizeof *scene);
@@ -363,6 +463,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         for (int v = 0; v < m->nverts; v++) m->verts[v*5+2] -= 0.05f;
     }
 
+    if (collision_edits && wce_map(collision_edits,trackname)) {
+        if (!wce_apply(collision_edits,&w->neighborhood.scene)) return 0;
+    } else if (!phys_prepare_boundaries(&w->neighborhood.scene)) return 0;
+
     /* per-mesh XY bounds — the draw cull and the ground grid both key off it */
     int nm = w->neighborhood.scene.count;
     w->neighborhood.mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
@@ -373,6 +477,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             float *p = m->verts + v*5;
             if (p[0]<x0)x0=p[0]; if (p[0]>x1)x1=p[0];
             if (p[1]<y0)y0=p[1]; if (p[1]>y1)y1=p[1];
+        }
+        for (int v=0;m->wall_policy==2 && v<m->wall_nverts;v++) {
+            const float *p=m->wall_verts+v*5;
+            x0=fminf(x0,p[0]);x1=fmaxf(x1,p[0]);y0=fminf(y0,p[1]);y1=fmaxf(y1,p[1]);
         }
         w->neighborhood.mbb[i][0]=x0; w->neighborhood.mbb[i][1]=y0; w->neighborhood.mbb[i][2]=x1; w->neighborhood.mbb[i][3]=y1;
     }
@@ -660,14 +768,18 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
 static WGroundGrid g_empty_grid;
 static const WGroundGrid *g_active_grid = &g_empty_grid;
 #define g_grid (*g_active_grid)
+static int world_wall_buried(const N2Scene *scene,float x,float y,float z,
+                             float fx,float fy,float top);
 
 void world_ground_grid_activate(const WGroundGrid *grid) {
     g_active_grid = grid ? grid : &g_empty_grid;
+    g_phys_prop_impact_hook=grid?world_prop_impact:NULL;
+    g_phys_wall_buried_hook=grid?world_wall_buried:NULL;
 }
 
 void world_ground_grid_free(WGroundGrid *grid) {
     if (!grid) return;
-    if (g_active_grid == grid) g_active_grid = &g_empty_grid;
+    if (g_active_grid == grid) world_ground_grid_activate(NULL);
     free(grid->start);
     free(grid->list);
     memset(grid, 0, sizeof *grid);
@@ -894,19 +1006,10 @@ int world_scripted_defs(const World *w, const char *troot,
 #define NAV_LINK_MAX 120.0f
 
 /* ---- race event catalog (Phase 71) ---------------------------------------
-   See world.h for the record layout and for why this, and not a barrier prop
-   list, is the authentic Freeroam/Race split.
-
-   AUDIT TRAIL (what was looked at before settling on this): a full recursive
-   chunk census of TRACKS/L4R*.BUN, GLOBAL/InGame{FreeRoam,Race,Drift,Drag}.bun,
-   and every TRACKS/ROUTES<REG> Paths/Routes/TrackPosMarkers file turns up NO barrier /
-   blockade instance chunk anywhere -- in particular 0x0003410B does not exist in
-   any shipped file. What the data DOES ship per event is a route network
-   restricted to the roads that event uses: Routes4001F.bin references only the
-   6 route sectors TrackRoutesA21/A30..A34, where RoutesFreeRoam.bin references
-   all 20 (A10..A44). The closure is expressed as omission, so the barrier
-   positions are exactly the links where the freeroam graph leaves the event
-   corridor -- computed below, never typed in. */
+   Event route records define the navigation corridor. Outgoing city links
+   produce approximate visual closure guides, not collision geometry.
+   Authored barriers are separate scenery instances selected by group membership
+   (world_scenery.h); their meshes use the ordinary body collision solver. */
 int world_load_events(World *w, const char *troot) {
     w->city.nev = 0; w->city.mode = MODE_FREEROAM; w->city.active_ev = -1;
     for (int r = 0; r < w->neighborhood.nreg; r++) {
@@ -947,9 +1050,44 @@ int world_load_events(World *w, const char *troot) {
         }
         free(d);
     }
-    {   int nc = 0; for (int i = 0; i < w->city.nev; i++) nc += w->city.ev[i].circuit;
-        printf("race events: %d parsed from Paths*.bin chunk 0x3414c "
-               "(%d circuits, %d sprints)\n", w->city.nev, nc, w->city.nev - nc); }
+    char global_path[1024];snprintf(global_path,sizeof global_path,"%s/../GLOBAL/GLOBALB.BUN",troot);
+    long global_len=0;unsigned char *global=n2_read_file(global_path,&global_len);
+    int known=0;
+    for(int i=0;i<w->city.nev;i++) {
+        WEvent *e=&w->city.ev[i];memset(&e->info,0,sizeof e->info);
+        if(n2_event_info(global,global_len,e->id,&e->info))known+=e->info.kind!=N2_RACE_UNKNOWN;
+    }
+    /* Some layout variants have no GLOBALB row. Inherit a mode only when
+       their complete source path records match a classified layout, and all
+       matching definitions agree. Never infer a mode from an ID range. */
+    for(int i=0;i<w->city.nev;i++) {
+        WEvent *e=&w->city.ev[i];if(e->info.kind!=N2_RACE_UNKNOWN)continue;
+        char path[1024];long len=0;
+        snprintf(path,sizeof path,"%s/ROUTES%s/Paths%d.bin",troot,e->reg,e->id);
+        unsigned char *data=n2_read_file(path,&len);N2Leaf own[2];int nown=0;
+        if(data)n2_find_leaves(data,0,len,0x34148,own,&nown,2);
+        N2EventInfo match={0};int ambiguous=0;
+        for(int j=0;nown==1 && j<w->city.nev;j++) {
+            const WEvent *other=w->city.ev+j;
+            N2EventInfo info;
+            if(strcmp(other->reg,e->reg) || !n2_event_info(global,global_len,other->id,&info) ||
+               info.kind==N2_RACE_UNKNOWN)continue;
+            snprintf(path,sizeof path,"%s/ROUTES%s/Paths%d.bin",troot,other->reg,other->id);
+            long bytes=0;unsigned char *peer=n2_read_file(path,&bytes);N2Leaf ref[2];int nref=0;
+            if(peer)n2_find_leaves(peer,0,bytes,0x34148,ref,&nref,2);
+            if(nref==1 && own[0].size==ref[0].size && !memcmp(data+own[0].off,peer+ref[0].off,own[0].size)) {
+                if(match.kind && (match.kind!=info.kind || match.downhill!=info.downhill))ambiguous=1;
+                match=info;
+            }
+            free(peer);
+        }
+        free(data);
+        if(match.kind && !ambiguous) {
+            e->info=match;snprintf(e->info.name,sizeof e->info.name,"%s route variant %d",n2_race_name(match.kind),e->id);known++;
+        }
+    }
+    free(global);
+    printf("race events: %d outlines, %d source-classified modes\n",w->city.nev,known);
     return w->city.nev;
 }
 
@@ -1166,33 +1304,9 @@ int world_set_mode(World *w, int mode, int evidx) {
     }
     printf("race event %d (%s, %s, ~%d00 m): corridor nodes %d, "
            "barriers %d, directed links masked %d\n",
-           e->id, e->reg, e->circuit ? "circuit" : "sprint", e->len100m,
+           e->id, e->reg, n2_race_name(e->info.kind), e->len100m,
            e->node1 - e->node0, w->city.nbar, w->city.nmasked);
     return w->city.nbar;
-}
-
-static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float *ox,float *oy);
-
-int world_barrier_push(const World *w, float *pos, float r) {
-    if (w->city.mode != MODE_RACE_EVENT) return 0;
-    int hit = 0;
-    for (int i = 0; i < w->city.nbar; i++) {
-        const WBarrier *b = &w->city.bar[i];
-        float rx = pos[0]-b->x, ry = pos[1]-b->y;
-        if (rx*rx + ry*ry > BAR_REACH*BAR_REACH) continue;
-        /* The rendered closure is one finite segment, not a deep volume on
-         * its far side. Resolve actual overlap to the nearest side/endpoint. */
-        float x,y;
-        float d2=seg_d2(pos[0],pos[1],b->x+b->dy*BAR_HALF,b->y-b->dx*BAR_HALF,
-                       b->x-b->dy*BAR_HALF,b->y+b->dx*BAR_HALF,&x,&y);
-        if(d2>=r*r)continue;
-        float d=sqrtf(d2),nx=d>1e-6f?(pos[0]-x)/d:-b->dx,
-                         ny=d>1e-6f?(pos[1]-y)/d:-b->dy;
-        pos[0]+=nx*(r-d);
-        pos[1]+=ny*(r-d);
-        hit = 1;
-    }
-    return hit;
 }
 
 /* ---- race state: checkpoint gates and laps (Phase 72) ---------------------
@@ -1238,13 +1352,27 @@ static int race_load_grid(const World *w, const char *troot, int evid,
     return n;
 }
 
+static int wg_unique_road(const N2Scene *scene,float x,float y,float *z);
+/* Match terrain-labelled pavement only at the shipped height on a drivable slope.
+   Some authored markers have obsolete heights. Preserve a matching road layer;
+   otherwise project XY only when the loaded geometry has ONE road layer.
+   Stacked roads remain ambiguous instead of guessing by race id/type. */
+int world_race_grid_ground(const N2Scene *scene,const WEvent *event,const float grid[3],float *z) {
+    if(!scene || !event || !grid || !z || !isfinite(grid[0]) || !isfinite(grid[1]) || !isfinite(grid[2]))return 0;
+    float normal[3];int surface=world_ground_pose(scene,grid[0],grid[1],grid[2],z,normal);
+    if((surface==WSURF_ROAD || (surface==WSURF_TERRAIN && normal[2]>=.7f)) &&
+       fabsf(*z-grid[2])<=(surface==WSURF_TERRAIN?.2f:1))return 1;
+    return wg_unique_road(scene,grid[0],grid[1],z);
+}
+
 int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
     WRace *R = &w->city.race;
     memset(R, 0, sizeof *R);
     if (evidx < 0 || evidx >= w->city.nev) return 0;
     world_set_mode(w, MODE_RACE_EVENT, evidx);
     const WEvent *e = &w->city.ev[evidx];
-    R->ev = evidx; R->maxlaps = maxlaps > 0 ? maxlaps : 2;
+    R->kind=e->info.kind;
+    R->ev = evidx; R->maxlaps = e->circuit ? (maxlaps > 0 ? maxlaps : 2) : 1;
 
     /* the outline closes (pts[n-1] == pts[0]), so the last vertex is a repeat */
     int np = e->npoly > 1 && e->circuit ? e->npoly - 1 : e->npoly;
@@ -1277,8 +1405,60 @@ int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
     R->next = 0; R->lap = 0; R->cleared = 0; R->havep = 0;
     printf("race armed: event %d (%s), %d gates from the 0x3414c outline, "
            "%d start-grid slots (0x34146), %d lap(s)\n",
-           e->id, e->circuit ? "circuit" : "sprint", R->ngate, R->ngrid, R->maxlaps);
+           e->id, n2_race_name(e->info.kind), R->ngate, R->ngrid, R->maxlaps);
     return R->ngate;
+}
+
+/* The outline is a coarse map line, not a decoded retail checkpoint table.
+   Project its runtime gates onto the actual ordered course and use the local
+   tangent. Player/opponents then cross the same planes in source course order. */
+int world_race_bind_course(WRace *race,const N2Path *path,float half) {
+    if(!race || !race->active || race->lap || !path || !path->xy ||
+       path->n<2 || path->n>4096 || race->ngate<2 || race->ngate>WORLD_MAXGATE ||
+       !isfinite(half) || half<=0)return 0;
+    float length=0;
+    for(int j=0;j<path->n;j++) {
+        if(!isfinite(path->xy[2*j]) || !isfinite(path->xy[2*j+1]))return 0;
+        if(j)length+=hypotf(path->xy[2*j]-path->xy[2*j-2],path->xy[2*j+1]-path->xy[2*j-1]);
+    }
+    if(length<1)return 0;
+    struct { WGate gate;float along; } projected[WORLD_MAXGATE];
+    for(int k=0;k<race->ngate;k++) {
+        if(!isfinite(race->gate[k].x) || !isfinite(race->gate[k].y) || !isfinite(race->gate[k].half))return 0;
+        float best=INFINITY,along=0;projected[k].gate=race->gate[k];projected[k].along=0;
+        for(int j=0;j<path->n-1;j++) {
+            float x=path->xy[2*j],y=path->xy[2*j+1];
+            float dx=path->xy[2*j+2]-x,dy=path->xy[2*j+3]-y,d=hypotf(dx,dy);
+            if(d<.01f)continue;
+            float t=fmaxf(0,fminf(1,((race->gate[k].x-x)*dx+(race->gate[k].y-y)*dy)/(d*d)));
+            float error=hypotf(x+t*dx-race->gate[k].x,y+t*dy-race->gate[k].y);
+            if(error<best) {
+                best=error;projected[k].along=along+t*d;
+                projected[k].gate=(WGate){.x=x+t*dx,.y=y+t*dy,.dx=dx/d,.dy=dy/d,
+                    .half=fmaxf(race->gate[k].half,half),.node=-1};
+            }
+            along+=d;
+        }
+    }
+    int loop=hypotf(path->xy[0]-path->xy[2*path->n-2],path->xy[1]-path->xy[2*path->n-1])<.01f;
+    float origin=projected[0].along;
+    if(loop)for(int k=0;k<race->ngate;k++) {
+        projected[k].along-=origin;if(projected[k].along<0)projected[k].along+=length;
+    }
+    /* Stable insertion sort; gate zero remains the authored start/finish. */
+    for(int k=1;k<race->ngate;k++) {
+        WGate gate=projected[k].gate;float along=projected[k].along;int j=k;
+        while(j>0 && projected[j-1].along>along) {projected[j]=projected[j-1];j--;}
+        projected[j].gate=gate;projected[j].along=along;
+    }
+    int n=0;WGate ordered[WORLD_MAXGATE];
+    for(int k=0;k<race->ngate;k++) {
+        if(k && projected[k].along-projected[k-1].along<.5f)continue;
+        if(loop && k && length-projected[k].along<.5f)continue;
+        ordered[n++]=projected[k].gate;
+    }
+    if(n<2)return 0;
+    memcpy(race->gate,ordered,(size_t)n*sizeof *ordered);race->ngate=n;return 1;
 }
 
 void world_race_stop(World *w) { w->city.race.active = 0; }
@@ -1293,8 +1473,7 @@ static int seg_cross(float ax, float ay, float bx, float by,
     return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
 }
 
-int world_race_update(World *w, float x, float y) {
-    WRace *R = &w->city.race;
+static int race_progress_update(WRace *R,int circuit,int event_id,float x,float y,int verbose) {
     if (!R->active || R->finished) return 0;
     if (!R->havep) { R->px = x; R->py = y; R->havep = 1; return 0; }
     float px = R->px, py = R->py;
@@ -1309,27 +1488,52 @@ int world_race_update(World *w, float x, float y) {
     /* and only in the direction of travel, so reversing back out un-scores nothing */
     if ((x-px)*g->dx + (y-py)*g->dy <= 0.0f) return 0;
 
-    const WEvent *e = &w->city.ev[R->ev];
     int was = R->next;
     if (was == 0) {
-        if (R->lap == 0) { R->lap = 1; printf("race: start line crossed, lap 1/%d\n", R->maxlaps); }
+        if (R->lap == 0) { R->lap = 1; if(verbose)printf("race: start line crossed, lap 1/%d\n", R->maxlaps); }
         else {
-            printf("race: LAP %d complete (%d/%d checkpoints)\n",
+            if(verbose)printf("race: LAP %d complete (%d/%d checkpoints)\n",
                    R->lap, R->cleared, R->ngate - 1);
             R->lap++;
             if (R->lap > R->maxlaps) { R->finished = 1; R->lap = R->maxlaps;
-                printf("race: FINISHED event %d after %d lap(s)\n", e->id, R->maxlaps); }
+                if(verbose)printf("race: FINISHED event %d after %d lap(s)\n", event_id, R->maxlaps); }
         }
         R->cleared = 0;
     } else {
         R->cleared++;
-        printf("race: checkpoint %d/%d cleared at (%.1f, %.1f)  lap %d/%d\n",
+        if(verbose)printf("race: checkpoint %d/%d cleared at (%.1f, %.1f)  lap %d/%d\n",
                was, R->ngate - 1, g->x, g->y, R->lap, R->maxlaps);
     }
-    if (e->circuit) R->next = (was + 1) % R->ngate;
+    if (circuit) R->next = (was + 1) % R->ngate;
     else if (was + 1 < R->ngate) R->next = was + 1;
-    else { R->finished = 1; printf("race: FINISHED sprint %d\n", e->id); }
+    else { R->finished = 1; if(verbose)printf("race: FINISHED sprint %d\n", event_id); }
+    if(R->finished && R->kind==N2_RACE_DRIFT)race_drift_bank(&R->drift);
     return 1;
+}
+
+void world_race_begin(WRace *r,float x,float y) {
+    if(!r->active || r->ngate<1)return;
+    r->lap=1;r->next=r->ngate>1?1:0;r->cleared=0;r->finished=0;r->failed=0;
+    r->drift=(RaceDrift){0};
+    r->px=x;r->py=y;r->havep=1;
+}
+int world_race_progress_update(WRace *r,int circuit,float x,float y) {
+    return race_progress_update(r,circuit,0,x,y,0);
+}
+int world_race_update(World *w,float x,float y) {
+    WRace *r=&w->city.race;
+    if(r->ev<0 || r->ev>=w->city.nev)return 0;
+    return race_progress_update(r,w->city.ev[r->ev].circuit,w->city.ev[r->ev].id,x,y,1);
+}
+float world_race_progress_value(const WRace *r,float x,float y) {
+    if(!r->active || r->ngate<1 || r->lap<1)return 0;
+    if(r->finished)return (float)(r->maxlaps*r->ngate);
+    int prev=(r->next+r->ngate-1)%r->ngate;
+    const WGate *a=&r->gate[prev],*b=&r->gate[r->next];
+    float dx=b->x-a->x,dy=b->y-a->y,dd=dx*dx+dy*dy;
+    float fraction=dd>1e-6f?((x-a->x)*dx+(y-a->y)*dy)/dd:0;
+    fraction=fmaxf(0,fminf(.999f,fraction));
+    return fmaxf(0,(float)(r->lap-1))*r->ngate+r->cleared+fraction;
 }
 
 int world_nav_nearest(const World *w, float x, float y) {
@@ -1369,8 +1573,11 @@ int world_route(const World *w, int start, int goal, int *out, int cap, float *o
     float *g = (float *)malloc((size_t)w->city.nnav * sizeof(float));
     int *came = (int *)malloc((size_t)w->city.nnav * sizeof(int));
     char *closed = (char *)calloc((size_t)w->city.nnav, 1);
-    for (int i = 0; i < w->city.nnav; i++) { g[i] = 1e30f; came[i] = -1; }
     HeapIt *heap = (HeapIt *)malloc((size_t)(w->city.nadj + 16) * sizeof(HeapIt));
+    if (!g || !came || !closed || !heap) {
+        free(g); free(came); free(closed); free(heap); return 0;
+    }
+    for (int i = 0; i < w->city.nnav; i++) { g[i] = 1e30f; came[i] = -1; }
     int hn = 0;
     float gx = w->city.nav[goal*2], gy = w->city.nav[goal*2+1];
     g[start] = 0.0f;
@@ -1601,6 +1808,27 @@ static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float 
     return found ? bestcat : WSURF_NONE;
 }
 
+/* Reuse the normal coverage calculation, restricted to roads. Coplanar
+   material slices are one layer; distinct decks cannot repair a stale marker. */
+static int wg_unique_road(const N2Scene *scene,float x,float y,float *z) {
+    float low=INFINITY,high=-INFINITY;int begin=0,end=scene->count,indexed=0;
+    if(scene->meshes==g_grid.meshes && g_grid.start) {
+        int cx=(int)((x-g_grid.x0)/GCELL),cy=(int)((y-g_grid.y0)/GCELL);
+        if(cx<0 || cy<0 || cx>=g_grid.gw || cy>=g_grid.gh)return 0;
+        int cell=cy*g_grid.gw+cx;begin=g_grid.start[cell];end=g_grid.start[cell+1];indexed=1;
+    }
+    for(int k=begin;k<end;k++) {
+        int id=indexed?g_grid.list[k]:k;
+        if(scene->meshes[id].cat!=N2_ROAD)continue;
+        N2Scene one={scene->meshes+id,1,1};float top,bottom;
+        if(!wg_pick(&one,NULL,x,y,N2_GROUND_HIGHEST,&top,NULL,NULL))continue;
+        if(!wg_pick(&one,NULL,x,y,-1e6f,&bottom,NULL,NULL))continue;
+        low=fminf(low,bottom);high=fmaxf(high,top);
+        if(high-low>.25f)return 0;
+    }
+    if(!isfinite(high))return 0;*z=high;return 1;
+}
+
 static int wg_at(const N2Scene *s, float x, float y, float fallback,
                  float *outz, float outn[3], WGroundHit *hit) {
     /* `fallback` is the caller's current Z at every callsite, so it doubles as
@@ -1627,6 +1855,26 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
         scratch[sub.count++] = s->meshes[src];
     }
     return wg_pick(&sub, srcmap, x, y, refz, outz, outn, hit);
+}
+
+/* Count only the exposed height of a pavement skirt. Follow reachable
+   ROAD/TERRAIN support from the body to the contact so grade changes can
+   bury the face, while disconnected decks and unsupported bodies keep it. */
+static int world_wall_buried(const N2Scene *scene,float x,float y,float z,
+                             float fx,float fy,float top) {
+    if(scene->meshes!=g_grid.meshes)return 0;
+    WGroundHit body;float ground;
+    if(wg_at(scene,x,y,z,&ground,NULL,&body)==WSURF_NONE ||
+       fabsf(ground-z)>PHYS_RIDE_REACH_UP || body.normal[2]<.7f)return 0;
+    /* ponytail: half-metre support samples; sub-sample gaps need surface adjacency. */
+    int steps=fmaxf(1,ceilf(hypotf(fx-x,fy-y)/.5f));
+    for(int k=1;k<=steps;k++) {
+        float t=(float)k/steps;WGroundHit floor;
+        if(!world_wheel_support(scene,x+t*(fx-x),y+t*(fy-y),ground,
+             PHYS_RIDE_REACH_UP,PHYS_RIDE_REACH_UP,&floor,NULL,NULL) || floor.normal[2]<.7f)return 0;
+        ground=floor.z;
+    }
+    return top-ground<WALL_MIN_FACE_SPAN;
 }
 
 /* Reachable ROAD/TERRAIN contact covering (x,y) inside [wz-down,
@@ -1670,6 +1918,8 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
             float e2x=c[0]-a[0],e2y=c[1]-a[1],e2z=c[2]-a[2];
             float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
             float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+            /* Nearly vertical pavement skirts remain walls, never tyre support. */
+            if (fabsf(nz)<.30f*nl) continue;
             int ramp = fabsf(nz)>=.30f*nl && fabsf(nx)+fabsf(ny)>fabsf(nz)*.005f;
             float key=dz>0 && ramp && u>=0 && v>=0 && w>=0 ? -dz : ad;
             if (bestcat != WSURF_NONE && key >= bestkey) continue;
@@ -1786,6 +2036,7 @@ static void wgs_mesh(const N2Mesh *m, int mi, const float p[3], const float q[3]
         double fx=c[0]-a[0], fy=c[1]-a[1], fz=c[2]-a[2];
         double nx=ey*fz-ez*fy, ny=ez*fx-ex*fz, nz=ex*fy-ey*fx;
         if (fabs(nz)<1e-9) continue;
+        if (m->wall_policy && nz*nz<.09*(nx*nx+ny*ny+nz*nz)) continue;
         if (nz<0) {nx=-nx;ny=-ny;nz=-nz;}
         double d0=(nx*(p[0]-a[0])+ny*(p[1]-a[1])+nz*(p[2]-a[2]))/nz;
         double d1=(nx*(q[0]-a[0])+ny*(q[1]-a[1])+nz*(q[2]-a[2]))/nz;
@@ -1868,13 +2119,25 @@ float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
        camera-query cost warrants one. No separate collision mesh ownership. */
     for(int mi=0;mi<s->count;mi++) {
         const N2Mesh*m=&s->meshes[mi];
-        if(m->cat==N2_SKY || m->cat==N2_GLOW)continue;
+        if(m->cat==N2_SKY || m->cat==N2_GLOW || n2_world_effect_only(m))continue;
         if(bounds && (fmaxf(anchor[0],eye[0])+radius<bounds[mi][0] ||
            fminf(anchor[0],eye[0])-radius>bounds[mi][2] ||
            fmaxf(anchor[1],eye[1])+radius<bounds[mi][1] ||
            fminf(anchor[1],eye[1])-radius>bounds[mi][3]))continue;
-        for(int ti=0;ti+2<m->nidx;ti+=3) {
-            const float*a=m->verts+5*m->idx[ti],*b=m->verts+5*m->idx[ti+1],*c=m->verts+5*m->idx[ti+2];
+        for(int pass=0;pass<2;pass++) {
+          const float *verts=pass?m->wall_verts:m->verts;
+          const uint16_t *idx=pass?m->wall_idx:m->idx;
+          int count=pass?m->wall_nidx:m->nidx;
+          if (!verts || !idx || (pass && m->wall_policy!=2) ||
+              (!pass && m->wall_policy && m->cat!=N2_ROAD && m->cat!=N2_TERRAIN)) continue;
+          for(int ti=0;ti+2<count;ti+=3) {
+            const float*a=verts+5*idx[ti],*b=verts+5*idx[ti+1],*c=verts+5*idx[ti+2];
+            if (!pass && m->wall_policy) {
+                float ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+                float vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+                float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+                if (nz*nz<.09f*(nx*nx+ny*ny+nz*nz)) continue;
+            }
             int outside=0;
             for(int k=0;k<3;k++)
                 if(fmaxf(anchor[k],eye[k])+radius<fminf(a[k],fminf(b[k],c[k])) ||
@@ -1890,6 +2153,7 @@ float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
                 t+=gap/length;
                 if(it==63 && t<best)best=t; /* conservative grazing contact */
             }
+          }
         }
     }
     for(int k=0;k<3;k++)eye[k]=anchor[k]+delta[k]*best;
@@ -2030,6 +2294,7 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
     int c = cy*g_grid.gw + cx, pushed = 0;
     for (int k = g_grid.start[c]; k < g_grid.start[c+1]; k++) {
         const N2Mesh *m = &s->meshes[g_grid.list[k]];
+        if (m->wall_policy) continue;
         for (int t = 0; t+2 < m->nidx; t += 3) {
             const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5, *cc=m->verts+m->idx[t+2]*5;
             float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2], e2x=cc[0]-a[0],e2y=cc[1]-a[1],e2z=cc[2]-a[2];
@@ -2084,20 +2349,29 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
 int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
                          const float bb[6],float z0,float z1,WRailHit *hit) {
     if (s->meshes != g_grid.meshes) return 0;
-    int cx=(int)((pos[0]-g_grid.x0)/GCELL),cy=(int)((pos[1]-g_grid.y0)/GCELL);
-    if(cx<0||cy<0||cx>=g_grid.gw||cy>=g_grid.gh)return 0;
-    int cell=cy*g_grid.gw+cx,pushed=0;
-    for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
+    /* A body can touch a wall in the next cell while its centre is still in
+       this one. Query its whole footprint, including long traffic vehicles. */
+    float reach=bb?hypotf(fmaxf(fabsf(bb[0]),fabsf(bb[3])),
+                         fmaxf(fabsf(bb[1]),fabsf(bb[4]))):1.3f;
+    if(!isfinite(reach) || reach<=0)reach=1.3f;
+    int x0=(int)floorf((pos[0]-reach-g_grid.x0)/GCELL),x1=(int)floorf((pos[0]+reach-g_grid.x0)/GCELL);
+    int y0=(int)floorf((pos[1]-reach-g_grid.y0)/GCELL),y1=(int)floorf((pos[1]+reach-g_grid.y0)/GCELL);
+    x0=x0<0?0:x0;y0=y0<0?0:y0;
+    x1=x1>=g_grid.gw?g_grid.gw-1:x1;y1=y1>=g_grid.gh?g_grid.gh-1:y1;
+    int pushed=0;
+    for(int cy=y0;cy<=y1;cy++)for(int cx=x0;cx<=x1;cx++)
+    for(int k=g_grid.start[cy*g_grid.gw+cx];k<g_grid.start[cy*g_grid.gw+cx+1];k++) {
         int mi=g_grid.list[k];PhysWallContact c;
         /* Terrain also contains tall retaining walls. The narrow phase clips
            to actual body height and rejects thin sloping curbs; the legacy
            rail census's height ceiling must not remove these solid faces. */
         if(!collide_body_mesh_wall(pos,vel,heading,bb,z0,z1,s,mi,
-                                   WALL_RAIL_MIN_H,INFINITY,&c))continue;
+                                   WALL_MIN_FACE_SPAN,INFINITY,&c))continue;
         if(hit&&!pushed) {
             const N2Mesh *m=&s->meshes[mi];int q=c.tri*3;
-            const float *a=m->verts+m->idx[q]*5,*b=m->verts+m->idx[q+1]*5,
-                        *d=m->verts+m->idx[q+2]*5;
+            const float *verts=m->wall_verts?m->wall_verts:m->verts;
+            const uint16_t *idx=m->wall_verts?m->wall_idx:m->idx;
+            const float *a=verts+idx[q]*5,*b=verts+idx[q+1]*5,*d=verts+idx[q+2]*5;
             float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2];
             float e2x=d[0]-a[0],e2y=d[1]-a[1],e2z=d[2]-a[2];
             float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
@@ -2109,6 +2383,37 @@ int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
         pushed=1;
     }
     return pushed;
+}
+
+int world_body_walls_move(const N2Scene *s,const float old[3],float pos[3],
+        float vel[2],float heading,const float bb[6],float z0,float z1,float dz,
+        const float obst[][4],const float obz[][2],int nobst,const int *src,
+        PhysWallContact *contacts,int max_contacts,WRailHit *rail,int *rail_count) {
+    float dx=pos[0]-old[0],dy=pos[1]-old[1];
+    int steps=(int)ceilf(hypotf(dx,dy)/.25f),walls=0,rails=0;
+    if(steps<1)steps=1;
+    dx/=steps;dy/=steps;pos[0]=old[0];pos[1]=old[1];
+    for(int k=0;k<steps;k++) {
+        pos[0]+=dx;pos[1]+=dy;
+        float a=dz*k/steps,b=dz*(k+1)/steps;
+        float lo=z0+fminf(a,b),hi=z1+fmaxf(a,b);
+        float before[2]={vel[0],vel[1]};
+        if(obst && src)walls+=collide_body_walls(pos,vel,heading,bb,obst,obz,nobst,
+            lo,hi,s,src,contacts && walls<max_contacts?contacts+walls:NULL,
+            walls<max_contacts?max_contacts-walls:0);
+        WRailHit hit={.mesh=-1};
+        if(world_body_wall_push(s,pos,vel,heading,bb,lo,hi,rail?&hit:NULL)) {
+            if(rail && !rails)*rail=hit;
+            rails++;
+        }
+        /* Subsequent substeps advance along the contacted face, never resume
+           the original into-wall displacement after a collision correction. */
+        float nx=vel[0]-before[0],ny=vel[1]-before[1],nn=nx*nx+ny*ny;
+        float inward=dx*nx+dy*ny;
+        if(nn>1e-12f && inward<0){dx-=inward*nx/nn;dy-=inward*ny/nn;}
+    }
+    if(rail_count)*rail_count=rails;
+    return walls;
 }
 
 int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r) {

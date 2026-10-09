@@ -793,6 +793,23 @@ There are two coupled but distinct systems.
 
 ### Horizontal arcade model
 
+Interactive play uses a 60 Hz accumulator, independently of rendering FPS.
+Each frame executes zero or more shared player/AI/contact/race-timer ticks.
+Catch-up is bounded to eight ticks; excess time from long stalls is discarded.
+Fractional time remains for the next frame. Car/track/race preparation resets
+that accumulator to avoid replaying loading time. Wheel spin, skid/smoke effects
+and landing shake advance with simulation; camera easing uses elapsed time.
+Drag key presses survive zero-tick frames and are consumed once. Frame-driven
+capture/audit modes keep one deterministic tick per output frame.
+`make ground-motion-test` checks identical driving at 10/30/60/120/144/240 FPS.
+Interactive rendering interpolates copies of the last two tick poses using the
+remaining tick fraction. Player/AI bodies, wheel phases and suspension, lamps,
+shadows and chase-camera targets share that displayed pose; gameplay stays on
+the completed tick. Actual wheel travel preserves fast rotations across phase
+wraps. Loads/grid moves and traffic births/respawns reset the history. Captures
+and audits use the exact current tick. `make race-ai-test` checks smooth display
+movement at mismatched rates, angle wraps and suspension/contact consistency.
+
 `phys_car_step` runs at 60 Hz in metres per tick. It owns XY velocity,
 heading, acceleration/braking, drag, speed-sensitive steering and lateral scrub.
 `PhysSurface` multiplies road/terrain behaviour. `PhysVehicle` reads stock mass,
@@ -883,9 +900,9 @@ minimum face thickness rejects seams and sloping curbs. Tall retaining faces
 also block when they overlap the body's actual height; the legacy rail census
 ceiling does not apply to gameplay. `world_wall_clear_at` uses the same faces
 for spawn probes; `world_wall_push` remains the legacy low-rail diagnostic.
-`world_barrier_push` is race-corridor closure. These predicates still have
-separate ownership, so a threshold proven for one is not automatically valid
-for another.
+These predicates retain separate ownership, so a threshold proven for one
+is not automatically valid for another. Generated red race-corridor guides
+have no physical collision; authored mesh barriers still use normal contacts.
 
 ### Next open-world collision investigation: overlapping instances
 
@@ -906,11 +923,10 @@ fix must remove the incorrect source or classification; hiding all props or
 loosening the wall predicate is not an acceptable workaround. Free-roam
 static contacts and race-generated closure barriers must be logged separately.
 
-Race-corridor closures resolve circle overlap with the same finite 18 m segment
-that is drawn. Both sides and rounded endpoints are solid; the far side is not
-a nine-metre-deep recovery volume. A side approach must not teleport the car
-back across a slope and leave its wheels below the road. These closures still
-use a circle and have no vertical-layer test or swept collision.
+Generated race-corridor closures are approximate 18 m visual guides inferred
+from navigation links. Their dedicated collision/push has been removed: these
+estimates must not create additional walls across a drivable race course.
+Authored scenery barriers, walls and vehicle contacts remain physical.
 
 ## 10. Racing, navigation and AI
 
@@ -921,22 +937,31 @@ circuits, its shipped sprint events can be selected instead.
 `world_load_events` reads `0x3414c` before nav so each event's `0x34148`
 node range can be tagged. `nav_build_adj` combines consecutive route edges and
 5 m coincidence welds into CSR adjacency. `world_set_mode` masks roads outside
-the active event corridor and derives closure barriers at outgoing links.
+the active event corridor and derives visual closure guides at outgoing links.
 
 `world_race_start` builds ordered gates from the event outline and loads
 shipped grid slots. Start placement selects a supported grid from the correct
 direction cluster; it must not project the car onto gate 0 when that XY has no
 ground.
 
-Current opponent AI in `ai_step` is kinematic:
+Live event opponents use `ai_race_step`: ordered source courses supply inputs
+to shared vehicle dynamics, four-wheel support and world/body contacts. The
+current conservative pace remains 50 km/h, reduced for turns, blocked corridor
+previews and nearby vehicles. The legacy showcase `ai_step` remains separate.
 
-- targets sequential racing-line waypoints;
-- eases heading and speed for bends;
-- snaps Z with `world_ground_at`;
-- does not run player physics, surface handling or mesh collision.
-
-That asymmetry is a known limitation, not evidence that player contact should
-be simplified to match AI. Sprint opponents are not implemented.
+When Paths and Routes distance ordering cannot produce a usable course,
+`race_route_topology` reads checked segment ranges (`0x34149`) and node links
+(`0x34148`) and reuses `world_route` between ordered event outline targets.
+Grid preparation also retries this reader if the decoded course accepts no
+supported starting slots; a usable existing grid keeps its course. The retry
+requires a player-grid join and repeats normal support/body/contact checks.
+Retail branch/direction activation is
+not recovered; support, grid, gates and actual physics still decide feasibility.
+`make race-ai-test` includes scrambled segment order, an unreachable distance
+course with a usable linked grid, and corrupt/disconnected source checks.
+`make race-events-check` builds the optional local-asset checker;
+`./build/race_events_check /path/to/TRACKS --drive EVENT` checks the loaded scene
+and neutral-car field completion, rather than equating parsing with racing.
 
 `--ai-drive-audit PREFIX --track STREAML4RB --event 4201` runs an input-only
 test driver through the normal player's steering response, physics, body/rail
@@ -1157,8 +1182,9 @@ this audit into a blanket name-prefix filter or section-level suppression.
 ### Scenery selection (M140/M147, conservative; not live activation)
 
 The checked reader is shared from `src/world_group_reader.h`. The selection
-policy in `src/world_scenery.h` hides only exclusively numeric-event
-memberships; ordinary/shared/unknown placements remain. Both rendering and
+policy in `src/world_scenery.h` suppresses exclusively numeric-event
+memberships; positive isolated races also omit exclusive career/demo closures.
+Ordinary/shared/unknown placements remain. Both rendering and
 collision are built from that same filtered scene. Normal instance-driven free
 roam selects `free` by default; a live `--event` race selects that event's own
 authored group (M160, below). Retail direction/career activation timing is

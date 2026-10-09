@@ -3,21 +3,22 @@
 #include "world_group_reader.h"
 
 /* Conservative load-time preview, NOT decoded retail activation flags.
- * Only exclusive membership in numeric event groups is suppressible. Unknown,
- * career, free-roam and shared memberships retain their previous behavior. */
+ * Exclusive numeric event closures are suppressible. Isolated race previews
+ * also omit career-only and demo-only closures; free roam retains them. Unknown
+ * and shared memberships retain their previous behavior. */
 typedef struct {
     uint16_t section, row, flags;
     unsigned char membership, checked;
 } WGSelected;
 typedef struct { WGSelected *items; size_t count; } WGSelection;
-enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4 };
+enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_KNOCKDOWN=8 };
 
 /* Runtime policy remains deliberately narrower than retail semantics. Normal
  * free roam hides only placements proven exclusive to numeric event groups.
  * A requested preview keeps its explicit selection. A live race selects its
- * OWN authored group, so another event's road closures no longer stand on the
- * raced route. Direction/career activation timing is still undecoded: within
- * the selected event nothing is further filtered.
+ * OWN authored group. Career-only and demo-only closures are omitted in an
+ * isolated retail race, since they otherwise block its authored course.
+ * This does not infer career-stage or direction activation flags.
  *
  * Measured on STREAML4RG event 4701 (M160): 4827 group placements are loaded,
  * only 77 of them belong to BARRIERS_4701, and foreign-exclusive placements
@@ -32,17 +33,26 @@ static int wg_runtime_selection(int preview_set,int preview_event,int race_event
     return race_event>0?race_event:-1;
 }
 
-static int wg_event_id(const char *name) {
-    const char *p=NULL;
-    if(!strncmp(name,"BARRIERS_",9))p=name+9;
-    else if(!strncmp(name,"PLAYER_BARRIERS_",16))p=name+16;
-    if(!p||!*p)return 0;
+static int wg_numeric_id(const char *p) {
+    if(!p || !*p)return 0;
     unsigned n=0;
     for(;*p;p++) {
         if(*p<'0'||*p>'9'||n>6553)return 0;
         n=n*10+(unsigned)(*p-'0');
     }
     return n>0&&n<=65535?(int)n:0;
+}
+static int wg_event_id(const char *name) {
+    if(!strncmp(name,"BARRIERS_",9))return wg_numeric_id(name+9);
+    if(!strncmp(name,"PLAYER_BARRIERS_",16))return wg_numeric_id(name+16);
+    return 0;
+}
+static int wg_isolated_closure(const char *name) {
+    /* L4RA's demo-exclusive panels cross the supported 4001 road. Use group
+       ownership, not mesh names/coordinates; active/shared members stay visible. */
+    return !strcmp(name,"BARRIERS_DEMO") ||
+        (!strncmp(name,"BARRIERS_CAREER",15) &&
+         (wg_numeric_id(name+15)>0 || !strcmp(name+15,"0")));
 }
 /* Does this bundle author a group for the requested event? Free roam (-1) and
  * "unchanged" (0) are always answerable, so only a positive id is looked up.
@@ -67,7 +77,6 @@ static int wg_selected_cmp(const void *aa,const void *bb) {
 static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
     memset(out,0,sizeof *out);
     if(event < -1 || event > 65535)return 0;
-    if(!event)return 1;
     size_t n=table->override_count;
     WGSelected *items=n?calloc(n,sizeof *items):NULL;
     if(n&&!items)return 0;
@@ -75,11 +84,12 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
         const unsigned char *r=table->overrides+8*i;
         items[i].section=wg_u16(r);items[i].row=wg_u16(r+2);items[i].flags=wg_u16(r+4);
     }
-    int found=event==-1;
+    int found=event<=0;
     for(size_t p=0;p<table->group_bytes;) {
         const unsigned char *g=table->groups+p;
         int id=wg_event_id((const char *)g+8);
-        unsigned bits=id?WG_EVENT:WG_OTHER;
+        unsigned bits=event && (id || (event>0 && wg_isolated_closure((const char *)g+8)))?WG_EVENT:WG_OTHER;
+        if(!strcmp((const char *)g+8,"SMOKEABLE"))bits|=WG_KNOCKDOWN;
         if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;

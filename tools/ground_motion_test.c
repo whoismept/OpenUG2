@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include "world.h"
 #include "physics.h"
+#include "render.h"
 
 #ifdef GROUND_MOTION_BASELINE
 static float sweep(const N2Scene *s, const float a[3], const float b[3], WGroundHit *h) {
@@ -30,6 +31,40 @@ static float ground_motion_limit(const N2Scene *s, const PhysRideState *r,
 static void close_to(float a, float b) {
     if(fabsf(a-b)>=.0001f){fprintf(stderr,"got %.9g expected %.9g\n",a,b);}
     assert(fabsf(a-b)<0.0001f);
+}
+
+/* A moving camera target needs the same elapsed-time solution at every
+ * cadence. Static-target exponential easing alone changes the high-speed lag. */
+static void camera_timing_test(void) {
+    const int rates[]={144,30,120,20,60,240,10};
+    const float velocities[]={8,61,-12};
+    const double lambda=-60*log(1-.22f);
+    for(int mode=0;mode<8;mode++)for(int speed=0;speed<3;speed++) {
+        float eye[]={-4,0,2},previous[]={-4,0,2};double elapsed=0;
+        float worst=0;
+        for(int frame=0;elapsed<10;frame++) {
+            int rate=rates[mode==7?frame%7:mode];double dt=1.0/rate;elapsed+=dt;
+            float desired[]={(float)(velocities[speed]*elapsed-4),
+                             (float)(-3*elapsed),(float)(2+.2*elapsed)};
+            render_camera_ease(eye,previous,desired,.22f,(float)(dt*60));
+            double lag=(1-exp(-lambda*elapsed))/lambda;
+            const double expected[]={velocities[speed]*(elapsed-lag)-4,
+                                     -3*(elapsed-lag),2+.2*(elapsed-lag)};
+            for(int c=0;c<3;c++)worst=fmaxf(worst,(float)fabs(eye[c]-expected[c]));
+            memcpy(previous,desired,sizeof previous);
+        }
+        printf("camera cadence %d speed%g: max path error %.7fm\n",mode,velocities[speed],worst);fflush(stdout);
+        assert(worst<.002f);
+    }
+    float eye[]={0,0,0},previous[]={10,20,30},desired[]={10,20,30};
+    render_camera_ease(eye,previous,desired,.22f,1);
+    for(int c=0;c<3;c++)close_to(eye[c],.22f*desired[c]); /* Same parked-car tuning. */
+    float saved[3];memcpy(saved,eye,sizeof saved);
+    render_camera_ease(eye,previous,desired,.22f,0);assert(!memcmp(saved,eye,sizeof eye));
+    render_camera_ease(eye,previous,desired,1,1);assert(!memcmp(desired,eye,sizeof eye));
+    render_camera_ease(eye,previous,desired,.22f,.000001f);
+    for(int c=0;c<3;c++)assert(isfinite(eye[c]));
+    puts("camera timing: fixed/changing FPS, forward/reverse speed, static tuning and snap PASS");
 }
 
 static void slope_spawn(float grade,float heading) {
@@ -153,6 +188,105 @@ static void camera_collision_test(void) {
     puts("camera sweep: PASS (two-sided walls, edges, clearance, floor/ceiling, long moves)");
 }
 
+static void light_effect_collision_test(void) {
+    float v[]={-4,-4,0,0,0, 4,-4,0,1,0, 4,4,0,1,1, -4,4,0,0,1,
+               -4,-4,10,0,0, 4,-4,10,1,0, 4,4,10,1,1, -4,4,10,0,1};
+    uint16_t idx[]={0,1,5,0,5,4,1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7};
+    N2Mesh m={.verts=v,.nverts=8,.idx=idx,.nidx=24,.cat=N2_OTHER,.scen=N2_SC_PROP};
+    N2Scene scene={&m,1,1};float bounds[][4]={{-4,-4,4,4}},heights[][2]={{0,10}};
+    float body[]={-2,-.85f,0,2,.85f,1.5f},saved[40];memcpy(saved,v,sizeof v);
+    int src[]={0};
+    for(int kind=0;kind<4;kind++) {
+        m.mat_exact=kind!=1;
+        m.texkey=kind<2?N2_TEX_SFX_LIGHT_BEAMA:kind==2?0:N2_TEX_SFX_FLARE_GLOWA;
+        int solid=kind!=0;float obstacles[1][4],z[1][2];int owner[1];
+        assert(phys_collect_walls(&scene,obstacles,owner,z,1)==solid);
+        assert(cw_probe_contact(&scene,0,-4.1f,0,.5f,.1f,1.5f)==solid);
+        float p[]={-5.9f,0,0},vel[]={.1f,0};
+        assert(!!collide_body_walls(p,vel,0,body,bounds,heights,1,.1f,1.5f,&scene,src,NULL,0)==solid);
+        p[0]=-5.9f;vel[0]=.1f;
+        assert(!!collide_body_mesh_wall(p,vel,0,body,.1f,1.5f,&scene,0,0,INFINITY,NULL)==solid);
+        float anchor[]={-6,0,1},eye[]={6,0,1};
+        assert((world_camera_clip(&scene,bounds,anchor,eye,.25f)<1)==solid);
+        assert(!memcmp(saved,v,sizeof v));
+    }
+    puts("light effects: PASS (exact material, opaque/ambiguous fixtures, broad/narrow collision, camera, unchanged geometry)");
+}
+
+static void buried_foundation_test(void) {
+    float road[]={-8,-8,0,0,0,8,-8,0,0,0,8,8,0,0,0,-8,8,0,0,0};
+    float lower[20];memcpy(lower,road,sizeof lower);
+    float wall[]={1.2f,-4,-1,0,0,1.2f,4,-1,0,0,
+                  1.2f,4,.15f,0,0,1.2f,-4,.15f,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh meshes[]={{.verts=road,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                     {.verts=lower,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                     {.verts=wall,.nverts=4,.idx=idx,.nidx=6,.cat=N2_OTHER}};
+    N2Scene scene={meshes,3,3};float bounds[][4]={{-8,-8,8,8},{-8,-8,8,8},{1.2f,-4,1.2f,4}};
+    float ob[][4]={{1.2f,-4,1.2f,4}},oz[][2]={{-3,1}};int src[]={2};
+    const float bb[]={-2,-.85f,0,2,.85f,1.5f};
+    WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));
+    world_ground_grid_activate(&grid);
+    for(int surface=0;surface<2;surface++)
+    for(int winding=0;winding<2;winding++) {
+        if(winding)for(int k=0;k<6;k+=3){uint16_t t=idx[k];idx[k]=idx[k+2];idx[k+2]=t;}
+        for(int reverse=0;reverse<2;reverse++)
+        for(int mode=0;mode<7;mode++) {
+            for(int k=0;k<4;k++) {
+                road[k*5]=(k==1 || k==2)?(mode==5?1:8):-8;
+                lower[k*5]=(k==0 || k==3)?(mode==5?1:-8):8;
+                road[k*5+2]=.2f*road[k*5];
+                lower[k*5+2]=.2f*lower[k*5]+(mode==5?1:-2);
+            }
+            float z=mode==2?-2:mode==3?-.35f:0;
+            wall[2]=wall[7]=mode==2?-3:-1;
+            wall[12]=wall[17]=mode==1?.8f:mode==6?.4f:.15f;
+            meshes[0].cat=mode==4?N2_OTHER:surface?N2_TERRAIN:N2_ROAD;
+            meshes[1].cat=surface?N2_TERRAIN:N2_ROAD;
+            float p[]={0,0,z},vel[]={.1f,0};
+            int solid=mode!=0 && mode!=6;
+            assert(!!collide_body_walls(p,vel,reverse*3.14159265f,bb,ob,oz,1,
+                z+.05f,z+1.5f,&scene,src,NULL,0)==solid);
+            p[0]=p[1]=0;vel[0]=.1f;
+            assert(!!collide_body_walls_preview(p,vel,reverse*3.14159265f,bb,
+                ob,oz,1,z+.05f,z+1.5f,&scene,src)==solid);
+            p[0]=p[1]=0;vel[0]=.1f;
+            assert(!!collide_body_mesh_wall(p,vel,reverse*3.14159265f,bb,
+                z+.05f,z+1.5f,&scene,2,0,INFINITY,NULL)==solid);
+            assert(!!cw_probe_contact(&scene,2,0,0,2,z+.05f,z+1.5f)==solid);
+            if(!solid)assert(p[0]==0 && vel[0]==.1f);
+        }
+    }
+    /* Without world support, standalone collision keeps the source wall. */
+    world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    assert(cw_probe_contact(&scene,2,0,0,2,.05f,1.5f));
+    puts("buried foundations/seams: PASS (ROAD/TERRAIN, both bumpers/windings, exposed wall, lower/disconnected decks, unsupported body, no ground, standalone)");
+}
+
+/* A narrow XY projection does not make a vertical skirt supporting pavement. */
+static void vertical_support_test(void) {
+    float floor[]={-4,-4,0,0,0,4,-4,0,0,0,4,4,0,0,0,-4,4,0,0,0};
+    float face[]={0,-4,-1,0,0,0,4,-1,0,0,.0001f,4,1,0,0,.0001f,-4,1,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh meshes[]={{.verts=floor,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                     {.verts=face,.nverts=4,.idx=idx,.nidx=6,.cat=N2_TERRAIN}};
+    N2Scene scene={meshes,2,2};WGroundHit h;
+    for(int winding=0;winding<2;winding++)for(int order=0;order<2;order++) {
+        assert(world_wheel_support(&scene,.0000525f,0,.05f,.25f,.25f,&h,NULL,NULL));
+        printf("support near vertical face z%.6f nz%.6f\n",h.z,h.normal[2]);fflush(stdout);
+        assert(fabsf(h.z)<.0001f && h.normal[2]>.99f);
+        N2Mesh swap=meshes[0];meshes[0]=meshes[1];meshes[1]=swap;
+        if(order)for(int t=0;t<6;t+=3){uint16_t q=idx[t];idx[t]=idx[t+2];idx[t+2]=q;}
+    }
+    N2Scene wall={meshes+1,1,1};
+    assert(!world_wheel_support(&wall,.0000525f,0,.05f,.25f,.25f,&h,NULL,NULL));
+    float a[]={-.1f,0,.25f},b[]={.1f,0,.25f};
+    assert(world_ground_sweep(&wall,a,b,&h)<1); /* still a solid crossed face */
+    float pos[]={-.5f,0,0},vel[]={.1f,0},bb[]={-1,-.5f,0,1,.5f,1.5f};
+    assert(collide_body_mesh_wall(pos,vel,0,bb,.05f,1.5f,&wall,0,0,INFINITY,NULL));
+    puts("near-vertical faces: reject tyre support, preserve swept/body collision PASS");
+}
+
 static void overlapping_ramp(float grade) {
     float floor[]={-20,-10,0,0,0,80,-10,0,0,0,80,10,0,0,0,-20,10,0,0,0};
     float ramp[]={0,-10,0,0,0,80,-10,12,0,0,80,10,12,0,0,0,10,0,0,0};
@@ -217,34 +351,152 @@ static void ramp_edge_wall(void) {
     puts("ramp edge: tall terrain walls, both sides, height clipping and passable curb PASS");
 }
 
+static void wall_across_cell_boundary(void) {
+    float floor[]={0,0,0,0,0,128,0,0,0,0,128,128,0,0,0,0,128,0,0,0};
+    float wall[]={64.5f,5,0,0,0,64.5f,40,0,0,0,64.5f,40,.55f,0,0,64.5f,5,.55f,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh meshes[]={{.verts=floor,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                    {.verts=wall,.nverts=4,.idx=idx,.nidx=6,.cat=N2_TERRAIN}};
+    N2Scene scene={meshes,2,2};float bounds[][4]={{0,0,128,128},{64.5f,5,64.5f,40}};
+    WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);
+    float bb[]={-1.97f,-.94f,0,1.97f,.94f,1.37f};
+    float p[]={63.9f,20,0},vel[]={.2f,.1f};
+    assert(world_body_wall_push(&scene,p,vel,0,bb,.1f,1.37f,NULL));
+    assert(p[0]<=62.531f && fabsf(vel[0])<1e-6f && vel[1]==.1f);
+    /* Keep low surface seams passable; the same region's real wall is solid. */
+    wall[12]=wall[17]=.1f;p[0]=63.9f;vel[0]=.2f;
+    assert(!world_body_wall_push(&scene,p,vel,0,bb,0,1.37f,NULL));
+    world_ground_grid_free(&grid);
+    puts("world walls: adjacent-cell body coverage and short terrain wall PASS");
+}
+
+static void test_swept_wall_motion(void) {
+    float verts[20]={64,-20,0,0,0,64,20,0,0,0,64,20,6,0,0,64,-20,6,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh mesh={.verts=verts,.nverts=4,.idx=idx,.nidx=6,.cat=N2_OTHER,.scen=N2_SC_WALL};
+    N2Scene scene={&mesh,1,1};float obst[1][4],obz[1][2];int src[1];
+    const float bb[]={-.8f,-.4f,0,.8f,.4f,1.4f};
+    for(int terrain=0;terrain<2;terrain++) {
+        mesh.cat=terrain?N2_TERRAIN:N2_OTHER;
+        mesh.scen=terrain?N2_SC_TERRAIN:N2_SC_WALL;
+        float bounds[1][4]={{64,-20,64,20}};WGroundGrid grid={0};
+        if(terrain){assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);}
+        int no=phys_collect_walls(&scene,obst,src,obz,1);
+        for(int side=-1;side<=1;side+=2)for(int air=0;air<2;air++) {
+            float old[]={64+4*side,0,air?2.5f:0},p[]={64-4*side,1,old[2]};
+            float vel[]={-side*2.0f,.25f},before[]={vel[0],vel[1]};int rails=0;
+            int walls=world_body_walls_move(&scene,old,p,vel,0,bb,old[2]+.05f,old[2]+1.4f,
+                air?-.5f:0,obst,obz,no,src,NULL,0,NULL,&rails);
+            assert(walls+rails>0 && side*(p[0]-64)>=.799f);
+            printf("sweep terrain%d side%d air%d p%g,%g vel%.9g,%.9g\n",terrain,side,air,p[0],p[1],vel[0],vel[1]);fflush(stdout);
+            assert(fabsf(vel[0])<1e-4f && fabsf(vel[1]-.25f)<1e-4f);
+            assert(fabsf(p[1]-1)<1e-4f); /* Full tangential travel retained. */
+            PhysRideState ride={.contact_mask=air?0:15};
+            phys_ride_wall_response(&ride,before,vel);
+            if(air)assert(side*vel[0]>.39f);else assert(fabsf(vel[0])<1e-5f);
+        }
+        float old[]={60,0,7},p[]={68,1,7},vel[]={2,.25f};int rails=0;
+        assert(!world_body_walls_move(&scene,old,p,vel,0,bb,7.05f,8.4f,0,
+            obst,obz,no,src,NULL,0,NULL,&rails) && !rails);
+        close_to(p[0],68);close_to(p[1],1); /* Above the wall remains free. */
+        world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    }
+}
+
+/* Real reverse throttle must use the same world contact path as forward
+ * driving: both wall sides, reversed winding, and compact/long body bounds. */
+static void reverse_wall_drive_test(void) {
+    float verts[20]={0,-100,0,0,0,0,100,0,0,0,0,100,4,0,0,0,-100,4,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh mesh={.verts=verts,.nverts=4,.idx=idx,.nidx=6,
+                 .cat=N2_OTHER,.scen=N2_SC_WALL};
+    N2Scene scene={&mesh,1,1};float obst[1][4],obz[1][2];int src[1];
+    float bounds[1][4]={{0,-100,0,100}};WGroundGrid grid={0};
+    for(int terrain=0;terrain<2;terrain++) {
+        mesh.cat=terrain?N2_TERRAIN:N2_OTHER;
+        mesh.scen=terrain?N2_SC_TERRAIN:N2_SC_WALL;
+        int no=phys_collect_walls(&scene,obst,src,obz,1);
+        if(terrain){assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);}
+        for(int winding=0;winding<2;winding++) {
+            for(int side=-1;side<=1;side+=2)for(int reverse=0;reverse<2;reverse++)
+            for(int longbody=0;longbody<2;longbody++) {
+                float length=longbody?6:2,width=longbody?1.3f:.9f;
+                float bb[]={-length,-width,0,length,width,1.5f};
+                float h=(side>0?3.14159265f:0)+.2f+reverse*3.14159265f;
+                float extent=width+(length-width)*fabsf(cosf(h));
+                float p[]={side*(length+1),0,0},v[]={0,0},speed=0;int hits=0;
+                PhysRideState ride={.contact_mask=15};
+                for(int t=0;t<600;t++) {
+                    float old[3];memcpy(old,p,sizeof old);
+                    phys_drive_step(p,v,&h,&speed,reverse?-1:1,0,0,NULL,NULL,&ride);
+                    float before[]={v[0],v[1]};int rails=0;
+                    int walls=world_body_walls_move(&scene,old,p,v,h,bb,.05f,1.5f,0,
+                        obst,obz,no,src,NULL,0,NULL,&rails);
+                    hits+=walls+rails;
+                    phys_ride_wall_response(&ride,before,v);
+                    speed=v[0]*cosf(h)+v[1]*sinf(h);
+                    assert(side*p[0]>=extent-.0001f);
+                }
+                assert(hits>0 && fabsf(p[1])>2); /* Stops inward, keeps wall slide. */
+            }
+            for(int t=0;t<6;t+=3){uint16_t tmp=idx[t];idx[t]=idx[t+2];idx[t+2]=tmp;}
+        }
+        world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    }
+    puts("forward/reverse drive: both wall sets/sides/windings/body sizes PASS");
+}
+
+/* Equal elapsed time must produce equal motion, independent of frame rate.
+ * Exercise the real horizontal solver with acceleration, steering and braking. */
+static void fixed_time_test(void) {
+    const int rates[]={10,30,60,120,144,240};
+    float expected[9]={0};
+    for(int r=0;r<6;r++) {
+        PhysClock clock={0};float pos[3]={0},vel[2]={0},heading=0,speed=0;
+        float shake=0,shake_velocity=0;int ticks=0,zero=0,multiple=0;
+        for(int frame=0;frame<20*rates[r];frame++) {
+            int steps=phys_clock_steps(&clock,1.0/rates[r]);
+            zero+=steps==0;multiple+=steps>1;
+            for(int step=0;step<steps;step++,ticks++) {
+                float throttle=ticks<900?1:-1,steer=ticks>=300 && ticks<600?.25f:0;
+                phys_car_step(pos,vel,&heading,&speed,throttle,steer,0,NULL,NULL);
+                phys_landing_camera(&shake,&shake_velocity,ticks==100?4:0,1/PHYS_TICKRATE);
+            }
+        }
+        float actual[]={pos[0],pos[1],pos[2],vel[0],vel[1],heading,speed,shake,shake_velocity};
+        assert(ticks==1200 && clock.remainder<1e-8);
+        if(!r)memcpy(expected,actual,sizeof expected);
+        else assert(!memcmp(expected,actual,sizeof expected));
+        if(rates[r]>60)assert(zero>0);
+        if(rates[r]<60)assert(multiple>0);
+        printf("fixed clock %d FPS: %d ticks, pose %.3f %.3f, speed %.3f\n",
+               rates[r],ticks,pos[0],pos[1],PHYS_KMH(speed));
+    }
+    PhysClock clock={0};assert(phys_clock_steps(&clock,1.0/120)==0);
+    double remainder=clock.remainder;
+    assert(!phys_clock_steps(&clock,NAN) && !phys_clock_steps(&clock,INFINITY));
+    assert(!phys_clock_steps(&clock,-1) && !phys_clock_steps(&clock,0));
+    assert(clock.remainder==remainder);
+    assert(phys_clock_steps(&clock,10)==8); /* bounded stall recovery */
+    assert(phys_clock_steps(&clock,1.0/120)==1); /* fractional time retained */
+    puts("fixed clock: render independence, fractional ticks and bounded stalls PASS");
+}
+
 int main(void) {
+    vertical_support_test();
+    buried_foundation_test();
+    fixed_time_test();
+    test_swept_wall_motion();
+    reverse_wall_drive_test();
+    wall_across_cell_boundary();
     ramp_edge_wall();
     overlapping_ramp(.15f);overlapping_ramp(.40f);
     slope_contact(.40f,0,.05f,0);
+    camera_timing_test();
     camera_collision_test();
+    light_effect_collision_test();
     slope_spawn(.40f,0);
     slope_spawn(.08f,0);slope_spawn(-.08f,1.2f);
-    /* A road closure is a finite segment, not a nine-metre-deep slab.
-     * Entering beside its far side must not teleport a car under a slope. */
-    World barrier={0};barrier.city.mode=MODE_RACE_EVENT;barrier.city.nbar=1;
-    barrier.city.bar[0].dx=1;
-    float beside[]={8,9.5f,-.4f};
-    int pushed=world_barrier_push(&barrier,beside,1.3f);
-    printf("closure side approach: hit=%d x=%.3f (expected no hit, x=8)\n",pushed,beside[0]);fflush(stdout);
-    assert(!pushed);close_to(beside[0],8);close_to(beside[2],-.4f);
-    float corner[]={1.2f,10.2f,0};assert(!world_barrier_push(&barrier,corner,1.3f));
-    for(int side=-1;side<=1;side+=2) {
-        float face[]={side*.5f,0,2};assert(world_barrier_push(&barrier,face,1.3f));
-        close_to(face[0],side*1.3f);close_to(face[1],0);close_to(face[2],2);
-    }
-    float end[]={-.5f,9.6f,0};assert(world_barrier_push(&barrier,end,1.3f));
-    close_to(hypotf(end[0],end[1]-9),1.3f);
-    barrier.city.bar[0].dx=0;barrier.city.bar[0].dy=-1;
-    float turned[]={9.5f,-8,0};assert(!world_barrier_push(&barrier,turned,1.3f));
-    turned[0]=0;turned[1]=.5f;assert(world_barrier_push(&barrier,turned,1.3f));
-    close_to(turned[1],1.3f);
-    barrier.city.mode=MODE_FREEROAM;turned[1]=0;
-    assert(!world_barrier_push(&barrier,turned,1.3f));
     slope_contact(-.06f,0,.5f,0);
     slope_contact(-.06f,1.2f,.5f,1);
     slope_contact(.06f,-.7f,.5f,0);

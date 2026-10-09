@@ -40,7 +40,11 @@ void hud_status_text(const HudState *s, char *out, int cap) {
     if (!out || cap <= 0) return;
     out[0] = 0;
     if (!s || !s->racing) return;
-    if (s->circuit) {
+    if(s->race_kind==N2_RACE_DRIFT) {
+        snprintf(out,(size_t)cap,"SCORE %.0f  +%.0f",s->drift_score,s->drift_chain);
+    } else if(s->race_kind==N2_RACE_DRAG) {
+        snprintf(out,(size_t)cap,s->engine_failed?"ENGINE BLOWN":"HEAT %d PCT%s",(int)(s->engine_heat*100),s->shift_ready?" SHIFT":"");
+    } else if (s->circuit) {
         int lap = s->lap < 1 ? 1 : s->lap, laps = s->laps < 1 ? 1 : s->laps;
         if (lap > laps) lap = laps;
         snprintf(out, (size_t)cap, "LAP %d/%d", lap, laps);
@@ -97,6 +101,8 @@ enum {
     ART_MAP_GPS, ART_MAP_START, ART_MAP_SAFEHOUSE, ART_MAP_CIRCUIT,
     ART_ARROW, ART_CINGULAR_LOGO, ART_CINGULAR_SLOGAN,
     ART_ENGAGE_BACKING, ART_ENGAGE_PHONE, ART_ENGAGE_CINGULAR,
+    ART_DRAG_BACK,ART_DRAG_ARC7,ART_DRAG_ARC8,ART_DRAG_ARC9,ART_DRAG_ARC10,
+    ART_DRAG_NEEDLE,ART_DRAG_HEAT,ART_DRAG_SHIFT,ART_DRIFT_SCORE,
     ART_COUNT
 };
 
@@ -126,6 +132,8 @@ struct Hud {
 static const char *HUD_PACKS[] = {
     "GLOBAL/InGameCommon.bun",
     "GLOBAL/InGameRace.bun",
+    "GLOBAL/InGameDrag.bun",
+    "GLOBAL/InGameDrift.bun",
     "GLOBAL/HUD_CustomTextures_ALL.bin",
 };
 enum { HUD_NPACK = (int)(sizeof HUD_PACKS / sizeof HUD_PACKS[0]) };
@@ -251,6 +259,15 @@ Hud *hud_init(const char *dataroot) {
     hud_art_define(h, ART_ENGAGE_PHONE,   "ENGAGE_PHONE_ICON",       0x6fff0767u);
     hud_art_define(h, ART_ENGAGE_CINGULAR,"ENGAGE_CINGULAR_ICON",    0xea570722u);
 
+    hud_art_define(h,ART_DRAG_BACK,"DRAG_RPM_BACKING",0x57046cd9u);
+    hud_art_define(h,ART_DRAG_ARC7,"DRAG_RPM_7000_LINES",0x0764b24bu);
+    hud_art_define(h,ART_DRAG_ARC8,"DRAG_RPM_8000_LINES",0x0b6f436cu);
+    hud_art_define(h,ART_DRAG_ARC9,"DRAG_RPM_9000_LINES",0x0f79d48du);
+    hud_art_define(h,ART_DRAG_ARC10,"DRAG_RPM_10000_LINES",0xde634915u);
+    hud_art_define(h,ART_DRAG_NEEDLE,"DRAG_RPM_NEEDLE",0x93476737u);
+    hud_art_define(h,ART_DRAG_HEAT,"DRAG_HEAT_FILL",0x37bd6804u);
+    hud_art_define(h,ART_DRAG_SHIFT,"DRAG_SHIFT_LIGHT",0x87e1ce11u);
+    hud_art_define(h,ART_DRIFT_SCORE,"DRIFT_STYLE_POINTS_BACK",0x51052532u);
     for (int p = 0; p < HUD_NPACK; p++) {
         char path[1024];
         snprintf(path, sizeof path, "%s/%s", dataroot, HUD_PACKS[p]);
@@ -511,6 +528,33 @@ static void hud_draw_cluster(Hud *h, const HudDC *dc, const HudState *s) {
    they can never drift apart. */
 static void hud_map_center(float asp, float *cx, float *cy) {
     hud_place(asp, -1.0f, -1.0f, 0.38f, 0.38f, cx, cy);
+}
+
+/* Drag's tall tach uses its own source art and fitted needle pivot. */
+static void hud_draw_drag(Hud *h,const HudDC *dc,const HudState *s) {
+    float cx,cy;hud_place(dc->asp,1,-1,-.65f,.62f,&cx,&cy);
+    int index=s->rpm_redline<=7000 ? 0 : s->rpm_redline<=8000 ? 1 : s->rpm_redline<=9000 ? 2 : 3;
+    const HudArt *arc=&h->art[ART_DRAG_ARC7+index];float width=.45f,height=.9f;
+    hud_blit(dc,h->art[ART_DRAG_BACK].tex,width,height,cx,cy,0,1,1,1,.9f);
+    hud_blit(dc,arc->tex,width,height,cx,cy,0,1,1,1,1);
+    float px=cx+(arc->arc.ok?arc->arc.cx-.5f:.5f)*width/dc->asp;
+    float py=cy-height*.5f+(arc->arc.ok?arc->arc.cy:1)*width;
+    float radius=arc->arc.ok?arc->arc.r*width:width*.75f;
+    float fraction=s->have_rpm?fmaxf(0,fminf(1,s->rpm/(7000+index*1000))):0;
+    h->needle_rpm+=(fraction-h->needle_rpm)*.35f;
+    float angle=hud_arc_angle(arc,h->needle_rpm,150,30),length=radius*.85f;
+    hud_blit(dc,h->art[ART_DRAG_NEEDLE].tex,length,.035f,
+        px+cosf(angle)*length*.5f/dc->asp,py+sinf(angle)*length*.5f,angle,1,1,1,1);
+    hud_blit(dc,h->art[ART_DRAG_SHIFT].tex,.08f,.08f,cx,cy+.45f,0,
+        1,s->shift_ready?.9f:.25f,.1f,s->shift_ready?1:.25f);
+    float heat=fmaxf(0,fminf(1,s->engine_heat));
+    if(heat>0)hud_blit(dc,h->art[ART_DRAG_HEAT].tex,.08f,.5f*heat,
+        cx-.35f/dc->asp,cy-.25f+.25f*heat,0,1,.3f,.1f,1);
+    char buf[64];snprintf(buf,sizeof buf,"%d",s->gear);
+    hud_label(dc,buf,px,py,.12f,1,1,1,1);
+    snprintf(buf,sizeof buf,"%.0f KMH",fabsf(s->speed_kmh));
+    hud_label(dc,buf,cx,cy+.52f,.055f,.7f,.9f,1,1);
+    if(s->have_nos)hud_label(dc,s->nitro_active?"NOS ACTIVE":"NOS N/A",cx,cy-.53f,.04f,.3f,.8f,1,1);
 }
 
 static float hud_map_rot(const HudState *s) {
@@ -810,7 +854,14 @@ void hud_draw(Hud *h, const RProg *rp, GpuMesh *quad,
     glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
 
     hud_draw_minimap(h, &dc, &s);
-    hud_draw_cluster(h, &dc, &s);
+    if(s.racing && s.race_kind==N2_RACE_DRAG)hud_draw_drag(h,&dc,&s);
+    else hud_draw_cluster(h, &dc, &s);
+    if(s.racing && s.race_kind==N2_RACE_DRIFT) {
+        float x,y;hud_place(dc.asp,0,1,0,-.18f,&x,&y);
+        hud_blit(&dc,h->art[ART_DRIFT_SCORE].tex,.65f,.08f,x,y,0,1,1,1,.8f);
+        char score[80];snprintf(score,sizeof score,"%.0f  +%.0f",s.drift_score,s.drift_chain);
+        hud_label(&dc,score,x,y,.065f,1,.9f,.5f,1);
+    }
     hud_draw_status(&dc, &s);
     if (!s.racing) hud_draw_message(h, &dc, &s);
     hud_draw_nav_arrow(h, &dc, &s);

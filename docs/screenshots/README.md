@@ -7,15 +7,11 @@ vehicle/lighting state.
 
 | Capture | What it shows |
 | --- | --- |
-| ![MIATA on the L4RA start line](miata-l4ra-startline.png) | MIATA on a real L4RA route with authored signage, barriers and lane materials |
-| ![MIATA city run](miata-city-run.png) | Open-world city driving under the recovered night lighting |
-| ![HUMMER on the L4RB start line](hummer-l4rb-startline.png) | HUMMER sprint start on the L4RB route |
-| ![Night open-world road](night-openworld.png) | Road, guardrail, foliage and lighting composition in the open-world bundle |
-| ![Two-car road test](ai-two-car-road-test.png) | Player and opponent vehicle test on the recovered road surface |
+| ![Native map editor](map-editor.png) | Bayview overview with ImGui collision, object, AI-path and event authoring controls |
+| ![Circuit race at 4K](race-circuit-4k.png) | MIATA in event 4083 with AI opponent, road lighting and prototype HUD; native 3840×2160, tick 300, high vehicle detail |
 | ![City plaza](showcase.png) | Plaza, fountain geometry and surrounding buildings; water animation remains work in progress |
 | ![Vehicle detail](detail_showcase.png) | Skyline body, glass, wheels and lamp presentation |
 | ![Modification menu](imgui.png) | ImGui body-shop modification controls |
-| ![Texture filtering 1x](detail_1x.png) | Road scene with 1× texture filtering |
 | ![Texture filtering 16x](detail_16x.png) | Road scene with 16× texture filtering |
 | ![Street lighting first view](lightpool_mark1_after.png) | Lighting near a parking entrance |
 | ![Street lighting second view](lightpool_mark2_after.png) | Lighting along the road and building fronts |
