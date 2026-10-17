@@ -2,12 +2,22 @@
 
 `components.json` contains 77 input/output cases of the named operations in
 SPEC.md; `surfaces.json` contains only the six functional numeric channels for
-29 surface IDs. All expected outputs are calculated from the statically inferred
+29 surface IDs; `surface_mapping.json` fixes how a world contact yields one of
+those IDs. All expected outputs are calculated from the statically inferred
 requirements, not captured by running original instructions. Surface parameters
 were read from the intake image and narrowed to numeric interoperability facts.
 The small bump sequence is a numeric compatibility parameter, not an asset.
 No original code, executable bytes, recovered identifiers or complete data records
 are included.
+
+`surface_mapping.json` is a static-derived compatibility artifact (S5-11). It
+records the identity mapping from the one-byte surface attribute carried by a
+world collision polygon to the S5-7 surface ID, the 0..28 ID domain, the
+per-record channel offsets, and the fixed fallback IDs. Its `shipped_*` fields
+and `used_by_shipped_data` flags come from a static walk of the shipped world
+collision geometry, not from a running game; the `vectors` field lists the
+boundary and representative attribute→ID cases an implementation must satisfy.
+No semantic material or surface names are asserted.
 
 For scalar/vector arithmetic use absolute tolerance 0.00002 plus relative
 0.00002; exact IDs, contact/lock predicates, update counts and Boolean results

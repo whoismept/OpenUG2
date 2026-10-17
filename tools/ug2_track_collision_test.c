@@ -63,9 +63,15 @@ int main(void) {
     unsigned char data[512],bad[512];size_t size=fixture(data);UG2TrackCollision out={0};
     assert(ug2_track_collision_read(data,size,&activation,NULL,&out));
     assert(out.count==3 && out.groups==1 && out.total==3);
+    /* A ready set carries the S5-11 CSR lookup index (grid dims > 0). */
+    assert(out.index.start && out.index.list && out.index.gw>0 && out.index.gh>0);
+    assert(out.index.start[0]==0);
     assert(out.polygons[0].corners[0][0]==-2 && out.polygons[0].corners[0][1]==-1 && out.polygons[0].corners[0][2]==10.5f);
     assert(out.polygons[1].corners[2][2]==12 && out.polygons[1].section==121 && out.polygons[1].source_offset==104);
     assert(!memcmp(out.polygons[1].metadata,data+104,8));
+    /* The +2 attribute byte is exposed as stored, not translated (S5-11). */
+    assert(out.polygons[0].attribute==data[72+2] && out.polygons[1].attribute==data[104+2]);
+    assert(out.polygons[1].attribute==(unsigned char)0x34 && out.polygons[1].metadata[2]==out.polygons[1].attribute);
     float bounds[]={1.9f,-.2f,2.1f,.2f};assert(ug2_track_collision_read(data,size,&activation,bounds,&out));
     assert(out.count==1 && out.total==3 && out.polygons[0].source_offset==104);
     UG2TrackPolygon *saved=out.polygons;
@@ -89,6 +95,7 @@ int main(void) {
     assert(!ug2_track_collision_read(bad,size,&activation,bounds,&out) && out.polygons==saved);
     assert(!ug2_track_collision_read(data,size,NULL,NULL,&out) && out.polygons==saved);
     float empty[]={40,40,50,50};assert(ug2_track_collision_read(data,size,&activation,empty,&out) && !out.count && out.total==3);
+    assert(!out.index.start && !out.index.list && !out.index.gw && !out.index.gh);
     ug2_track_collision_free(&out);ug2_track_collision_free(&out);
     /* Empty original sections retain an inverted finite bounds sentinel. */
     memset(data,0,sizeof data);size_t h=leaf(data,8,0x34131,48);
@@ -97,6 +104,7 @@ int main(void) {
     size_t p=leaf(data,h+48,0x34134,0);p=leaf(data,p,0x34136,0);p=leaf(data,p,0x34137,4);
     size=p+4;u32(data,0x80034130);u32(data+4,(uint32_t)(size-8));
     assert(ug2_track_collision_read(data,size,&activation,NULL,&out) && out.groups==1 && !out.count && !out.total);
+    assert(!out.index.start);
     ug2_track_collision_free(&out);
     puts("ug2_track_collision_test: PASS");
 }

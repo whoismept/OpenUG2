@@ -2092,17 +2092,30 @@ static int select_car_vinyl(int choice) {
 
 static Stage1Drive g_stage1;
 static int g_stage1_requested;
-/* Independent host world selector. All reachable triangles use the explicit
- * numeric road fixture 1 until material-to-ID mapping is reviewed (U5-2). */
+/* S5-11 world contact source. The scene selects the support height/normal; the
+ * collision polygon selected at the same query point supplies the contact's
+ * surface ID (attribute byte, identity over 0..28). The collision view follows
+ * world.neighborhood across resident/track switches; no-pack and no-polygon
+ * paths keep the fixed default ID. */
+typedef struct { const N2Scene *scene; const UG2TrackCollision *collision; } Stage5WorldSource;
+static Stage5WorldSource g_stage5_world;
 static CtGround stage5_world_query(void *user,const float q[3],int wheel) {
-    const N2Scene *scene=user;WGroundHit hit;
+    const Stage5WorldSource *src=user;const N2Scene *scene=src->scene;WGroundHit hit;
     const CtCar *car=&g_stage1.contacts.car;
     float down=fmaxf(-car->axle[wheel/2].lower,PHYS_RIDE_REACH_DOWN);
     if(g_ride_ready)down=fmaxf(down,phys_ride_reach_down(&g_ride,1/PHYS_TICKRATE));
-    int found=world_wheel_support(scene,q[0],q[1],q[2]-car->radius[wheel],
+    float wheel_z=q[2]-car->radius[wheel];
+    int found=world_wheel_support(scene,q[0],q[1],wheel_z,
         PHYS_RIDE_REACH_UP,down,&hit,NULL,NULL)!=WSURF_NONE;
-    CtGround result={.found=found,.surface=1,.normal={0,0,1}};
-    if(found){result.height=hit.z;memcpy(result.normal,hit.normal,sizeof result.normal);}
+    CtGround result={.found=found,.surface=CT_SURFACE_ID_DEFAULT,.normal={0,0,1}};
+    if(found){
+        result.height=hit.z;memcpy(result.normal,hit.normal,sizeof result.normal);
+        /* S5-11.1: the hit polygon's stored attribute is the ID verbatim; the
+         * domain check rejects >28 instead of indexing an undefined row. */
+        int id=ct_surface_id(ug2_tc_surface_attribute(src->collision,q[0],q[1],
+                                                      wheel_z,PHYS_RIDE_REACH_UP,down));
+        if(id>=0)result.surface=id;
+    }
     return result;
 }
 
@@ -3685,6 +3698,8 @@ int main(int argc, char **argv) {
     }
     if (!nm) { fprintf(stderr, "no track data\n  (pass your NFSU2 data dir: nfsu2 /path/to/data)\n"); return 1; }
     N2Scene scene = world.neighborhood.scene;   /* shares world.neighborhood.scene.meshes */
+    g_stage5_world.scene=&scene;
+    g_stage5_world.collision=&world.neighborhood.track_collision;
     /* The stored SKYDOME references the sunrise dome/cap pair. LOC4 also
        ships structurally matching sunset/night pairs; remap only those two
        proven SKY keys before the normal world texture resolver runs. */
@@ -4744,7 +4759,7 @@ int main(int argc, char **argv) {
                    !stage5_body_car_read(globdata,globlen,carname,&body) || stage1_drive_init(&g_stage1,&stock,&resistance,0) ||
                    stage3_drive_brakes(&g_stage1,&brakes,0,0) ||
                    stage4_drive_lateral(&g_stage1,&lateral,1/lat_inertia(stock.mass,lateral.dimensions),0) ||
-                   stage5_drive_contacts(&g_stage1,&contacts,stage5_world_query,&scene) ||
+                   stage5_drive_contacts(&g_stage1,&contacts,stage5_world_query,&g_stage5_world) ||
                    stage5_drive_body(&g_stage1,&body,1,0,0)) {
                     fprintf(stderr,"--drivetrain: no valid stock Stage-1/2/3/4/5 tuning for %s\n",carname);
                     return 2;
@@ -4752,7 +4767,7 @@ int main(int argc, char **argv) {
                 tm_car_read(globdata,globlen,carname,g_tm_width);   /* TM-1.1; keeps defaults if absent */
                 printf("Stage-1/2/3/4/5 drivetrain enabled; W forward, S brake/reverse, Space handbrake.\n"
                        "  Geometric spring/aligned loads, frame handbrake/grip; full dynamic body momentum and orientation.\n"
-                       "  Independent host policy: c=1 p=1, session status from ordinary host lifecycle, surface ID=1, q=1 X/event=0, G=1 reduction=0, initial locks=0; bottom impulses enabled. Drag/drift use legacy.\n");
+                       "  Independent host policy: c=1 p=1, session status from ordinary host lifecycle, surface ID from the hit collision polygon attribute (identity 0..28, fixed fallback 1), q=1 X/event=0, G=1 reduction=0, initial locks=0; bottom impulses enabled. Drag/drift use legacy.\n");
             }
             g_vehicle_source_valid=physics_from_global;
             if(physics_from_global)g_vehicle_source=pa;
@@ -6926,7 +6941,7 @@ int main(int argc, char **argv) {
                             stage1_drive_init(&g_stage1,&next_stage1,&next_resistance,0);
                             stage3_drive_brakes(&g_stage1,&next_brakes,0,0);
                             stage4_drive_lateral(&g_stage1,&next_lateral,1/lat_inertia(next_stage1.mass,next_lateral.dimensions),0);
-                            stage5_drive_contacts(&g_stage1,&next_contacts,stage5_world_query,&scene);
+                            stage5_drive_contacts(&g_stage1,&next_contacts,stage5_world_query,&g_stage5_world);
                             stage5_drive_body(&g_stage1,&next_body,1,0,0);
                             tm_car_read(candidate.globaldata,candidate.globallen,next_car,g_tm_width);
                             vel[0]=vel[1]=0;speed=0;sim_reset=1;

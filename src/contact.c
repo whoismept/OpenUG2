@@ -1,5 +1,6 @@
 #include "contact.h"
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 static void cross(const float a[3],const float b[3],float c[3]){float r[3]={a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};memcpy(c,r,sizeof r);}
 static void transform(const ResBasis*b,const float r[3],float o[3]){for(int k=0;k<3;k++)o[k]=(float)((double)b->forward[k]*r[0]+(double)b->lateral[k]*r[1]+(double)b->up[k]*r[2]);}
@@ -35,13 +36,23 @@ static const CtSurface surfaces[29]={
  {0.99000000953674316f,0.9812999963760376f,1.0f,1.0f,1.0f,0.0f},
 };
 const CtSurface *ct_surface(int id){return surfaces+id;}
+int ct_surface_id(int attribute){return attribute>=CT_SURFACE_ID_MIN && attribute<=CT_SURFACE_ID_MAX ? attribute : CT_SURFACE_ID_INVALID;}
+static float ct_record_f32(const unsigned char *p){uint32_t bits=(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;float f;memcpy(&f,&bits,4);return f;}
+void ct_surface_record(const unsigned char record[CT_SURFACE_RECORD_SIZE],CtSurface *out){
+ out->frequency=ct_record_f32(record+CT_SURFACE_OFFSET_FREQUENCY);
+ out->amplitude=ct_record_f32(record+CT_SURFACE_OFFSET_AMPLITUDE);
+ out->peak=ct_record_f32(record+CT_SURFACE_OFFSET_PEAK);
+ out->slide=ct_record_f32(record+CT_SURFACE_OFFSET_SLIDE);
+ out->spin=ct_record_f32(record+CT_SURFACE_OFFSET_SPIN);
+ out->body_drag=ct_record_f32(record+CT_SURFACE_OFFSET_BODY_DRAG);
+}
 static float noise(double i,double j){static const float samples[16]={-.5f,-.2f,.5f,.2f,-.4f,-.1f,.2f,.5f,-.2f,-.5f,.4f,-.3f,.3f,0,-.2f,.1f};double index=fmod(-5*i*j-3*(i+1)*(j+1),16);if(index<0)index+=16;return samples[(int)index];}
 float ct_bump(float x,float y,float frequency,float amplitude){double px=(double)x*frequency,py=(double)y*frequency,i=floor(px),j=floor(py),u=px-i,w=py-j;return (float)(amplitude*((1-u)*(1-w)*noise(i,j)+u*(1-w)*noise(i+1,j)+(1-u)*w*noise(i,j+1)+u*w*noise(i+1,j+1)));}
 CtPreload ct_preload(float mass,float cx,float xf,float xr,int enabled,const ResCar*a,float kA,float v,float enable){double c=enabled?cx:0;float sr=(float)(.5*(xf-c)/((double)xf-xr)),sf=(float)(.5-sr);float total=(float)((double)mass*9.8f+((double)a->front+a->rear)*enable*fmax(v,0)*kA);return (CtPreload){total,(float)((double)total*sf),(float)((double)total*sr),sf,sr};}
 void ct_inertia(const CtCar*c,float ordinary[3],float selected[3]){for(int k=0;k<3;k++){double a=c->dimensions[(k+1)%3],b=c->dimensions[(k+2)%3];ordinary[k]=(float)(c->mass*(a*a+b*b)*(1.0f/12));selected[k]=ordinary[k];}selected[2]=(float)((double)selected[2]*c->yaw_scale);}
 void ct_change_centre(float p[3],const ResBasis*b,const float old[3],const float changed[3]){float d[3],v[3];for(int k=0;k<3;k++)d[k]=changed[k]-old[k];transform(b,d,v);for(int k=0;k<3;k++)p[k]+=v[k];}
-float ct_distance(float dot,float difference,int*surface){if(dot<.001f){*surface=0;return -100;}return (float)((double)difference/dot);}
-float ct_ground_distance(const float p[3],const float up[3],const CtGround*g,float bump,int*s){*s=g->override_surface?1:g->surface;float difference=(float)(((g->found?(double)g->height+g->height_offset:-10000)+bump-p[2])*g->normal[2]);return ct_distance((float)res_dot(up,g->normal),difference,s);}
+float ct_distance(float dot,float difference,int*surface){if(dot<.001f){*surface=CT_SURFACE_ID_STEEP;return -100;}return (float)((double)difference/dot);}
+float ct_ground_distance(const float p[3],const float up[3],const CtGround*g,float bump,int*s){*s=g->override_surface?CT_SURFACE_ID_DEFAULT:g->surface;float difference=(float)(((g->found?(double)g->height+g->height_offset:-10000)+bump-p[2])*g->normal[2]);return ct_distance((float)res_dot(up,g->normal),difference,s);}
 void ct_spring(CtWheel*w,const CtAxle*a,float candidate,float pair,float preload,float h){float old=w->travel;w->contact=candidate>=a->lower;w->travel=fmaxf(a->lower,fminf(a->upper,candidate));if(h>.0001f)w->rate=(float)(((double)w->travel-old)/h);double t=w->travel;w->scalar=w->contact?(float)fmax(0,preload+(1+a->progression*fmax(t,0))*a->stiffness*t+(w->rate>0?a->d_positive:a->d_nonpositive)*(double)w->rate+a->antiroll*(t-pair)):0;}
 float ct_alignment(float dot){return (float)fmax(.3f,1-4*(double)dot*dot);}
 float ct_align(float scalar,const float lateral[3],const float normal[3]){float first[3],second[3];cross(lateral,normal,first);cross(first,lateral,second);return scalar>0?(float)((double)scalar*fmax(.3f,4*res_dot(second,normal)-3)):0;}

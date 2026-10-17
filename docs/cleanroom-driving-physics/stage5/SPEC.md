@@ -327,9 +327,11 @@ yaw speed or add an independent handbrake yaw impulse in this bounded branch.
 IDs 0…28 to peak, sliding, spin-drag, body-drag, bump frequency and amplitude.
 Decimals designate binary32. These six channels are compatibility parameters;
 no original names, visual assets or complete record dumps are supplied. IDs are
-returned by the external collision query. Mapping world material/triangle types
-or user-facing labels to those IDs remains U5-2; ID 1 is an explicit ordinary
-road fixture. Do not assign IDs based on unverified semantic labels.
+returned by the external collision query; S5-11 specifies the world attribute
+that yields them (a per-polygon byte used directly as the ID). User-facing
+labels remain unestablished; ID 1 is an explicit ordinary road fixture and is
+also the query's default/override ID. Do not assign IDs based on unverified
+semantic labels.
 
 Peak multiplies the final Stage1 friction cap; sliding multiplies the sliding
 coefficient and lock input. Spin-drag is rho in the Stage1/2 wheel angular drag
@@ -392,8 +394,14 @@ the previous clamped travel, not an invented free-fall suspension state.
 - **U5-1** No isolated original runtime, trajectory or differential capture;
   complete handling and visual slope/landing parity are unmeasured.
 - **U5-2** External world-height query validity, search/triangle selection,
-  world-material-to-surface IDs, collision impulses and missing-output policy.
+  collision impulses and missing-output policy.
   The wrapper and numeric ID channels are specified, not a collision engine.
+  **Resolved part:** the attribute returned as a contact's surface ID is a
+  one-byte per-polygon surface attribute used directly as the ID (identity
+  mapping over 0…28); see S5-11 and `test-vectors/surface_mapping.json`.
+  **Residual:** validity and triangle selection of the height search, behaviour
+  for an out-of-domain attribute (>28), collision impulses, and the
+  missing-output policy beyond the fixed ID fallbacks specified in S5-3/S5-11.
 - **U5-3** Complete q/X/event producers, externally changed interpolation
   calibrations, other wheel multiplier writers, shift/launch/nitrous composition.
   Supply them explicitly; fixture values do not establish general retail defaults.
@@ -412,8 +420,66 @@ the previous clamped travel, not an invented free-fall suspension state.
 
 Evidence IDs E5-1 data/inertia, E5-2 preload/centre, E5-3 ground/travel,
 E5-4 spring/pair/bottoming, E5-5 alignment/basis/point, E5-6 handbrake/grip,
-E5-7 surfaces/noise and E5-8 scheduling resolve in the analyst-only evidence
-register. Test vectors in `test-vectors/` are synthetic component, sequence and
-composition fixtures, with README provenance and tolerances. They do not claim
-retail runtime execution. Implement each covered producer or expose its explicit
-supplied-input boundary; do not fill unknowns with silent retail assumptions.
+E5-7 surfaces/noise, E5-8 scheduling and E5-9…E5-12 world attribute/ID mapping
+resolve in the analyst-only evidence register. Test vectors in `test-vectors/`
+are synthetic component, sequence and composition fixtures, with README
+provenance and tolerances. They do not claim retail runtime execution. Implement
+each covered producer or expose its explicit supplied-input boundary; do not fill
+unknowns with silent retail assumptions.
+
+## S5-11 World surface attribute and surface-ID derivation
+
+This refines S5-7 and resolves the attribute-to-ID part of U5-2. A contact's
+surface ID is not chosen by the host from semantic labels; the world geometry
+carries it. All statements here are testable; `test-vectors/surface_mapping.json`
+supplies the identity table, the fallback IDs, the channel record layout and
+boundary/representative vectors.
+
+Every driving-collision polygon in the shipped world geometry stores a one-byte
+**surface attribute** at offset 2 of its 32-byte polygon record. (Offset 0 is a
+barrier/group byte, offset 1 a vertex-extent selector and offset 3 a flags byte;
+the attribute is a distinct field, not any of those.)
+
+**S5-11.1 (attribute to ID is identity).** When the ground query selects a
+polygon, the returned surface ID equals that polygon's attribute byte widened to
+an integer, with no arithmetic remap, table lookup, offset addition or clamp.
+The attribute byte is returned unchanged on the found path. Vector: attribute 20
+gives ID 20; attribute 1 gives ID 1.
+
+**S5-11.2 (ID domain).** The surface ID domain is 0…28 inclusive, matching the 29
+rows of `surfaces.json`. A host reproducing a ground contact maps attribute A to
+surface ID A for A in 0…28 and then applies the S5-7 channel row with that id.
+An attribute above 28 selects no defined row and is invalid (U5-2 residual).
+
+**S5-11.3 (no material/name table).** For every integer A with 0 <= A <= 28,
+`surface_id(A) = A`. There is no material-name table and no material-to-surface
+translation step between the polygon attribute and the channel row. Do not invent
+semantic material or surface names for any value.
+
+**S5-11.4 (no transform at load or query).** Loading and querying the world do
+not transform the attribute. A polygon's byte is returned exactly as stored,
+independent of which pack, section or load path supplied it.
+
+**S5-11.5 (fallback IDs do not consult the attribute).** With no collision pack,
+or with a pack but no polygon selected, the query output is ID 1; an explicitly
+selected forced-surface override sets the effective ID to 1; a failed steep-normal
+test sets the effective ID to 0. These restate the S5-3 rules for the mapping; all
+of these fallbacks use fixed constants, not geometry.
+
+**S5-11.6 (shipped reachability).** A static walk of the eight shipped world
+stream bundles yields 417572 collision polygons whose attribute takes exactly the
+values {0, 1, 3, 8, 9, 10, 11, 14, 15, 16, 17, 19, 20, 23, 25, 26, 28}; none
+exceeds 28 and value 1 dominates (259255 polygons). IDs 2, 4, 5, 6, 7, 12, 13,
+18, 21, 22, 24 and 27 do not occur in these bundles but remain valid rows because
+the query may return any value in 0…28. Reproducing shipped-world contacts
+therefore requires only the identity mapping over 0…28.
+
+**S5-11.7 (channel record layout).** `surfaces.json` fixes the channel values. The
+ID indexes fixed-size records of 152 bytes, 29 in number, with frequency at record
+offset 0x18, amplitude at 0x1C, peak at 0x24, slide at 0x28, spin at 0x2C and
+body-drag at 0x30. These offsets are compatibility data; a host must not reorder
+or share the channels.
+
+Subsequent writers of a contact's ID (for example a race-specific forced surface,
+U5-6) are external and must be supplied explicitly; this section fixes only the
+world-attribute derivation.

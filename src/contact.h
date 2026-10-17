@@ -10,6 +10,24 @@ typedef struct {
  CtAxle axle[2];
 } CtCar;
 typedef struct { float peak,slide,spin,body_drag,frequency,amplitude; } CtSurface;
+/* S5-11 surface ID: the collision polygon's one-byte attribute is the numeric
+ * ID verbatim over the 29-row channel domain (identity, no remap or clamp);
+ * above the domain no row is defined. S5-11.5 fixes the fallback IDs. */
+#define CT_SURFACE_ID_MIN 0
+#define CT_SURFACE_ID_MAX 28
+#define CT_SURFACE_ID_COUNT 29
+#define CT_SURFACE_ID_INVALID (-1)
+#define CT_SURFACE_ID_DEFAULT 1 /* no pack / no polygon / forced override */
+#define CT_SURFACE_ID_STEEP 0   /* failed steep-normal test */
+/* S5-11.7 source channel records: 29 fixed 152-byte rows. */
+#define CT_SURFACE_RECORD_COUNT 29
+#define CT_SURFACE_RECORD_SIZE 152
+#define CT_SURFACE_OFFSET_FREQUENCY 0x18
+#define CT_SURFACE_OFFSET_AMPLITUDE 0x1C
+#define CT_SURFACE_OFFSET_PEAK 0x24
+#define CT_SURFACE_OFFSET_SLIDE 0x28
+#define CT_SURFACE_OFFSET_SPIN 0x2C
+#define CT_SURFACE_OFFSET_BODY_DRAG 0x30
 typedef struct { float travel,rate,scalar,load,point[3],centre[3],arm[3],normal[3]; int contact,surface; } CtWheel;
 typedef struct { float position[3],velocity[3],omega[3]; ResBasis axes; } CtPose;
 typedef struct { float height,normal[3],height_offset;int found,surface,override_surface; } CtGround;
@@ -24,6 +42,8 @@ typedef struct {
  unsigned frame_refreshes,blend_refreshes,post_sweeps,zero_sweeps;
 } CtState;
 const CtSurface *ct_surface(int id);
+int ct_surface_id(int attribute);
+void ct_surface_record(const unsigned char record[CT_SURFACE_RECORD_SIZE],CtSurface *out);
 float ct_bump(float x,float y,float frequency,float amplitude);
 CtPreload ct_preload(float mass,float cx,float xf,float xr,int centre_switch,const ResCar *a,float kA,float v,float previous_enable);
 void ct_inertia(const CtCar *car,float ordinary[3],float selected[3]);

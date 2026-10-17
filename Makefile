@@ -217,6 +217,23 @@ ug2-track-collision-test: tools/ug2_track_collision_test.c src/ug2_track_collisi
 
 .PHONY: ug2-track-collision-test
 
+# S5-11: world polygon attribute -> numeric surface ID vectors (surface_mapping.json).
+surface-mapping-test: tools/surface_mapping_test.c tools/test_json.h src/contact.c src/contact.h src/resistance.c src/braking.c src/ug2_track_collision.h src/asset_chunks.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/surface_mapping_test.c src/contact.c src/resistance.c src/braking.c -o build/surface_mapping_test -lm
+	./build/surface_mapping_test
+
+.PHONY: surface-mapping-test
+
+# S5-11 lookup acceleration: indexed select vs a brute-force reference over
+# synthetic sets (equivalence) plus a 100k-polygon timing comparison.
+surface-index-test: tools/surface_index_test.c src/ug2_track_collision.h src/asset_chunks.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/surface_index_test.c -o build/surface_index_test -lm
+	./build/surface_index_test
+
+.PHONY: surface-index-test
+
 world-collision-test: tools/world_collision_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/render_params.c src/rhi_gl_state.c src/rhi_gl.c src/tex_override.c src/physics.c $(HDRS) src/generated_shaders.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/world_collision_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/render_params.c src/rhi_gl_state.c src/rhi_gl.c src/tex_override.c src/physics.c -o build/world_collision_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
