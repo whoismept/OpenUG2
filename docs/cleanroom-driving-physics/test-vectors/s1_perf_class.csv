@@ -1,0 +1,66 @@
+case,source,force_flag,drive_score,class,note
+PEUGOT,retail_stock,0,196.6961,3,emulated
+FOCUS,retail_stock,0,175.1087,3,emulated
+COROLLA,retail_stock,0,144.1214,3,emulated
+240SX,retail_stock,0,195.9229,3,emulated
+MIATA,retail_stock,0,179.7861,3,emulated
+CIVIC,retail_stock,0,182.1949,3,emulated
+PEUGOT106,retail_stock,0,180.5773,3,emulated
+CORSA,retail_stock,0,176.3622,3,emulated
+HUMMER,retail_stock,0,152.6228,3,emulated
+NAVIGATOR,retail_stock,0,145.4300,3,emulated
+ESCALADE,retail_stock,0,174.1649,3,emulated
+TIBURON,retail_stock,0,207.5086,3,emulated
+SENTRA,retail_stock,0,205.6618,3,emulated
+CELICA,retail_stock,0,242.0617,3,emulated
+IS300,retail_stock,0,234.0550,3,emulated
+SUPRA,retail_stock,0,230.6087,3,emulated
+GOLF,retail_stock,0,209.1710,3,emulated
+A3,retail_stock,0,275.9721,2,emulated
+RSX,retail_stock,0,222.1664,3,emulated
+ECLIPSE,retail_stock,0,223.7548,3,emulated
+TT,retail_stock,0,265.5596,3,emulated
+RX8,retail_stock,0,282.5373,2,emulated
+350Z,retail_stock,0,316.6458,2,emulated
+G35,retail_stock,0,283.8392,2,emulated
+3000GT,retail_stock,0,300.4683,2,emulated
+GTO,retail_stock,0,303.0198,2,emulated
+MUSTANGGT,retail_stock,0,285.5879,2,emulated
+SKYLINE,retail_stock,0,273.8293,2,emulated
+LANCEREVO8,retail_stock,0,309.3935,2,emulated
+RX7,retail_stock,0,304.6127,2,emulated
+IMPREZAWRX,retail_stock,0,333.6643,2,emulated
+TAXI,retail_stock,2,,3,forced (flag!=0)
+4DR_SEDAN02,retail_stock,2,,3,forced (flag!=0)
+AMBULANCE,retail_stock,2,,3,forced (flag!=0)
+TAXI02,retail_stock,2,,3,forced (flag!=0)
+PANELVAN,retail_stock,2,,3,forced (flag!=0)
+COUPE,retail_stock,2,,3,forced (flag!=0)
+FIRETRUCK,retail_stock,2,,3,forced (flag!=0)
+PARCELVAN,retail_stock,2,,3,forced (flag!=0)
+PICKUP,retail_stock,2,,3,forced (flag!=0)
+4DR_SEDAN,retail_stock,2,,3,forced (flag!=0)
+BUS,retail_stock,2,,3,forced (flag!=0)
+SUV,retail_stock,2,,3,forced (flag!=0)
+MINIVAN,retail_stock,2,,3,forced (flag!=0)
+HATCHBACK,retail_stock,2,,3,forced (flag!=0)
+HATCHBACK02,retail_stock,2,,3,forced (flag!=0)
+BOUNDARY_gt_500.0001,rule,0,500.0001,0,strict-gt boundary
+BOUNDARY_gt_500.0,rule,0,500.0000,1,strict-gt boundary
+BOUNDARY_gt_401.0001,rule,0,401.0001,1,strict-gt boundary
+BOUNDARY_gt_401.0,rule,0,401.0000,2,strict-gt boundary
+BOUNDARY_gt_273.0001,rule,0,273.0001,2,strict-gt boundary
+BOUNDARY_gt_273.0,rule,0,273.0000,3,strict-gt boundary
+BOUNDARY_gt_0.0,rule,0,0.0000,3,strict-gt boundary
+BOUNDARY_gt_-1.0,rule,0,-1.0000,3,strict-gt boundary
+350Z_scale_0.0,synthetic,0,0.0000,3,torque scaled
+350Z_scale_0.5,synthetic,0,141.6221,3,torque scaled
+350Z_scale_0.8,synthetic,0,244.7144,3,torque scaled
+350Z_scale_1.0,synthetic,0,316.6458,2,torque scaled
+350Z_scale_1.2,synthetic,0,390.3267,2,torque scaled
+350Z_scale_1.25,synthetic,0,409.0211,1,torque scaled
+350Z_scale_1.4,synthetic,0,465.2585,1,torque scaled
+350Z_scale_1.45,synthetic,0,484.0042,1,torque scaled
+350Z_scale_1.5,synthetic,0,502.7501,0,torque scaled
+350Z_scale_1.6,synthetic,0,540.2416,0,torque scaled
+350Z_scale_2.0,synthetic,0,690.2080,0,torque scaled

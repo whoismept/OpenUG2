@@ -47,6 +47,11 @@ extern "C" {
 enum { DRV_GEAR_R = 0, DRV_GEAR_N = 1 };
 enum { DRV_CLUTCH_DISENGAGING = 0, DRV_CLUTCH_OPEN = 1, DRV_CLUTCH_ENGAGING = 2, DRV_CLUTCH_LOCKED = 3 };
 enum { DRV_CLASS_A = 0, DRV_CLASS_B = 1, DRV_CLASS_C = 2 };
+/* Performance class C (S1-12): 0 = highest performance ... 3 = lowest. The
+ * physics-parameter object stores it as a signed byte; -1 = not yet computed.
+ * The drivetrain block's own created copy defaults to 3 before the
+ * creation-time copy overwrites it. */
+enum { DRV_PERF_CLASS_UNSET = -1, DRV_PERF_CLASS_DEFAULT = 3 };
 /* gear command (kappa, S1-4.5) */
 enum { DRV_CMD_MANUAL_ASSIST = -2, DRV_CMD_AUTO = -1 /* >= 0: direct gear index */ };
 enum { DRV_DIR_BACKWARD = -1, DRV_DIR_STOPPED = 0, DRV_DIR_FORWARD = 1 };
@@ -85,6 +90,21 @@ typedef struct DrvCar {
 int  drv_car_finalize(DrvCar *car);
 int  drv_drive_class(float rear_share);                 /* S1-1.4 */
 float drv_launch_scale(int drive_class);                /* S1-1.4 */
+/* S1-12.3: performance class 0..3 from the stored binary32 drive score S,
+ * thresholds applied in descending order with strict >. */
+int    drv_perf_class_from_score(float score);
+/* S1-12.1 + S1-12.3: a nonzero forced flag yields class 3 without forming a
+ * score; otherwise the score mapping above. */
+int    drv_perf_class_resolve(int forced, float score);
+/* S1-7.7 / S1-12.5: the unguarded K[C] read. The four entries are the stored
+ * binary32 words 0x00000000, 0xBE4CCCCD, 0xBECCCCCD, 0xBF333333 (shorthand
+ * 0.0, -0.2, -0.4, -0.7), contiguous in C order, and the coefficient returned
+ * is each exact stored value (not a double built from the decimal literal).
+ * The unset sentinel C = -1 selects the 4-byte slot immediately preceding
+ * K[0], whose stored binary32 value is 0.25 (0x3E800000); it is not K[0] and
+ * not a no-op. The class scheme produces only -1 and 0..3 (U-17), so any other
+ * index is outside the stated read and returns NAN. */
+double drv_kappa_c(int perf_class);
 /* rpm of sample i of a q-sample curve spread over [a, b] (S1-3.1) */
 float drv_curve_knot_rpm(float a, float b, int q, int i);
 
@@ -93,7 +113,11 @@ float drv_curve_knot_rpm(float a, float b, int q, int i);
 typedef struct DrvTune {
     float torque_scale;     /* G  (S1-3.3, U-7): initial 1.0 */
     int   torque_bonus;     /* B = 1.05 when set (S1-3.3, U-6): default 0 */
-    int   perf_class;       /* C, 0..3, selects kappa_C (S1-7.7, U-11): UNKNOWN, default 0 (rule inert) */
+    /* C (S1-12): per-vehicle-instance signed byte of the physics-parameter
+     * object, 0..3 or DRV_PERF_CLASS_UNSET (-1). Derived by the parameter-
+     * composition step (out of Stage-1 scope, U-11); drv_init copies it into
+     * the drivetrain block. drv_tune_default() leaves it unset. */
+    signed char perf_class;
     float initial_rpm;      /* engine rpm at creation (U-15): <= 0 means idle */
     float grip_q;           /* q (S1-7.8, U-4): 1.0 */
     float grip_loc_x;       /* X (S1-7.8, U-4): 0 (feature switch off) */
@@ -179,6 +203,7 @@ typedef struct DrvWheel {
 typedef struct Drivetrain {
     DrvCar  car;                /* copy; finalized */
     DrvTune tune;
+    signed char perf_class;     /* C copy taken at creation (S1-12); may be DRV_PERF_CLASS_UNSET */
     DrvWheel wheel[4];
 
     /* engine (S1-3) */
@@ -224,6 +249,8 @@ typedef struct Drivetrain {
 /* Create a drivetrain at rest, in neutral, clutch Engaging with c = 0 (S1-4.1).
  * The car is copied and finalized. Creation zero-time post-processing yields
  * mc=0.7 and Phi=0. Manual-assist initial state remains caller-supplied (U-2).
+ * The physics-parameter performance class is copied into d->perf_class at
+ * creation (S1-12); it is never recomputed by this module (U-11 residual).
  * Returns 0 or -1 (bad car). */
 int  drv_init(Drivetrain *d, const DrvCar *car, const DrvTune *tune);
 

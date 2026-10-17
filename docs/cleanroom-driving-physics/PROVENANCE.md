@@ -73,5 +73,70 @@
 - 2026-10-15 COORDINATOR: prepared Stage-1 publication commit f9cc1ce. Normalized
   CSV fixture line endings to LF without changing values; all 3,606 drivetrain checks passed.
   Analyst scratch remains ignored. A fresh cleanroom-implementer, stage1_upstream_merge,
-  resolved independent project integration conflicts with upstream development 961f783
-  in Makefile and src/main.c only; approved Stage-1 specification remains unchanged.
+   resolved independent project integration conflicts with upstream development 961f783
+   in Makefile and src/main.c only; approved Stage-1 specification remains unchanged.
+
+- 2026-10-17 ANALYST (fresh cleanroom-analyst, PHY-01 `perf_class`): resolved unknown U-11
+  (performance class C) by static analysis of the reference binary only (no retail runtime).
+  Added S1-12 to SPEC.md, narrowed U-11, added a QUESTIONS.md addendum and test vectors
+  `test-vectors/s1_perf_class.csv` (+ README row). Evidence kept analyst-only in
+  `cleanroom/analysis/stage1-perfclass/` (`notes.md`, `evidence/`, `scripts/`). Reference hash
+  confirmed unchanged (`f9dd86c0…468a7`); no implementation or decompilation content placed in the spec.
+
+- 2026-10-17 REVIEWER (fresh cleanroom-reviewer, PHY-01 spec gate): scanned the new S1-12 /
+  S1-7.7 / U-11 material and vectors; retagged confidence markers to the project convention
+  ([inf], "derived"), removed an analyst-only path re-introduced into the implementer-visible
+  `test-vectors/README.md`, marked the `a(v)` sample construction as out of Stage-1 scope, and
+  appended the gate to REVIEW.md. APPROVED SPEC.md SHA-256:
+  `355d67b46fd713578d17800338469cecb450169ad8e746b1199dd5564de803d4`.
+  Contamination notice: the transient analyst-path pointer existed only in the reviewed README;
+  no implementer session had run yet, so no implementer exposure occurred. Recorded for audit.
+
+- 2026-10-17 IMPLEMENTER (fresh cleanroom-implementer, PHY-01): worked from approved hash
+  `355d67b4…03d4`; changed only `src/drivetrain.c`, `src/drivetrain.h`, `tools/drivetrain_test.c`,
+  `docs/cleanroom-driving-physics/IMPL_DESIGN.md`, and added Q-17 to QUESTIONS.md. Reported
+  `make drivetrain-test` 3,804 checks / 0 failed, strict C99 clean, ASan/UBSan clean, `make normal`
+  and `make drive-stage1-test` exit 0. No original/analyst access reported.
+
+- 2026-10-17 VERIFIER (fresh cleanroom-verifier, PHY-01): confirmed approved hash `355d67b4…03d4`,
+  reproduced 3,804 checks (strict C99 + ASan/UBSan) and 225 independent vector/property checks with
+  no divergence against any defined S1-12 / S1-7.7 statement. Proposed amendment A-17.1 for Q-17
+  (coefficient undefined at class −1). No retail differential (U-16); `S` values not independently
+  recomputed (composition step, U-11). No implementation/spec edits. See VERIFIER_AMENDMENTS.md.
+
+- 2026-10-17 ANALYST (fresh cleanroom-analyst, PHY-01 Q-17): resolved the class −1 coefficient by
+  static analysis; added S1-12.5 and residual U-17 to SPEC.md, recorded the answer in QUESTIONS.md,
+  and added `test-vectors/s1_kappa_c.csv`. Reference hash unchanged (`f9dd86c0…468a7`).
+  CONTAMINATION NOTE (incidental, low impact): a repo-wide grep over the docs tree returned several
+  `docs/cleanroom-driving-physics/IMPL_DESIGN.md` lines (an implementer design note) to the analyst
+  context. The analyst reports it did not open that file and did not read `src/`/`tools/`/`Makefile`;
+  the surfaced lines restated facts already disclosed in QUESTIONS.md Q-17 and VERIFIER_AMENDMENTS.md
+  A-17.1, so no new implementation information was exposed. No implementer exposure occurred; no code
+   quarantine required. Recommendation recorded: exclude implementer design notes from repo-wide greps.
+
+- 2026-10-17 REVIEWER (fresh cleanroom-reviewer, PHY-01 Q-17 gate): approved the S1-12.5 / S1-7.7 /
+  U-17 amendment; trimmed an analyst RE-tool command name from the vectors README; APPROVED SPEC.md
+  SHA-256 `224d71e4c74c211bfa8ed6ff5233ee1fde487a1c7181c940bdd0870570555adb`. no implementer exposure.
+
+- 2026-10-17 IMPLEMENTER (fresh cleanroom-implementer, PHY-01 Q-17 fix): worked from approved hash
+  `224d71e4…55adb`; changed `src/drivetrain.c` (`drv_kappa_c` slot table: `C=−1 → 0.25`), `src/drivetrain.h`,
+  `tools/drivetrain_test.c` (loads `s1_kappa_c.csv`), and `IMPL_DESIGN.md` (stale-hash fix). Reported
+  `make drivetrain-test` 3,813 checks / 0 failed, strict C99 + ASan/UBSan clean, `make normal` and
+  `make drive-stage1-test` exit 0. No original/analyst access reported.
+
+- 2026-10-17 VERIFIER (fresh cleanroom-verifier, PHY-01 round 2): confirmed hash `224d71e4…55adb`,
+  reproduced 3,813 checks (strict + ASan/UBSan) and 181 independent checks; all five `s1_kappa_c`
+  rows and the first-gear term reproduced; U-17 confirmed residual. Proposed A-17.2 (`K` decimal
+  double literals vs the vector's "exact binary32" claim) and A-17.3 (out-of-range beyond `−1`
+  asserted but implemented as `NAN`). No retail differential (U-16). See VERIFIER_AMENDMENTS.md.
+
+- 2026-10-17 ANALYST (fresh cleanroom-analyst, PHY-01 A-17.2/A-17.3): pinned `K` and the `C=−1`
+  coefficient to their exact stored binary32 values and narrowed S1-12.5 to the defined index set;
+  updated `s1_kappa_c.csv` (exact stored values + bit patterns), the vectors README, QUESTIONS.md and
+  U-14/U-17. Reference hash unchanged (`f9dd86c0…24168a7`).
+  CONTAMINATION NOTE (incidental, low impact): one grep run to locate the vector consumer incidentally
+  surfaced a few lines of `tools/drivetrain_test.c` (`test_kappa_c` region) and `src/drivetrain.{c,h}`
+  line references to the analyst context. The analyst reports every value/precision finding came from
+  the binary and evidence files, not that output, and edited nothing under `src/`/`tools/`/`Makefile`.
+  No implementer exposure; no code quarantine required. Repeats the earlier recommendation to scope
+  repo-wide greps away from implementer artifacts.

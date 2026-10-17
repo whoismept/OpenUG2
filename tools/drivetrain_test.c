@@ -20,6 +20,16 @@ static int g_checks, g_fail;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
     if (g_fail <= 80) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } } while (0)
 static int near_(double a, double b, double tol) { return fabs(a - b) <= tol; }
+/* Stored binary32 word of a value, for exact-constant checks (S1-7.7). */
+static unsigned float_bits(double v) { float f = (float)v; unsigned b = 0; memcpy(&b, &f, sizeof b); return b; }
+/* First "0x........" token of a note field (the stored binary32 pattern). */
+static unsigned note_bits(const char *note, int *ok) {
+    const char *p = strstr(note, "0x");
+    char *end = NULL;
+    unsigned long v = p ? strtoul(p, &end, 16) : 0;
+    if (ok) *ok = (p && end && end >= p + 3);
+    return (unsigned)v;
+}
 
 static float test_rand(void *ud) { return *(float *)ud; }
 static const char *g_dir = "docs/cleanroom-driving-physics/test-vectors";
@@ -253,6 +263,68 @@ static void test_axle_split(void) {
     csv_close(&csv);
 }
 
+/* ---- s1_perf_class.csv: S1-12 performance class, S1-7.7 kappa-C ---------------- */
+static void test_perf_class(void) {
+    Csv csv; if (!csv_open(&csv, "s1_perf_class.csv")) return;
+    CHECK(csv.n == 66, "perf class rows %d", csv.n);
+    int retail = 0, rule = 0, synth = 0, forced = 0, bad_source = 0;
+    for (int r = 1; r < csv.n; r++) {
+        char scratch[256]; char *f[CSV_MAXF];
+        if (csv_fields(csv.line[r], scratch, f) < 6) { CHECK(0, "perf class row %d fields", r); continue; }
+        const int flag = atoi(f[2]);
+        const int expect = atoi(f[4]);
+        CHECK(expect >= 0 && expect <= 3, "perf class row %d class range %s", r, f[4]);
+        if (flag != 0) {
+            forced++;
+            /* S1-12.1: a nonzero forced flag yields class 3 without forming a
+             * score; the blank score column is passed as NAN to prove it is unused. */
+            CHECK(drv_perf_class_resolve(flag, (float)NAN) == expect,
+                  "row %d forced flag %d -> class %d", r, flag, expect);
+            continue;
+        }
+        if (!strcmp(f[1], "retail_stock")) retail++;
+        else if (!strcmp(f[1], "rule")) rule++;
+        else if (!strcmp(f[1], "synthetic")) synth++;
+        else bad_source++;
+        const double score = strtod(f[3], NULL);
+        /* S1-12.3: strict > thresholds on the stored binary32 score. */
+        const int got = drv_perf_class_from_score((float)score);
+        CHECK(got == expect, "row %d %s S=%s: class %d expected %d", r, f[1], f[3], got, expect);
+        CHECK(drv_perf_class_resolve(0, (float)score) == expect, "row %d unflagged resolve -> %d", r, expect);
+    }
+    CHECK(bad_source == 0, "perf class sources: unexpected %d", bad_source);
+    CHECK(retail == 31 && rule == 8 && synth == 11 && forced == 15,
+          "perf class coverage retail %d rule %d synthetic %d forced %d", retail, rule, synth, forced);
+    csv_close(&csv);
+}
+
+/* ---- s1_kappa_c.csv: S1-7.7 / S1-12.5 coefficient lookup ----------------------- */
+static void test_kappa_c(void) {
+    Csv csv; if (!csv_open(&csv, "s1_kappa_c.csv")) return;
+    CHECK(csv.n == 6, "kappa_c rows %d", csv.n);
+    int rows = 0;
+    for (int r = 1; r < csv.n; r++) {
+        char scratch[256]; char *f[CSV_MAXF];
+        if (csv_fields(csv.line[r], scratch, f) < 5) { CHECK(0, "kappa_c row %d fields", r); continue; }
+        const int c = atoi(f[1]);
+        const double expect = strtod(f[2], NULL);
+        const double got = drv_kappa_c(c);
+        /* S1-7.7/S1-12.5: the four K entries and the preceding -1 slot are
+         * stored binary32 constants. The CSV decimal is the exact real value of
+         * that word and the note carries its bit pattern; both are checked. */
+        CHECK(got == expect, "row %d %s C=%d: %.17g expected %s", r, f[0], c, got, f[2]);
+        int have_bits = 0;
+        const unsigned want_bits = note_bits(f[4], &have_bits);
+        CHECK(have_bits, "kappa_c row %d note carries no binary32 pattern", r);
+        if (have_bits)
+            CHECK(float_bits(got) == want_bits, "row %d %s C=%d coefficient bits 0x%08X expected 0x%08X",
+                  r, f[0], c, float_bits(got), want_bits);
+        rows++;
+    }
+    CHECK(rows == 5, "kappa_c rows exercised %d", rows);
+    csv_close(&csv);
+}
+
 /* ---- s1_freerev_neutral_<car>.csv: S1-2, S1-3, S1-4.4 ------------------------------ */
 static void test_freerev(void) {
     for (int c = 0; c < 4; c++) {
@@ -373,8 +445,13 @@ static void test_question_cases(void) {
             for (int i = 0; i < 4; i++) CHECK(near_(d.wheel[i].omega, expected[i], tol), "Q7 corrected wheel %d", i);
             CHECK(near_(drv_wheel_side_speed(&d), json_num(out, "new_wheel_side_speed"), tol), "Q7 synchronized combined speed");
         } else if (strstr(item, "\"first_gear_feedback\"")) {
+            /* S1-12: the per-instance class reaches the block through the
+             * creation-time copy, so the vector supplies it at init. */
+            DrvTune fb_tune; drv_tune_default(&fb_tune);
+            fb_tune.perf_class = (signed char)json_num(in, "class");
+            drv_init(&d, &car, &fb_tune);
             d.gear = d.target_gear = (int)json_num(in, "gear"); d.mode = (int)json_num(in, "mode");
-            d.tune.perf_class = (int)json_num(in, "class"); d.feedback = (float)json_num(in, "feedback"); d.throttle = d.throttle_mult = 1;
+            d.feedback = (float)json_num(in, "feedback"); d.throttle = d.throttle_mult = 1;
             for (int i = 0; i < 9; i++) d.car.torque[i] = (float)json_num(in, "engine_torque");
             for (int i = 0; i < 4; i++) env.wheel[i].contact = 0;
             drv_couple(&d, &env, NULL, NULL);
@@ -681,9 +758,13 @@ static void test_behaviour(void) {
         drv_couple(&d, &env, drv_body_accel_straight, &body);
         CHECK(d.feedback == 0.0f && d.wheel[2].tau == 0.0f && d.wheel[3].tau == 0.0f, "neutral: no torque, no reaction");
     }
-    /* S1-7.3 / 7.2: clutch slip torque reaches the rear wheels of an RWD car, reaction on engine */
+    /* S1-7.3 / 7.2: clutch slip torque reaches the rear wheels of an RWD car, reaction on engine.
+     * An explicit computed class with K[0] = 0.0 keeps the independent S1-7.7
+     * first-gear term at zero so this fixture isolates the clutch reaction; it
+     * does not rely on the unset class (U-17). */
     {
-        drv_init(&d, &car, &tune);
+        DrvTune t3 = tune; t3.perf_class = 0;
+        drv_init(&d, &car, &t3);
         DrvEnv env; drv_env_default(&env);
         DrvBodyStraight body = { d.car.mass, 0 };
         d.gear = d.target_gear = 2; d.mode = DRV_CLUTCH_ENGAGING; d.engage = 0.5f;
@@ -741,6 +822,58 @@ static void test_behaviour(void) {
         drv_init(&d, &car, &tune);
         CHECK(d.jitter[0] == 0.0f && d.jitter[1] == 0.0f && d.jitter[2] == 0.0f, "jitter suppressed without generator");
     }
+    /* S1-12 performance class storage/classification and S1-7.7 kappa-C */
+    {
+        DrvTune tp; drv_tune_default(&tp);
+        CHECK(tp.perf_class == -1, "physics-parameter class starts unset (-1)");
+        CHECK(drv_perf_class_from_score(500.0001f) == 0 && drv_perf_class_from_score(500.0f) == 1 &&
+              drv_perf_class_from_score(401.0001f) == 1 && drv_perf_class_from_score(401.0f) == 2 &&
+              drv_perf_class_from_score(273.0001f) == 2 && drv_perf_class_from_score(273.0f) == 3 &&
+              drv_perf_class_from_score(0.0f) == 3 && drv_perf_class_from_score(-1.0f) == 3,
+              "classification uses strict > at 500/401/273");
+        CHECK(drv_perf_class_resolve(1, (float)NAN) == 3 && drv_perf_class_resolve(2, (float)NAN) == 3,
+              "forced flag short-circuits the score");
+        /* S1-7.7/S1-12.5: exact stored binary32 words, not the real decimal
+         * literals; test_kappa_c() checks the same table loaded from the CSV. */
+        CHECK(float_bits(drv_kappa_c(0)) == 0x00000000u &&
+              float_bits(drv_kappa_c(1)) == 0xBE4CCCCDu &&
+              float_bits(drv_kappa_c(2)) == 0xBECCCCCDu &&
+              float_bits(drv_kappa_c(3)) == 0xBF333333u,
+              "K binary32 words in C order (S1-7.7)");
+        CHECK(float_bits(drv_kappa_c(-1)) == 0x3E800000u,
+              "-1 selects the preceding 0.25 binary32 word (S1-12.5)");
+        /* Indices the class scheme never produces are outside the spec; this
+         * API rejects them instead of reading a guessed neighbour (S1-12.5). */
+        CHECK(isnan(drv_kappa_c(4)) && isnan(drv_kappa_c(-2)),
+              "indices outside {-1,0,1,2,3} are rejected");
+        tp.perf_class = 2;
+        drv_init(&d, &car, &tp);
+        CHECK(d.perf_class == 2, "creation-time copy of the physics-parameter class");
+        CHECK(sizeof d.perf_class == 1, "class copy is a signed byte");
+        d.perf_class = -1;
+        CHECK(d.perf_class == -1, "class byte is signed");
+        /* S1-7.7 first-gear term reads the block copy taken at creation. Attempt 0
+         * is a direct isolated fixture with the unset class copy (the S1-12.5
+         * coefficient 0.25 applies there); it makes no claim about whether a
+         * simulated drivetrain reaches the clause in that state (U-17). */
+        for (int attempt = 0; attempt < 4; attempt++) {
+            DrvTune tc; drv_tune_default(&tc);
+            if (attempt == 1) tc.perf_class = 1;
+            if (attempt == 2) tc.perf_class = 3;
+            if (attempt == 3) tc.perf_class = 1;
+            drv_init(&d, &car, &tc);
+            if (attempt == 3) d.tune.perf_class = 3;   /* after creation: no live recompute (U-11 residual) */
+            d.gear = d.target_gear = 2; d.mode = DRV_CLUTCH_OPEN;
+            d.feedback = -10.0f; d.throttle = d.throttle_mult = 1.0f;
+            for (int i = 0; i < 9; i++) d.car.torque[i] = 0.0f;
+            DrvEnv env12; drv_env_default(&env12);
+            for (int i = 0; i < 4; i++) env12.wheel[i].contact = 0;
+            drv_couple(&d, &env12, NULL, NULL);
+            const double expect_fb[4] = { -12.5, -8.0, -3.0, -8.0 };
+            CHECK(near_(d.feedback, expect_fb[attempt], 1e-5),
+                  "first-gear kappaC attempt %d: feedback %.5f expected %.5f", attempt, d.feedback, expect_fb[attempt]);
+        }
+    }
     /* Smoke test (NOT a vector): 1-D full-throttle launch with assumed loads. */
     {
         DrvTune t2 = tune; t2.is_player = 0;
@@ -788,6 +921,8 @@ int main(int argc, char **argv) {
     test_substeps();       printf("substeps     : %d checks, %d failed so far\n", g_checks, g_fail);
     test_clutch_torque();  printf("clutch torque: %d checks, %d failed so far\n", g_checks, g_fail);
     test_axle_split();     printf("axle split   : %d checks, %d failed so far\n", g_checks, g_fail);
+    test_perf_class();     printf("perf class   : %d checks, %d failed so far\n", g_checks, g_fail);
+    test_kappa_c();        printf("kappa C      : %d checks, %d failed so far\n", g_checks, g_fail);
     test_freerev();        printf("free rev     : %d checks, %d failed so far\n", g_checks, g_fail);
     test_question_cases(); printf("question cases: %d checks, %d failed so far\n", g_checks, g_fail);
     test_amended_boundaries(); printf("amendment boundaries: %d checks, %d failed so far\n", g_checks, g_fail);

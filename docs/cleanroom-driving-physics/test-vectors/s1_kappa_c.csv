@@ -1,0 +1,6 @@
+case,c_class,kappa_c,status,note
+KAPPA_C_0,0,0.0,defined,K[0] binary32 0x00000000
+KAPPA_C_1,1,-0.20000000298023224,defined,K[1] binary32 0xBE4CCCCD exact stored value not decimal -0.2
+KAPPA_C_2,2,-0.4000000059604645,defined,K[2] binary32 0xBECCCCCD exact stored value not decimal -0.4
+KAPPA_C_3,3,-0.699999988079071,defined,K[3] binary32 0xBF333333 exact stored value not decimal -0.7
+KAPPA_C_UNSET,-1,0.25,out-of-range sentinel,slot immediately preceding K binary32 0x3E800000; read is unguarded; reachability of the state at the term is U-17

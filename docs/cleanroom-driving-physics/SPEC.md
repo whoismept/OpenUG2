@@ -347,8 +347,31 @@ overwrite the cached initial-coupling speed unless the slip-sync branch explicit
   In exact arithmetic this correction makes the combined driven wheel-side speed equal `ωe`.
 Independently of the preceding `M = 3` and `nc > 0` condition, in any clutch mode, if `g = 2` (first gear): with `Te` recomputed, if `Φ < Te` and `Te + Φ < 0`, then
 `Φ ← Φ + Ψ(Te + Φ) · κC · (Te + Φ)` where `Ψ` is the piecewise-linear table
-`(−10, 1.0) (−7.5, 0.96) (−3.5, 0.925) (−0.3, 0.875) (−0.05, 0.0)` (clamped at both ends) and `κC` depends on
-the car's performance class C: `(0, −0.2, −0.4, −0.7)` for C = 0…3 (U-11).
+`(−10, 1.0) (−7.5, 0.96) (−3.5, 0.925) (−0.3, 0.875) (−0.05, 0.0)` (clamped at both ends) and `κC = K[C]`
+with `K` a fixed four-entry table indexed by the car's performance class `C ∈ {0,1,2,3}` (defined in S1-12).
+
+The four entries are stored **contiguously in `C` order as binary32**, and the coefficient used is the
+stored binary32 value (not the real decimal literal). Their exact encodings are:
+
+| `C` | bits (little-endian) | bit pattern | coefficient (exact stored value) |
+|---:|---|---|---|
+| 0 | `00 00 00 00` | `0x00000000` | `0.0` |
+| 1 | `CD CC 4C BE` | `0xBE4CCCCD` | `−0.20000000298023223876953125` |
+| 2 | `CD CC CC BE` | `0xBECCCCCD` | `−0.4000000059604644775390625` |
+| 3 | `33 33 33 BF` | `0xBF333333` | `−0.699999988079071044921875` |
+
+The shorthand `(0, −0.2, −0.4, −0.7)` used elsewhere denotes these stored binary32 values; for `C = 1…3`
+they are the nearest-binary32 values, not the real decimals (they differ by ≈1.5e−8 relative).
+
+Precision of the term [inf]: `Ψ`, `κC`, `Te + Φ` and the stored `Φ` are all binary32; the product
+`(Ψ·κC)·(Te + Φ) + Φ` is evaluated at a working precision wider than binary32 (the original's default working
+significand is 53 bits, i.e. **double**), and the resulting `Φ` is stored back as binary32. The vector in
+`test-vectors/s1_kappa_c.csv` therefore pins the coefficient exactly (a stored constant) but does not claim
+a bit-exact term result; bit-exact intermediate rounding is not required by this stage (U-14).
+
+`K[C]` is read as a plain base-plus-4·C access with no bounds test, clamp or default. The class scheme
+produces only the sentinel `C = −1` and `C ∈ {0,1,2,3}`; those are the only defined inputs of `K`. The value
+for `C = −1` is stated in **S1-12.5**; no other index is defined by this specification.
 
 ### S1-7.8 Grip multipliers
 `γi = q · (1 − 0.025·X)`; for rear wheels additionally × a handbrake/yaw term that equals
@@ -426,14 +449,31 @@ The body's mass is `m` from the record.
 - **U-9** The grip-wheel force update mixes force and torque terms; reproduce literally.
 - **U-10** The shift-decision rpm may come from an alternative source under some unidentified global condition;
   default is engine rpm.
-- **U-11** Performance class C (0…3) is computed by a parameter-composition step not specified here.
+- **U-11** Performance class `C` (0…3) is derived by the parameter-composition step; its definition,
+  thresholds, forced-class rule, owner and lifetime are specified in **S1-12**, where the drive score
+  `S` is defined given the sampled acceleration curve `a(v)`. Residual: the construction of `a(v)` (its
+  speed sampling and gear advance) is not specified here, so `S` is reproducible only when that curve —
+  or `S` itself — is supplied (out of Stage-1 scope); and whether a mid-session upgrade recomputes a
+  live instance's class (versus only on reconstruction/load).
 - **U-12** The race-mode flags that disable pedal exclusivity.
 - **U-13** An external analog-clutch path (status 3) exists in the player input code; normally off.
 - **U-14** Exact binary32/extended-precision rounding of intermediates is not specified; vectors carry tolerances.
   Q-2 resolves arithmetic grouping only; exact-binary32 shift-table vectors use a documented
   reference convention and do not establish exact retail results.
+  The S1-7.7 `κC` coefficients are stored binary32 and are pinned exactly (S1-7.7); the first-gear
+  term's product is evaluated with binary32 operands at a wider (default double) working precision and
+  stored back as binary32, so a faithful implementation matches the *coefficient* exactly but the term
+  result only to tolerance.
 - **U-15** Initial engine speed at vehicle creation (vectors start at idle; S1-3.5 clamps to idle anyway).
 - **U-16** No retail runtime trace validates any per-tick behaviour yet.
+- **U-17** Whether a *simulated* drivetrain ever reaches the S1-7.7 first-gear clause with its class copy
+  equal to the unset sentinel `−1` is not established. The drivetrain copy can hold `−1` (it is overwritten
+  with the physics-parameter object's unset class byte when the car type is unset at vehicle creation) and
+  neither the clause nor its caller gates on the class or car type, but the normal spawn path resolves the
+  class before the copy is taken. The value the clause would then use is fixed (S1-12.5); only the
+  reachability of the state is open, and no runtime trace exists (U-16). The defined class set is
+  `{−1, 0, 1, 2, 3}`; any other index is produced by no reachable state and is outside the specification
+  (S1-12.5).
 
 
 ## S1-11 Question resolution and remaining boundaries (2026-10-15)
@@ -463,3 +503,99 @@ no-handbrake synthetic case. No general retail default is established.
 Frame-duration vectors exercise subdivision of supplied `Δt`; they do not test the upstream clock.
 
 The earlier approval applies only to its recorded hash. This revision requires a fresh reviewer gate.
+
+## S1-12 Performance class `C` (2026-10-17)
+
+This resolves the class source named in U-11 and completes Q-8's `κC` reference in S1-7.7. The class
+values below were derived by deterministic execution of the parameter-composition step against retail
+car rows, and the mapping and stored tables were read from the executable's data (static analysis; the
+game was not launched — see U-16).
+
+`C` is an integer 0…3 (0 = highest performance) held per **vehicle instance** in the physics-parameter
+object as a signed byte, with `−1` meaning "not yet computed"; it is *not* a field of the car-type
+record. It is derived by the parameter-composition step from the *current effective record* — the
+car-type record with currently installed upgrades and active tuning applied — so two instances of the
+same model with different builds may have different `C`. The drivetrain block keeps its own copy, taken
+at vehicle creation; that block's constructor default is 3, but the copy overwrites it. If the car type
+is unset the composition step does nothing, the class stays `−1`, and the copy is left as `−1`. Whether
+a mid-session upgrade recomputes a live instance's class (as opposed to only on
+reconstruction/load) is not established.
+
+### S1-12.1 Forced class [inf]
+If the effective record's signed 32-bit field at row + 0x844 is nonzero, `C = 3` without forming a
+score. In the retail table every non-player traffic/service row has this field set (value 2) and every
+player-available row has 0.
+
+### S1-12.2 Drive score `S` [inf]
+Using the effective record, form a drive-acceleration-versus-speed curve `a(v)` in m/s² — the
+composition step's 64-sample scoring curve over `[0, v_top]`, `v_top` being its top sampled speed. With
+`cd` the aerodynamic coefficient at row + 0x370, `m` the mass at row + 0x220, and the fixed binary32
+step `Δ = 1.3410818576812744`:
+
+```
+v ← 0 ;  S ← 0
+while v ≤ v_top:
+    a ← curve(v)                 # endpoint-clamped linear interpolation of the 64 samples
+    r ← v · cd · v / m
+    if a < r: stop
+    S ← S + (a − r) · Δ
+    v ← v + Δ
+```
+
+`S` is stored as binary32 in the physics-parameter object. The loop condition is inclusive
+(`v ≤ v_top`) and the break is strict (`a < r`); equality `a = r` continues with a zero increment. The
+composition step's construction of `a(v)` (its speed sampling and gear advance) is out of Stage-1 scope
+(see U-11); the class rule below depends only on `S`.
+
+The `K` table of S1-7.7 is four **binary32** coefficients stored contiguously in `C` order; the shorthand
+`(0.0, −0.2, −0.4, −0.7)` denotes those stored binary32 values, and their exact bit patterns and real values
+are tabulated in S1-7.7 (not the real decimal literals).
+
+### S1-12.3 Classification [inf]
+The thresholds are applied in descending order with **strict** `>`:
+
+| condition | `C` |
+|---|---|
+| `S > 500` | 0 |
+| `401 < S ≤ 500` | 1 |
+| `273 < S ≤ 401` | 2 |
+| `S ≤ 273` (including `S ≤ 0`) | 3 |
+
+Equality falls to the lower class: `S = 500 → 1`, `S = 401 → 2`, `S = 273 → 3`, `S = 0 → 3`. These are
+the only thresholds; the `0` entry only ever yields class 3. No further clamping or rounding is applied.
+
+### S1-12.4 Stock classes [inf]
+With stock (unupgraded, untuned) records: the 15 traffic/service rows are forced to 3; among the 31
+player models, 20 are 3 (`S` 144–266) and 11 are 2 (`S` 274–334, the A3/RX8/350Z/G35/3000GT/GTO/
+MUSTANGGT/SKYLINE/LANCEREVO8/RX7/IMPREZAWRX group). No stock record reaches `S > 401`, so classes 0–1
+occur only with upgraded/tuned records (a scaled-torque sweep crosses all four classes; see
+`test-vectors/s1_perf_class.csv`).
+
+### S1-12.5 The `−1` class copy and the S1-7.7 coefficient [inf]
+The class copy held by the drivetrain block is the physics-parameter object's signed class byte sign-extended
+to an integer; it is written unconditionally at vehicle creation from that byte, overwriting the drivetrain
+block constructor's default of `3`. When the car type is unset at creation the composition step does not run,
+so the object's class byte is still its `−1` sentinel and the copy is `−1`.
+
+The S1-7.7 coefficient lookup is a plain base-plus-4·C read of the four contiguous `K` entries with no bounds
+test, no clamp and no default. For `C = −1` the selected 4-byte slot is the one immediately preceding the
+`K` table; its binary32 value is `0.25` (`0x3E800000`) and it is a constant also used elsewhere in the vehicle
+physics. The coefficient actually applied is therefore `κC = 0.25` for `C = −1` — not `K[0] = 0` and not a
+no-op. The class scheme produces no index other than the `−1` sentinel and `0…3`; those five are the only
+**defined** inputs of `K`, and their coefficients are pinned above and in S1-7.7. Any other index is outside
+this specification (it is never produced, and its behaviour need not be reproduced); an implementation may
+reject or ignore it.
+
+[inf] For traceability only, the unguarded read would select the static neighbours of the table: the word
+immediately after `K[3]` is binary32 `0.0` (`0x00000000`), so `C = 4` would read `0.0`; the word before the
+`−1` slot is binary32 `1.0` (`0x3F800000`), so `C = −2` would read `1.0`. These are constant-pool
+neighbours, not behaviour any reachable state depends on, and they are not requirements.
+
+Whether a drivetrain whose copy is `−1` is ever simulated as far as the first-gear clause is not established
+(U-17); the clause and its caller have no class or car-type gate, but the normal spawn path resolves the class
+before the copy is taken. The direction of this statement is behavioral only: an implementation that returns
+`0` for `C = −1` diverges from the original if the state is reached.
+
+Provenance: this section's findings are inferred from static evidence and deterministic execution of
+the parameter-composition step; the game was not launched, so no retail runtime trace was captured
+(U-16) and the tags are [inf].

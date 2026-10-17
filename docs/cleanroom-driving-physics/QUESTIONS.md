@@ -96,3 +96,72 @@ inferences; none is runtime-validated.
 
 New derived regression examples: `test-vectors/s1_question_cases.json`; provenance and tolerances
 in `test-vectors/README.md`. Runtime differential verification remains outstanding (U-16).
+
+## Addendum — 2026-10-17
+
+Q-8's `κC` source is now specified. The performance class `C` is defined in SPEC **S1-12**: a drive
+score `S` integrated over the composed acceleration-versus-speed curve, classified by strict `>`
+against `{273, 401, 500}` (0→3 scale), with a per-row forced-3 flag and a per-instance signed-byte
+storage (`−1` = unset). `κC = K[C]` with the fixed table `K = (0, −0.2, −0.4, −0.7)`. U-11 is narrowed
+accordingly and no longer blocks Q-8.
+
+Residual (kept in U-11): whether a mid-session upgrade recomputes a live instance's class (versus only
+on reconstruction/load); the out-of-scope construction of the drive-acceleration curve `a(v)` that the
+score integrates; and no per-record upgraded class values beyond the torque-scale sweep that crosses
+all four thresholds. Vectors: `test-vectors/s1_perf_class.csv`. This addendum is a static/derived finding
+(data reading plus deterministic emulation of the parameter-composition step), not a runtime validation
+(U-16). No new implementer question is raised.
+
+## Implementer addendum — 2026-10-17 (performance class)
+
+Raised while implementing S1-12 / the S1-7.7 `κC` clause against the approved hash
+`355d67b46fd713578d17800338469cecb450169ad8e746b1199dd5564de803d4`.
+
+* **Q-17 (S1-12 / S1-7.7, `κC` when `C = −1`).** S1-12 defines `C` as a signed byte whose
+  `−1` value means "not yet computed", and S1-7.7 defines `κC = K[C]` only for
+  `C ∈ {0,1,2,3}`. The specification does not state the first-gear term's coefficient when
+  the drivetrain block's creation-time copy is `−1` (parameter-composition step not run, or
+  car type unset). Implemented in the meantime as `drv_kappa_c()` returning `0.0` for any
+  class outside `0..3`, which leaves the term a no-op — the same behaviour the module had
+  while U-11 was open. Question: is `−1` unreachable in the drivetrain block in retail (the
+  copy always holds a computed class by the time the drivetrain couples), or does the term
+  have defined behaviour with an uncomputed class?
+
+## Analyst answer — 2026-10-17 (Q-17 / A-17.1)
+
+Static analysis of the retail executable (never launched) resolves the coefficient but not the
+reachability. The first-gear clause loads the drivetrain block's class copy and multiplies by a plain
+base-plus-4·C read of the four contiguous `K` entries with **no bounds test, clamp or default**. For
+`C = −1` the 32-bit address wraps to the 4-byte slot immediately preceding the `K` table, whose binary32
+value is **`0.25`** (`0x3E800000`) — a constant also used elsewhere in the vehicle physics, not padding.
+So the term is **not** a no-op at `−1`; it would compute `Φ ← Φ + Ψ(Te+Φ)·0.25·(Te+Φ)`.
+
+The drivetrain block's own byte is initialised to the constructor default `3` and then overwritten
+unconditionally at vehicle creation with the sign-extended class byte of the physics-parameter object; that
+object starts at the `−1` sentinel and is only written by the composition step, which does nothing when the
+car type is unset. So the copy can be `−1`, and it is not refreshed afterwards.
+
+What is unresolved: whether a drivetrain in that state is ever *simulated* as far as the first-gear clause.
+The clause and its caller gate only on gear and the drag condition, not on class or car type, but the normal
+spawn path resolves the class immediately before the copy is taken, so the unset state at creation is
+expected to be transient/abnormal. Recorded as residual **U-17** in SPEC.
+
+Disposition of A-17.1: **reject option (A)** ratifying `κC = 0.0` as a retail claim (observed retail value
+is `0.25`); **adopt (B)** in part — SPEC S1-12.5 now states the `−1` coefficient as `0.25` and U-17 records
+the open reachability. The interim `0.0` stub should be changed to `0.25` for `C = −1`.
+
+## Analyst addendum — 2026-10-17 (Q-17 representation; A-17.2 / A-17.3)
+
+Follow-up to the Q-17 answer and the round-2 verifier amendments. The `K` coefficients are stored as four
+**binary32** words; the exact encodings are `0x00000000`, `0xBE4CCCCD`, `0xBECCCCCD`, `0xBF333333` for
+`C = 0..3`, with stored values `0`, `−0.20000000298023224`, `−0.4000000059604645`, `−0.699999988079071`.
+The shorthand `(0, −0.2, −0.4, −0.7)` denotes these stored values, not the real decimal literals (they
+differ by ≈1.5e−8 relative). The S1-7.7 product reads the stored binary32 entries at a wider (default
+double) working precision and stores `Φ` back as binary32, so the coefficient is exact but the term result
+carries the U-14 tolerance. `test-vectors/s1_kappa_c.csv` now carries the stored values and bit patterns.
+
+For `K`, only the sentinel `C = −1` (`0.25`, `0x3E800000`) and `C = 0..3` are defined; the class scheme
+produces no other index and the specification does not require reproducing an out-of-range read (A-17.3).
+This refines the Q-17 disposition: beside changing the `−1` stub to `0.25`, an implementation that stores
+the `C = 1..3` coefficients as decimal `double` literals diverges from the specification's stored binary32
+values and should be corrected. Whether a simulated drivetrain reaches the clause with `−1` remains U-17.

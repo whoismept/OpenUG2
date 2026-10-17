@@ -6,6 +6,7 @@
 #include "tire_marks.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #define MPS_TO_MPH 2.237        /* S1-7.4 / U-8 */
@@ -22,6 +23,45 @@ int drv_drive_class(float s) {
 }
 float drv_launch_scale(int cls) {
     return cls == DRV_CLASS_A ? 1.0f : (cls == DRV_CLASS_C ? 1.1f : 1.2f);
+}
+
+/* S1-12.3: descending thresholds, strict >. Equality falls to the lower class. */
+int drv_perf_class_from_score(float score) {
+    const double S = (double)score;
+    if (S > 500.0) return 0;
+    if (S > 401.0) return 1;
+    if (S > 273.0) return 2;
+    return 3;
+}
+
+/* S1-12.1: the forced flag short-circuits the classification; the score is unused. */
+int drv_perf_class_resolve(int forced, float score) {
+    if (forced != 0) return 3;
+    return drv_perf_class_from_score(score);
+}
+
+/* S1-7.7 / S1-12.5: the fixed four-entry K table, contiguous in C order, read
+ * as a plain base-plus-slot access with no bounds test, clamp or default. The
+ * coefficient is the stored binary32 word itself, so the table is held as the
+ * exact bit patterns tabulated in S1-7.7 rather than decimal literals (whose
+ * nearest doubles differ from the stored values by about 1.5e-8). The slot
+ * immediately preceding K[0] holds the stored 0.25 constant (binary32
+ * 0x3E800000) that the unset sentinel C = -1 selects (S1-12.5). The class
+ * scheme produces only -1 and 0..3; any other index is outside both the scheme
+ * and the stated read (U-17), so it is reported as unspecified rather than
+ * guessed. */
+double drv_kappa_c(int perf_class) {
+    static const uint32_t slots[5] = {
+        0x3E800000u,  /* C = -1: preceding slot, stored 0.25 (S1-12.5) */
+        0x00000000u,  /* K[0] =  0.0                                  */
+        0xBE4CCCCDu,  /* K[1] = -0.20000000298023223876953125         */
+        0xBECCCCCDu,  /* K[2] = -0.4000000059604644775390625          */
+        0xBF333333u   /* K[3] = -0.699999988079071044921875          */
+    };
+    if (perf_class < -1 || perf_class > 3) return NAN;
+    float stored = 0.0f;
+    memcpy(&stored, &slots[perf_class + 1], sizeof stored);  /* exact word read */
+    return (double)stored;
 }
 float drv_curve_knot_rpm(float a, float b, int q, int i) {
     if (q < 2) return a;
@@ -61,6 +101,7 @@ int drv_car_finalize(DrvCar *car) {
 void drv_tune_default(DrvTune *t) {
     memset(t, 0, sizeof *t);
     t->torque_scale = 1.0f;
+    t->perf_class = (signed char)DRV_PERF_CLASS_UNSET;  /* composition step has not run (S1-12) */
     t->grip_q = 1.0f;
     t->rate_scale = 1.0f;
 }
@@ -200,6 +241,11 @@ int drv_init(Drivetrain *d, const DrvCar *car, const DrvTune *tune) {
     d->car = finalized;
     if (tune) d->tune = *tune; else drv_tune_default(&d->tune);
     if (!(d->tune.rate_scale > 0.0f)) d->tune.rate_scale = 1.0f;
+    /* S1-12: the drivetrain block's constructor default is 3; the creation-time
+     * copy of the physics-parameter object's class overwrites it (including -1
+     * when the parameter-composition step did not run). */
+    d->perf_class = (signed char)DRV_PERF_CLASS_DEFAULT;
+    d->perf_class = d->tune.perf_class;
 
     for (int i = 0; i < 4; i++) {
         d->wheel[i].w_long = 1.0f;
@@ -656,13 +702,14 @@ void drv_couple(Drivetrain *d, const DrvEnv *env, DrvBodyAccelFn body, void *bod
             }
         }
     }
-    if (d->gear == 2) {                   /* first gear, any clutch mode */
+    if (d->gear == 2) {                   /* first gear, any clutch mode (S1-7.7) */
         const double Te = drv_engine_torque(d);
         const double phi = d->feedback;
         if (phi < Te && Te + phi < 0.0) {
-            static const double kc[4] = { 0.0, -0.2, -0.4, -0.7 };
-            int pc = d->tune.perf_class < 0 ? 0 : (d->tune.perf_class > 3 ? 3 : d->tune.perf_class);
-            d->feedback = (float)(phi + psi(Te + phi) * kc[pc] * (Te + phi));
+            /* kappa_C = K[C] from the class copy taken at creation (S1-12);
+             * C = -1 selects the preceding 0.25 constant (S1-12.5). */
+            const double kc = drv_kappa_c(d->perf_class);
+            d->feedback = (float)(phi + psi(Te + phi) * kc * (Te + phi));
         }
     }
 }
