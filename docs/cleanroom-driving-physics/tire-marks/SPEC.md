@@ -81,11 +81,42 @@ pixels are not reproduced here; load them from the user's install.
 Once per outer vehicle update (the call that runs all of that frame's integration
 substeps), after the frame's final integration and state publication, the mark sampler runs
 for wheels 0, 1, 2, 3 in that order — **only if** the vehicle-level gate `G` is true.
-`G` is a host-supplied Boolean combining: effects enabled for this vehicle, the vehicle not
-being in the special mover mode in which aero is disabled and published per-wheel utilisation
-is forced to 0 (Stage-external), and a global game-state code not lying in a reserved range.
-These producers are external (TM-U2). When `G` is false nothing is sampled: no strip is
-ended and no point is added; each wheel's open strip stays open. [inf]
+`G` is the conjunction of three conditions (TM-U2, resolved 2026-10-17):
+
+1. **Wheel effects are enabled for this vehicle.** A per-vehicle Boolean `E`, the
+   conjunction of four conditions: the vehicle's wheel-effects flag is set; the vehicle is
+   not session-suppressed; its wheel collider exists; and its mover is not in the no-effects
+   context. `E` is false while the vehicle is being set up, torn down or despawned (flag
+   cleared) and during the pre-race start phase **including the countdown**, where a
+   session-phase suspension is applied to every car in the field and lifted when the cars are
+   put into play at race start. It is true during ordinary racing. **Residual (unknown):** the
+   paused, finished and replay phases, and the exact set of race types that run the pre-race
+   start phase. [inf]
+2. **The vehicle is not in the special mover mode**, the mode in which aero is disabled and
+   the published per-wheel utilisation is forced to 0 (TM-12). It is entered during vehicle
+   (re)placement/initialisation (placing the car at its start transform) and leaves when
+   normal vehicle dynamics take over. [inf; exact real-play trigger gue]
+3. **The global game-state code — the current venue id (the number used to select the
+   venue's route/track data) — is not in the reserved range [4400, 4499] inclusive.** That
+   range is the id block of the **Organic Drag** events (public in-game event name, flagged
+   for traceability; block header 4400; shipped venues 4401, 4402, 4404). Free roam uses 4000,
+   and ordinary circuit/sprint/street/drift/speedway
+   events use ids outside the block, so this condition is true for them and **false for the
+   Organic Drag events**. [obs for ids/range; inf for the comparison]
+
+When `G` is false nothing is sampled: no strip is ended and no point is added; each wheel's
+open strip stays open. In particular **no skid marks are ever laid on the Organic Drag
+venues (ids 4400…4499), for any car, including the player's.** [inf]
+
+`G` is evaluated **per vehicle**: the sampler runs for the player vehicle and for every
+in-play non-player vehicle (AI opponents and traffic), each with its own clause-1 and
+clause-2 state and all sharing the single global clause-3 venue id. The wheel-effects
+routine is reached from the update path of more than one car-mover class, and the pre-race
+start phase suspends wheel effects for every car in the field, so a non-player car with `G`
+true lays a strip exactly as the player's does. A host that samples only the player vehicle
+does not reproduce this. **Residual (unknown):** which car roles use which mover class,
+whether every mover class that runs the routine applies all three clauses, and whether
+ambient free-roam traffic outside a race field runs it at all. [inf]
 
 Per-wheel inputs read by the sampler are the values left by the most recent force
 preparation/cap of that frame (the same values the frame publishes): sliding branch flag,
@@ -116,6 +147,18 @@ sliding wheel moving faster than 1 m/s lays a mark regardless of load. A grippin
 lays one only when `u·N > 8` kN, i.e. near saturation under a heavy load. Equality (`u·N=8`,
 speed exactly 1) does not lay. If the predicate is false the wheel's trail is **ended** (TM-9).
 NaN comparisons are false. [inf]
+
+**Wheel-suppression mask (TM-U3, resolved 2026-10-17).** The mask is a per-vehicle field of
+four bits (bit `i` = wheel `i`) with a single per-vehicle **enable** flag. Both
+belong to the vehicle's serialized state: they are set to zero when the vehicle object is
+created, and their only other access is the per-vehicle state save/load path (used to persist
+and to exchange car state). **No in-game event writer exists** — no damage, race-type, drag,
+scripted-state or mode-change code ever sets either field. Therefore, unless a loaded or
+exchanged state carries non-zero values, the mask is always all-clear and this clause never
+suppresses a mark in ordinary play. The same mask together with its enable flag also gates a
+per-wheel tyre effect; shipped effect tables contain effects named for a blown tyre /
+driving on a flat tyre consistent with that intended use, but no producer was found (naming:
+[gue]). [inf]
 
 ## TM-4 Mark sample geometry
 
@@ -299,7 +342,10 @@ The utilisation `u` of TM-3 is published per wheel every frame (forced to 0 in t
 mover mode of TM-2) together with its four-wheel mean. The executable reads these published
 values in several other places; which effects (smoke, audio, camera) use them and with which
 thresholds was **not** established (TM-U1). No smoke/screech law is specified here. The
-mark system itself consumes only the unpublished internal values listed in TM-2. [inf]
+mark system itself consumes only the unpublished internal values listed in TM-2. Whether the
+published `u` is in fact forced to 0 in the special mover mode is a TM-U1 (published-value
+consumer) question: it cannot affect marks, because TM-2 clause 2 excludes that mode before
+the sampler runs and the mark system reads only the internal values. [inf]
 
 ## TM-13 Edge cases
 
@@ -317,7 +363,8 @@ mark system itself consumes only the unpublished internal values listed in TM-2.
 `test-vectors/tire_marks.json` covers: lay predicate boundaries; sample geometry and
 intensity (straight, 30°, 70°, sideways; road/dirt/grass/puddle; cross slope);
 quantisation; strip sequences (straight replacement, arc commits and *full* continuation,
-corner break, surface split, origin-distance reject, long steps); vertex alpha; the fade
+corner break, surface split, origin-distance reject, long steps); the per-vehicle gate `G`
+truth table and venue-range boundaries (`vehicle_gate`); vertex alpha; the fade
 metric; cell keys. `test-vectors/render_state.json` (TM-15) covers effective per-pixel
 opacity, source colour and composited results over a reference grey.
 
@@ -448,11 +495,21 @@ which overlapping strips are drawn. [inf; arithmetic exact]
 ## Unknowns / ambiguities
 
 - **TM-U1** Smoke, screech, camera or controller consumers of the published `u`/sliding
-  values and their thresholds; whether they share TM-3's gate.
-- **TM-U2** Producers of the vehicle gate `G` (effects-enabled flag, game-state code range,
-  special mover mode) in ordinary single-player driving; assumed true for a normal player car.
-- **TM-U3** Producer of the per-wheel suppression mask. Only a reset-time clear and a
-  state serializer were found; a "blown tyre" meaning is guessed. Default all clear.
+  values and their thresholds; whether they share TM-3's gate. Includes whether the published
+  `u` is actually zeroed in the special mover mode (TM-12; not a mark-system concern).
+- **TM-U2** *Resolved 2026-10-17 (see TM-2).* Producers of the vehicle gate `G`: a
+  per-vehicle wheel-effects-enabled flag (set/cleared on join/leave play and during a session
+  phase such as the pre-race start), the special mover mode (entered during vehicle
+  (re)placement/initialisation), and the current venue id compared with the reserved
+  Organic-Drag block [4400, 4499] (clause false on those events). Residual: whether ordinary
+  single-player driving ever holds the special mover mode (believed not), the exact frames
+  on which the effects-enabled flag flips, and the clause-1 state in the paused, finished and
+  replay phases (TM-2 clause 1).
+- **TM-U3** *Resolved 2026-10-17 (see TM-3).* The per-wheel suppression mask (four bits) and
+  its adjacent enable flag are per-vehicle serialized state, zeroed at creation and touched
+  only by the state save/load path; **no in-game producer exists**, so the mask is all-clear
+  in ordinary play. Residual: the external source of non-zero values (a saved/exchanged car
+  state) and the "blown tyre" naming, which remains [gue].
 - **TM-U4** *Mostly resolved by TM-15* (colour ×2 so RGB 128 ≈ unity; alpha ×1 so 127 →
   0.498; blend/depth/cull/fog/filter state; no depth bias). Residual: draw order of the mark
   block relative to cars, tyre smoke and other blended decals; the min/mag filter values of the

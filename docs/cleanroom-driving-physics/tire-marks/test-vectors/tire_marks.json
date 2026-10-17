@@ -118,6 +118,218 @@
    "lay": true
   }
  ],
+ "vehicle_gate": [
+  {
+   "name": "clause1 false, clause2 false, non-reserved 4399",
+   "input": {
+    "clause1": false,
+    "clause2": false,
+    "venue": 4399,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "clause1 false, clause2 true, non-reserved 4399",
+   "input": {
+    "clause1": false,
+    "clause2": true,
+    "venue": 4399,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "clause1 true, clause2 false, non-reserved 4399",
+   "input": {
+    "clause1": true,
+    "clause2": false,
+    "venue": 4399,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "gate true: clause1 true, clause2 true, non-reserved 4399",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4399,
+    "clause3": true
+   },
+   "lays": true
+  },
+  {
+   "name": "reserved lower bound 4400, clause1 true clause2 true",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4400,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4400, clause1 false clause2 true",
+   "input": {
+    "clause1": false,
+    "clause2": true,
+    "venue": 4400,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4400, clause1 true clause2 false",
+   "input": {
+    "clause1": true,
+    "clause2": false,
+    "venue": 4400,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4400, clause1 false clause2 false",
+   "input": {
+    "clause1": false,
+    "clause2": false,
+    "venue": 4400,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved upper bound 4499, clause1 true clause2 true",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4499,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4499, clause1 false clause2 true",
+   "input": {
+    "clause1": false,
+    "clause2": true,
+    "venue": 4499,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4499, clause1 true clause2 false",
+   "input": {
+    "clause1": true,
+    "clause2": false,
+    "venue": 4499,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "reserved 4499, clause1 false clause2 false",
+   "input": {
+    "clause1": false,
+    "clause2": false,
+    "venue": 4499,
+    "clause3": false
+   },
+   "lays": false
+  },
+  {
+   "name": "gate true: clause1 true, clause2 true, non-reserved 4500",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4500,
+    "clause3": true
+   },
+   "lays": true
+  },
+  {
+   "name": "clause1 false, clause2 true, non-reserved 4500",
+   "input": {
+    "clause1": false,
+    "clause2": true,
+    "venue": 4500,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "clause1 true, clause2 false, non-reserved 4500",
+   "input": {
+    "clause1": true,
+    "clause2": false,
+    "venue": 4500,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "clause1 false, clause2 false, non-reserved 4500",
+   "input": {
+    "clause1": false,
+    "clause2": false,
+    "venue": 4500,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "free roam 4000, gate true",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4000,
+    "clause3": true
+   },
+   "lays": true
+  },
+  {
+   "name": "ordinary circuit 1200, gate true",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 1200,
+    "clause3": true
+   },
+   "lays": true
+  },
+  {
+   "name": "pre-race countdown / load: clause1 false",
+   "input": {
+    "clause1": false,
+    "clause2": true,
+    "venue": 4000,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "special mover mode: clause2 false",
+   "input": {
+    "clause1": true,
+    "clause2": false,
+    "venue": 4000,
+    "clause3": true
+   },
+   "lays": false
+  },
+  {
+   "name": "non-player vehicle, gate true (lays)",
+   "input": {
+    "clause1": true,
+    "clause2": true,
+    "venue": 4000,
+    "clause3": true
+   },
+   "lays": true
+  }
+ ],
  "sample_geometry": [
   {
    "name": "240SX front, rolling straight, sliding (lock), road",
@@ -2397,5 +2609,5 @@
    ]
   }
  ],
- "_provenance": "Synthetic. Every expected value is an arithmetic/state consequence of tire-marks SPEC.md TM-3..TM-11 computed by an analyst-only reference calculation; none is an original runtime capture. Floats rounded to 7 decimals; compare with abs tol 1e-6 unless the README says exact."
+ "_provenance": "Synthetic. Every expected value is an arithmetic/state consequence of tire-marks SPEC.md TM-3..TM-11 computed by an analyst-only reference calculation; none is an original runtime capture. Floats rounded to 7 decimals; compare with abs tol 1e-6 unless the README says exact. vehicle_gate rows give clause3 = (venue not in [4400,4499]) and lays = clause1 AND clause2 AND clause3 (SPEC.md TM-2), evaluated per vehicle."
 }

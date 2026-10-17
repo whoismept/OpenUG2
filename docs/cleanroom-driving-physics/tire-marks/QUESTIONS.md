@@ -8,8 +8,28 @@ SPEC.md through review, not by implementer contact.
   reuse the TM-3 lay predicate?
 - **TM-Q2 (TM-U2)** In ordinary single-player free-roam and races, is the vehicle-level gate
   G always true for the player car and for AI/traffic cars?
+  **Answered by SPEC.md TM-2 (2026-10-17, static [inf]; ids/range [obs]):** No.
+  `G` = wheel-effects-enabled(this vehicle) AND not special-mover-mode AND (venue id not in
+  [4400, 4499]). Free roam is id 4000 and ordinary circuit/sprint/street/drift/speedway
+  events use ids outside the block, so for those `G` reduces to the first two conditions,
+  which normally hold for the player car and for in-play AI/traffic. But the range
+  [4400, 4499] is the **Organic Drag** venue block (public in-game event name, flagged;
+  shipped venues 4401/4402/4404): on those
+  events clause 3 is false and **no skid marks are laid at all**, for any car. Effects are
+  also suspended for every car during the pre-race start / load phase (suppress flag) and
+  while a car is in the special mover mode (re)placement state. Residual: whether ordinary
+  driving ever holds the special mover mode.
 - **TM-Q3 (TM-U3)** What sets the per-wheel suppression mask in retail play (blown tyre,
   drag-race event, scripted state)? Until answered, hosts supply all-clear.
+  **Answered by SPEC.md TM-3 (2026-10-17, static [inf]):** Nothing in game logic sets it. The
+  four-bit mask and its adjacent enable flag are per-vehicle **serialized state**: zeroed when
+  the vehicle object is created, and otherwise only read/written by the per-vehicle state
+  save/load path. An exhaustive instruction search found no in-place (bit/byte/dword) writer
+  and no game-logic store anywhere in the executable — no damage, drag, scripted or
+  mode-change path touches it. So in ordinary play the mask is always all-clear and
+  **hosts supplying all-clear are correct**. The mask (with its enable flag) also gates a
+  per-wheel tyre effect; shipped effect tables name a blown-tyre / drive-on-flat-tyre effect
+  consistent with the intended use, but no producer was found (naming [gue]).
 - **TM-Q4 (TM-U4)** Is vertex colour/alpha 128 unity (×2 modulate) in the original renderer?
   This decides whether a full-intensity mark shows the texture at ~50 % or ~100 % opacity.
   A controlled in-game screenshot comparison on plain road would settle it.
@@ -60,7 +80,34 @@ named host choice (see IMPL_DESIGN.md); none is claimed to be retail behaviour.
 - **TM-IQ8 (TM-6, TM-U10)** Out-of-range half-width components / intensity are saturated
   (int8 / 0..255) rather than wrapped; unreachable with stock data.
 - **TM-IQ9 (TM-2/TM-U2)** Host gate G = contact model ready AND not the alternate-mover mode (aero
-  disabled) AND session not suspended. No game-state-code range exists in this host.
+  disabled) AND session not suspended AND the venue id not in [4400, 4499].
+  *Retail parity note (2026-10-17):* the retail gate also suppresses wheel effects when the venue
+  id is in [4400, 4499] (the Organic Drag block, public event name; shipped venues 4401/4402/4404). A parity host
+  should add that range check; the implementer's host choice above is otherwise unchanged.
+  **Implemented (2026-10-17, SPEC.md sha256 b8fddf79...):** the range check is now `tm_venue_lays_marks`
+  (`!TM_VENUE_RESERVED_LO <= id <= TM_VENUE_RESERVED_HI`, 4400/4499) and `tm_drive_gate(s, venue_id)`
+  combines all three clauses. `main.c` passes the active event's route id (`world.city.ev[...].id`) or
+  4000 for free roam. Clause 1 stays the host mapping `contact_ready && prepared && !suspended`; the
+  per-wheel mask stays host-supplied all-clear (TM-3: no in-game producer).
+  *Amendment (2026-10-17, SPEC.md TM-2 clause 1):* clause 1 is now the per-vehicle conjunction
+  (wheel-effects flag set, not session-suppressed, collider present, mover not in the no-effects
+  context), and the **pre-race start/countdown is an explicit suspended phase**: a parity host must
+  treat the pre-race start/countdown as suspended, not only `DRIVE_SESSION_SUSPENDED`. The sampler is
+  **per vehicle** — retail runs it for the player and for every in-play AI/traffic car, so a host that
+  samples only the player vehicle is a scope limitation, not a spec choice. The per-wheel mask stays
+  host-supplied all-clear (TM-3: no in-game producer).
+  **Implemented (2026-10-17, SPEC.md sha256 5b968486...):** the per-vehicle gate is now a pure module
+  predicate `tm_vehicle_gate(clause1, clause2, venue_id) = clause1 && clause2 && tm_venue_lays_marks(venue_id)`
+  (the `vehicle_gate` vectors test it: 21 rows, each also checking `clause3 == tm_venue_lays_marks(venue)`),
+  and the host adapter computes `clause1` as `contact_ready && prepared && phase != DRIVE_SESSION_SUSPENDED
+  && phase != DRIVE_SESSION_COUNTDOWN`. The countdown conjunct is the behavioural change: marks are no
+  longer laid during the pre-race start (`race_state == 0`, host phase `DRIVE_SESSION_COUNTDOWN`) and
+  resume at race start (`DRIVE_SESSION_ACTIVE`). **Scope limitation (recorded as the spec directs):** this
+  host still samples **only the player vehicle** (`g_tm_player`); it does not run the sampler for AI
+  opponents or traffic, so their marks are not reproduced. Clause 1's remaining per-vehicle conditions
+  (wheel-effects flag, collision-info present, mover not in the no-effects context) and the non-player
+  vehicle roles are not separable with this host's state and are approximated by `contact_ready && prepared`
+  plus the two phase exclusions. The per-wheel mask stays host-supplied all-clear (TM-3).
 
 ## Render-parity questions (analyst, 2026-10-16)
 

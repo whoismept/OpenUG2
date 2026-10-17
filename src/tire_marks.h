@@ -15,6 +15,11 @@
 #define TM_SURFACES   29       /* TM-1.2 ids 0...28 */
 #define TM_ORIGIN_RANGE 4.0f   /* TM-7 step 1 */
 #define TM_CELL_REFRESH 300    /* TM-10.2: world frames (60 Hz) */
+/* TM-2 clause 3: the reserved (global game-state code / venue id) block of the Organic
+ * Drag events. Marks are never laid while the current venue id is inside it; free roam
+ * (4000) and ordinary events are outside. */
+#define TM_VENUE_RESERVED_LO 4400
+#define TM_VENUE_RESERVED_HI 4499
 
 /* Mark textures (TM-1.3): index into per-texture arrays. 0 = none. */
 enum { TM_TEX_NONE = 0, TM_TEX_ROAD = 1, TM_TEX_DIRT = 2, TM_TEX_GRASS = 3, TM_TEX_COUNT = 4 };
@@ -62,6 +67,14 @@ typedef struct {
 } TmSample;
 
 int tm_lays(const TmWheelIn *wheel);                         /* TM-3 predicate */
+/* TM-2 clause 3: 1 when the current global game-state code / venue id permits wheel
+ * effects, 0 inside the reserved Organic-Drag block [4400, 4499]. */
+int tm_venue_lays_marks(int venue_id);
+/* TM-2 vehicle-level gate G, evaluated per vehicle: clause 1 (wheel effects enabled for
+ * this vehicle) AND clause 2 (not the special mover mode) AND clause 3
+ * (tm_venue_lays_marks of the shared venue id). A false G means nothing is sampled for
+ * that vehicle this frame. */
+int tm_vehicle_gate(int clause1, int clause2, int venue_id);
 /* TM-4/5/6. Returns 1, or 0 when no ground is found by either probe
  * (TM-U7 host choice: nothing is laid). */
 int tm_sample(const TmWheelIn *wheel, int index, const TmGround *ground, TmSample *out);

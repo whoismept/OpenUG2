@@ -1,7 +1,7 @@
 # Synthetic tire-mark vectors
 
 `tire_marks.json` is normative after review. Every expected value is an arithmetic or
-state consequence of SPEC.md TM-3…TM-11, computed by an analyst-only reference calculation
+state consequence of SPEC.md TM-2…TM-11, computed by an analyst-only reference calculation
 written from the spec text. None is an original runtime capture; the original executable
 was not run. Car tyre widths used (.205, .225, .235) are the stock values of TM-1.1 [obs].
 
@@ -10,6 +10,13 @@ Sections:
 - `lay_predicate` — TM-3 inputs (contact, suppression bit, horizontal U, sliding flag, u,
   N in kN) → lay/end. Booleans exact; includes the strict equality cases `u·N = 8` and
   horizontal speed exactly 1.
+- `vehicle_gate` — TM-2 vehicle gate `G`, evaluated per vehicle. Inputs: `clause1` (wheel
+  effects enabled for this vehicle), `clause2` (not the special mover mode), `clause3`
+  (venue not in the reserved block) and the raw `venue` id, with the invariant
+  `clause3 = (venue ∉ [4400, 4499])`; output `lays` = `clause1 ∧ clause2 ∧ clause3`. Full
+  2×2×4 truth table over venue {4399, 4400, 4499, 4500}, plus free roam (4000), an ordinary
+  circuit (1200), the pre-race countdown (clause 1 false), the special mover mode (clause 2
+  false) and a non-player vehicle. Arithmetic consequence of the TM-2 text.
 - `sample_geometry` — TM-4/5/6: wheel centre C, sampled velocity U, lateral axis l
   (level, l = (0,1,0) so heading is +x), width W, factor k_s, sliding flag, surface, and a
   ground function (flat z = 0 or z = 0.1·y) → alignment, half-width w, sample point,

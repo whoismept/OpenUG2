@@ -1,12 +1,16 @@
 # Tire marks - implementation design log
 
-Implements `SPEC.md` (sha256 `1b864fc16a007d8e6d6736bf8615b469ec975abc695620bf7a1bbbfd784ff454`,
-approved in `REVIEW.md`; rendering updated to TM-15/TM-11.2 on 2026-10-16, geometry/storage written against the
-earlier approved text `99b70795...`) and encodes `test-vectors/tire_marks.json`
-(sha256 `1f18c4b4b0f299711dc68a291528533b84ab42dee213b10081a6ba14ed2e2633`) and `test-vectors/render_state.json`
+Implements `SPEC.md` (sha256 `5b968486f48d970e7872848ae70d113eafa18082104307e4137e40bdd28276e0`,
+the 2026-10-17 per-vehicle-gate amendment: TM-2 clause 1 gains the session-state conjunct
+(pre-race start **including the countdown**) and the gate is restated as a per-vehicle
+conjunction; earlier revisions `b8fddf79...` TM-U2/TM-U3, `1b864fc1...` TM-15/TM-11.2 and
+`99b70795...` geometry/storage)
+and encodes `test-vectors/tire_marks.json`
+(sha256 `e2be25a37aa2469377766dbc913727d396b17403c5301d873fbd4ea51407194d`, adding the
+`vehicle_gate` truth table) and `test-vectors/render_state.json`
 (sha256 `5aa0eace8e1f55a3509211c3e7486efa81bd121252b181d761a40abc86de7e25`). Clean-room: only the
 spec, the vectors and the merged independent Stage1-5 modules were used. Open points the spec leaves
-unanswered are in `QUESTIONS.md` under "Implementer questions" (TM-IQ1..12).
+unanswered are in `QUESTIONS.md` under "Implementer questions" (TM-IQ1..13).
 
 ## Files
 
@@ -57,6 +61,40 @@ unanswered are in `QUESTIONS.md` under "Implementer questions" (TM-IQ1..12).
   wheels 0..3 in order, only when `tm_drive_gate`. Inputs are the values the frame left behind (contact
   flag, `gripping`, `utilisation`, load, `contact.wheel[i].centre/surface`, `U = V + Omega x arm`, steered
   wheel lateral axis, `O = P - B c`).
+- **TM-2 gate `G` (per-vehicle amendment, 2026-10-17).** `G` is a per-vehicle conjunction of the
+  three spec clauses, sharing the one global venue id. It is factored into a pure predicate in the
+  module and a host mapping in the adapter:
+  - pure module: `tm_vehicle_gate(clause1, clause2, venue_id) = clause1 && clause2 &&
+    tm_venue_lays_marks(venue_id)`; clause 3 is
+    `tm_venue_lays_marks(venue_id) = !(4400 <= venue_id <= 4499)` (`TM_VENUE_RESERVED_LO/HI`).
+    This is what the `vehicle_gate` vectors test (`lays = clause1 AND clause2 AND clause3`).
+  - host adapter: `tm_drive_gate(s, venue_id) = tm_vehicle_gate(clause1, !s->alternate_movement,
+    venue_id)` with `clause1 = s->contact_ready && s->prepared &&
+    s->session.phase != DRIVE_SESSION_SUSPENDED && s->session.phase != DRIVE_SESSION_COUNTDOWN`.
+  Clause 1 (wheel effects enabled for this vehicle) is the host mapping: `contact_ready && prepared`
+  (collider present / mover prepared) and "no session-phase suspension". The amendment makes the
+  pre-race start phase **including the countdown** an explicit suspended phase, lifted at race start;
+  the host carries it as `DRIVE_SESSION_COUNTDOWN` (set by `drive_session_local(active, countdown)`
+  while `race_state == 0`), which clause 1 now excludes alongside the general
+  `DRIVE_SESSION_SUSPENDED`. Clause 2 (special mover mode, aero disabled / utilisation forced to 0)
+  is `alternate_movement` (the Stage1-5 alternate-movement channel). Clause 3 is unchanged.
+  The host passes the current global game-state code = the active event's route id
+  (`world.city.ev[world.city.race.ev].id`, the number that selects `Paths<id>.bin`), or 4000 for
+  free roam. Free roam and ordinary circuit/sprint/street/drift/speedway ids are outside the block,
+  so the gate reduces to clauses 1-2; on an Organic-Drag venue (ids 4401/4402/4404 shipped) the gate
+  is false for every car, so nothing is sampled and each open strip stays open (TM-2). The
+  countdown conjunct is the only behavioural change from the amendment.
+- **TM-2 per-vehicle scope limitation.** The spec's sampler runs per vehicle: for the player and for
+  every in-play non-player vehicle (AI opponents and traffic), each with its own clause-1/clause-2
+  state and the shared clause-3 venue id; a non-player car with `G` true lays a strip exactly as the
+  player's. This host still samples **only the player vehicle** (`g_tm_player` at the single call
+  site in `main.c`); that is a **scope limitation of this host, not a spec choice**, and no claim of
+  reproducing AI/traffic marks is made (also recorded in QUESTIONS.md TM-IQ9).
+- **TM-3 mask (2026-10-17 amendment).** The amendment resolves TM-U3: the four-bit suppression mask
+  and its enable flag are per-vehicle serialized state with **no in-game producer**, so the
+  all-clear value the host already supplies (`tm_drive_inputs(..., mask = 0, ...)` in `main.c`) is
+  correct for ordinary play. No behaviour change: the `masked` bit path in `tm_lays` is retained for
+  a loaded/exchanged state that carries non-zero bits, which no host path currently produces.
 - **TM-13** Verified by tests: origin range, ended trail on airborne/masked wheel, store persistence.
 
 ## Host integration (main.c)
@@ -101,18 +139,23 @@ as stored (value*17).
 
 ## Tests
 
-`make tire-marks-test` (710 checks, including every `render_state.json` section: constants, effective_alpha 9 rows,
+`make tire-marks-test` (754 checks, including every `render_state.json` section: constants, effective_alpha 9 rows,
 source_colour 5 rows, composite 5 rows, plus a built-strip check and `tm_payload_base`; `make tire-marks-render-test`
 (52 checks, hidden GL window, no data needed except the optional texture statistics): the composite vector rows
 through the production mark pass (+-3/255), colour x256/255 and clamp, alpha not doubled (white mark 127/255),
 texel alpha used as is, no discard of faint pixels, fog on colour only, no culling, depth `<=` pass/reject, depth write
 off, sampler wrap/mips, state restore; when `GLOBAL/InGameCommon.bun` is found (`TM_DATA_DIR`, default
 `/home/dq/Games/Need for Speed Underground 2`) the three decoded textures are checked against TM-15.5 (alpha max/mean).
-Earlier list: lay_predicate 9, sample_geometry 7, strip_sequences 6 (events, strips, points,
+Earlier list: lay_predicate 9, `vehicle_gate` 21 rows (each row checks both
+`tm_venue_lays_marks(venue) == clause3` and `tm_vehicle_gate(clause1, clause2, venue) == lays`),
+sample_geometry 7, strip_sequences 6 (events, strips, points,
 attached flags), render_alpha 6, view_metric 8 plus K, cell_keys 5, then non-vector behaviour (surface table,
 hashes, utilisation, origin range, trail ending, 128/64 capacity eviction, 40-cell eviction, vertex geometry/alpha/
-culling). `make tire-marks-drive-test` drives the Stage5 fixture: gripping cruise lays nothing, a handbrake slide
-lays strips from the locked rear wheels, `u` stays in 0..1, gate drops in alternate-mover mode.
+culling, and the TM-2 clause-3 venue block `[4400, 4499]`). `make tire-marks-drive-test` drives the Stage5 fixture: gripping cruise lays nothing, a handbrake slide
+lays strips from the locked rear wheels, `u` stays in 0..1, gate drops in alternate-mover mode,
+on the reserved venue block `[4400, 4499]` (true at 4000/4001/4399/4500) and in the pre-race
+start/countdown phase (`DRIVE_SESSION_COUNTDOWN` and `DRIVE_SESSION_SUSPENDED` both false; true
+again when `DRIVE_SESSION_ACTIVE`).
 The vectors prove spec self-consistency only; the `[inf]` claims (8 kN, 128/64 capacities, alpha unity) are
 unverified against retail (REVIEW.md note).
 

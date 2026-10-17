@@ -6,12 +6,22 @@
 #include "drive_stage1.h"
 #include "tire_marks.h"
 
-/* TM-2 vehicle-level gate G. Effects are enabled for this host; the special
- * mover mode (aero disabled, alternate movement) and a suspended session do
- * not sample (TM-U2: the global game-state code range has no host producer). */
-static inline int tm_drive_gate(const Stage1Drive *s) {
-    return s->contact_ready && s->prepared && !s->alternate_movement &&
-           s->session.phase != DRIVE_SESSION_SUSPENDED;
+/* TM-2 vehicle-level gate G, the conjunction of clause 1 (wheel effects enabled
+ * for this vehicle: the host's contact model is ready and prepared, the wheel
+ * collider exists, and no session-phase suspension is applied), clause 2 (not the
+ * special mover mode = alternate_movement, aero disabled), and clause 3 (the current
+ * venue id is not in the reserved Organic-Drag block; `venue_id` is the host's current
+ * global game-state code, the event's route id, or 4000 for free roam).
+ *
+ * Clause 1 (TM-2, amended): the pre-race start phase INCLUDING the countdown applies a
+ * session-phase suspension to every car in the field, lifted when the cars are put into
+ * play at race start. The host carries that phase as DRIVE_SESSION_COUNTDOWN, so both it
+ * and the general no-dynamics DRIVE_SESSION_SUSPENDED make clause 1 false. */
+static inline int tm_drive_gate(const Stage1Drive *s, int venue_id) {
+    int clause1 = s->contact_ready && s->prepared &&
+                  s->session.phase != DRIVE_SESSION_SUSPENDED &&
+                  s->session.phase != DRIVE_SESSION_COUNTDOWN;
+    return tm_vehicle_gate(clause1, !s->alternate_movement, venue_id);
 }
 
 /* Fills the four wheels' TmWheelIn and the vehicle origin O = P - B*c.

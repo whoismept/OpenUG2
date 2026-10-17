@@ -47,6 +47,22 @@ static void test_lay(const J *root) {
     }
 }
 
+/* ---- vehicle_gate (TM-2) ------------------------------------------------------------- */
+static void test_vehicle_gate(const J *root) {
+    const J *list = jget(root, "vehicle_gate");
+    CHECK(list && list->n > 0, "vehicle_gate missing");
+    for (int i = 0; list && i < list->n; i++) {
+        const J *c = list->kid[i], *in = jget(c, "input");
+        int clause1 = jbool(in, "clause1"), clause2 = jbool(in, "clause2");
+        int venue = (int)jnum(in, "venue", 0), clause3 = jbool(in, "clause3");
+        int want = jbool(c, "lays");
+        CHECK(tm_venue_lays_marks(venue) == clause3, "vehicle_gate '%s': clause3 %d want %d",
+              jstrv(c, "name"), tm_venue_lays_marks(venue), clause3);
+        CHECK(tm_vehicle_gate(clause1, clause2, venue) == want, "vehicle_gate '%s': got %d want %d",
+              jstrv(c, "name"), tm_vehicle_gate(clause1, clause2, venue), want);
+    }
+}
+
 /* ---- sample_geometry -------------------------------------------------------------- */
 static int ground_flat(void *u, int wheel, float x, float y, float z, float *h) {
     (void)u; (void)wheel; (void)x; (void)y; (void)z; *h = 0; return 1;
@@ -190,6 +206,10 @@ static void test_behaviour(void) {
           tm_surface_width_factor(8) == 1.4f && tm_surface_width_factor(10) == 1.0f, "width factors");
     CHECK(tm_texture_hash(TM_TEX_ROAD) == 0x9076F58Fu && tm_texture_hash(TM_TEX_DIRT) == 0x906F30FCu &&
           tm_texture_hash(TM_TEX_GRASS) == 0x9E904149u, "texture hashes");
+    /* TM-2 clause 3: the reserved Organic-Drag venue block [4400, 4499] suppresses marks */
+    CHECK(tm_venue_lays_marks(4000) && tm_venue_lays_marks(4001) && tm_venue_lays_marks(4399) &&
+          tm_venue_lays_marks(4500) && !tm_venue_lays_marks(4400) && !tm_venue_lays_marks(4401) &&
+          !tm_venue_lays_marks(4499), "venue-id gate [4400,4499]");
     /* TM-3 utilisation */
     CHECK(tm_utilisation(5, 10, 0, 1) == .5f && tm_utilisation(20, 10, 0, 1) == 1.0f &&
           tm_utilisation(1, .001, 0, 1) == 1.0f && tm_utilisation(1, 10, 1, 1) == 1.0f &&
@@ -372,7 +392,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0]) g_dir = argv[1];
     J *root = jload("tire_marks.json");
     if (!root) return 1;
-    test_lay(root); test_geometry(root); test_sequences(root); test_render(root);
+    test_lay(root); test_vehicle_gate(root); test_geometry(root); test_sequences(root); test_render(root);
     test_behaviour();
     test_payload_base();
     test_render_state();

@@ -8481,7 +8481,10 @@ int main(int argc, char **argv) {
            integration, for wheels 0..3, only while gate G holds. */
         g_tm_frame++;tm_set_frame(&g_tm,g_tm_frame);
         if(stage1_active && g_stage1.contact_ready) {
-            if(tm_drive_gate(&g_stage1) && !sstatic && !capture_policy.freeze_motion) {
+            /* TM-2 clause 3: the current venue id (event route id; free roam 4000). */
+            int tm_venue = world.city.race.active && world.city.race.ev >= 0
+                         ? world.city.ev[world.city.race.ev].id : 4000;
+            if(tm_drive_gate(&g_stage1,tm_venue) && !sstatic && !capture_policy.freeze_motion) {
                 TmWheelIn tm_in[4];float tm_origin[3];
                 tm_drive_inputs(&g_stage1,g_tm_width,0,tm_in,tm_origin);
                 TmGround tm_ground={tm_world_ground,&scene,0};

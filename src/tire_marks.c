@@ -38,7 +38,13 @@ int tm_car_read(const unsigned char *data, long length, const char *name, float 
     return 1;
 }
 
-/* ---- TM-3 ------------------------------------------------------------------------ */
+/* ---- TM-2 clause 3 / TM-3 --------------------------------------------------------- */
+int tm_venue_lays_marks(int venue_id) {
+    return !(venue_id >= TM_VENUE_RESERVED_LO && venue_id <= TM_VENUE_RESERVED_HI);
+}
+int tm_vehicle_gate(int clause1, int clause2, int venue_id) {
+    return clause1 && clause2 && tm_venue_lays_marks(venue_id);
+}
 int tm_lays(const TmWheelIn *w) {
     if (!w->contact || w->masked) return 0;
     float h = sqrtf(w->U[0] * w->U[0] + w->U[1] * w->U[1]);

@@ -12,7 +12,7 @@ static void tick_marks(Trace *t,TmStore *store,TmVehicle *v,const float width[4]
     tick5(t,pedal,steer,hb,&ride);
     for(int i=0;i<4;i++){float u=t->drive.drivetrain.wheel[i].utilisation;assert(u>=0&&u<=1);}
     float m=t->drive.drivetrain.utilisation_mean;assert(m>=0&&m<=1);
-    if(!tm_drive_gate(&t->drive))return;
+    if(!tm_drive_gate(&t->drive,4001))return;
     TmWheelIn in[4];float O[3];tm_drive_inputs(&t->drive,width,0,in,O);
     TmGround g={flat_ground,NULL,0};tm_vehicle_update(store,v,in,O,0,&g);
 }
@@ -23,7 +23,7 @@ int main(void){
     for(int k=0;k<100;k++)tick_marks(&t,&store,&v,width,.3f,0,0);
     tm_vehicle_destroy(&v);tm_init(&store,128);
     for(int k=0;k<20;k++)tick_marks(&t,&store,&v,width,.3f,0,0);
-    assert(tm_drive_gate(&t.drive));
+    assert(tm_drive_gate(&t.drive,4001));
     printf("cruise: strips %d\n",used_strips(&store));
     assert(used_strips(&store)==0);
     for(int k=0;k<60;k++)tick_marks(&t,&store,&v,width,0,.5f,1);
@@ -32,7 +32,22 @@ int main(void){
            !t.drive.drivetrain.wheel[1].gripping,!t.drive.drivetrain.wheel[2].gripping,!t.drive.drivetrain.wheel[3].gripping);
     assert(strips>0);
     for(int i=0;i<TM_MAX_STRIPS;i++)if(store.strip[i].used)assert(store.strip[i].surface==1&&store.strip[i].n>=1);
-    t.drive.alternate_movement=1;assert(!tm_drive_gate(&t.drive));
-    puts("tire-mark drive adapter: gate, lay predicate on locked wheels, utilisation range passed");
+    t.drive.alternate_movement=1;assert(!tm_drive_gate(&t.drive,4001));
+    /* TM-2 clause 3: only the reserved Organic-Drag venue block [4400,4499] drops the gate */
+    t.drive.alternate_movement=0;
+    assert(tm_drive_gate(&t.drive,4000));   /* free roam id (spec TM-2) */
+    assert(tm_drive_gate(&t.drive,4001));   /* ordinary circuit event */
+    assert(tm_drive_gate(&t.drive,4399)&&tm_drive_gate(&t.drive,4500));
+    assert(!tm_drive_gate(&t.drive,4400)&&!tm_drive_gate(&t.drive,4401)&&!tm_drive_gate(&t.drive,4499));
+    /* TM-2 clause 1 (amended): the pre-race start phase INCLUDING the countdown suspends
+       wheel effects for every car in the field, so G is false there; it is lifted when the
+       cars are put into play at race start (ACTIVE). */
+    t.drive.session=(DriveSession){DRIVE_SESSION_COUNTDOWN,0};
+    assert(!tm_drive_gate(&t.drive,4001));
+    t.drive.session=(DriveSession){DRIVE_SESSION_SUSPENDED,0};
+    assert(!tm_drive_gate(&t.drive,4001));
+    t.drive.session=(DriveSession){DRIVE_SESSION_ACTIVE,0};
+    assert(tm_drive_gate(&t.drive,4001));
+    puts("tire-mark drive adapter: gate, venue block [4400,4499], countdown suspended, lay predicate on locked wheels, utilisation range passed");
     return 0;
 }
