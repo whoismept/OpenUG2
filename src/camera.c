@@ -547,6 +547,13 @@ static void cam_scales_original(int fov_bau, float aspect, int main_view, float 
     /* The half angles are whole BAU (SPEC 1: angles are 16-bit); the vectors in
      * tv09 only reproduce with truncation (docs/CAMERA.md D9). */
     int hx = (int)(s0 * (float)fov_bau * 0.5f), hy = (int)(s1 * (float)fov_bau * 0.5f);
+    /* The vertical half angle grows with height/width, so a narrow viewport pushes it past 90 degrees,
+     * where tan() turns negative and the picture flips (and near 90 it collapses to a sliver). SPEC 7 is
+     * only defined for ordinary window shapes (no test vector reaches 46 degrees), so a limit below 90
+     * changes none of them and keeps very narrow windows right side up. */
+    const int max_half = (int)(CAM_BAU_PER_TURN * (80.0f / 360.0f));
+    if (hx > max_half) hx = max_half;
+    if (hy > max_half) hy = max_half;
     *xs = 1.0f / tanf(CAM_BAU_TO_RAD(hx));
     *ys = 1.0f / tanf(CAM_BAU_TO_RAD(hy));
 }
