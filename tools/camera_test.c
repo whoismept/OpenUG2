@@ -568,6 +568,23 @@ static void test_projection_policy(const char *dir) {
         CHECK(m[0] == wx && m[5] == wy && m[11] == -1.0f, "cam_projection matrix scales");
     }
 }
+/* Very narrow viewports: the vertical half angle must stay below 90 degrees, or the picture flips. */
+static void test_projection_narrow(void) {
+    static const int sizes[][2] = {{300, 600}, {200, 600}, {120, 600}, {40, 600}, {1, 600}, {1, 100000}};
+    for (int mv = 0; mv < 2; mv++) for (int k = 0; k < 6; k++) {
+        float xs, ys;
+        cam_projection_scales(CAM_PROJ_ORIGINAL, 13020, sizes[k][0], sizes[k][1], mv, &xs, &ys);
+        CHECK(xs > 0 && ys > 0 && isfinite(xs) && isfinite(ys), "narrow %dx%d mv %d scales %g %g", sizes[k][0], sizes[k][1], mv, xs, ys);
+        cam_projection_scales(CAM_PROJ_WIDE, 13020, sizes[k][0], sizes[k][1], mv, &xs, &ys);
+        CHECK(xs > 0 && ys > 0 && isfinite(xs) && isfinite(ys), "narrow wide %dx%d mv %d scales %g %g", sizes[k][0], sizes[k][1], mv, xs, ys);
+    }
+    /* Narrower never gives a wider vertical view than the limit, and 4:3 is untouched. */
+    float x4, y4, xn, yn;
+    cam_projection_scales(CAM_PROJ_ORIGINAL, 13020, 640, 480, 1, &x4, &y4);
+    CHECK(near(y4, 1.486711, 2e-6), "4:3 unchanged %g", y4);
+    cam_projection_scales(CAM_PROJ_ORIGINAL, 13020, 1, 100000, 1, &xn, &yn);
+    CHECK(near(2 * atan(1.0 / yn) * 180 / M_PI, 160.0, 0.05), "vertical view limit %g", 2 * atan(1.0 / yn) * 180 / M_PI);
+}
 static void test_cycle(const char *dir) {
     Csv c; if (!csv_open(&c, dir, "tv10_view_cycle.csv")) return;
     for (int r = 1; r < c.n; r++) {
@@ -858,6 +875,7 @@ int main(int argc, char **argv) {
     test_noise(dir);
     test_projection(dir);
     test_projection_policy(dir);
+    test_projection_narrow();
     test_cycle(dir);
     test_behaviour();
     test_render_pose();

@@ -1,6 +1,6 @@
 /* rhi_vk.c - Vulkan backend of rhi.h (issue #14, P11a slice).
  *
- * Offscreen v0: no swapchain, no surface. The "main target" is a single RGBA8
+ * Offscreen v0: no swapchain. (P12a adds a window surface when the window can take one.) The "main target" is a single RGBA8
  * VkImage (plus a D16 depth image) sized to the window, which we clear and read
  * back. This slice implements only device/frame/readback/clear/caps; buffers,
  * textures, shaders, pipelines, draws and passes are stubs returning {0} /
@@ -14,6 +14,7 @@
 #include "rhi.h"
 #include "generated_shaders_vk.h"   /* build-time SPIR-V for the src/shaders/vk shaders */
 #include <SDL.h>
+#include <SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,6 +130,19 @@ static struct {
     SDL_Window              *window;
     VkInstance               instance;
     VkDebugUtilsMessengerEXT messenger;
+    VkSurfaceKHR             surface;      /* present mode only (P12a: created, not yet presented to) */
+    int                      present;      /* 1 = window surface + present-capable queue, 0 = offscreen */
+    int                      vsync;        /* RHI_DEVICE_VSYNC: FIFO, else MAILBOX/IMMEDIATE when offered */
+    /* Swapchain (present mode). The game renders into the offscreen colour image above; frame_end
+     * blits it (y-flipped) into the acquired swapchain image and presents. */
+    VkSwapchainKHR           sc;
+    VkImage                 *sc_img;       /* sc_n entries, owned by the swapchain */
+    VkSemaphore             *sc_render_sem; /* sc_n entries, one per image: present may outlive the fence */
+    uint32_t                 sc_n;
+    VkExtent2D               sc_ext;
+    VkFormat                 sc_fmt;
+    int                      sc_dirty;     /* out of date / suboptimal: recreate before the next present */
+    VkSemaphore              acquire_sem;
     VkPhysicalDevice         phys;
     VkDevice                 device;
     uint32_t                 queue_family;
@@ -399,12 +413,15 @@ static int ensure_recording(void) {
     return 1;
 }
 
-/* End, submit and wait for the frame command buffer (offscreen: no present). */
-static int flush(void) {
+/* End, submit and wait for the frame command buffer. `wait`/`signal` (optional) are the swapchain
+ * acquire / render-finished semaphores of a presenting frame_end. */
+static int flush_sync(VkSemaphore wait, VkSemaphore signal) {
     if (!g_vk.recording) return 1;
     if (!vk_ok(vkEndCommandBuffer(g_vk.cmd), "vkEndCommandBuffer")) return 0;
     g_vk.recording = 0;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_vk.cmd, 0, NULL };
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;   /* the blit into the swapchain image */
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, wait ? 1u : 0u, wait ? &wait : NULL,
+                        wait ? &wait_stage : NULL, 1, &g_vk.cmd, signal ? 1u : 0u, signal ? &signal : NULL };
     if (!vk_ok(vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence), "vkQueueSubmit")) return 0;
     g_vk.submits++;
     if (!vk_ok(vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return 0;
@@ -412,6 +429,7 @@ static int flush(void) {
     stream_after_submit();
     return vk_ok(vkResetFences(g_vk.device, 1, &g_vk.fence), "vkResetFences");
 }
+static int flush(void) { return flush_sync(VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
 /* Orientation: the engine's shaders are authored for GL clip space (+y up) and
  * rhi_read_pixels (P11a) flips image rows to match GL's bottom-left glReadPixels.
@@ -898,12 +916,207 @@ const RhiCaps *rhi_caps(void) {
 /* -------------------------------------------------------------------------- */
 /* Device lifetime                                                            */
 /* -------------------------------------------------------------------------- */
+static int has_ext(const VkExtensionProperties *ep, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(ep[i].extensionName, name)) return 1;
+    return 0;
+}
+
+static int device_has_ext(VkPhysicalDevice pd, const char *name) {
+    uint32_t ec = 0; vkEnumerateDeviceExtensionProperties(pd, NULL, &ec, NULL);
+    VkExtensionProperties *ep = calloc(ec ? ec : 1, sizeof *ep);
+    vkEnumerateDeviceExtensionProperties(pd, NULL, &ec, ep);
+    int r = has_ext(ep, ec, name);
+    free(ep);
+    return r;
+}
+
+/* ---- swapchain ---------------------------------------------------------- */
+static void swapchain_destroy(void) {
+    if (!g_vk.device) return;
+    vkDeviceWaitIdle(g_vk.device);
+    for (uint32_t i = 0; g_vk.sc_render_sem && i < g_vk.sc_n; i++)
+        if (g_vk.sc_render_sem[i]) vkDestroySemaphore(g_vk.device, g_vk.sc_render_sem[i], NULL);
+    free(g_vk.sc_render_sem); g_vk.sc_render_sem = NULL;
+    free(g_vk.sc_img);        g_vk.sc_img = NULL;
+    if (g_vk.sc) vkDestroySwapchainKHR(g_vk.device, g_vk.sc, NULL);
+    g_vk.sc = VK_NULL_HANDLE;
+    g_vk.sc_n = 0;
+}
+
+/* (Re)creates the swapchain for the surface's current size. Returns 0 when the device cannot present
+ * at all (no usable format/usage); returns 1 with sc == NULL when the surface is currently 0x0. */
+static int swapchain_create(void) {
+    VkSurfaceCapabilitiesKHR caps;
+    if (!vk_ok(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps), "surface capabilities")) return 0;
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        fprintf(stderr, "rhi_vk: swapchain images cannot be a transfer destination\n"); return 0;
+    }
+    uint32_t fc = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &fc, NULL);
+    VkSurfaceFormatKHR *fm = calloc(fc ? fc : 1, sizeof *fm);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &fc, fm);
+    static const VkFormat pref[2] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };   /* UNORM = GL's default framebuffer */
+    int pick = -1;
+    for (int p = 0; p < 2 && pick < 0; p++)
+        for (uint32_t i = 0; i < fc; i++)
+            if (fm[i].format == pref[p] && fm[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { pick = (int)i; break; }
+    for (uint32_t i = 0; i < fc && pick < 0; i++) {   /* any format the blit can write */
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.phys, fm[i].format, &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) pick = (int)i;
+    }
+    VkSurfaceFormatKHR chosen = pick >= 0 ? fm[pick] : (VkSurfaceFormatKHR){0};
+    free(fm);
+    if (pick < 0) { fprintf(stderr, "rhi_vk: no swapchain format the blit can write\n"); return 0; }
+    {   VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.phys, chosen.format, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+            fprintf(stderr, "rhi_vk: swapchain format %d is not a blit destination\n", (int)chosen.format); return 0; } }
+
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == UINT32_MAX) {   /* surface follows the swapchain: use the target size */
+        uint32_t tw = (uint32_t)g_vk.width, th = (uint32_t)g_vk.height;
+        ext.width  = tw < caps.minImageExtent.width  ? caps.minImageExtent.width  :
+                     tw > caps.maxImageExtent.width  ? caps.maxImageExtent.width  : tw;
+        ext.height = th < caps.minImageExtent.height ? caps.minImageExtent.height :
+                     th > caps.maxImageExtent.height ? caps.maxImageExtent.height : th;
+    }
+    swapchain_destroy();
+    g_vk.sc_dirty = 0;
+    if (ext.width == 0 || ext.height == 0) return 1;   /* minimised: present nothing until it has a size */
+
+    uint32_t pmc = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &pmc, NULL);
+    VkPresentModeKHR *pm = calloc(pmc ? pmc : 1, sizeof *pm);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &pmc, pm);
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;   /* always available; what vsync means */
+    if (!g_vk.vsync) {
+        int have_mailbox = 0, have_immediate = 0;
+        for (uint32_t i = 0; i < pmc; i++) {
+            if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) have_mailbox = 1;
+            if (pm[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) have_immediate = 1;
+        }
+        mode = have_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : have_immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : mode;
+    }
+    free(pm);
+
+    uint32_t want = caps.minImageCount + 1;
+    if (caps.maxImageCount && want > caps.maxImageCount) want = caps.maxImageCount;
+    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & alpha))
+        for (uint32_t b = 1; b <= VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR; b <<= 1)
+            if (caps.supportedCompositeAlpha & b) { alpha = (VkCompositeAlphaFlagBitsKHR)b; break; }
+    VkSwapchainCreateInfoKHR sci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, g_vk.surface, want,
+        chosen.format, chosen.colorSpace, ext, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+        caps.currentTransform, alpha, mode, VK_TRUE, VK_NULL_HANDLE };
+    if (!vk_ok(vkCreateSwapchainKHR(g_vk.device, &sci, NULL, &g_vk.sc), "vkCreateSwapchainKHR")) { g_vk.sc = VK_NULL_HANDLE; return 0; }
+    /* The driver may create more images than asked for. A swapchain that is not fully set up is torn down,
+     * never left half built for present_frame to use. */
+    uint32_t n = 0;
+    if (!vk_ok(vkGetSwapchainImagesKHR(g_vk.device, g_vk.sc, &n, NULL), "vkGetSwapchainImagesKHR") || n == 0) {
+        swapchain_destroy(); return 0;
+    }
+    g_vk.sc_img = calloc(n, sizeof *g_vk.sc_img);
+    g_vk.sc_render_sem = calloc(n, sizeof *g_vk.sc_render_sem);
+    g_vk.sc_n = n;
+    if (!g_vk.sc_img || !g_vk.sc_render_sem ||
+        !vk_ok(vkGetSwapchainImagesKHR(g_vk.device, g_vk.sc, &n, g_vk.sc_img), "vkGetSwapchainImagesKHR")) {
+        swapchain_destroy(); return 0;
+    }
+    VkSemaphoreCreateInfo semi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    for (uint32_t i = 0; i < n; i++)
+        if (!vk_ok(vkCreateSemaphore(g_vk.device, &semi, NULL, &g_vk.sc_render_sem[i]), "vkCreateSemaphore")) {
+            swapchain_destroy(); return 0;
+        }
+    g_vk.sc_ext = ext;
+    g_vk.sc_fmt = chosen.format;
+    return 1;
+}
+
+/* Offscreen main target: colour + depth images, their views and the readback buffer, sized
+ * g_vk.width x g_vk.height. Created at device creation and again whenever the window resizes. */
+static int main_target_create(void) {
+    /* ---- offscreen main target: RGBA8 colour + depth-stencil (GL asks for 24+8) ----
+     * The colour image needs TRANSFER_DST for vkCmdClearColorImage and
+     * TRANSFER_SRC for the readback copy, besides COLOR_ATTACHMENT for draws
+     * (P11e). The depth image needs TRANSFER_DST for vkCmdClearDepthStencilImage
+     * and TRANSFER_SRC so P11f can copy it into a RHI_FORMAT_DEPTH texture. */
+    if (!make_image(VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    &g_vk.color, &g_vk.color_mem)) return 0;
+    g_vk.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_vk.depth_fmt = pick_depth_format();
+    if (g_vk.depth_fmt == VK_FORMAT_UNDEFINED) {
+        fprintf(stderr, "rhi_vk: no usable depth-stencil format (D24S8/D32S8)\n"); return 0;
+    }
+    if (!make_image(g_vk.depth_fmt,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    &g_vk.depth, &g_vk.depth_mem)) return 0;
+    g_vk.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    /* Attachment views for dynamic rendering (P11a made the images, not views). */
+    {
+        VkImageViewCreateInfo cv = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_vk.color,
+            VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+            { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+              VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
+            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if (!vk_ok(vkCreateImageView(g_vk.device, &cv, NULL, &g_vk.color_view), "vkCreateImageView(color)")) return 0;
+        VkImageViewCreateInfo dv = cv;
+        dv.image = g_vk.depth; dv.format = g_vk.depth_fmt;
+        dv.subresourceRange.aspectMask = VK_DS_ASPECT;
+        if (!vk_ok(vkCreateImageView(g_vk.device, &dv, NULL, &g_vk.depth_view), "vkCreateImageView(depth)")) return 0;
+    }
+
+    /* ---- host-visible readback buffer, full-frame sized (reused each read) ---- */
+    VkDeviceSize bsize = (VkDeviceSize)g_vk.width * g_vk.height * 4;
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bsize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+    if (!vk_ok(vkCreateBuffer(g_vk.device, &bci, NULL, &g_vk.readback), "vkCreateBuffer")) return 0;
+    VkMemoryRequirements bmr; vkGetBufferMemoryRequirements(g_vk.device, g_vk.readback, &bmr);
+    uint32_t bmt = find_mem(bmr.memoryTypeBits,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (bmt == UINT32_MAX) { fprintf(stderr, "rhi_vk: no host-visible memory type\n"); return 0; }
+    VkMemoryAllocateInfo bmai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bmr.size, bmt };
+    if (!vk_ok(vkAllocateMemory(g_vk.device, &bmai, NULL, &g_vk.readback_mem), "vkAllocateMemory(buffer)")) return 0;
+    if (!vk_ok(vkBindBufferMemory(g_vk.device, g_vk.readback, g_vk.readback_mem, 0), "vkBindBufferMemory")) return 0;
+    return 1;
+}
+
+/* Callers guarantee the GPU is idle with the target (frame_begin, after the previous frame's wait). */
+static void main_target_destroy(void) {
+    if (g_vk.color_view)   vkDestroyImageView(g_vk.device, g_vk.color_view, NULL);
+    if (g_vk.depth_view)   vkDestroyImageView(g_vk.device, g_vk.depth_view, NULL);
+    if (g_vk.readback)     vkDestroyBuffer(g_vk.device, g_vk.readback, NULL);
+    if (g_vk.readback_mem) vkFreeMemory(g_vk.device, g_vk.readback_mem, NULL);
+    if (g_vk.depth)        vkDestroyImage(g_vk.device, g_vk.depth, NULL);
+    if (g_vk.depth_mem)    vkFreeMemory(g_vk.device, g_vk.depth_mem, NULL);
+    if (g_vk.color)        vkDestroyImage(g_vk.device, g_vk.color, NULL);
+    if (g_vk.color_mem)    vkFreeMemory(g_vk.device, g_vk.color_mem, NULL);
+    g_vk.color_view = g_vk.depth_view = VK_NULL_HANDLE;
+    g_vk.readback = VK_NULL_HANDLE; g_vk.readback_mem = VK_NULL_HANDLE;
+    g_vk.depth = VK_NULL_HANDLE; g_vk.depth_mem = VK_NULL_HANDLE;
+    g_vk.color = VK_NULL_HANDLE; g_vk.color_mem = VK_NULL_HANDLE;
+}
+
+/* Present mode: follow the window. The main target takes the new size, the swapchain is rebuilt
+ * before the next present, and the default viewport covers the new target. */
+static int main_target_resize(int32_t w, int32_t h) {
+    vkDeviceWaitIdle(g_vk.device);
+    main_target_destroy();
+    g_vk.width = w; g_vk.height = h;
+    if (!main_target_create()) return 0;
+    g_vk.viewport[0] = 0; g_vk.viewport[1] = 0;
+    g_vk.viewport[2] = w; g_vk.viewport[3] = h;
+    g_vk.sc_dirty = 1;
+    return 1;
+}
+
 RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
     if (!desc || !desc->window || g_vk.device) return RHI_ERR_INVALID;
     if (desc->backend != RHI_BACKEND_DEFAULT && desc->backend != RHI_BACKEND_VULKAN)
         return RHI_ERR_UNSUPPORTED;
 
     g_vk.window = (SDL_Window *)desc->window;
+    g_vk.vsync = (desc->flags & RHI_DEVICE_VSYNC) != 0;
     int w = 0, h = 0;
     SDL_GetWindowSize(g_vk.window, &w, &h);
     g_vk.width = w > 0 ? w : VK_DEFAULT_W;
@@ -911,8 +1124,32 @@ RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
 
     /* ---- instance: validation layer + debug messenger when present ---- */
     const char *layers[1]; uint32_t n_layers = 0;
-    const char *exts[2]; uint32_t n_exts = 0;
+    const char *exts[16]; uint32_t n_exts = 0;
     int have_debug = 0, have_features = 0;
+    VkInstanceCreateFlags ici_flags = 0;
+    /* Present mode needs a window created with SDL_WINDOW_VULKAN (the offscreen video driver
+     * and the headless shim refuse it) and the instance extensions SDL asks for. */
+    int want_present = (SDL_GetWindowFlags(g_vk.window) & SDL_WINDOW_VULKAN) != 0;
+    if (want_present) {
+        unsigned sdl_n = 0;
+        if (!SDL_Vulkan_GetInstanceExtensions(g_vk.window, &sdl_n, NULL) || sdl_n == 0 || sdl_n > 8) {
+            fprintf(stderr, "rhi_vk: no SDL Vulkan surface extensions (%s); offscreen\n", SDL_GetError());
+            want_present = 0;
+        } else {
+            SDL_Vulkan_GetInstanceExtensions(g_vk.window, &sdl_n, &exts[n_exts]);
+            n_exts += sdl_n;
+        }
+    }
+    {   /* MoltenVK (and other portability drivers) are only enumerated with this opt-in. */
+        uint32_t ec = 0; vkEnumerateInstanceExtensionProperties(NULL, &ec, NULL);
+        VkExtensionProperties *ep = calloc(ec ? ec : 1, sizeof *ep);
+        vkEnumerateInstanceExtensionProperties(NULL, &ec, ep);
+        if (has_ext(ep, ec, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+            exts[n_exts++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+            ici_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+        free(ep);
+    }
     {
         uint32_t lc = 0; vkEnumerateInstanceLayerProperties(&lc, NULL);
         VkLayerProperties *lp = calloc(lc ? lc : 1, sizeof *lp);
@@ -960,7 +1197,7 @@ RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
     VkDebugUtilsMessengerCreateInfoEXT dci_ici = dci;
     dci_ici.pNext = have_features ? &vfe : NULL;
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-                                 have_debug ? (const void *)&dci_ici : have_features ? (const void *)&vfe : NULL, 0, &app,
+                                 have_debug ? (const void *)&dci_ici : have_features ? (const void *)&vfe : NULL, ici_flags, &app,
                                  n_layers, layers, n_exts, exts };
     if (!vk_ok(vkCreateInstance(&ici, NULL, &g_vk.instance), "vkCreateInstance")) goto fail;
     if (have_debug) {
@@ -969,20 +1206,47 @@ RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
         if (cdm && !vk_ok(cdm(g_vk.instance, &dci, NULL, &g_vk.messenger), "vkCreateDebugUtilsMessengerEXT")) goto fail;
     }
 
-    /* ---- physical device + graphics queue family (no present: offscreen) ---- */
+    if (want_present) {
+        if (SDL_Vulkan_CreateSurface(g_vk.window, g_vk.instance, &g_vk.surface)) {
+            g_vk.present = 1;
+            fprintf(stderr, "rhi_vk: window surface created (present mode)\n");
+        }
+        else {
+            fprintf(stderr, "rhi_vk: SDL_Vulkan_CreateSurface: %s; offscreen\n", SDL_GetError());
+            g_vk.surface = VK_NULL_HANDLE;
+        }
+    }
+
+    /* ---- physical device + graphics queue family (that can present, in present mode) ---- */
     uint32_t pdc = 0;
     if (!vk_ok(vkEnumeratePhysicalDevices(g_vk.instance, &pdc, NULL), "vkEnumeratePhysicalDevices") || !pdc) {
         fprintf(stderr, "rhi_vk: no Vulkan devices (check VK_DRIVER_FILES)\n"); goto fail;
     }
     VkPhysicalDevice *pds = calloc(pdc, sizeof *pds);
     vkEnumeratePhysicalDevices(g_vk.instance, &pdc, pds);
+    for (;;) {
     for (uint32_t i = 0; i < pdc && !g_vk.phys; i++) {
+        if (g_vk.present && !device_has_ext(pds[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
         uint32_t qc = 0; vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &qc, NULL);
         VkQueueFamilyProperties *qp = calloc(qc ? qc : 1, sizeof *qp);
         vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &qc, qp);
         for (uint32_t q = 0; q < qc; q++)
-            if (qp[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g_vk.phys = pds[i]; g_vk.queue_family = q; break; }
+            if (qp[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                VkBool32 can_present = VK_TRUE;
+                if (g_vk.present) {
+                    can_present = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(pds[i], q, g_vk.surface, &can_present);
+                }
+                if (can_present) { g_vk.phys = pds[i]; g_vk.queue_family = q; break; }
+            }
         free(qp);
+    }
+    if (g_vk.phys || !g_vk.present) break;
+    /* No device can present to this window: keep the offscreen target, as before the surface existed. */
+    fprintf(stderr, "rhi_vk: no device with a graphics+present queue and VK_KHR_swapchain; offscreen\n");
+    vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
+    g_vk.surface = VK_NULL_HANDLE;
+    g_vk.present = 0;
     }
     free(pds);
     if (!g_vk.phys) { fprintf(stderr, "rhi_vk: no device with a graphics queue\n"); goto fail; }
@@ -1009,8 +1273,16 @@ RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, &en12, VK_TRUE };
     /* Push descriptors (set 0 written per draw, no descriptor pool). Not core
      * before 1.4, so enable the extension and fetch its entry point by name. */
-    const char *dev_exts[1]; uint32_t n_dev_exts = 0;
+    const char *dev_exts[3]; uint32_t n_dev_exts = 0;
     dev_exts[n_dev_exts++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+    if (g_vk.present) dev_exts[n_dev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    {   /* A portability device (MoltenVK) must enable VK_KHR_portability_subset when it offers it. */
+        uint32_t ec = 0; vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ec, NULL);
+        VkExtensionProperties *ep = calloc(ec ? ec : 1, sizeof *ep);
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ec, ep);
+        if (has_ext(ep, ec, "VK_KHR_portability_subset")) dev_exts[n_dev_exts++] = "VK_KHR_portability_subset";
+        free(ep);
+    }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_vk.queue_family, 1, &prio };
     VkDeviceCreateInfo dc = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &dyn, 0, 1, &qci, 0, NULL,
@@ -1030,53 +1302,17 @@ RhiResult rhi_device_create(const RhiDeviceDesc *desc) {
     if (!vk_ok(vkAllocateCommandBuffers(g_vk.device, &cbai, &g_vk.cmd), "vkAllocateCommandBuffers")) goto fail;
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
     if (!vk_ok(vkCreateFence(g_vk.device, &fci, NULL, &g_vk.fence), "vkCreateFence")) goto fail;
-
-    /* ---- offscreen main target: RGBA8 colour + depth-stencil (GL asks for 24+8) ----
-     * The colour image needs TRANSFER_DST for vkCmdClearColorImage and
-     * TRANSFER_SRC for the readback copy, besides COLOR_ATTACHMENT for draws
-     * (P11e). The depth image needs TRANSFER_DST for vkCmdClearDepthStencilImage
-     * and TRANSFER_SRC so P11f can copy it into a RHI_FORMAT_DEPTH texture. */
-    if (!make_image(VK_FORMAT_R8G8B8A8_UNORM,
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    &g_vk.color, &g_vk.color_mem)) goto fail;
-    g_vk.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    g_vk.depth_fmt = pick_depth_format();
-    if (g_vk.depth_fmt == VK_FORMAT_UNDEFINED) {
-        fprintf(stderr, "rhi_vk: no usable depth-stencil format (D24S8/D32S8)\n"); goto fail;
-    }
-    if (!make_image(g_vk.depth_fmt,
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    &g_vk.depth, &g_vk.depth_mem)) goto fail;
-    g_vk.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    /* Attachment views for dynamic rendering (P11a made the images, not views). */
-    {
-        VkImageViewCreateInfo cv = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_vk.color,
-            VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
-            { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-              VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
-            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-        if (!vk_ok(vkCreateImageView(g_vk.device, &cv, NULL, &g_vk.color_view), "vkCreateImageView(color)")) goto fail;
-        VkImageViewCreateInfo dv = cv;
-        dv.image = g_vk.depth; dv.format = g_vk.depth_fmt;
-        dv.subresourceRange.aspectMask = VK_DS_ASPECT;
-        if (!vk_ok(vkCreateImageView(g_vk.device, &dv, NULL, &g_vk.depth_view), "vkCreateImageView(depth)")) goto fail;
+    if (g_vk.present) {   /* a swapchain that cannot be built leaves the backend offscreen, as before P12 */
+        VkSemaphoreCreateInfo semi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (!vk_ok(vkCreateSemaphore(g_vk.device, &semi, NULL, &g_vk.acquire_sem), "vkCreateSemaphore") ||
+            !swapchain_create()) {
+            fprintf(stderr, "rhi_vk: swapchain unavailable; offscreen\n");
+            swapchain_destroy();
+            g_vk.present = 0;
+        }
     }
 
-    /* ---- host-visible readback buffer, full-frame sized (reused each read) ---- */
-    VkDeviceSize bsize = (VkDeviceSize)g_vk.width * g_vk.height * 4;
-    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bsize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
-    if (!vk_ok(vkCreateBuffer(g_vk.device, &bci, NULL, &g_vk.readback), "vkCreateBuffer")) goto fail;
-    VkMemoryRequirements bmr; vkGetBufferMemoryRequirements(g_vk.device, g_vk.readback, &bmr);
-    uint32_t bmt = find_mem(bmr.memoryTypeBits,
-                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (bmt == UINT32_MAX) { fprintf(stderr, "rhi_vk: no host-visible memory type\n"); goto fail; }
-    VkMemoryAllocateInfo bmai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bmr.size, bmt };
-    if (!vk_ok(vkAllocateMemory(g_vk.device, &bmai, NULL, &g_vk.readback_mem), "vkAllocateMemory(buffer)")) goto fail;
-    if (!vk_ok(vkBindBufferMemory(g_vk.device, g_vk.readback, g_vk.readback_mem, 0), "vkBindBufferMemory")) goto fail;
+    if (!main_target_create()) goto fail;
 
     /* ---- 1x1 white dummy texture (for unbound sampler slots) ---- */
     if (!make_image(VK_FORMAT_R8G8B8A8_UNORM,
@@ -1282,15 +1518,10 @@ void rhi_device_destroy(void) {
     if (g_vk.dummy_attr_mem) vkFreeMemory(g_vk.device, g_vk.dummy_attr_mem, NULL);
     if (g_vk.dummy_vbuf)     vkDestroyBuffer(g_vk.device, g_vk.dummy_vbuf, NULL);
     if (g_vk.dummy_vbuf_mem) vkFreeMemory(g_vk.device, g_vk.dummy_vbuf_mem, NULL);
-    if (g_vk.color_view)   vkDestroyImageView(g_vk.device, g_vk.color_view, NULL);
-    if (g_vk.depth_view)   vkDestroyImageView(g_vk.device, g_vk.depth_view, NULL);
-    if (g_vk.readback)     vkDestroyBuffer(g_vk.device, g_vk.readback, NULL);
-    if (g_vk.readback_mem) vkFreeMemory(g_vk.device, g_vk.readback_mem, NULL);
-    if (g_vk.depth)        vkDestroyImage(g_vk.device, g_vk.depth, NULL);
-    if (g_vk.depth_mem)    vkFreeMemory(g_vk.device, g_vk.depth_mem, NULL);
-    if (g_vk.color)        vkDestroyImage(g_vk.device, g_vk.color, NULL);
-    if (g_vk.color_mem)    vkFreeMemory(g_vk.device, g_vk.color_mem, NULL);
+    main_target_destroy();
     if (g_vk.timer_pool)   vkDestroyQueryPool(g_vk.device, g_vk.timer_pool, NULL);
+    swapchain_destroy();
+    if (g_vk.acquire_sem)  vkDestroySemaphore(g_vk.device, g_vk.acquire_sem, NULL);
     if (g_vk.fence)        vkDestroyFence(g_vk.device, g_vk.fence, NULL);
     if (g_vk.pool)         vkDestroyCommandPool(g_vk.device, g_vk.pool, NULL);
     if (g_vk.device)       vkDestroyDevice(g_vk.device, NULL);
@@ -1299,13 +1530,22 @@ void rhi_device_destroy(void) {
             (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.instance, "vkDestroyDebugUtilsMessengerEXT");
         if (ddm) ddm(g_vk.instance, g_vk.messenger, NULL);
     }
+    if (g_vk.surface)  vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, NULL);
     memset(&g_vk, 0, sizeof g_vk);
 }
 
+/* Present mode: the window's current drawable size (what the next frame_begin will adopt). Offscreen:
+ * the fixed target size. */
 void rhi_drawable_size(int32_t *width, int32_t *height) {
-    if (width)  *width  = g_vk.width;
-    if (height) *height = g_vk.height;
+    int w = g_vk.width, h = g_vk.height;
+    if (g_vk.present) {
+        int dw = 0, dh = 0;
+        SDL_Vulkan_GetDrawableSize(g_vk.window, &dw, &dh);
+        w = dw; h = dh;
+    }
+    if (width)  *width  = w;
+    if (height) *height = h;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1313,6 +1553,17 @@ void rhi_drawable_size(int32_t *width, int32_t *height) {
 /* -------------------------------------------------------------------------- */
 RhiResult rhi_frame_begin(RhiFrameInfo *out) {
     if (!g_vk.device) return RHI_ERR_INVALID;
+    if (g_vk.present) {
+        /* A minimised or zero-sized window has nothing to present. Otherwise follow its size
+         * (the previous frame was submitted and waited for, so the target is idle). */
+        int dw = 0, dh = 0;
+        SDL_Vulkan_GetDrawableSize(g_vk.window, &dw, &dh);
+        if ((SDL_GetWindowFlags(g_vk.window) & SDL_WINDOW_MINIMIZED) || dw <= 0 || dh <= 0)
+            return RHI_ERR_SKIP_FRAME;
+        if (dw != g_vk.width || dh != g_vk.height) {
+            if (!main_target_resize(dw, dh)) return RHI_ERR_DEVICE_LOST;
+        }
+    }
     /* Grow the arena if last frame's demand overflowed it (safe here: the prior
      * frame was already submitted + waited at frame_end), then restart the bump
      * allocator for this frame (P11-review Fix 1). */
@@ -1342,11 +1593,57 @@ RhiResult rhi_frame_begin(RhiFrameInfo *out) {
     return RHI_OK;
 }
 
+/* Present mode: blit the offscreen colour image into the next swapchain image (flipping y: the image
+ * is bottom-up, the swapchain top-down), submit, wait, present. Returns 1 when the frame's command
+ * buffer has been submitted and waited for (whether or not an image was presented), 0 when it
+ * has not been submitted (offscreen mode, nothing to present to) so the caller flushes it, -1 when
+ * the submit failed. */
+static int present_frame(void) {
+    if (!g_vk.present) return 0;
+    /* A hidden window (--shot capture) has nothing to show: skip the acquire/blit/present round trip. */
+    if (SDL_GetWindowFlags(g_vk.window) & SDL_WINDOW_HIDDEN) return 0;
+    if (g_vk.sc_dirty || !g_vk.sc) swapchain_create();
+    if (!g_vk.sc) return 0;
+    uint32_t idx = 0;
+    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.sc, UINT64_MAX, g_vk.acquire_sem, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {   /* resized between frames: rebuild once and retry */
+        swapchain_create();
+        if (!g_vk.sc) return 0;
+        r = vkAcquireNextImageKHR(g_vk.device, g_vk.sc, UINT64_MAX, g_vk.acquire_sem, VK_NULL_HANDLE, &idx);
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { g_vk.sc_dirty = 1; return 0; }   /* nothing acquired: no wait on the semaphore */
+    if (!ensure_recording()) return -1;
+    if (g_vk.color_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        image_barrier(g_vk.color, VK_IMAGE_ASPECT_COLOR_BIT, g_vk.color_layout,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        g_vk.color_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+    VkImage dst = g_vk.sc_img[idx];
+    image_barrier(dst, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit blit = {
+        { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, 0, 0 }, { (int32_t)g_vk.width, (int32_t)g_vk.height, 1 } },
+        { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { 0, (int32_t)g_vk.sc_ext.height, 0 }, { (int32_t)g_vk.sc_ext.width, 0, 1 } } };
+    int same = (uint32_t)g_vk.width == g_vk.sc_ext.width && (uint32_t)g_vk.height == g_vk.sc_ext.height;
+    vkCmdBlitImage(g_vk.cmd, g_vk.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &blit, same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    image_barrier(dst, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                  VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if (!flush_sync(g_vk.acquire_sem, g_vk.sc_render_sem[idx])) return -1;
+    VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_vk.sc_render_sem[idx], 1, &g_vk.sc, &idx, NULL };
+    VkResult pr = vkQueuePresentKHR(g_vk.queue, &pi);
+    if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g_vk.sc_dirty = 1;
+    else if (pr != VK_SUCCESS) { vk_ok(pr, "vkQueuePresentKHR"); g_vk.sc_dirty = 1; }
+    return 1;
+}
+
 RhiResult rhi_frame_end(void) {
     if (!g_vk.device || !g_vk.in_frame) return RHI_ERR_INVALID;
     if (g_vk.pass.active) rhi_cmd_end_pass();         /* a pass does not outlive its frame */
     if (g_vk.rendering) end_rendering_if_active();   /* never submit an open render scope */
-    if (!flush()) return RHI_ERR_DEVICE_LOST;   /* submit + fence wait (no present) */
+    int presented = present_frame();
+    if (presented < 0 || (presented == 0 && !flush())) return RHI_ERR_DEVICE_LOST;   /* else: submit + fence wait, offscreen */
     /* flush() drained the deferred frees: every recorded draw has completed (Fix 2) */
     g_vk.in_frame = 0;
     g_vk.frame_index++;

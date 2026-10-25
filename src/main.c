@@ -3900,8 +3900,10 @@ int main(int argc, char **argv) {
     const int capture_window = shot || raudit || resident_route_audit;
     uint32_t window_flags = rhi_window_flags(RHI_BACKEND_DEFAULT);
 #ifdef N2_VULKAN
-    /* Offscreen Vulkan uses the window size only; it creates no SDL surface. */
-    window_flags &= ~(uint32_t)SDL_WINDOW_VULKAN;
+    /* Headless SDL drivers cannot create a Vulkan surface; desktop drivers keep presentation. */
+    const char *video_driver = SDL_GetCurrentVideoDriver();
+    if (video_driver && (!strcmp(video_driver, "offscreen") || !strcmp(video_driver, "dummy")))
+        window_flags &= ~(uint32_t)SDL_WINDOW_VULKAN;
 #endif
     SDL_Window *win = SDL_CreateWindow("OpenUG2",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, render_width, render_height,
@@ -9077,7 +9079,17 @@ int main(int argc, char **argv) {
 
 
         RhiFrameInfo frame;
-        rhi_frame_begin(&frame);
+        RhiResult frame_result = rhi_frame_begin(&frame);
+        if (frame_result == RHI_ERR_SKIP_FRAME) {
+            /* minimised or zero-sized window: nothing can be presented; keep pumping events */
+            SDL_Delay(20);
+            continue;
+        }
+        if (frame_result != RHI_OK) {   /* e.g. the main target could not be recreated after a resize */
+            fprintf(stderr, "rhi_frame_begin failed (%d)\n", (int)frame_result);
+            running = 0;
+            continue;
+        }
         int W = frame.width, H = frame.height;
         pf_mark(PF_CAMERA); pf_gpu(pf_frame,0);
         /* the sky is cleared to the fog colour: distant geometry dissolves
@@ -11989,8 +12001,8 @@ int main(int argc, char **argv) {
         }
 #endif
         if (pause_menu_is_open(pause_menu)) {
-            int pw, ph;
-            SDL_GL_GetDrawableSize(win, &pw, &ph);
+            int32_t pw, ph;
+            rhi_drawable_size(&pw, &ph);
             pause_menu_draw(pause_menu, pw, ph);
         }
         pf_mark(PF_POST_DRAW); pf_gpu(pf_frame,-1);
