@@ -132,7 +132,7 @@ int res_list_circuits(const char *troot, const char *trackname,
         if (pd && n2_load_path(pd, pl, &tp) > 4) {
             /* closed loop: first waypoint ~= last (sprints are open routes) */
             float dx=tp.xy[0]-tp.xy[(tp.n-1)*2], dy=tp.xy[1]-tp.xy[(tp.n-1)*2+1];
-            if (dx*dx+dy*dy < 900.0f) strncpy(list[n++], rel, 255);
+            if (dx*dx+dy*dy < 900.0f) { memcpy(list[n], rel, strlen(rel) + 1); n++; }   /* rel fits list[n] and is terminated; strncpy(.., 255) was not for a 255-char name */
         }
         free(tp.xy); free(pd);
     }

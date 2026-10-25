@@ -622,7 +622,7 @@ static void png_chunk(FILE *f, const char *tag, const unsigned char *d, uLong n)
     fwrite(len, 1, 4, f);
     uLong crc = crc32(0, (const Bytef*)tag, 4);
     if (n) crc = crc32(crc, d, n);   /* crc32(crc, NULL, 0) returns 0, not crc */
-    fwrite(tag, 1, 4, f); fwrite(d, 1, n, f);
+    fwrite(tag, 1, 4, f); if (n) fwrite(d, 1, n, f);   /* IEND has d == NULL: fwrite(NULL, ...) is undefined even for 0 bytes */
     unsigned char c[4] = { crc>>24, crc>>16, crc>>8, crc };
     fwrite(c, 1, 4, f);
 }

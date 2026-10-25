@@ -859,6 +859,12 @@ resource-map-test: tools/resource_map_test.c src/resource.c src/resource.h
 
 .PHONY: resource-map-test
 
+resource-circuits-test: tools/resource_circuits_test.c src/resource.c src/resource.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/resource_circuits_test.c src/resource.c -o build/resource_circuits_test$(EXEEXT) -lm
+	./build/resource_circuits_test$(EXEEXT)
+.PHONY: resource-circuits-test
+
 dir-scan-test: tools/dir_scan_test.c src/dir_scan.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/dir_scan_test.c -o build/dir_scan_test$(EXEEXT)
