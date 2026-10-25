@@ -827,7 +827,8 @@ static void test_mouse_look(void) {
     float r=0;for(int i=0;i<3;i++)r+=(p.eye[i]-p.look[i])*(p.eye[i]-p.look[i]);
     cam_mouse_look_move(&s,.4f,.2f);cam_mouse_look_pose(&s,&car,&o);
     float rr=0;for(int i=0;i<3;i++){rr+=(o.eye[i]-o.look[i])*(o.eye[i]-o.look[i]);CHECK(near(o.look[i],p.look[i],2e-6),"orbit target fixed %d",i);}
-    CHECK(near(rr,r,2e-5),"orbit retains actual camera distance");
+    /* Squared distances near 90: float rounding of the orbit rotation is a few ulp (3.8e-5 here without FMA), so the tolerance is relative. */
+    CHECK(near(rr,r,2e-6*r),"orbit retains actual camera distance");
     CamMouseLook down=s;cam_mouse_look_move(&down,0,-100);cam_mouse_look_pose(&down,&car,&moved);
     CHECK(moved.eye[2]>=moved.look[2]-1e-5f,"external orbit cannot sink below its car-facing target");
     car.pos[0]+=5;car.pos[2]+=2;cam_mouse_look_pose(&s,&car,&moved);
