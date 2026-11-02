@@ -1,17 +1,18 @@
 /* Optional check against locally installed assets; no game files are fixtures.
  * Course decoding is distinct from completing a race under normal collision.
- * Neutral car dimensions test route feasibility, not every fitted car/model. */
+ * Neutral car dimensions test route feasibility, not every fitted car/model.
+ * Finishing a course does not certify drift scoring or URL tournaments. */
 #include "ai.h"
 #include "world.h"
 
 static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
-        const RaceAiSource *source,int difficulty,float pace) {
+        const RaceAiSource *source,int difficulty,float pace,int laps) {
     World w={0};
     char region[64];snprintf(region,sizeof region,"STREAM%s",e->reg);
     w.neighborhood.nreg=1;snprintf(w.neighborhood.rgn[0].name,64,"%s",region);
     if(!world_city_load(&w.city,&w.neighborhood,root,region)){world_city_free(&w.city);return 0;}
     int ev=-1;for(int k=0;k<w.city.nev;k++)if(w.city.ev[k].id==e->id)ev=k;
-    if(!world_race_start(&w,root,ev,1)){world_city_free(&w.city);return 0;}
+    if(!world_race_start(&w,root,ev,laps)){world_city_free(&w.city);return 0;}
     WorldNeighborhood nb={0};
     WLoadOptions opt={1,w.city.race.grid[0][0],w.city.race.grid[0][1],6000,e->id};
     if(!world_neighborhood_load(&nb,root,region,&opt)) {
@@ -35,7 +36,8 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
         phys_wall_index_build(walls,heights,n);
         AiTrafficWorld world={.scene=&nb.scene,.obst=walls,.obstz=heights,.obstsrc=sources,.nobst=n,
             .race_source=source,.race_source_choice=-1,.race_difficulty=difficulty,.race_pace=pace};
-        AiCar cars[N_RACE_AI]={0};AiRace drivers[N_RACE_AI]={0};
+        /* Five URL rivals still need a separate moving player reference. */
+        AiCar cars[N_RACE_AI+1]={0};AiRace drivers[N_RACE_AI+1]={0};
         for(int k=0;k<N_RACE_AI;k++)cars[k]=(AiCar){.half_length=2,.half_width=.85f,.height=1.5f,.mass=1.4f};
         *spawned=ai_race_prepare(root,e,&w.city.race,&world,&course,cars,drivers,&player);
         int wanted=e->info.downhill?1:e->info.kind==N2_RACE_URL?5:3,driven=*spawned;
@@ -44,8 +46,8 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
         }
         int reference=-1;float low[N_RACE_AI],high[N_RACE_AI]={0};
         for(int k=0;k<N_RACE_AI;k++)low[k]=INFINITY;
-        if(source && driven==3 && drivers[0].source){
-            reference=3;cars[reference]=player;cars[reference].head=ai_course_heading(&course,player.pos);
+        if(source && (driven==3 || driven==5) && drivers[0].source){
+            reference=driven;cars[reference]=player;cars[reference].head=ai_course_heading(&course,player.pos);
             drivers[reference].progress=w.city.race;
             if(!ai_drive_join(&drivers[reference].drive,&course,player.pos,cars[reference].head,
                     drivers[0].drive.error_limit)){reference=-1;driven=0;}
@@ -58,7 +60,7 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
         }
         if(driven==wanted) {
             for(int frame=0;frame<90000;frame++) {
-                AiCar *contacts[N_RACE_AI];int done=0,failed=0;
+                AiCar *contacts[N_RACE_AI+1];int done=0,failed=0;
                 for(int k=0;k<driven;k++) {
                     ai_race_step(cars,drivers,k,driven,e->circuit,&world,reference>=0?cars+reference:NULL);
                     if(drivers[k].source){float intent=ai_race_pace(cars+k,drivers+k,k,&world,reference>=0?cars+reference:NULL);
@@ -68,7 +70,7 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
                 if(reference>=0){
                     AiTrafficWorld control=world;control.race_source=NULL;
                     control.race_pace=pace>0?fmaxf(40,pace-12):pace;
-                    ai_race_step(cars,drivers,reference,4,e->circuit,&control,NULL);
+                    ai_race_step(cars,drivers,reference,driven+1,e->circuit,&control,NULL);
                     contacts[reference]=cars+reference;
                     failed+=drivers[reference].drive.failed;
                 }
@@ -77,7 +79,18 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
                 *finished=done;
                 if(done==driven || failed)break;
             }
-            ok=*finished==driven;
+            ok=*finished==driven && (reference<0 || !drivers[reference].drive.failed);
+            int applied=0;
+            for(int k=0;k<driven;k++)applied+=drivers[k].source!=NULL;
+            printf("EVENT-MODE %d kind=%s laps=%d source-drivers=%d/%d\n",
+                e->id,n2_race_name(e->info.kind),w.city.race.maxlaps,applied,driven);
+            if(reference>=0)printf("EVENT-REFERENCE %d finished=%d failed=%d lap=%d gate=%d error=%.2f\n",
+                e->id,drivers[reference].progress.finished,drivers[reference].drive.failed,
+                drivers[reference].progress.lap,drivers[reference].progress.next,drivers[reference].drive.error);
+            if(e->info.kind==N2_RACE_DRIFT)for(int k=0;k<driven;k++)
+                printf("EVENT-DRIFT %d car=%d bank=%.2f chain=%.2f finished=%d\n",
+                    e->id,k,drivers[k].progress.drift.bank,drivers[k].progress.drift.chain,
+                    drivers[k].progress.finished);
             if(source && drivers[0].source)for(int k=0;k<driven;k++)printf("SOURCE-DRIVER car=%d skill=%d scale=%.4f catchup=%d intent-range=%.2f..%.2f km/h\n",
                 k,drivers[k].source_skill,drivers[k].source_scale,drivers[k].source_catch_up,low[k],high[k]);
             for(int k=0;k<driven;k++)if(!drivers[k].progress.finished)
@@ -93,7 +106,7 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
 }
 int main(int argc,char **argv) {
     const char *root=argc>1?argv[1]:"../TRACKS";
-    int simulate=argc>2 && !strcmp(argv[2],"--drive"),only=0,use_source=0,difficulty=1,opt=3;
+    int simulate=argc>2 && !strcmp(argv[2],"--drive"),only=0,use_source=0,difficulty=1,opt=3,laps=1;
     float pace=0;
     if(argc>3 && strncmp(argv[3],"--",2)){
         char *end=NULL;long id=strtol(argv[3],&end,10);
@@ -106,7 +119,9 @@ int main(int argc,char **argv) {
             char *end=NULL;long n=strtol(argv[++j],&end,10);if(!end || *end || n<0 || n>2)return 2;difficulty=(int)n;
         }else if(!strcmp(argv[j],"--pace") && j+1<argc){
             char *end=NULL;pace=strtof(argv[++j],&end);if(!end || *end || !isfinite(pace))return 2;
-        }else {fprintf(stderr,"Usage: race_events_check TRACKS [--drive [event] [--source-ai] [--difficulty 0..2] [--pace km/h]]\n");return 2;}
+        }else if(!strcmp(argv[j],"--laps") && j+1<argc){
+            char *end=NULL;long n=strtol(argv[++j],&end,10);if(!end || *end || n<1 || n>99)return 2;laps=(int)n;
+        }else {fprintf(stderr,"Usage: race_events_check TRACKS [--drive [event] [--source-ai] [--difficulty 0..2] [--pace km/h] [--laps 1..99]]\n");return 2;}
     }
     RaceAiSource *source=NULL;
     if(use_source){
@@ -126,7 +141,7 @@ int main(int argc,char **argv) {
         WEvent *e=catalog.city.ev+k;if(only && e->id!=only)continue;
         N2Path p={0};int route=ai_race_course(root,e,&p),spawned=0,finished=0,ok=0;
         count++;decoded+=route;free(p.xy);
-        if(simulate && route)ok=drive(root,e,&spawned,&finished,source,difficulty,pace);
+        if(simulate && route)ok=drive(root,e,&spawned,&finished,source,difficulty,pace,laps);
         completed+=ok;
         printf("EVENT-CHECK %d %s %s route=%d spawned=%d finished=%d/%d %s\n",
             e->id,e->reg,n2_race_name(e->info.kind),route,spawned,finished,e->info.downhill?1:spawned,
