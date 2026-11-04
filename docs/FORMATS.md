@@ -1258,6 +1258,46 @@ separately sold engine, ECU and induction products is not yet proven, so OpenUG2
 levels rather than inventing category-specific percentages. Brake, tyre and
 suspension upgrade fields remain undecoded.
 
+### Stock drivetrain and axle-force fields — local aggregate verification
+
+**Interpretation evidence `[inf]`; no retail runtime observed.** The offsets
+below come from the Stage-1 static-evidence spec; their semantics are not
+retail-proven. Local aggregate checks across the 46 local records (no
+per-car values committed anywhere) support the framing:
+
+| record offset | type | reading | Local aggregate (46 records) |
+|---:|---|---|---|
+| `+0x1E0` / `+0x200` | `f32` | axle slip-angle threshold (front / rear) | 12.0 in all 46 (inactive per the analyst note) |
+| `+0x1EC` / `+0x20C` | `f32` | axle peak-grip multiplier | front 1.425–2.5; rear 1.425–3.0 |
+| `+0x1F0` / `+0x210` | `f32` | axle sliding-grip multiplier | front 1.2–1.7; rear 1.2–2.8 |
+| `+0x2C0` | `f32` | launch fraction (stock block) | 0.8 in all 46 |
+| `+0x2C4` | `f32` | unnamed, stock block | 500.0 in all 46 |
+| `+0x2C8` / `+0x2CC` | `f32` | final-drive ratio (stock block) | 3.27–4.8; equal per record in 46/46 |
+| `+0x2D0` | `f32` | rear drive share | values {0.0 (×10), 0.4 (×1), 0.5 (×23), 0.575 (×1), 1.0 (×11)} |
+| `+0x2D4` | `f32` | clutch coupling coefficient | 0.04–0.05 |
+| `+0x2D8` | `u32` | forward gear count (stock block) | 4 (×3), 5 (×29), 6 (×14) |
+| `+0x2DC` | `f32` | clutch rate | 2.0 / 4.0 in every record |
+| `+0x2E0…+0x2FC` | `8*f32` | reverse, neutral, six forward ratios | forward ratios strictly descend in 46/46 |
+| `+0x300` / `+0x304` / `+0x308` | `f32` | idle / redline / limiter RPM | 800–1000 / 5000–8500 / 6000–9000 |
+| `+0x30C` | `f32` | engine rotational inertia | 19 distinct values, ~2e-4–7e-4 tonne·m² |
+| `+0x358…+0x360` | `3*f32` | engine-braking samples | 0.065–0.41; present in all 46 |
+| `+0x398` / `+0x39C` | `f32` | slip-dependent vertical-torque restriction scalars | 17.0 and 0.0 in all 46 |
+
+Cross-checks: inertia matches the solid-box relation within 1% in 46/46;
+the forward-ratio sequence descends strictly in 46/46; the stock and L1–L3
+gearbox blocks share framing. The local drive-share values suggest three
+coarse classes (0.0 / 0.5 / 1.0) plus two intermediate records; the class
+mapping is **not** proven.
+
+**Provenance boundary.** Every offset above lies below `+0x3E0` and is
+therefore identical to retail in the local image. The L1–L3 blocks (`+0x460`
+onwards) are inside the local installation's modified region
+(`GlobalB.lzc`/`GLOBALB.BUN` bytes `+0x3E0…+0x5AE` differ from retail), so
+local L1–L3 observations are **install-specific** and must not be cited as
+retail evidence. Common constants (0.8, 500.0, 12.0, 17.0, 0.0) may be
+engine-wide defaults rather than per-car tuning; their producers are
+unresolved.
+
 ### `0x00135200` AttribSys records
 
 The file also contains standard chunk-framed records with magic
