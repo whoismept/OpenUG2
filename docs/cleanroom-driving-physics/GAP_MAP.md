@@ -45,14 +45,14 @@ samples, gain curves, `rear_drive`, `steer_ratio` (meaning unverified).
 | W2-2 | `+0x398` / `+0x39C` slip-restriction scalars — presence, range, cross-car distribution | **Done 2026-11-04** (1d26292): 17.0 / 0.0 in all 46 local records; documented aggregate only. |
 | W2-6 | `GlobalB.lzc` modified-record region (+0x3E0…+0x5AE differs from retail) — document the divergence boundary | **Done 2026-11-04** (1d26292): FORMATS.md now tags below-`+0x3E0` as retail-identical and L1–L3 observations as install-specific. |
 | W2-3 | Brake, tyre and suspension **upgrade** packages — locate and structurally prove, or demonstrate measured negatives | **Survey done 2026-11-04**: suspension-shaped upgrade pair at `+0x6D0`/`+0x6F0` (same 8-float layout as stock axle blocks; traffic shares one default) is the strongest candidate; tyre-upgrade block not found; brake candidate `+0x6C0`/`+0x6CC` unproven. All logged in FORMATS.md "Unmapped record regions". Semantics unproven; nothing wired into the engine. |
-| W2-4 | Aero / drag-related fields if any exist in the record | Not yet investigated; may be a measured negative. |
+| W2-4 | Aero / drag-related fields | **Done 2026-11-04**: cF/cR (`+0x374/+0x378`), kA (`+0x37C`), kI (`+0x270`), brake Kb/Kh/beta (`+0x384…+0x38C`), rear slip-bonus b0/b1 (`+0x390/+0x394`) documented with fleet aggregates in FORMATS.md. |
 | W2-5 | `steer_ratio` (+0x380) meaning — unverified label; candidates: steering response/rate scaling vs geometry ratio | Needs behavioural correlation or analyst amendment; do not rename without evidence. |
 
 ### W3 — Harness and measurement (local engine; no retail)
 
 | ID | Gap | Notes |
 | --- | --- | --- |
-| W3-1 | **Fixed-input comparison harness** for HUMMER, MIATA, 240SX — scripted inputs, fixed tick, logged outputs (speed, gear, slip, loads, forces) | Listed in #9 help-needed. Works today against OpenUG2; compare across builds, not against retail. |
+| W3-1 | **Fixed-input comparison harness** for HUMMER, MIATA, 240SX | **Exists as M121** (`--vehicle-compare A B`), GL-free, verified locally 2026-11-04; baseline recorded in `fixed-input-baseline.md`. No new tool needed. |
 | W3-2 | Probe: prescribed-ride 30 m/s braking — Fz/My preparation vs consumed pose | Audit finding 1 probe; reproducible with existing fixtures. |
 | W3-3 | Yaw-inertia selection probe — kI=1 vs kI=10 identity check currently passes (gameplay ignores kI) | Audit finding 2 probe; becomes a real regression test once W1-4 lands. |
 | W3-4 | `--fleet-census` / `--vehicle-compare` extensions for W2 fields | Keep diagnostics read-only; production behaviour unchanged. |
@@ -92,7 +92,7 @@ samples, gain curves, `rear_drive`, `steer_ratio` (meaning unverified).
 1. **W1-1 review/gate** — finish the timed-history draft (already on branch). Cheap; is the one genuinely missing contract.
 2. **W2-1 / W2-2 / W2-6** — document known Stage-1 offsets in FORMATS.md with local-data cross-car checks. Pure docs + diagnostics; directly serves #9's "locate and prove fields" slice. **Done 2026-11-04** (1d26292).
 3. ~~W1-2 + W1-3~~ — already covered by the approved body-response amendment; do not re-specify.
-4. **W3-1 / W3-3** — fixed-input harness and the kI probe as committed deterministic tests (no behaviour change; shadow mode).
+4. ~~W3-1~~ — harness already exists (M121); baseline recorded. Remaining: a committed regression check if the maintainer wants one.
 5. **W1-6** — producer cadence contract (small; required before implementing W1-1).
 6. **Host integration project** — wire the approved dynamic body path into the playable vehicle behind an explicit opt-in; this is the audit's Priority 1, needs maintainer sign-off, a design doc and review capacity. It is not a spec gap.
 7. **W2-3** — brake/tyre/suspension upgrade packages (open-ended format research; timeboxed; measured negatives are a valid outcome).
