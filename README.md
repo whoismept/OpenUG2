@@ -336,7 +336,9 @@ Point it at your NFS: Underground 2 data directory (the folder containing
 ```
 
 `--path DIR` selects the data root; the older positional `DATA_DIR` argument
-also works. Quote directories containing spaces.
+also works. Quote directories containing spaces. `--help` prints the usage line;
+an unknown option, or an option given last without its value, exits with
+status 2 instead of being taken as the data directory.
 
 The normal command opens the current L4RA open-world reference. The engine
 derives a start district from the selected STREAM bundle and places the car on
