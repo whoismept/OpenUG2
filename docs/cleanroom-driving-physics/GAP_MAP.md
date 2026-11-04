@@ -25,9 +25,9 @@ Legend for "Needs":
 | ID | Gap | Evidence anchor | Notes |
 | --- | --- | --- | --- |
 | W1-1 | **Timed steering histories** (input 0.55 s/66; rate 0.15 s/18; overwrite/expiry/append rules) | EFA-4; Stage4 U4-2 / Q4-I1 | **Drafted** in `timed-history/` (unreviewed). |
-| W1-2 | **Ordinary angular damping** — curve D(w) endpoint-clamped, stabilize gate, independent gates | EFA-2; Stage4 U4-5 / Q4-I2 | **Drafted** in `angular-response/` (unreviewed; shares a doc with W1-3). Pairs `(0,.05),(2,.05),(4,.25),(6,.7),(8,2),(10,5)` rad/s→1/s. |
-| W1-3 | **Slip-dependent vertical torque restriction** — K from row `+0x398` (selector p==0) or `+0x39C`; zero-K + p≠0 + sigma test can set K=20; raw-T.z clamp after damping, sign-strict | EFA-3 | **Drafted** in `angular-response/` (unreviewed). Selector `p` identity unresolved; never equated to contact count/torque-limit selectors. Local aggregates 17.0/0.0. |
-| W1-4 | **Body-response amendment** — P/L/B/M coupling, V=P/M, Ω=B·I⁻¹·Bᵀ·L, basis-vector derivatives, adjusted-vs-basic inertia transition (L.z/kI on adjusted→basic only), adjusted yaw inertia multiplier, post-step Ω cap 250 rad/s, per-substep orthonormalization, bottoming impulse caps (1000 kN·s linear / 10 kN·m·s angular), full suspension feedback loop | EFA-1; Stage5 U5-6; Stage4 U4-5 | Largest contract; combine EFA-1..3. Inertia selector `c` identity unresolved — never guess from contact count. |
+| W1-2 | **Ordinary angular damping** — curve D(w) endpoint-clamped, stabilize gate, independent gates | EFA-2; Stage4 U4-5 / Q4-I2 | **Covered by the approved body-response amendment** (`body-response/SPEC.md` BR-1/BR-2; APPROVED 2026-10-15; hash-locked; implemented in `src/body_response.c`, 63/63 vectors pass). Not to be re-specified. |
+| W1-3 | **Slip-dependent vertical torque restriction** — K from row `+0x398` (selector p==0) or `+0x39C`; zero-K + p≠0 + sigma test can set K=20; raw-T.z clamp after damping | EFA-3 | **Covered by the approved body-response amendment** (`body-response/SPEC.md` BR-1/BR-3). Local aggregates 17.0/0.0 recorded in FORMATS.md. Not to be re-specified. |
+| W1-4 | **Body-response amendment** — P/L/B/M coupling, selected inertia with adjusted/basic transition, bottoming impulse caps, suspension feedback closure | EFA-1; Stage5 U5-6 | **Approved and implemented** (`body-response/`, REVIEW.md APPROVED; VERIFICATION.md: builds pass, 63/63 vectors, BR feedback moments verified non-consuming in the planar host). **Remaining gap is host integration** — the playable vehicle still drives the prescribed planar/M130 path; it does not consume the dynamic 3D body path. That is the audit's Priority 1 and is an implementation project, not a spec gap. |
 | W1-5 | **Shift-adjustment grip composition** — A>0 multiplies two wheel-grip coefficients by `1+min(1,A/R)` (captured operations only) | EFA-5 | Conditional follow-up; full four-wheel law and A/R producers unresolved. Spec only with explicit A/R inputs. |
 | W1-6 | **Timed-history call cadence** — who calls the producer, at what rate, relative to S4-2 consumption | EFA-4 cadence unknown; Stage4 U4-1/U4-2 | Separate small contract; blocks any frame-rate-independence claim for the new filter. |
 | W1-7 | **response_scale API mapping** — S4-6 names response_scale; composed cap has no separately named input; ResInput.scale is copied to torque/aero only | Audit finding 7 (C) | Contract/API clarification; no math fix asserted. |
@@ -41,12 +41,12 @@ samples, gain curves, `rear_drive`, `steer_ratio` (meaning unverified).
 
 | ID | Gap | Notes |
 | --- | --- | --- |
-| W2-1 | Document Stage-1 fields not yet in FORMATS.md: `+0x1E0` axle blocks (slip-angle threshold A, peak/sliding grip multipliers), `+0x2C0` launch fraction, `+0x2C4`, `+0x2C8/+0x2CC` front/rear final drives, `+0x2D0` rear share, `+0x2D4` clutch coupling k, `+0x2D8` gear count, `+0x2DC` clutch rate, `+0x2E0` ratio table, `+0x30C` engine inertia, `+0x358` engine-braking samples | All [inf] from the analyst spec; local-data validation possible (46 records). Keep tags and cross-car checks. |
-| W2-2 | `+0x398` / `+0x39C` slip-restriction scalars (W1-3) — presence, range, cross-car distribution; measured negatives allowed | Never commit table dumps; document aggregates only. |
+| W2-1 | Document Stage-1 fields not yet in FORMATS.md: `+0x1E0` axle blocks, `+0x2C0` launch fraction, `+0x2C4`, `+0x2C8/+0x2CC` final drives, `+0x2D0` rear share, `+0x2D4` clutch coupling, `+0x2D8` gear count, `+0x2DC` clutch rate, `+0x2E0` ratio table, `+0x30C` engine inertia, `+0x358` engine-braking | **Done 2026-11-04** (1d26292); validations recorded in FORMATS.md. |
+| W2-2 | `+0x398` / `+0x39C` slip-restriction scalars — presence, range, cross-car distribution | **Done 2026-11-04** (1d26292): 17.0 / 0.0 in all 46 local records; documented aggregate only. |
+| W2-6 | `GlobalB.lzc` modified-record region (+0x3E0…+0x5AE differs from retail) — document the divergence boundary | **Done 2026-11-04** (1d26292): FORMATS.md now tags below-`+0x3E0` as retail-identical and L1–L3 observations as install-specific. |
 | W2-3 | Brake, tyre and suspension **upgrade** packages — locate and structurally prove, or demonstrate measured negatives | Explicit "help needed" slice from #9; largest unmapped region of the 0x890 record. |
 | W2-4 | Aero / drag-related fields if any exist in the record | Not yet investigated; may be a measured negative. |
 | W2-5 | `steer_ratio` (+0x380) meaning — unverified label; candidates: steering response/rate scaling vs geometry ratio | Needs behavioural correlation or analyst amendment; do not rename without evidence. |
-| W2-6 | `GlobalB.lzc` modified-record region (+0x3E0…+0x5AE differs from retail) — document the divergence boundary so offsets can be marked retail-identical vs install-specific | Provenance hygiene for all W2 offsets. |
 
 ### W3 — Harness and measurement (local engine; no retail)
 
@@ -89,12 +89,12 @@ samples, gain curves, `rear_drive`, `steer_ratio` (meaning unverified).
 
 ## 2. Suggested order (spec-first, smallest risk first)
 
-1. **W1-1 review/gate** — finish the timed-history draft (already on branch). Cheap, unblocks the pattern for the rest.
-2. **W2-1 / W2-2 / W2-6** — document known Stage-1 offsets in FORMATS.md with local-data cross-car checks. Pure docs + diagnostics; directly serves #9's "locate and prove fields" slice.
-3. **W1-2 + W1-3** — angular damping and slip torque restriction as one amendment draft (they share the angular-momentum equation). Small, high-value, fully static.
+1. **W1-1 review/gate** — finish the timed-history draft (already on branch). Cheap; is the one genuinely missing contract.
+2. **W2-1 / W2-2 / W2-6** — document known Stage-1 offsets in FORMATS.md with local-data cross-car checks. Pure docs + diagnostics; directly serves #9's "locate and prove fields" slice. **Done 2026-11-04** (1d26292).
+3. ~~W1-2 + W1-3~~ — already covered by the approved body-response amendment; do not re-specify.
 4. **W3-1 / W3-3** — fixed-input harness and the kI probe as committed deterministic tests (no behaviour change; shadow mode).
 5. **W1-6** — producer cadence contract (small; required before implementing W1-1).
-6. **W1-4** — body-response amendment (large; do only after 1–4 land and review capacity exists).
+6. **Host integration project** — wire the approved dynamic body path into the playable vehicle behind an explicit opt-in; this is the audit's Priority 1, needs maintainer sign-off, a design doc and review capacity. It is not a spec gap.
 7. **W2-3** — brake/tyre/suspension upgrade packages (open-ended format research; timeboxed; measured negatives are a valid outcome).
 8. **W5-\*** — only if and when the maintainer authorizes an original-runtime observation method.
 
