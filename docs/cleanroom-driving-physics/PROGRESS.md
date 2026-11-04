@@ -95,6 +95,12 @@ to reproduce.
 - `+0x270` kI (yaw-inertia multiplier, 2.0–2.28) exists per car but is
   **not consumed** by the playable yaw equation today.
 
+## Shared with the maintainer
+
+- Issue #128 — `car-material-test` deterministic segfault (toolchain-dependent?).
+- Draft PR #129 — docs package (this branch) for review; **draft, not for merge**; asks listed there (scope, timed-history review, host-integration direction, aggregate-doc ok).
+- Note: the fork author cannot add labels to upstream PRs (permission); labels left empty.
+
 ## Blocked / needs the maintainer
 
 - **Host integration** — the playable vehicle still uses the prescribed
