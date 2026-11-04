@@ -1298,6 +1298,56 @@ retail evidence. Common constants (0.8, 500.0, 12.0, 17.0, 0.0) may be
 engine-wide defaults rather than per-car tuning; their producers are
 unresolved.
 
+### Unmapped record regions — structural survey (2026-11-04)
+
+**Structure `[obs]`; semantics unknown unless tagged.** Local
+`GLOBAL/GLOBALB.BUN` only. The local image is documented to diverge from
+retail in record bytes `+0x3E0…+0x5AE`; offsets outside that window match
+retail in the local copy. Aggregates only; nothing here is a per-car dump.
+"Traffic" below means the pooled records for TAXI, TAXI02, AMBULANCE,
+FIRETRUCK, PANELVAN, PARCELVAN, PICKUP, 4DR_SEDAN, 4DR_SEDAN02, SUV,
+MINIVAN, HATCHBACK, HATCHBACK02, BUS and COUPE.
+
+| record offset | observation (aggregate) | reading |
+|---:|---|---|
+| `+0x340…+0x354` | 6 floats, ≤8 distinct each, range 0–0.1 | unknown; possible damage/wear factors |
+| `+0x370` | 3e-4…5e-4, 13 distinct | unknown |
+| `+0x3A0` | integer-valued, {0, 125…159}, 14 distinct; 0×15 and 155×11 dominate | candidate handling-class/preset ID; not correlated with rear share; unresolved `[inf]` |
+| `+0x3C0` | 0.015 (all 46) | constant, unknown |
+| `+0x3C4` | {0.199, 0.6, 0.801} | enum-like; unknown |
+| `+0x3C8` | 0.125 (all 46) | constant, unknown |
+| `+0x3CC` | {0.05, 0.06, 0.2} | enum-like; unknown |
+| `+0x3D0…+0x3DC` | 0.05 (all 46) | constant, unknown |
+| `+0x6A4…+0x6AC` | duplicated **exactly** at `+0x6B4…+0x6BC` in 46/46; one trailing zero each | unknown paired block |
+| `+0x650`, `+0x670` | `(12.0, 1.0, 1.0)` constant pair + two ≈1.5–2.13 floats (differ between copies); traffic shares one default (2.0/1.5) | unknown paired block; 12.0 matches the axle slip-angle sentinel |
+| `+0x6C0…+0x6CC` | four floats on the same scale as stock brakes (`+0x384`) and steer (`+0x380`); per-car values, **not** a constant multiple of stock; `+0x6CC == +0x380` in 24/46 | candidate upgraded brakes; no mapping proven `[inf]` |
+| **`+0x6D0…+0x6EC`, `+0x6F0…+0x70C`** | two 8-float blocks, 0x20 stride, **identical field layout and scale to the stock axle suspension blocks** (j, k, d+, d−, a, U, L, ref); stiffer progression/stiffness/damping in every record; all traffic records carry one shared default (1.0/100.0/5.0/5.0/0.0/0.15/−0.15/0.15) | **strongest structural candidate for the upgraded suspension package (single tier, front+rear)** `[inf]`; no retail-name mapping, no second tier found |
+| `+0x734…+0x738` | {−5.8, 1.7} in 44/46; heavy vehicles {−6.7, 2.3} | unknown constant pair |
+| `+0x744…+0x748` | {−4.7, 1.7} in 44/46 (3 variants total) | unknown constant pair |
+| `+0x754…+0x758`, `+0x7B4…+0x7B8`, `+0x7D4…+0x7D8` | three float pairs on similar scale; traffic shares one default (0.716/1.09/0.94 and 0.25/1.5); racers differ; `+0x754 != +0x7B4` per record | duplicated-style calibration blocks; unresolved |
+| `+0x7F4` | 7 (racers) / 85 (traffic) — binary split by segment | unknown integer flag; candidate traffic/racer class |
+| `+0x7F8` | 135–275 | unknown |
+| `+0x7FC`, `+0x800` | −43 / +43 (all 46) | constant pair, unknown |
+| `+0x808` | 7000 (racers) / 8000 (traffic) | unknown large-integer flag |
+| `+0x810…+0x834` | paired sequences 48…53 / 200…360 | unknown; possibly paired limits |
+| `+0x860…+0x870` | 2…120, traffic distinct from racers (e.g. 5.0/2.0/30.0 patterns) | unknown |
+| `+0x7B0`, `+0x84C…+0x850` | bytes do not decode as finite float32 in all records | likely non-float data (integer/hash); float interpretation invalid here |
+
+**What this survey does not prove**
+
+- No name mapping from any block to a retail upgrade product
+  ("sport suspension", brake kit, …) and no upgrade-tier ladder; only one
+  suspension-shaped upgrade tier is visible.
+- No separate tyre-upgrade grip block has been identified.
+- The suspension candidate blocks are above `+0x5AE` and therefore outside
+  the documented divergent window (retail-identical locally); the
+  semantics remain unproven either way.
+- Brake/tyre/suspension upgrade graph, purchase flow and tuning variants
+  remain undecoded `[inf]`.
+- Everything in the survey is a **structural** observation. Promotion to a
+  named field requires cross-car analysis, behavioural correlation and a
+  reviewed amendment before any engine use.
+
 ### `0x00135200` AttribSys records
 
 The file also contains standard chunk-framed records with magic
