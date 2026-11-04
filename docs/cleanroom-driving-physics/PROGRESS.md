@@ -44,8 +44,7 @@ to reproduce.
   `printf` at line ~2006, before any game-data check). No code was
   changed on this branch, so the crash exists in the audited
   `development` tree; it may be toolchain-specific (MSYS2 UCRT64 GCC
-  16.2.0).
-  Not filed as an issue yet — awaiting the maintainer's/user's call.
+  16.2.0). Reported as whoismept/OpenUG2#128.
 
 ## What was done (commits on `docs/timed-history-spec`)
 
