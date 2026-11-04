@@ -1282,6 +1282,12 @@ per-car values committed anywhere) support the framing:
 | `+0x30C` | `f32` | engine rotational inertia | 19 distinct values, ~2e-4–7e-4 tonne·m² |
 | `+0x358…+0x360` | `3*f32` | engine-braking samples | 0.065–0.41; present in all 46 |
 | `+0x398` / `+0x39C` | `f32` | slip-dependent vertical-torque restriction scalars | 17.0 and 0.0 in all 46 |
+| `+0x270` | `f32` | yaw-inertia multiplier kI (Stage 5 BR-1) | 2.0–2.28, 11 distinct |
+| `+0x370` | `f32` | unknown (tiny) | 3e-4–5e-4, 11 distinct |
+| `+0x374` / `+0x378` | `f32` | aero coefficients cF / cR (Stage 2) | 0.13–0.185 / 0.14–0.18 |
+| `+0x37C` | `f32` | aero-to-preload factor kA (Stage 2) | 0–0.03, 5 distinct |
+| `+0x384` / `+0x388` / `+0x38C` | `f32` | brake strengths Kb / Kh and rear share beta (Stage 3) | 0.4–1.0 / 0.3–0.67 / 0.47–0.6 |
+| `+0x390` / `+0x394` | `f32` | rear slip-bonus b0 / b1 (Stage 5) | 0.0 and 2.5 in all 46 |
 
 Cross-checks: inertia matches the solid-box relation within 1% in 46/46;
 the forward-ratio sequence descends strictly in 46/46; the stock and L1–L3
