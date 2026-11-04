@@ -81,6 +81,11 @@ to reproduce.
    duplicated draft; gap map corrected. The actual remaining gap is
    **host integration**, not specification.
 7. `4913fe0` — Gap map status updated (W3-1/W2-4 done).
+8. `f2ef378` — **Shared with maintainer**: issue #128 + draft PR #129.
+9. **`+0x380` steer_ratio correlation survey**: weak/moderate correlation
+   with kI (0.47), Izz (0.41), mass (0.37), wheelbase (0.26); none with
+   rear share; traffic ≈1.0 (one 1.25), racers 1.01–1.25; discrete-bucket
+   pattern. Semantics unproven; recorded in FORMATS.md; no rename/wiring.
 
 ## Discoveries worth knowing
 
@@ -119,7 +124,6 @@ to reproduce.
 - No EA assets or dumps were committed; measurements are aggregate-only.
 
 ## How to reproduce locally
-
 ```
 make debug                                     # build
 ./nfsu2.exe --path <data-root> --shot out.png  # smoke test

@@ -1304,6 +1304,18 @@ retail evidence. Common constants (0.8, 500.0, 12.0, 17.0, 0.0) may be
 engine-wide defaults rather than per-car tuning; their producers are
 unresolved.
 
+### `steer_ratio` (`+0x380`) — correlation survey (2026-11-04)
+
+**Aggregates only; meaning unverified.** Correlations across the 46 local
+records: with kI 0.47, with Izz 0.41, with mass 0.37, with wheelbase 0.26,
+with rear share 0.06 (none). Traffic records average 1.017 (fourteen at
+exactly 1.0; the heavy traffic record is 1.25); racers average 1.106
+(range 1.01–1.25). Values are consistent with a discrete,
+handling-family-flavoured multiplier but equally fit other bucketings;
+no consumer is wired and no behavioural correlation exists. Keep the
+"steering response" label provisional. Per-car values are not committed;
+reproduction needs the local data root.
+
 ### Unmapped record regions — structural survey (2026-11-04)
 
 **Structure `[obs]`; semantics unknown unless tagged.** Local

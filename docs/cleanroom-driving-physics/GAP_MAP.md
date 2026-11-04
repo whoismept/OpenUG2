@@ -46,7 +46,7 @@ samples, gain curves, `rear_drive`, `steer_ratio` (meaning unverified).
 | W2-6 | `GlobalB.lzc` modified-record region (+0x3E0…+0x5AE differs from retail) — document the divergence boundary | **Done 2026-11-04** (1d26292): FORMATS.md now tags below-`+0x3E0` as retail-identical and L1–L3 observations as install-specific. |
 | W2-3 | Brake, tyre and suspension **upgrade** packages — locate and structurally prove, or demonstrate measured negatives | **Survey done 2026-11-04**: suspension-shaped upgrade pair at `+0x6D0`/`+0x6F0` (same 8-float layout as stock axle blocks; traffic shares one default) is the strongest candidate; tyre-upgrade block not found; brake candidate `+0x6C0`/`+0x6CC` unproven. All logged in FORMATS.md "Unmapped record regions". Semantics unproven; nothing wired into the engine. |
 | W2-4 | Aero / drag-related fields | **Done 2026-11-04**: cF/cR (`+0x374/+0x378`), kA (`+0x37C`), kI (`+0x270`), brake Kb/Kh/beta (`+0x384…+0x38C`), rear slip-bonus b0/b1 (`+0x390/+0x394`) documented with fleet aggregates in FORMATS.md. |
-| W2-5 | `steer_ratio` (+0x380) meaning — unverified label; candidates: steering response/rate scaling vs geometry ratio | Needs behavioural correlation or analyst amendment; do not rename without evidence. |
+| W2-5 | `steer_ratio` (+0x380) meaning — unverified label; correlation survey done | Correlates weakly/moderately with kI (0.47), Izz (0.41), mass (0.37), wheelbase (0.26); no correlation with rear share; traffic ≈1.0 (except one 1.25), racers 1.01–1.25. Discrete-bucket pattern; semantics unproven. Recorded in FORMATS.md "steer_ratio (+0x380)". No rename, no wiring. |
 
 ### W3 — Harness and measurement (local engine; no retail)
 
