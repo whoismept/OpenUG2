@@ -59,27 +59,32 @@ static int drive(const char *root,const WEvent *e,int *spawned,int *finished,
                 e->id,source->event[selected].name,difficulty,reference>=0);
         }
         if(driven==wanted) {
+            int invalid=0;
             for(int frame=0;frame<90000;frame++) {
                 AiCar *contacts[N_RACE_AI+1];int done=0,failed=0;
                 for(int k=0;k<driven;k++) {
+                    int was_finished=drivers[k].progress.finished;
                     ai_race_step(cars,drivers,k,driven,e->circuit,&world,reference>=0?cars+reference:NULL);
                     if(drivers[k].source){float intent=ai_race_pace(cars+k,drivers+k,k,&world,reference>=0?cars+reference:NULL);
                         low[k]=fminf(low[k],intent);high[k]=fmaxf(high[k],intent);}
-                    contacts[k]=cars+k;done+=drivers[k].progress.finished;failed+=drivers[k].drive.failed;
+                    contacts[k]=cars+k;done+=drivers[k].progress.finished;
+                    failed+=!was_finished && drivers[k].drive.failed;
                 }
                 if(reference>=0){
+                    int was_finished=drivers[reference].progress.finished;
                     AiTrafficWorld control=world;control.race_source=NULL;
                     control.race_pace=pace>0?fmaxf(40,pace-12):pace;
                     ai_race_step(cars,drivers,reference,driven+1,e->circuit,&control,NULL);
                     contacts[reference]=cars+reference;
-                    failed+=drivers[reference].drive.failed;
+                    failed+=!was_finished && drivers[reference].drive.failed;
                 }
                 ai_car_contacts(contacts,driven+(reference>=0),&world,NULL);
                 world_props_step(1/PHYS_TICKRATE);
                 *finished=done;
+                invalid|=failed;
                 if(done==driven || failed)break;
             }
-            ok=*finished==driven && (reference<0 || !drivers[reference].drive.failed);
+            ok=!invalid && *finished==driven && (reference<0 || drivers[reference].progress.finished || !drivers[reference].drive.failed);
             int applied=0;
             for(int k=0;k<driven;k++)applied+=drivers[k].source!=NULL;
             printf("EVENT-MODE %d kind=%s laps=%d source-drivers=%d/%d\n",

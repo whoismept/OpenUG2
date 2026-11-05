@@ -184,7 +184,7 @@ static int structural_name(const char *n) {
 }
 static int sweep(const char *troot, float corridor) {
     static const char *regions[] = { "L4RA","L4RB","L4RC","L4RD","L4RF","L4RG","L4RH","L4RR" };
-    long tot_ev = 0, tot_degrade = 0, tot_fail = 0, tot_noroute = 0, tot_onroute = 0;
+    long tot_ev = 0, tot_absent = 0, tot_fail = 0, tot_noroute = 0, tot_onroute = 0;
     long tot_risky = 0;
     int worst_on_route = 0, worst_ev = 0;
     char worst_reg[8] = "";
@@ -227,13 +227,14 @@ static int sweep(const char *troot, float corridor) {
             long own = 0, foreign = 0, nonev = 0, risky = 0;
             int on_route = 0, npts = 0;
             if (!present) {
-                tot_degrade++;
-                verdict = "degrade";
-                note = "no authored group; unfiltered scene";
-            } else if (!wg_selection_open(&t, event, &sel)) {
+                tot_absent++;
+                verdict = "common";
+                note = "no own group; shared/unknown memberships retained";
+            }
+            if (!wg_selection_open(&t, event, &sel)) {
                 tot_fail++;
                 verdict = "FAIL";
-                note = "selection rejected an authored group";
+                note = "selection rejected the requested event";
             } else if (!winst_check_scenery(d, 0, len, 0, &sel)) {
                 tot_fail++;
                 verdict = "FAIL";
@@ -339,8 +340,8 @@ static int sweep(const char *troot, float corridor) {
         }
         free(idx.sections); free(idx.present); free(d); free(c);
     }
-    printf("\nSWEEP events=%ld degraded=%ld failed=%ld without_own_route=%ld\n",
-           tot_ev, tot_degrade, tot_fail, tot_noroute);
+    printf("\nSWEEP events=%ld without_own_group=%ld failed=%ld without_own_route=%ld\n",
+           tot_ev, tot_absent, tot_fail, tot_noroute);
     printf("SWEEP road-named placements some event selection hides: %ld "
            "(dressing only; ground comes from the unfiltered prototype path)\n", tot_risky);
     printf("SWEEP foreign placements standing within %.1f m of the raced route: "

@@ -206,7 +206,8 @@ float ai_drag_lane_target(const AiTrafficWorld *world,const AiCar *car,const AiD
 typedef struct {
     WRace progress; AiDrive drive; PhysManual gearbox;
     float offset,finish_at,pass_side; int blocked,finishing;
-    float turn_speed; /* m/s, zero when no tight-turn pace limit is active */
+    float turn_speed; /* m/s, zero when no lane-speed limit is active */
+    int drop_phase,drop_ticks; /* 0: normal, 1: validated launch, 2: airborne; bounded by the forecast */
     const RaceAiSource *source;
     float source_scale;
     int source_skill,source_catch_up;

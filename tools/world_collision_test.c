@@ -343,13 +343,13 @@ static void bun_event_walls(void) {
     for(int q=0;q<5;q++) {
         int event=events[q];N2Scene scene={0};assert(wce_bun(&scene,&data,7,event));
         float obst[6][4],z[6][2];int src[6];int count=phys_collect_walls(&scene,obst,src,z,6);
-        assert(count==(event==-1?4:event==4004||event==4103?3:6));
+        assert(count==(event==-1||event==4999?2:event==4004||event==4103?3:6));
         assert(bun_probe(&scene,10.1f));
         assert(bun_probe(&scene,40.1f)); /* unknown/common retained */
-        assert(!!bun_probe(&scene,20.1f)==(event==4004||event==4999||event==0));
-        assert(!!bun_probe(&scene,30.1f)==(event==4103||event==4999||event==0));
-        assert(!!bun_probe(&scene,50.1f)==(event==-1||event==4999||event==0));
-        assert(!!bun_probe(&scene,60.1f)==(event==-1||event==4999||event==0));
+        assert(!!bun_probe(&scene,20.1f)==(event==4004||event==0));
+        assert(!!bun_probe(&scene,30.1f)==(event==4103||event==0));
+        assert(!!bun_probe(&scene,50.1f)==(event==0)); /* career: closed only in */
+        assert(!!bun_probe(&scene,60.1f)==(event==0)); /* explicit unfiltered scene */
         for(int k=0;k<scene.count;k++){free(scene.meshes[k].verts);free(scene.meshes[k].idx);}free(scene.meshes);
     }
     N2Mesh *m=calloc(1,sizeof *m);assert(m);m[0]=mesh(1,1,0,0);N2Scene scene={m,1,1};

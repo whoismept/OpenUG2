@@ -4,18 +4,10 @@
 #include "ug2_track_collision.h"
 #include "world_scenery.h"
 
-static int wce_bun_event(const UG2TrackCollision *data,int event) {
-    if(event<=0)return event;
-    for(size_t k=0;k<data->activation.count;k++)
-        if(wg_event_id((const char*)data->activation.records[k]+9)==event)return event;
-    return 0; /* no authored event group: preserve the existing unfiltered fallback */
-}
-
 static int wce_bun(N2Scene *scene,const UG2TrackCollision *data,uint32_t bundle,int event) {
     if(!scene || !data || event < -1 || event > 65535 || !data->activation.count || data->activation.count>256 ||
        scene->count<0 || data->count>(size_t)(INT_MAX-scene->count) ||
        (data->count && !data->polygons))return 0;
-    event=wce_bun_event(data,event);
     N2Mesh *walls=data->count?calloc(data->count,sizeof *walls):NULL;
     if(data->count && !walls)return 0;
     int count=0;
@@ -26,7 +18,7 @@ static int wce_bun(N2Scene *scene,const UG2TrackCollision *data,uint32_t bundle,
         const char *name=(const char*)data->activation.records[group]+9;
         int owner=wg_event_id(name);
         /* shortcut: named group selection; decode retail activation flags before widening this policy. */
-        if(event && ((owner && owner!=event) || (event>0 && wg_isolated_closure(name))))continue;
+        if(event && ((owner && owner!=event) || wg_isolated_closure(name)))continue;
         for(int v=0;v<4;v++)memcpy(verts+v*5,poly->corners[v],3*sizeof(float));
         uint16_t indices[]={0,1,2,0,2,3};
         N2Mesh m={0};m.verts=verts;m.idx=indices;m.nverts=4;m.nidx=6;

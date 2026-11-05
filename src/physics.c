@@ -207,11 +207,12 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
 
     /* bump stop: no wheel may end the frame compressed past its travel, so the
        body can never settle through a surface it is standing on. */
-    float pen = 0;
+    float pen = 0, contact_vz = -INFINITY;
     for (int k = 0; k < 4; k++) {
         if (!s->valid[k]) continue;
         float wz = r->z + ax[k]*r->pitch + ay[k]*r->roll;
         float over = (s->z[k] - wz) - PHYS_RIDE_BUMP;
+        if (over > 0) contact_vz=fmaxf(contact_vz,s->vz[k]-ax[k]*r->pitch_rate-ay[k]*r->roll_rate);
         if (over > pen) pen = over;
     }
     if (pen > 0) {
@@ -221,7 +222,8 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
            reachable contacts reach this loop, so an out-of-reach deck overhead
            contributes nothing. */
         if (pen > PHYS_RIDE_PEN_MAX) pen = PHYS_RIDE_PEN_MAX;
-        r->z += pen; r->lift = pen; if (r->vz < 0) r->vz = 0;
+        /* Cancel closing speed at the supported wheel, preserving downhill travel. */
+        r->z += pen; r->lift = pen; r->vz=fmaxf(r->vz,contact_vz);
     }
 
     /* refresh the reported compressions after the clamp/bump-stop */
