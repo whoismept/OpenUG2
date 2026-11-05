@@ -521,6 +521,69 @@ static void lane_heights(const char *root,float along,float across,float base) {
     rewind(f);assert(fwrite(data,1,(size_t)size,f)==(size_t)size);free(data);assert(!fclose(f));
 }
 
+/* A coarse endpoint can see the floor beneath a continuous rising road.
+   Source height selects the deck; the incoming-height sweep must still reach it. */
+/* Alternating solid ends need a changing lane inside the authored corridor;
+   no single parallel offset can pass both. Branch progress is deliberately absent. */
+static void fallback_chicane_test(const char *root) {
+    for(int mirror=-1;mirror<=1;mirror+=2)for(int narrow=0;narrow<3;narrow++){
+        segmented_file(root,0);
+        float shift=narrow==1?20:0;
+        if(narrow==1){char path[512];snprintf(path,sizeof path,"%s/ROUTESTEST/Paths1.bin",root);FILE*f=fopen(path,"r+b");assert(f);for(int i=0;i<9;i++){float x;assert(!fseek(f,24+24*i,SEEK_SET));assert(fread(&x,4,1,f)==1);x+=shift;assert(!fseek(f,-4,SEEK_CUR));assert(fwrite(&x,4,1,f)==1);}assert(!fclose(f));}
+        enum {N=9,RECORD=140+56*N,SIZE=16+RECORD};unsigned char bytes[SIZE]={0};
+        uint32_t heads[]={0x80034120,SIZE-8,0x34121,SIZE-16},pair=N|(N<<16);memcpy(bytes,heads,16);memcpy(bytes+24+44,&pair,4);
+        for(int i=0;i<N;i++){float x=i*40.0f+shift;memcpy(bytes+24+128+i*56+4,&x,4);uint16_t width[]={(narrow==1?5:24)*256,(narrow==1?5:24)*256};memcpy(bytes+24+128+i*56+24,width,4);if(narrow==2){int16_t height=20*8;memcpy(bytes+24+128+i*56+22,&height,2);}}
+        char file[512];snprintf(file,sizeof file,"%s/ROUTESTEST/Routes1F.bin",root);FILE*f=fopen(file,"wb");assert(f);assert(fwrite(bytes,1,sizeof bytes,f)==sizeof bytes);assert(!fclose(f));
+        float floor[]={-40,-22,0,0,0,360,-22,0,0,0,360,22,0,0,0,-40,22,0,0,0};
+        float wall[2][20];uint16_t ix[]={0,1,2,0,2,3};N2Mesh meshes[3]={{.verts=floor,.cat=N2_ROAD}};
+        for(int i=0;i<2;i++){float x=100+20*i,lo=i?-.5f:-22,hi=i?22:.5f;float v[]={x,mirror*lo,0,0,0,x,mirror*hi,0,0,0,x,mirror*hi,3,0,0,x,mirror*lo,3,0,0};memcpy(wall[i],v,sizeof v);meshes[i+1]=(N2Mesh){.verts=wall[i],.cat=N2_COLLISION,.ground_disabled=1,.scen=N2_SC_WALL};}
+        for(int i=0;i<3;i++){meshes[i].nverts=4;meshes[i].idx=ix;meshes[i].nidx=6;}
+        N2Scene scene={meshes,3,3};float bounds[][4]={{-40,-22,360,22},{100,-22,100,22},{120,-22,120,22}};WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);
+        float walls[3][4],height[3][2];int src[3],nw=phys_collect_walls(&scene,walls,src,height,3);assert(nw==2);phys_wall_index_build(walls,height,nw);
+        AiTrafficWorld world={.scene=&scene,.obst=walls,.obstz=height,.obstsrc=src,.nobst=nw,.race_pace=50};
+        AiCar player={.pos={-20,0,0},.half_length=2,.half_width=.85f,.height=1.5f},cars[N_RACE_AI];for(int k=0;k<N_RACE_AI;k++)cars[k]=player;
+        AiRace drivers[N_RACE_AI]={0};N2Path path={0};WEvent event={.id=1,.reg="TEST",.npoly=2,.poly={{shift,0},{320+shift,0}},.info={.kind=N2_RACE_SPRINT}};
+        WRace race={.active=1,.maxlaps=1,.ngate=3,.ngrid=3,.gate={{.dx=1,.half=25},{.x=160,.dx=1,.half=25},{.x=320,.dx=1,.half=25}},.grid={{-10,0,0},{-4,0,0},{2,0,0}}};
+        if(narrow==1){player.pos[0]=20;player.pos[1]=4;float slots[][3]={{20,-4,0},{26,4,0},{32,4,0}};memcpy(race.grid,slots,sizeof slots);}
+        assert(ai_race_prepare(root,&event,&race,&world,&path,cars,drivers,&player)==3);int done=0,failed=0;
+        if(narrow){assert(path.n==(narrow==1?9:10));assert(fabsf(path.xy[1])<.01f);for(int k=0;k<3;k++)assert(!drivers[k].drive.failed);free(path.xy);phys_wall_index_build(NULL,NULL,0);world_ground_grid_activate(NULL);world_ground_grid_free(&grid);continue;}
+        for(int tick=0;tick<18000 && done<3 && !failed;tick++){done=failed=0;AiCar*contacts[3];for(int k=0;k<3;k++){ai_race_step(cars,drivers,k,3,0,&world,NULL);done+=drivers[k].progress.finished;failed+=!drivers[k].progress.finished && drivers[k].drive.failed;contacts[k]=cars+k;}ai_car_contacts(contacts,3,&world,NULL);}
+        fprintf(stderr,"fallback chicane mirror%d complete%d failed%d\n",mirror,done,failed);assert(done==3 && !failed);
+        free(path.xy);phys_wall_index_build(NULL,NULL,0);world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    }
+}
+
+static void rising_deck_course_test(const char *root) {
+    parallel_lane_file(root);
+    char file[512];snprintf(file,sizeof file,"%s/ROUTESTEST/Routes1F.bin",root);
+    FILE *f=fopen(file,"r+b");assert(f);
+    for(int lane=0;lane<2;lane++)for(int k=0;k<5;k++){
+        float x=-20+20*k;int16_t h=(int16_t)lroundf(8*(lane?0:.12f*fmaxf(0,x)));
+        unsigned char z[2]={(unsigned char)h,(unsigned char)((uint16_t)h>>8)};
+        assert(!fseek(f,24+lane*(140+5*56)+128+k*56+22,SEEK_SET));assert(fwrite(z,1,2,f)==2);
+        if(lane){float y=20+2*sinf(k*3.14159265f/4);assert(!fseek(f,24+lane*(140+5*56)+128+k*56+8,SEEK_SET));assert(fwrite(&y,4,1,f)==1);}
+    }assert(!fclose(f));
+    float floor[]={-50,-30,0,0,0,0,-30,0,0,0,0,30,0,0,0,-50,30,0,0,0};
+    float far_floor[]={-50,14,0,0,0,110,14,0,0,0,110,30,0,0,0,-50,30,0,0,0};
+    float under[]={14.9f,-6,1,0,0,110,-6,1,0,0,110,6,1,0,0,14.9f,6,1,0,0};
+    float ramp[]={0,-6,0,0,0,110,-6,13.2f,0,0,110,6,13.2f,0,0,0,6,0,0,0};
+    float wall[]={35,-8,0,0,0,35,8,0,0,0,35,8,1.5f,0,0,35,-8,1.5f,0,0};
+    uint16_t ix[]={0,1,2,0,2,3};N2Mesh meshes[]={{.verts=floor,.cat=N2_ROAD},{.verts=far_floor,.cat=N2_ROAD},{.verts=under,.cat=N2_ROAD},{.verts=ramp,.cat=N2_ROAD},{.verts=wall,.cat=N2_COLLISION,.ground_disabled=1,.scen=N2_SC_WALL}};
+    for(int k=0;k<5;k++){meshes[k].nverts=4;meshes[k].idx=ix;meshes[k].nidx=6;}
+    N2Scene scene={meshes,5,5};float bounds[][4]={{-50,-30,0,30},{-50,14,110,30},{14.9f,-6,110,6},{0,-6,110,6},{35,-8,35,8}};
+    WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);
+    float walls[3][4],heights[3][2];int sources[3],count=phys_collect_walls(&scene,walls,sources,heights,3);assert(count==1);phys_wall_index_build(walls,heights,count);
+    AiTrafficWorld world={.scene=&scene,.obst=walls,.obstz=heights,.obstsrc=sources,.nobst=count,.race_pace=50};
+    AiCar player={.pos={-30,0,0},.half_length=2,.half_width=.85f,.height=1.5f},cars[N_RACE_AI]={0};for(int k=0;k<N_RACE_AI;k++)cars[k]=player;
+    AiRace drivers[N_RACE_AI]={0};N2Path path={0};WEvent event={.id=1,.reg="TEST",.npoly=2,.poly={{-20,0},{60,0}},.info={.kind=N2_RACE_SPRINT}};
+    WRace race={.active=1,.maxlaps=1,.ngate=3,.ngrid=3,.gate={{.x=-20,.dx=1,.half=25},{.x=20,.dx=1,.half=25},{.x=60,.dx=1,.half=25}},.grid={{-10,0,0},{-4,0,0},{2,0,.24f}}};
+    assert(ai_race_prepare(root,&event,&race,&world,&path,cars,drivers,&player)==3);
+    for(int i=0;i<path.n;i++)if(path.xy[2*i]>25 && path.xy[2*i]<55)assert(fabsf(path.xy[2*i+1])<1);
+    for(int tick=0;tick<6000;tick++){int done=0;AiCar*contacts[N_RACE_AI];for(int k=0;k<3;k++){ai_race_step(cars,drivers,k,3,0,&world,NULL);assert(!drivers[k].drive.failed);contacts[k]=cars+k;done+=drivers[k].progress.finished;}ai_car_contacts(contacts,3,&world,NULL);if(done==3)break;}
+    for(int k=0;k<3;k++)assert(drivers[k].progress.finished && cars[k].pos[2]>5);
+    free(path.xy);phys_wall_index_build(NULL,NULL,0);world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+}
+
 /* Prefer the physically supported route whose authored height matches the
    grid's deck over a closer XY chain authored for an unreachable upper road. */
 static void authored_layer_test(const char *root) {
@@ -1761,6 +1824,108 @@ static void corner_margin_test(void) {
     world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
 }
 
+/* Ramp lips can intentionally leave the tyres airborne above a lower landing.
+   A driver must land under ordinary physics; missing floors and walls stay closed. */
+static int ramp_drop_contacts;
+static void ramp_drop_contact(const float before[3],const float after[3],int kind) {
+    (void)before;(void)after;if(!kind)ramp_drop_contacts++;
+}
+static void ramp_drop_test(void) {
+    for(int manual=0;manual<2;manual++)for(int direction=-1;direction<=1;direction+=2)for(int hazard=0;hazard<4;hazard++) {
+        float floor[]={-50,-15,0,0,0,200,-15,0,0,0,200,15,0,0,0,-50,15,0,0,0};
+        float ramp[]={20,-15,0,0,0,40,-15,1.8f,0,0,40,15,1.8f,0,0,20,15,0,0,0};
+        float wall[]={46,-15,0,0,0,46,15,0,0,0,46,15,8,0,0,46,-15,8,0,0};
+        if(hazard==1){floor[5]=40;floor[10]=40;}
+        if(hazard==2)for(int j=0;j<4;j++)floor[5*j+2]=-20;
+        for(int j=0;j<4;j++){floor[5*j]*=direction;ramp[5*j]*=direction;wall[5*j]*=direction;}
+        uint16_t idx[]={0,1,2,0,2,3};
+        N2Mesh meshes[]={{.verts=floor,.cat=N2_TERRAIN},{.verts=ramp,.cat=N2_TERRAIN},
+            {.verts=wall,.cat=N2_OTHER,.scen=N2_SC_WALL}};
+        for(int j=0;j<3;j++){meshes[j].nverts=4;meshes[j].idx=idx;meshes[j].nidx=6;}
+        N2Scene scene={meshes,hazard==3?3:2,3};
+        WGroundGrid grid={0};float bounds[][4]={{-200,-15,200,15},{-40,-15,40,15},{-46,-15,46,15}};
+        assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);
+        float obs[3][4],oz[3][2];int src[3];
+        AiTrafficWorld world={.scene=&scene,.obst=obs,.obstz=oz,.obstsrc=src,.race_pace=50};
+        world.nobst=phys_collect_walls(&scene,obs,src,oz,3);phys_wall_index_build(obs,oz,world.nobst);
+        float xy[]={direction*20,0,direction*40,0,direction*60,0,direction*100,0,direction*140,0};
+        N2Path path={.xy=xy,.n=5};AiCar cars[N_RACE_AI]={0};AiRace drivers[N_RACE_AI]={0};
+        int airborne[3]={0},recovered[3]={0},hits=0,done=0,frames=0;
+        AiContactHook old_hook=g_ai_contact_hook;g_ai_contact_hook=ramp_drop_contact;ramp_drop_contacts=0;
+        for(int k=0;k<3;k++) {
+            cars[k]=(AiCar){.pos={direction*25,(k-1)*4.0f,.45f},.head=direction>0?0:3.14159265f,
+                .spd=20/3.6f/PHYS_TICKRATE,.half_length=2,.half_width=.85f,.height=1.5f};
+            if(manual) {
+                cars[k].has_powertrain=1;cars[k].tyre_radius=.3f;
+                cars[k].vehicle=phys_vehicle_from_geometry(4,1.7f,1.5f,2.6f,1.6f,.25f);
+                cars[k].powertrain=(N2PhysicsAttr){.idle_rpm=800,.redline_rpm=6500,.limiter_rpm=7000};
+                cars[k].powertrain.gearbox[0]=(N2GearboxAttr){.final_drive=4,.forward={3,2,1},.gear_count=3};
+                for(int j=0;j<9;j++)cars[k].powertrain.torque[j]=1;
+            }
+            drivers[k]=(AiRace){.offset=direction*(k-1)*4.0f,
+                .progress={.active=1,.kind=N2_RACE_DRAG,.ngate=2,.maxlaps=1,
+                    .gate={{.x=direction*20,.dx=direction,.half=15},
+                           {.x=direction*120,.dx=direction,.half=15}}}};
+            if(manual && !hazard)drivers[k].offset+=1.5f; /* unfinished lane change at the lip */
+            assert(ai_drive_init(&drivers[k].drive,&path,cars[k].pos,cars[k].head));
+            drivers[k].drive.error_limit=12;
+        }
+        for(int tick=0;tick<3000 && done<3;tick++) {
+            frames++;done=0;
+            for(int k=0;k<3;k++) {
+                ai_race_step(cars,drivers,k,3,0,&world,NULL);
+                airborne[k]|=cars[k].ride.contact_mask==0;
+                recovered[k]|=drivers[k].drop_phase!=0;
+                done+=drivers[k].progress.finished;
+                assert(isfinite(cars[k].pos[2]));
+                if(hazard)assert(direction*cars[k].pos[0]<46);
+            }
+            AiCar *contact[]={cars,cars+1,cars+2};
+            hits+=ai_car_contacts(contact,3,&world,NULL)>0;
+        }
+        fprintf(stderr,"ramp drop manual%d dir%d hazard%d finished%d airborne%d,%d,%d contacts%d\n",manual,direction,hazard,done,airborne[0],airborne[1],airborne[2],hits);
+        if(!hazard)for(int k=0;k<3;k++)assert(drivers[k].progress.finished && airborne[k] && recovered[k] && !drivers[k].drop_phase && cars[k].ride.contact_mask==15 && !drivers[k].drive.failed);
+        else assert(!done);
+        assert(!hits && ramp_drop_contacts==frames*3 && g_ai_contact_hook==ramp_drop_contact);
+        g_ai_contact_hook=old_hook;phys_wall_index_build(NULL,NULL,0);world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    }
+}
+
+
+/* A convex ramp ends where an otherwise drivable bend begins. */
+static void crest_course_test(void) {
+    enum{N=81,P=N-10};uint16_t ix[(N-1)*6];float vertices[N*10],xy[P*2];
+    for(int side=-1;side<=1;side+=2)for(int delay=0;delay<=30;delay+=30)for(int hill=1;hill>=0;hill--) {
+        for(int i=0;i<N;i++) {
+            float start=100+delay,s=-20+4*i,a=fmaxf(0,fminf(1.570796327f,(s-start)/45)),x=s,y=0;
+            if(s>start){x=start+45*sinf(a);y=45*(1-cosf(a))+fmaxf(0,s-start-45*1.570796327f);}
+            float z=hill?.2f*fmaxf(0,fminf(60,s-40)):0;
+            if(i>=5 && i<5+P){xy[2*(i-5)]=x;xy[2*(i-5)+1]=side*y;}
+            for(int k=0;k<2;k++){float w=k?-20:20;float *v=vertices+10*i+5*k;v[0]=x-sinf(a)*w;v[1]=side*(y+cosf(a)*w);v[2]=z;v[3]=v[4]=0;}
+            if(i+1<N){uint16_t indices[]={2*i,2*i+1,2*i+2,2*i+1,2*i+3,2*i+2};memcpy(ix+6*i,indices,sizeof indices);}
+        }
+        N2Mesh mesh={.verts=vertices,.idx=ix,.nverts=N*2,.nidx=(N-1)*6,.cat=N2_ROAD};N2Scene scene={&mesh,1,1};
+        float bounds[][4]={{-40,-40,220,220}};if(side<0){bounds[0][1]=-220;bounds[0][3]=40;}
+        WGroundGrid grid={0};assert(world_ground_grid_build(&grid,&scene,bounds));world_ground_grid_activate(&grid);phys_wall_index_build(NULL,NULL,0);
+        N2Path path={xy,P};AiCar cars[N_RACE_AI]={0};AiRace drivers[N_RACE_AI]={0};
+        cars[0]=(AiCar){.pos={0,delay?-side*10:0,0},.head=0,.spd=(delay?180:120)/3.6f/PHYS_TICKRATE,.half_length=2,.half_width=.85f,.height=1.5f};
+        assert(ai_drive_join(&drivers[0].drive,&path,cars[0].pos,0,12));
+        drivers[0].offset=delay?-side*10:0;
+        drivers[0].progress=(WRace){.active=1,.kind=N2_RACE_URL,.lap=1,.maxlaps=1,.ngate=2,.next=1,
+            .gate={{.dx=1,.half=20},{.x=145+delay,.y=xy[2*(P-1)+1]-side*20,.dy=side,.half=20}}};
+        AiTrafficWorld world={.scene=&scene,.race_pace=180};float peak=0,entry=0;int max_air=0,air=0;
+        for(int tick=0;tick<12000 && !drivers[0].progress.finished && !drivers[0].drive.failed;tick++) {
+            ai_race_step(cars,drivers,0,1,0,&world,NULL);peak=fmaxf(peak,drivers[0].drive.error);
+            if(!cars[0].ride.contact_mask){air++;if(air>max_air)max_air=air;}else air=0;
+            if(drivers[0].drive.progress<100)entry=PHYS_KMH(cars[0].spd);
+        }
+        fprintf(stderr,"crest side%d delay%d hill%d finished%d failed%d error%.3f entry%.1f air%d\n",side,delay,hill,drivers[0].progress.finished,drivers[0].drive.failed,peak,entry,max_air);
+        assert(drivers[0].progress.finished && !drivers[0].drive.failed);
+        assert(peak<12);
+        world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    }
+}
+
 int main(void) {
     corner_margin_test();
     side_by_side_corner_test();
@@ -1769,6 +1934,7 @@ int main(void) {
     moving_gap_test();
     street_turn_course_test();
     street_turn_pace_test();
+    crest_course_test();
     pursuit_recovery_speed_test();
     steady_lane_test();
     race_testdrive_test();
@@ -2294,6 +2460,8 @@ int main(void) {
     narrow_course_test(root,1);
     source_ai_test(root);
     authored_layer_test(root);
+    rising_deck_course_test(root);
+    fallback_chicane_test(root);
     progress_outlier_course_test(root,0);
     progress_outlier_course_test(root,1);
     route_height_test(root);
@@ -2306,6 +2474,7 @@ int main(void) {
     snprintf(dir,sizeof dir,"%s/ROUTESTEST/Routes1F.bin",root);assert(!unlink(dir));
     snprintf(dir,sizeof dir,"%s/ROUTESTEST",root);assert(!rmdir(dir));assert(!rmdir(root));
     world_ground_grid_activate(NULL);world_ground_grid_free(&grid);
+    ramp_drop_test();
     rising_overlap_test();
     corner_wall_test();
     wall_turn_recovery_test();

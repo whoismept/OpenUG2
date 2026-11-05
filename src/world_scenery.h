@@ -25,9 +25,8 @@ enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_KNOCKDOWN=8 };
  * including two other events' start/finish gantries sit at 0.00 m from 4701's
  * own 0x34148 racing line.
  *
- * A positive id here is a REQUEST. Some shipped events author no group at all
- * (L4RB 4201/4202/4203, L4RC 4341), and the builder degrades those back to the
- * unfiltered scene rather than failing to load. */
+ * A positive request with no own group retains common/unknown memberships;
+ * it does not activate other events' exclusive placements. */
 static int wg_runtime_selection(int preview_set,int preview_event,int race_event) {
     if(preview_set)return preview_event;
     return race_event>0?race_event:-1;
@@ -48,8 +47,9 @@ static int wg_event_id(const char *name) {
     return 0;
 }
 static int wg_isolated_closure(const char *name) {
-    /* L4RA's demo-exclusive panels cross the supported 4001 road. Use group
-       ownership, not mesh names/coordinates; active/shared members stay visible. */
+    /* L4RA's demo-exclusive panels cross the supported 4001 road, and the
+       career-stage sheets (200 m tall) cross 12420->12421. Races and free roam
+       drop both; use group ownership, not mesh names/coordinates. */
     return !strcmp(name,"BARRIERS_DEMO") ||
         (!strncmp(name,"BARRIERS_CAREER",15) &&
          (wg_numeric_id(name+15)>0 || !strcmp(name+15,"0")));
@@ -84,20 +84,18 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
         const unsigned char *r=table->overrides+8*i;
         items[i].section=wg_u16(r);items[i].row=wg_u16(r+2);items[i].flags=wg_u16(r+4);
     }
-    int found=event<=0;
     for(size_t p=0;p<table->group_bytes;) {
         const unsigned char *g=table->groups+p;
         int id=wg_event_id((const char *)g+8);
-        unsigned bits=event && (id || (event>0 && wg_isolated_closure((const char *)g+8)))?WG_EVENT:WG_OTHER;
+        unsigned bits=event && (id || wg_isolated_closure((const char *)g+8))?WG_EVENT:WG_OTHER;
         if(!strcmp((const char *)g+8,"SMOKEABLE"))bits|=WG_KNOCKDOWN;
-        if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
+        if(id>0&&id==event)bits|=WG_ACTIVE;
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;
         p+=(size_t)((52ULL+2ULL*refs+3)&~3ULL);
     }
     if(n>1)qsort(items,n,sizeof *items,wg_selected_cmp);
     for(size_t i=1;i<n;i++)if(!wg_selected_cmp(items+i-1,items+i)){free(items);return 0;}
-    if(!found){free(items);return 0;}
     out->items=items;out->count=n;return 1;
 }
 static const WGSelected *wg_selection_find(const WGSelection *s,unsigned section,unsigned row) {

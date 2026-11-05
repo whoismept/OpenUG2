@@ -497,7 +497,27 @@ static void fixed_time_test(void) {
     puts("fixed clock: render independence, fractional ticks and bounded stalls PASS");
 }
 
+/* A bump stop removes closing speed into the road, not downhill tangent motion. */
+static void downhill_bump_velocity(void) {
+    for(int side=-1;side<=1;side+=2)for(int angular=0;angular<2;angular++) {
+        PhysRideSupport s={0};
+        for(int k=0;k<4;k++) {s.ax[k]=k<2?1.3f:-1.3f;s.ay[k]=(k&1)?-.8f:.8f;
+            s.valid[k]=1;s.z[k]=side*.2f*s.ax[k];s.vz[k]=side*6;}
+        s.pitch_limit=s.roll_limit=.4f;
+        PhysRideState r;phys_ride_init(&r,&s);r.z-=PHYS_RIDE_BUMP+.001f;r.vz=side*6;
+        r.pitch_rate=angular*.3f;r.roll_rate=-angular*.2f;
+        phys_ride_step(&r,&s,1/PHYS_TICKRATE);
+        assert(r.contact_mask==15);
+        if(side<0)assert(r.lift>0);
+        fprintf(stderr,"bump direction%d vertical%.3f lift%.5f\n",side,r.vz,r.lift);
+        assert(side<0?r.vz<-4:r.vz>4);
+        for(int k=0;k<4;k++)if(r.compression[k]>PHYS_RIDE_BUMP-.001f)
+            assert(r.vz+s.ax[k]*r.pitch_rate+s.ay[k]*r.roll_rate>=s.vz[k]-.001f);
+    }
+}
+
 int main(void) {
+    downhill_bump_velocity();
     vertical_support_test();
     buried_foundation_test();
     fixed_time_test();

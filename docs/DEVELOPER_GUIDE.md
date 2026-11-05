@@ -1274,9 +1274,9 @@ For a bounded city comparison, run these as three independent loads:
 `--instance-audit` can replace the capture flags for a GL-free assembly check.
 The preview cannot be used interactively, with `--event`, race/drive audits,
 or alternate-spawn captures/audits. Event selection here does not arm a race.
-Inconsistent group data fails loading. A numeric event the bundle authors no
-group for degrades to the unfiltered scene instead (M160, below); that is the
-only fallback, and it is reported.
+Inconsistent group data fails loading. A numeric event with no own group retains common/unknown scenery and keeps
+foreign event-exclusive placements inactive (M160, below). Explicit selection
+0 remains the unfiltered mode.
 
 At this RA pose with the current 1000 m chunk, free suppresses 258 placements;
 event 4144 suppresses 226, restoring 32 placements / 92 emitted meshes / 604
@@ -1308,20 +1308,19 @@ the event's own `0x34148` racing line and 15 foreign-exclusive ones sit at
 0.00 m from it, including event 4707's start/finish gantry pair 17.6 m from
 4701's own start grid. Before M160 a race loaded all of them.
 
-**A positive id here is a request, not a guarantee.** Four shipped events
-author no group at all (L4RB 4201/4202/4203, L4RC 4341), and
-`wg_selection_open` rejects an absent group exactly as it rejects a corrupt
-table. `wg_event_group_present` separates the two:
+**A positive selection does not require an exclusive group.** Some layouts,
+such as L4RB4201/4202/4203, have no own group. They retain shared/unknown
+memberships; barriers owned exclusively by other events remain inactive.
+Malformed tables, duplicate overrides and out-of-contract IDs still fail closed.
+`wg_event_group_present` reports the authoring fact independently of selection.
 
-- group absent -> `world_instance_build_for_event` degrades `effective_event`
-  to 0 and builds the unfiltered scene. `collect.scenery` follows
-  `effective_event`, never the request, so nothing is half-filtered.
-- table malformed, duplicate or out-of-contract id -> still fails closed.
+`WInstStats.scenery_effective` retains the requested event. BUN collision uses
+the same numeric selection even if its own activation table has no matching
+group. This matters for L4RG4709: its scenery can select the event while the BUN
+activation table lacks4709; degrading collision to0 activated unrelated URL
+walls. The shared collision polygons remain solid after selection.
 
-`WInstStats.scenery_effective` carries what was actually selected back to the
-caller. The `SCENERY SELECTION` line prints that, not the request, so a
-degraded load reads `mode=unfiltered(no authored group)` and can never claim a
-filter that did not run. Check it when a race looks unfiltered:
+Check the actual selection in a local capture:
 
 ```sh
 ./nfsu2 /path/to/NFSU2 --car MIATA --track STREAML4RG --event 4701 \
@@ -1334,11 +1333,11 @@ entirely — no event selection can hide them. Attribute before assuming a
 contact is filterable: match the collision AABB to its two authored end posts,
 then look the posts up with `build/world_group_audit`.
 
-`make world-group-test` covers the policy table, `wg_event_group_present`
-against a real `BARRIERS_4701` group, and the sibling-id rejection that makes
-the predicate necessary. `make world-instance-test` covers the degrade path:
-an unauthored id must produce the same meshes, rows and wall set as the
-unfiltered build, with `scenery_hidden == 0` and `scenery_effective == 0`.
+`make world-group-test` covers present and missing own groups. The missing-group
+world-instance fixture retains the shared rows and hides foreign-exclusive rows,
+reporting the requested event. `make world-collision-test` verifies the matching
+BUN policy: common/unknown solids remain, other events' solids are absent, and
+explicit event0 stays unfiltered.
 
 ### Selection can never remove ground (M161)
 
@@ -1369,8 +1368,8 @@ make route-membership-audit
 
 The sweep reports per-event own/foreign counts, how many foreign placements sit
 within the corridor of that event's own racing line, and any road-named
-placement a selection hides. Expect 0 failures and exactly 4 degrades. It
-exercises the selection path only and builds no scene, so a clean sweep is not
+placement a selection hides. Expect 0 failures; `without_own_group` counts authoring absences, which still
+receive ordinary event filtering. The audit exercises the selection path only and builds no scene, so a clean sweep is not
 a claim that every event loads and drives.
 
 Catalog exposure and runtime exposure are different numbers: L4RB/4211 has

@@ -33,8 +33,8 @@ int main(void) {
     /* Normal open-world free roam must use the conservative selection that
      * removes event-exclusive placements. Explicit previews retain their
      * requested mode. A live race now REQUESTS its own authored group, so
-     * another event's road closures cannot stand on the raced route; the
-     * builder degrades a request the bundle does not author (M160). */
+     * another event's road closures cannot stand on the raced route, even
+     * when this bundle has no exclusive group for the requested event. */
     assert(wg_runtime_selection(0, 0, 0) == -1);
     assert(wg_runtime_selection(1, -1, 0) == -1);
     assert(wg_runtime_selection(1, 4144, 0) == 4144);
@@ -55,9 +55,7 @@ int main(void) {
     assert(wg_event_group_present(&t,-1) && wg_event_group_present(&t,0));
     assert(!wg_event_group_present(&t,4701));
     assert(!wg_event_group_present(NULL,4701));
-    {   /* One real BARRIERS_<id> group: present for its own id only. Absence
-         * of a sibling id is what the builder degrades on, and it must never
-         * be confused with the table being rejected. */
+    {   /* A missing own group is separate from a malformed table. */
         unsigned char bov[8], bg[56];
         WGTable bt;
         memset(bov,0,sizeof bov);memset(bg,0,sizeof bg);
@@ -73,13 +71,15 @@ int main(void) {
         assert(sel_probe.items[0].membership==(WG_EVENT|WG_ACTIVE));
         assert(wg_selection_visible(&sel_probe,0,0));
         free(sel_probe.items);memset(&sel_probe,0,sizeof sel_probe);
-        /* A sibling id the bundle does not author is rejected by the selection
-         * helper; only wg_event_group_present separates that from corruption. */
-        assert(!wg_selection_open(&bt,4702,&sel_probe));
+        /* Absence of an own group must not activate another race's barriers. */
+        assert(wg_selection_open(&bt,4702,&sel_probe));
+        assert(sel_probe.items[0].membership==WG_EVENT);
+        assert(!wg_selection_visible(&sel_probe,0,0));
+        free(sel_probe.items);memset(&sel_probe,0,sizeof sel_probe);
     }
 
-    /* Career and demo-only closures must not block an isolated retail race.
-       Keep active race/shared placements and leave free-roam policy intact. */
+    /* Career and demo-only closures must not block an isolated retail race or
+       free roam (no career: the whole city is open). Shared placements stay. */
     const char *isolated_closures[]={"BARRIERS_CAREER0","BARRIERS_CAREER4","BARRIERS_DEMO"};
     for(int closure=0;closure<3;closure++) {
         fixture(ov,g);
@@ -96,7 +96,8 @@ int main(void) {
         assert(!wg_selection_visible(&sel_probe,18,7)); /* non-race closure only */
         free(sel_probe.items);
         assert(wg_selection_open(&t,-1,&sel_probe));
-        assert(wg_selection_visible(&sel_probe,17,3) && wg_selection_visible(&sel_probe,18,7));
+        /* free roam: race 1's barrier and the closure are both inactive */
+        assert(!wg_selection_visible(&sel_probe,17,3) && !wg_selection_visible(&sel_probe,18,7));
         free(sel_probe.items);memset(&sel_probe,0,sizeof sel_probe);
     }
     assert(!wg_isolated_closure("BARRIERS_CAREER") && !wg_isolated_closure("BARRIERS_CAREER4X"));

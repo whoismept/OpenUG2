@@ -1219,10 +1219,8 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
      * until a complete temporary assembly has been built and committed. */
     if (!bundle_data) goto cleanup;
 
-    /* A requested event id the bundle does not author is degraded to the
-     * unfiltered scene. That is an authoring fact, not a corrupt table, so it
-     * must not fail the build: L4RB 4201/4202/4203 and L4RC 4341 are raceable
-     * events with no group of their own. Everything else still fails closed. */
+    /* No own group means common scenery only, not every other race's barriers.
+     * Shared and unclassified memberships retain their existing selection rules. */
     int effective_event = scenery_event;
     {
         const char *stem = !strncmp(local_stats.bundle,"STREAM",6)
@@ -1230,7 +1228,6 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
         long len=0;unsigned char *data=winst_read_named(track_root,stem,&len);
         WGTable table;
         int valid=data && wg_open_file(data,(size_t)len,&table);
-        if(valid && !wg_event_group_present(&table,scenery_event))effective_event=0;
         valid=valid && wg_selection_open(&table,effective_event,&scenery);
         free(data); /* selection owns copied membership, not borrowed bytes */
         if(valid) {

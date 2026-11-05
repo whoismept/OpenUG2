@@ -892,8 +892,7 @@ static void test_scenery_event_assembly(void) {
         N2Scene scene={0},vista={0};WInstStats stats;
         assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,cases[i].event));
         assert(scene.count==cases[i].count && vista.count==0);
-        /* An authored request is reported back unchanged; only an unauthored
-         * one degrades, so a diagnostic can never claim a filter that did not run. */
+        /* Selection reports the requested event, including an absent own group. */
         assert(stats.scenery_effective==cases[i].event);
         unsigned seen=0;
         for(int j=0;j<scene.count;j++){
@@ -920,20 +919,17 @@ static void test_scenery_event_assembly(void) {
         free_scene(&scene);free_scene(&vista);
     }
     N2Scene scene={0},vista={0};WInstStats stats;
-    /* M160: a positive id this bundle does not author is an authoring fact,
-     * not a corrupt table. It degrades to the unfiltered scene so a raceable
-     * event with no group of its own still loads; nothing is hidden and the
-     * event-preview accounting stays at zero. Compare 999 with case {0,5,31}
-     * above: same mesh count, same rows, same wall set. */
+    /* A race without an own group keeps shared scenery while other events'
+     * placements remain inactive, consistently with BUN collision selection. */
     assert(world_instance_build_for_event(&scene,&vista,root,bundles,1,0,0,100,NULL,0,&stats,999));
-    assert(scene.count==5 && vista.count==0 && stats.scenery_hidden==0);
-    assert(stats.scenery_effective==0);   /* degraded, and reported as degraded */
+    assert(scene.count==2 && vista.count==0 && stats.scenery_hidden==3);
+    assert(stats.scenery_effective==999);
     {   unsigned seen=0;
         for(int j=0;j<scene.count;j++){
             int row=(int)lroundf(scene.meshes[j].verts[0]/10);
             assert(row>=0&&row<5);seen|=1u<<row;
         }
-        assert(seen==31u);
+        assert(seen==12u);
     }
     free_scene(&scene);free_scene(&vista);
     memset(&scene,0,sizeof scene);memset(&vista,0,sizeof vista);

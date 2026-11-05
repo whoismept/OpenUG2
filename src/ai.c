@@ -1869,6 +1869,8 @@ static void race_street_course(const char *root,const WEvent *event,const AiTraf
    Loaded support checks carry height along the chosen predecessor; probing
    every hill from grid height can select the ceiling beneath its road instead.
    ponytail: up to 64 lane choices per sample, one measured height per prefix. */
+static int race_ground_at(N2Scene *scene,float x,float y,float ref,float *z);
+
 static int race_course_read_mode(const char *root,const WEvent *event,N2Path *out,int full,
         const AiTrafficWorld *world,const AiCar *body,float *widest,int lane_terrain,
         int repair_distance,int *unsupported_out) {
@@ -2079,7 +2081,8 @@ static int race_course_read_mode(const char *root,const WEvent *event,N2Path *ou
                             } else {
                                 int edge=row[q].edge,next=lanes.next[edge];
                                 float h=atan2f(lanes.xy[2*next+1]-lanes.xy[2*edge+1],lanes.xy[2*next]-lanes.xy[2*edge]);
-                                int surface=world_ground_at(world->scene,row[q].x,row[q].y,z,&z);
+                                /* Resolve the authored deck, then require the incoming sweep to reach it. */
+                                int surface=world_ground_at(world->scene,row[q].x,row[q].y,row[q].authored_z,&z);
                                 /* Retry a lost road layer by carrying height uphill.
                                    Keep successful endpoint probes and body sweeps unchanged. */
                                 if(surface==WSURF_NONE || (!along_lane && surface!=WSURF_ROAD)) {
@@ -2115,7 +2118,7 @@ static int race_course_read_mode(const char *root,const WEvent *event,N2Path *ou
                                     for(int s=1;s<steps;s++) {
                                         float t=(float)s/steps,x=prev[r].x+(row[q].x-prev[r].x)*t;
                                         float y=prev[r].y+(row[q].y-prev[r].y)*t;
-                                        int cat=world_ground_at(world->scene,x,y,midz,&midz);
+                                        int cat=race_ground_at(world->scene,x,y,midz,&midz);
                                         if(cat==WSURF_NONE || (!along_lane && cat!=WSURF_ROAD) ||
                                            !traffic_body_clear(world,body,x,y,midz,h)) {
                                             penalty=1e8f;break;
@@ -2125,7 +2128,7 @@ static int race_course_read_mode(const char *root,const WEvent *event,N2Path *ou
                                        same layer, not opposite sides of a deck. */
                                     if(!penalty) {
                                         float end=midz;
-                                        world_ground_at(world->scene,row[q].x,row[q].y,end,&end);
+                                        race_ground_at(world->scene,row[q].x,row[q].y,end,&end);
                                         if(fabsf(end-z)>.01f)penalty=1e8f;
                                     }
                                 }
@@ -2577,6 +2580,99 @@ static int race_grid_search(const WEvent *event,const WRace *race,const AiTraffi
     return 0;
 }
 
+/* Match the grid's observed plane to nearby authored lanes, including road bank. */
+static int race_corridor_grid_layer(const AiRoadNet *lanes,const float *height,N2Scene *scene,
+        float x,float y,float z,float margin) {
+    float ground=z,normal[3];
+    if(!world_ground_pose(scene,x,y,z,&ground,normal) || ground-z>PHYS_RIDE_REACH_UP ||
+       z-ground>PHYS_RIDE_REACH_DOWN || normal[2]<.7f)return 0;
+    for(int i=0;i<lanes->n;i++){
+        int next=lanes->next[i];if(next<0)continue;
+        float dx=lanes->xy[2*next]-lanes->xy[2*i],dy=lanes->xy[2*next+1]-lanes->xy[2*i+1],len2=dx*dx+dy*dy;if(len2<.0001f)continue;
+        float t=fmaxf(0,fminf(1,((x-lanes->xy[2*i])*dx+(y-lanes->xy[2*i+1])*dy)/len2));
+        float sx=lanes->xy[2*i]+t*dx,sy=lanes->xy[2*i+1]+t*dy,extent=lanes->half_width[i]+t*(lanes->half_width[next]-lanes->half_width[i]);
+        if(hypotf(x-sx,y-sy)>extent+margin)continue;
+        float authored=height[i]+t*(height[next]-height[i]);
+        float projected=ground-(normal[0]*(sx-x)+normal[1]*(sy-y))/normal[2];
+        if(fabsf(projected-authored)<=1)return 1;
+    }
+    return 0;
+}
+
+/* Recover a source spine whose branch-progress records cannot form a course.
+   Lane extents bound the search; actual supports and solids validate each join. */
+static int race_corridor_course(const char *root,const WEvent *event,const AiTrafficWorld *world,
+        const AiCar *body,const AiCar *cars,int count,const AiCar *player,const WRace *race,N2Path *path,float widest) {
+    N2Path progress={0};
+    int decoded=race_course_read(root,event,&progress,0,NULL,NULL,NULL) ||
+        (!event->circuit && race_course_read(root,event,&progress,1,NULL,NULL,NULL));
+    free(progress.xy);
+    if(decoded)return 0; /* A sound source course rejected by the world is not a progress-map failure. */
+    char file[1024];snprintf(file,sizeof file,"%s/ROUTES%s/Routes%dF.bin",root,event->reg,event->id);
+    long bytes=0;unsigned char *data=n2_read_file(file,&bytes);if(!data)return 0;
+    AiRoadNet lanes={0};float *height=NULL;int cap=0,ok=ai_roads_read(&lanes,data,bytes,&cap,NULL,&height,NULL);free(data);
+    for(int k=-1;ok && k<count;k++){
+        const AiCar *actor=k<0?player:cars+k;
+        ok=race_corridor_grid_layer(&lanes,height,world->scene,actor->pos[0],actor->pos[1],actor->pos[2],actor->half_width);
+    }
+    float length=0;for(int i=0;i+1<path->n;i++)length+=ai_segment(path,i);
+    float spacing=body->half_width+1.2f;int sides=(int)floorf(fminf(30,widest)/spacing),cols=2*sides+1,rows=(int)ceilf(length/5)+1;
+    typedef struct {float xy[2],z;double cost;int parent;} Cell;
+    Cell *cells=ok && sides>0 && cols<=63 && rows>1 && rows<=4096?calloc((size_t)rows*cols,sizeof *cells):NULL;
+    float *xy=cells?malloc((size_t)rows*3*sizeof *xy):NULL;ok=cells && xy;
+    float grid_offset=ai_course_lateral(path,player->pos);for(int i=0;i<count;i++)grid_offset+=ai_course_lateral(path,cars[i].pos);grid_offset/=count+1;
+    for(int j=0;ok && j<rows;j++){
+        float along=fminf(length,j*5),point[2],heading;ai_route_point(path,0,0,1,along,point,&heading);
+        float best=INFINITY;
+        for(int i=0;i<lanes.n;i++){int next=lanes.next[i];if(next<0)continue;
+            float dx=lanes.xy[2*next]-lanes.xy[2*i],dy=lanes.xy[2*next+1]-lanes.xy[2*i+1],len2=dx*dx+dy*dy;if(len2<.0001f)continue;
+            float t=fmaxf(0,fminf(1,((point[0]-lanes.xy[2*i])*dx+(point[1]-lanes.xy[2*i+1])*dy)/len2));
+            float error=hypotf(point[0]-lanes.xy[2*i]-t*dx,point[1]-lanes.xy[2*i+1]-t*dy);
+            if(error<best)best=error;
+        }
+        if(best>30){ok=0;break;}
+        int reachable=0;
+        for(int c=0;c<cols;c++){
+            Cell *q=cells+j*cols+c;float offset=(c-sides)*spacing;
+            q->xy[0]=point[0]-sinf(heading)*offset;q->xy[1]=point[1]+cosf(heading)*offset;q->z=player->pos[2];q->cost=INFINITY;q->parent=-1;
+            if(!j){
+                if(!race_ground_at(world->scene,q->xy[0],q->xy[1],player->pos[2],&q->z) || !race_pose_clear(world,body,q->xy[0],q->xy[1],q->z,heading))continue;
+                q->cost=(offset-grid_offset)*(offset-grid_offset);reachable++;continue;
+            }
+            for(int c0=c-1;c0<=c+1;c0++)if(c0>=0 && c0<cols){
+                Cell *a=cells+(j-1)*cols+c0;if(!isfinite(a->cost))continue;
+                float dx=q->xy[0]-a->xy[0],dy=q->xy[1]-a->xy[1],distance=hypotf(dx,dy),h=atan2f(dy,dx),z=a->z;
+                double cost=a->cost+distance+.01f*offset*offset+.2f*(c-c0)*(c-c0);if(cost>=q->cost)continue;
+                int steps=fmaxf(1,ceilf(distance)),clear=1;
+                for(int k=0;k<=steps && clear;k++){
+                    float t=(float)k/steps,x=a->xy[0]+dx*t,y=a->xy[1]+dy*t;
+                    float oldz=z;clear=race_ground_at(world->scene,x,y,z,&z)!=WSURF_NONE && fabsf(z-oldz)<=distance/steps*sqrtf(1-.7f*.7f)/.7f+PHYS_RIDE_REACH_UP && race_pose_clear(world,body,x,y,z,h);
+                }
+                if(clear){q->cost=cost;q->parent=c0;q->z=z;}
+            }
+            reachable+=isfinite(q->cost);
+        }
+        if(!reachable)ok=0;
+    }
+    int end=-1;double best=INFINITY;
+    if(ok)for(int c=0;c<cols;c++){Cell *q=cells+(rows-1)*cols+c;if(q->cost<best){best=q->cost;end=c;}}
+    ok=ok && end>=0;
+    for(int j=rows-1;ok && j>=0;j--){Cell *q=cells+j*cols+end;xy[2*j]=q->xy[0];xy[2*j+1]=q->xy[1];xy[2*rows+j]=q->z;end=q->parent;}
+    N2Path candidate={xy,rows};
+    AiCar envelope=*body;float worst=envelope.vehicle.accel>0?envelope.vehicle.steer:1;
+    for(int k=-1;k<count;k++){const AiCar *actor=k<0?player:cars+k;float steer=actor->vehicle.accel>0?actor->vehicle.steer:1;if(steer<worst){worst=steer;envelope.vehicle=actor->vehicle;}}
+    if(ok)race_course_round(world,&envelope,&candidate,xy+2*rows);
+    int kept=1;for(int j=1;ok && j<rows;j++)if(hypotf(xy[2*j]-xy[2*kept-2],xy[2*j+1]-xy[2*kept-1])>=.01f){xy[2*kept]=xy[2*j];xy[2*kept+1]=xy[2*j+1];kept++;}candidate.n=kept;
+    ok=ok && ai_drive_route_valid(&candidate);
+    for(int k=-1;ok && k<count;k++){
+        const AiCar *actor=k<0?player:cars+k;AiDrive join;
+        float entry=race->grid_named?fmaxf(12,fminf(60,widest+actor->half_width)):(widest>0?widest:8);
+        ok=ai_drive_join(&join,&candidate,actor->pos,actor->head,entry);
+    }
+    if(ok){free(path->xy);*path=candidate;xy=NULL;printf("race corridor: %d supported source-width samples\n",path->n);}
+    free(xy);free(cells);ai_roads_free(&lanes);free(height);return ok;
+}
+
 int ai_race_prepare(const char *root,const WEvent *event,WRace *race,
         const AiTrafficWorld *world,N2Path *path,AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],
         AiCar *player) {
@@ -2588,6 +2684,7 @@ int ai_race_prepare(const char *root,const WEvent *event,WRace *race,
        (!rawcourse && !ai_race_course(root,event,&course))) {
         free(course.xy);printf("race opponents: continuous course unavailable; route topology needs decoding\n");return 0;
     }
+    int source_supported=rawcourse;
     float widest=race_lane_width(root,event);
     int wanted=event->info.kind==N2_RACE_URL ? 5 :
         event->info.kind==N2_RACE_UNKNOWN ? N_AI : 3;
@@ -2603,7 +2700,7 @@ int ai_race_prepare(const char *root,const WEvent *event,WRace *race,
         N2Path supported={0};
         if(race_course_read(root,event,&supported,0,world,&body,&widest) ||
            (!event->circuit && race_course_read(root,event,&supported,1,world,&body,&widest))) {
-            free(course.xy);course=supported;
+            free(course.xy);course=supported;source_supported=1;
         }
     }
     if(event->info.downhill) {
@@ -2681,6 +2778,8 @@ int ai_race_prepare(const char *root,const WEvent *event,WRace *race,
         envelope.half_width=fmaxf(envelope.half_width,cars[k].half_width);
         envelope.height=fmaxf(envelope.height,cars[k].height);
     }
+    if(!source_supported && !event->circuit && event->info.kind!=N2_RACE_UNKNOWN &&
+       race_corridor_course(root,event,world,&envelope,cars,count,player,race,path,widest))rawcourse=0;
     if(rawcourse)race_route_refine(root,event,world,&envelope,cars,count,path,&widest);
     if(event->info.kind==N2_RACE_STREETX)
         race_street_course(root,event,world,&envelope,cars,count,player,path,race,widest);
@@ -2928,6 +3027,45 @@ static float race_corner_limit(const AiDrive *d,const AiCar *car,float offset,fl
     return limit*PHYS_TICKRATE;
 }
 
+
+
+/* Gravity-bound speed on turning crests, using the authored ground profile. */
+static float race_crest_limit(const AiTrafficWorld *world,const AiDrive *d,const AiCar *car,float offset,float pace) {
+    typedef struct {float xy[2],z,along,heading;} Sample;
+    Sample samples[77];int n=0;float error,t=ai_projection(d->path,d->segment,car->pos,&error),z=car->pos[2];
+    /* One height walk keeps the active road layer through overlapping decks. */
+    for(float ahead=0;ahead<=300 && n<77;ahead+=4) {
+        Sample q={.z=z};race_line_point(d,t,ahead,offset,q.xy,&q.heading);
+        if(race_ground_at(world->scene,q.xy[0],q.xy[1],z,&q.z)==WSURF_NONE || !isfinite(q.z))break;
+        if(n){float step=hypotf(q.xy[0]-samples[n-1].xy[0],q.xy[1]-samples[n-1].xy[1]);
+            if(step<.01f)break;
+            q.along=samples[n-1].along+step;}
+        samples[n++]=q;z=q.z;
+    }
+    const PhysVehicle *vh=car->vehicle.accel>0?&car->vehicle:NULL;
+    float speed=fabsf(car->spd)*PHYS_TICKRATE;
+    float launch=fmaxf(speed,fminf(pace/3.6f,phys_vehicle_top_speed(vh)*PHYS_TICKRATE));
+    float brake2=2*RACE_BRAKE_SHARE*phys_vehicle_brake_decel(vh)*PHYS_TICKRATE*PHYS_TICKRATE;
+    float reach=fminf(300,speed*speed/brake2+20),limit=INFINITY;
+    for(int i=1;i+1<n && samples[i].along<=reach;i++) {
+        Sample *a=samples+i-1,*b=samples+i,*c=samples+i+1;
+        float ab=b->along-a->along,bc=c->along-b->along;
+        float grade=(b->z-a->z)/ab,curvature=2*((c->z-b->z)/bc-grade)/(ab+bc);
+        if(curvature>=0)continue;
+        float crest=.95f*sqrtf(PHYS_RIDE_G/-curvature);if(crest>=launch)continue;
+        for(int j=i+1;j<n;j++) {
+            float distance=samples[j].along-b->along,seconds=distance/launch;
+            float ballistic=b->z+grade*distance-.5f*PHYS_RIDE_G*seconds*seconds;
+            /* Inspect the whole flight: an S-bend can finish at its starting heading. */
+            if(fabsf(sinf(samples[j].heading-b->heading))>.001f) {
+                limit=fminf(limit,sqrtf(crest*crest+brake2*fmaxf(0,b->along-car->half_length)));break;
+            }
+            if(ballistic<=samples[j].z)break;
+        }
+    }
+    return limit;
+}
+
 /* Only tight Street X turns need this bounded flat-road mechanical screen.
    Candidate support/body sweeps still validate the actual scene afterwards. */
 static int race_turn_needs_preview(const AiDrive *d,float t,const AiCar *car,float *reach) {
@@ -2988,6 +3126,65 @@ static int race_turn_preview(const AiDrive *d,const AiCar *car,float offset,floa
     return 0;
 }
 
+/* Share the existing drag gearbox and chassis step with read-only forecasts. */
+static int race_vehicle_step(AiCar *car,AiRace *driver,AiDriveInput input,
+        const AiTrafficWorld *world) {
+    PhysVehicle stock=car->vehicle;
+    if(driver->progress.kind==N2_RACE_DRAG && car->has_powertrain) {
+        int shift=driver->gearbox.rpm>=car->powertrain.redline_rpm &&
+                  driver->gearbox.gear<car->powertrain.gearbox[0].gear_count;
+        float gain=phys_manual_step(&driver->gearbox,&car->powertrain,0,0,
+            car->tyre_radius,car->spd,input.throttle,shift,1/PHYS_TICKRATE);
+        car->vehicle.accel*=gain;if(gain<=0 && input.throttle>0)input.throttle=0;
+        if(driver->gearbox.failed)driver->drive.failed=1;
+    }
+    int collision=ai_vehicle_step(car,input.throttle,input.steer,input.handbrake,world);car->vehicle=stock;
+    return collision;
+}
+
+/* A ramp lip can have a lower landing instead of four simultaneous contacts.
+   Accept only a short, collision-free physical rollout in the held lane. */
+static int race_drop_clear(const AiTrafficWorld *world,const AiCar *car,
+        const AiRace *driver,float offset,float pace) {
+    if(!world || !world->scene || !car->ride_ready || driver->drive.failed)return 0;
+    float z=car->pos[2],normal[3];
+    if(world_ground_pose(world->scene,car->pos[0],car->pos[1],z,&z,normal)==WSURF_NONE)return 0;
+    if(car->ride.contact_mask==15 &&
+       -(normal[0]*cosf(car->head)+normal[1]*sinf(car->head))<.02f)return 0;
+    AiCar probe=*car;AiRace forecast=*driver;
+    AiDrive *drive=&forecast.drive;drive->stalled=0;
+    AiPerf perf=g_ai_perf;AiContactHook contact=g_ai_contact_hook;
+    PhysPropImpactHook impact=g_phys_prop_impact_hook;
+    g_ai_contact_hook=NULL;g_phys_prop_impact_hook=NULL;
+    int left=car->ride.contact_mask==0,stable=0,ok=0,air_ticks=0;
+    float peak=car->pos[2];
+    /* shortcut: four-second local rollout, not general airborne route planning. */
+    for(int tick=0;tick<4*PHYS_TICKRATE;tick++) {
+        ai_drive_step(drive,probe.pos,probe.head,probe.spd);
+        if(drive->failed)break;
+        float error,t=ai_projection(drive->path,drive->segment,probe.pos,&error);
+        float point[2],look=fminf(24,4+fabsf(probe.spd)*PHYS_TICKRATE*.5f);
+        float base[2];ai_route_point(drive->path,drive->segment,t,drive->direction,0,base,NULL);
+        look=fmaxf(look,hypotf(drive->target[0]-base[0],drive->target[1]-base[1]));
+        race_line_point(drive,t,look,offset,point,NULL);
+        float steer=race_line_steer(&probe,point);
+        float target=fminf(pace/3.6f,race_corner_limit(drive,&probe,offset,look)/3.6f);
+        if(!drive->loop)target=fminf(target,sqrtf(6*fmaxf(0,drive->length-drive->progress-1)));
+        AiDriveInput input={.throttle=ai_throttle(target/PHYS_TICKRATE,probe.spd),.steer=steer};
+        if(race_vehicle_step(&probe,&forecast,input,world) || drive->failed)break;
+        peak=fmaxf(peak,probe.pos[2]);
+        if(peak-probe.pos[2]>2*car->half_length ||
+           fabsf(ai_course_lateral(drive->path,probe.pos)-offset)>car->half_width)break;
+        if(probe.ride.contact_mask!=15){left|=probe.ride.contact_mask==0;stable=0;air_ticks+=probe.ride.contact_mask==0;}
+        else if(left && ++stable>=6) {
+            ok=race_pose_clear(world,&probe,probe.pos[0],probe.pos[1],probe.pos[2],probe.head);break;
+        }
+        if(air_ticks>PHYS_TICKRATE)break;
+    }
+    g_ai_perf=perf;g_ai_contact_hook=contact;g_phys_prop_impact_hook=impact;
+    return ok;
+}
+
 void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int count,
         int circuit,const AiTrafficWorld *world,const AiCar *player) {
     AiCar *car=&cars[k];AiRace *driver=&drivers[k];
@@ -3001,7 +3198,15 @@ void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int coun
          count*(2*car->half_length+1.2f)+2))) {
         ai_vehicle_step(car,car->spd>.002f?-1:0,0,1,world);return;
     }
+    if(driver->drop_phase) {
+        if(--driver->drop_ticks<=0)driver->drop_phase=0;
+        else if(!car->ride.contact_mask)driver->drop_phase=2;
+        else if(driver->drop_phase==2 && car->ride.contact_mask==15 &&
+                race_pose_clear(world,car,car->pos[0],car->pos[1],car->pos[2],car->head))
+            driver->drop_phase=0;
+    }
     AiDriveInput input=ai_drive_step(&driver->drive,car->pos,car->head,car->spd);
+    if(driver->drive.failed || driver->drive.finished)driver->drop_phase=0;
     float pace=ai_race_pace(car,driver,k,world,player);
     float target=driver->drive.target_kmh/3.6f;
     if(!driver->drive.failed && !driver->drive.finished && world && world->scene) {
@@ -3020,7 +3225,7 @@ void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int coun
         int tick=car->t++;
         /* Spread costly Street X plans across frames; every actor plans at spawn. */
         int phase=driver->progress.kind==N2_RACE_STREETX?RACE_PLAN_TICKS*k/(count>0?count:1):0;
-        if((!tick || tick%RACE_PLAN_TICKS==phase)) {
+        if((!tick || tick%RACE_PLAN_TICKS==phase) && !driver->drop_phase) {
             float speed=fabsf(car->spd)*PHYS_TICKRATE;
             float preview=fmaxf(20,car->half_length+speed*.5f+speed*speed/6);
             /* Preserve a clear conservative line. If none exists, search the
@@ -3210,6 +3415,19 @@ void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int coun
                     if(clear){best=cost;best_offset=offset;best_pace=tight?turn_pace[option+1]:0;}
                 }
             }
+            /* Only recover a stalled driver; moving racers keep their normal plan.
+               At a lip, an unfinished lane change may need to continue
+               straight from its actual offset instead of chasing that lane. */
+            for(int option=0;option<2 && !isfinite(best) && driver->drive.stalled>PHYS_TICKRATE/2;option++) {
+                float offset=option?current_offset:old_offset;
+                if(fabsf(current_offset-offset)>.3f)continue;
+                int occupied=0;
+                for(int r=0;r<rivals;r++)
+                    if(rival_conflict[r] && fabsf(offset-rival_lateral[r])<car->half_width+rival_width[r]+.1f)occupied=1;
+                if(!occupied && race_drop_clear(world,car,driver,offset,pace)) {
+                    best=0;best_offset=offset;driver->drop_phase=1;driver->drop_ticks=4*PHYS_TICKRATE;
+                }
+            }
             driver->blocked=!isfinite(best);
             /* Lane cost ignores pace, so refine only the selected candidate. */
             if(!driver->blocked && best_pace>0 && best_pace<pace) {
@@ -3220,6 +3438,10 @@ void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int coun
                 }
             }
             driver->turn_speed=best_pace>0?best_pace/3.6f:0;
+            if(!driver->blocked && driver->progress.kind==N2_RACE_URL) {
+                float crest=race_crest_limit(world,&driver->drive,car,best_offset,pace);
+                if(isfinite(crest))driver->turn_speed=driver->turn_speed>0?fminf(driver->turn_speed,crest):crest;
+            }
             if(!driver->blocked) {
                 driver->offset=best_offset;
                 driver->pass_side=engaged && fabsf(best_offset)>=spacing*.5f?(best_offset>0?1:-1):0;
@@ -3295,17 +3517,8 @@ void ai_race_step(AiCar cars[N_RACE_AI],AiRace drivers[N_RACE_AI],int k,int coun
     car->target_speed=target/PHYS_TICKRATE;
     if(!driver->drive.failed && !driver->drive.finished)
         input.throttle=ai_throttle(car->target_speed,car->spd);
-    PhysVehicle stock=car->vehicle;
-    if(driver->progress.kind==N2_RACE_DRAG && car->has_powertrain) {
-        int shift=driver->gearbox.rpm>=car->powertrain.redline_rpm &&
-                  driver->gearbox.gear<car->powertrain.gearbox[0].gear_count;
-        float gain=phys_manual_step(&driver->gearbox,&car->powertrain,0,0,
-            car->tyre_radius,car->spd,input.throttle,shift,1/PHYS_TICKRATE);
-        car->vehicle.accel*=gain;if(gain<=0 && input.throttle>0)input.throttle=0;
-        if(driver->gearbox.failed)driver->drive.failed=1;
-    }
     float before[3]={car->pos[0],car->pos[1],car->pos[2]};
-    int collision=ai_vehicle_step(car,input.throttle,input.steer,input.handbrake,world);car->vehicle=stock;
+    int collision=race_vehicle_step(car,driver,input,world);
     if(driver->progress.kind==N2_RACE_DRIFT)race_drift_step(&driver->progress.drift,
         car->vel,car->head,hypotf(car->pos[0]-before[0],car->pos[1]-before[1]),
         car->ride.contact_mask!=0,collision,1/PHYS_TICKRATE);

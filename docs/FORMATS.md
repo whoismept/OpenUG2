@@ -452,7 +452,7 @@ normal instance-driven free-roam loader applies the conservative `free`
 selection: placements exclusively owned by numeric event groups are absent
 from both rendering and collision. Explicit capture-only previews may select
 one numeric event. Live `--event` races request that event's own authored group;
-missing authored groups degrade to the unfiltered scene. Retail direction/career
+a missing own group retains shared/unknown memberships while other named events remain inactive. Retail direction/career
 activation timing remains undecoded.
 
 **M140/M147 conservative selection policy, not retail activation semantics.**
@@ -464,7 +464,7 @@ memberships are numeric event groups and none matches the selection. `free`
 selects no event. Non-event, unknown, ungrouped and shared-with-non-event
 placements stay visible. Positive isolated-race selections also omit exclusive
 `BARRIERS_CAREER<stage>` and `BARRIERS_DEMO` closures. This is a gameplay policy,
-not recovered activation semantics; free roam retains those closures, and active
+not recovered activation semantics; free roam also omits exclusive career/demo closures, and active
 or shared-with-ordinary memberships still win. L4RA demo-only panels at section
 619, rows 26/27 blocked the supported Circuit 4001 road; the shared selection fix
 lets its three test opponents finish without removing ordinary walls.
@@ -475,8 +475,7 @@ event remain together, and RB's six ungrouped graphics remain present.
 The builder checks every override target in the chosen home bundle, including
 targets outside the viewing radius: section/row/type bounds, matching copied
 flags and unique targets. Missing/inconsistent data fails assembly before
-replacing the caller's scenes; an absent requested group uses the reported
-unfiltered fallback. The compact
+replacing the caller's scenes; an absent own group preserves the requested numeric selection and common scenery. The compact
 selection owns its data after the companion file is released. Filtering occurs
 before instance emission, so render meshes and collision extraction consume
 the same scene; ground prototypes and all placement transforms are unchanged.
