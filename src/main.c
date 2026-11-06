@@ -2792,6 +2792,18 @@ int main(int argc, char **argv) {
             }
             world2_heading_set = 1;
         }
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("Usage: nfsu2 [DATA_DIR | --path DATA_DIR] [options]\n"
+                   "DATA_DIR is your NFSU2 data folder (contains TRACKS/, CARS/, GLOBAL/).\n"
+                   "Options are described in README.md (\"Run\") and docs/DEVELOPER_GUIDE.md.\n");
+            return 0;
+        }
+        /* An unrecognised option, or a value option given last without its
+           value, must not silently become the data directory. */
+        else if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown option or missing value: %s (see --help)\n", argv[i]);
+            return 2;
+        }
         else dataroot = argv[i];
     }
     if (chase_d > 0.0f) { g_dbg.chase_distance = chase_d; g_dbg.chase_height = chase_h; }
