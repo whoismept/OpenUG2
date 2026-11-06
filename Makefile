@@ -786,13 +786,16 @@ race-ai-source-test: tools/race_ai_source_test.c src/race_ai_source.h src/asset_
 # ----------------------------------------------------------------------------
 # Vulkan backend (issue #14, P11a). Offscreen v0 only. By default it builds against the system SDL2 and
 # Vulkan (sdl2-config, -lvulkan, glslangValidator on PATH). To build against a self-contained tree instead
-# (headers in $(VK_SYSROOT)/usr/include, libraries in $(VK_SYSROOT)/usr/lib/x86_64-linux-gnu, tools in
-# $(VK_SYSROOT)/usr/bin), set VK_SYSROOT=/path. VK_ICD is the Vulkan driver the smoke test runs on
+# (headers in $(VK_SYSROOT)/usr/include, libraries in $(VK_SYSROOT)/usr/lib/$(VK_MULTIARCH), tools in
+# $(VK_SYSROOT)/usr/bin), set VK_SYSROOT=/path. VK_MULTIARCH is the Debian multiarch directory: the
+# compiler's own (e.g. aarch64-linux-gnu on ARM64), else x86_64-linux-gnu; override it if needed.
+# VK_ICD is the Vulkan driver the smoke test runs on
 # (default: lavapipe, if its ICD file is found; the Khronos validation layer is used when installed).
 VK_SYSROOT ?=
 ifneq ($(VK_SYSROOT),)
-VK_LIBDIR  := $(VK_SYSROOT)/usr/lib/x86_64-linux-gnu
-VK_INC     := -I$(VK_SYSROOT)/usr/include/SDL2 -I$(VK_SYSROOT)/usr/include -I$(VK_SYSROOT)/usr/include/x86_64-linux-gnu
+VK_MULTIARCH ?= $(or $(shell $(CC) -print-multiarch 2>/dev/null),x86_64-linux-gnu)
+VK_LIBDIR  := $(VK_SYSROOT)/usr/lib/$(VK_MULTIARCH)
+VK_INC     := -I$(VK_SYSROOT)/usr/include/SDL2 -I$(VK_SYSROOT)/usr/include -I$(VK_SYSROOT)/usr/include/$(VK_MULTIARCH)
 VK_LIBS    := -L$(VK_LIBDIR) -lSDL2 -lvulkan -Wl,-rpath,$(VK_LIBDIR)
 else
 VK_INC     := $(SDL_CFLAGS)
