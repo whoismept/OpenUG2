@@ -13,6 +13,7 @@
  *         region stem (e.g. STREAML4RA), LOC4DYNTEX, INGAMECOMMON, a car name
  *         (covers its GLOBALB fallbacks), WHEELS or VINYLS. Master-region and
  *         body-kit textures pass no pack, so only plain KEY files apply there.
+ * Minimaps may instead use their record name: TRACKMAP4144[_anything].dds.
  * Lookup: KEY@PACK for the requesting pack, then plain KEY. A file bound to a
  * different pack is never applied (logged once as "not applied"); a rejected
  * KEY@PACK falls through to plain KEY. Same key and pack twice: the first path
@@ -25,7 +26,7 @@
  *     sRGB variants (uploaded linear, like the originals), RGBA8/BGRA8/BGRX8
  *     and 32-bit legacy masks. BC7 and everything else are rejected.
  *   - Width/height powers of two, <= min(4096, caps.max_texture_size), exactly
- *     1x, 2x or 4x the ORIGINAL on both axes.
+ *     1x, 2x, 4x or 8x the ORIGINAL on both axes.
  *   - Only whole mip levels inside the file are used (at most 16); no whole
  *     base level = reject. The file is re-read at upload and length-checked.
  *   - An original with alpha/usage/blend needs an override format with alpha;

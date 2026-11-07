@@ -121,9 +121,24 @@ static int dds_parse(TexOvr *o, const char **why) {
 }
 
 /* KEY8HEX[@PACK][_suffix].dds -> key, pack. */
+/* TRACKMAP4144.dds: minimaps by their readable record name. The key is the same
+   bin hash the record carries (case-folded, start ~0, h*33+c). */
+static int parse_map_name(const char *fn, uint32_t *key, char *pack) {
+    if (strncasecmp(fn, "TRACKMAP", 8)) return 0;
+    int n = 8;
+    while (fn[n] >= '0' && fn[n] <= '9') n++;
+    if (n == 8 || (fn[n] != '_' && fn[n] != '.')) return 0;
+    uint32_t h = UINT32_MAX;
+    for (int i = 0; i < n; i++) h = 33 * h + (unsigned char)toupper((unsigned char)fn[i]);
+    *key = h;
+    pack[0] = 0;
+    return 1;
+}
+
 static int parse_name(const char *fn, uint32_t *key, char *pack) {
     size_t L = strlen(fn);
     if (L < 12 || strcasecmp(fn + L - 4, ".dds")) return 0;
+    if (parse_map_name(fn, key, pack)) return 1;
     uint32_t k = 0;
     for (int i = 0; i < 8; i++) {
         int c = (unsigned char)fn[i], v;
@@ -290,12 +305,12 @@ RhiTexture tex_override_upload(uint32_t key, const char *pack, const N2Tex *orig
     TexOvr *o = find(key, pack);
     if (!o) return (RhiTexture){0};
     if (orig->w <= 0 || orig->h <= 0) return (RhiTexture){0};
-    /* scale k in {0,1,2}, identical on both axes */
+    /* scale k in {0,1,2,3}, identical on both axes */
     int k = -1;
-    for (int s = 0; s <= 2; s++)
+    for (int s = 0; s <= 3; s++)
         if (o->w == orig->w << s && o->h == orig->h << s) { k = s; break; }
     if (k < 0) {
-        char why[96]; snprintf(why, sizeof why, "size %dx%d is not 1x/2x/4x of original %dx%d",
+        char why[96]; snprintf(why, sizeof why, "size %dx%d is not 1x/2x/4x/8x of original %dx%d",
                                o->w, o->h, orig->w, orig->h);
         reject(o, why); return (RhiTexture){0};
     }

@@ -46,6 +46,7 @@
 #include "hud_race.h"
 #include "hud_host.h"     /* GL-free HUD context/preview policy */
 #include "map_bake.h"     /* city minimap detail levels */
+#include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
 #include "world_scenery.h"
@@ -3989,6 +3990,14 @@ int main(int argc, char **argv) {
              g_tex_aniso_max, g_tex_aniso_max <= 1 ? " -- extension absent" : ""); }
     /* Optional HD texture overrides; nothing is scanned or uploaded without a
        directory, so the default path is unchanged. */
+    {
+        /* <game>/OpenUG2Textures is picked up without a flag. */
+        static char imported[1200];
+        struct stat folder;
+        snprintf(imported, sizeof imported, "%s/OpenUG2Textures", dataroot);
+        if (!tex_override_dir && !stat(imported, &folder) && (folder.st_mode & S_IFDIR))
+            tex_override_dir = imported;
+    }
     if (tex_override_dir && !tex_override_off)
         tex_override_init(tex_override_dir, tex_override_budget);
 #ifdef DEBUG_UI

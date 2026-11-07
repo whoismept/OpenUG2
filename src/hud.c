@@ -6,6 +6,7 @@
 #include "hud_race.h"
 #include "race.h"
 #include "map_bake.h"
+#include "tex_override.h"
 
 /* One bake on the worker. event>0 is a race map, 0 the free-roam map. */
 typedef struct {
@@ -174,6 +175,19 @@ static Texture upload_baked(unsigned char *rgb,int size){
  return (Texture){id,size,size};
 }
 
+/* An imported map from the override folder wins over any bake. It follows the
+ * same detail setting: below it the retail image stays. */
+static Texture imported_map(const Hud*h,const char*name,const HaPixels*pixels){
+ if(h->bake_size<=0)return (Texture){0};
+ N2Tex original;memset(&original,0,sizeof original);
+ original.w=(int)pixels->width;original.h=(int)pixels->height;
+ RhiTexture id=tex_override_upload(ha_hash(name),NULL,&original);
+ if(!id.id)return (Texture){0};
+ render_texture_clamp_edges(id);
+ printf("map texture: %s imported\n",name);
+ return (Texture){id,original.w,original.h};
+}
+
 static int map_job_run(void*data){
  MapJob*job=data;
  if(job->cached)job->rgb=map_cache_read(job->cache,job->size);
@@ -288,6 +302,8 @@ static void load_race_map(Hud *h, int event, const HudState *s) {
  HaPixels pixels;
  if(data && track_map_origin(&h->packs[5],event,h->race_map_origin) &&
     ha_texture_find(data,len,ha_hash(name),&pixels)==1){
+  h->race_map=imported_map(h,name,&pixels);
+  if(h->race_map.id.id){free(pixels.rgba);free(data);return;}
   RhiTexture id=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
      RHI_FORMAT_RGBA8,(int)pixels.width,(int)pixels.height,RHI_TEXTURE_SAMPLED});
   if(id.id && rhi_texture_upload(id,0,0,pixels.rgba,0)==RHI_OK){
@@ -523,6 +539,8 @@ void hud_request_city_map(Hud*h){
   free(data);diagnostic(h,"TRACKMAP4000 unavailable; retail map kept");return;
  }
  free(data);
+ h->city_map=imported_map(h,"TRACKMAP4000",&pixels);
+ if(h->city_map.id.id){free(pixels.rgba);return;}
  MapJob job;memset(&job,0,sizeof job);
  if(map_job_locate(h,&job,"CITY",&pixels))free(pixels.rgba);
  else if(map_layers_ready(h,h->origin)){job.src=pixels.rgba;job.w=(int)pixels.width;job.h=(int)pixels.height;}

@@ -17,8 +17,22 @@ with OpenUG2.
 | `OPENUG2_TEX_OVERRIDES=0` | environment switch: disable |
 | `OPENUG2_TEX_OVERRIDES_CPU=1` | test switch: force the CPU-decode upload path |
 
-Without `--tex-overrides` nothing is scanned or uploaded and rendering is
-byte-identical to a build without the feature.
+A folder named `OpenUG2Textures` inside the game data directory is used without
+any flag. With neither a folder nor `--tex-overrides`, nothing is scanned or
+uploaded and rendering is byte-identical to a build without the feature.
+
+## Minimaps
+
+Minimaps can be imported by record name, up to 4096x4096:
+
+```
+OpenUG2Textures/TRACKMAP4000.dds    free-roam city map
+OpenUG2Textures/TRACKMAP4144.dds    the map of event 4144
+```
+
+A map must cover the same area as the original image, because the HUD samples it
+through the original's TrackInfo frame. An imported map replaces any baked map.
+It follows the Level Of Detail setting: at levels 1 and 2 the retail image stays.
 
 ## Naming
 
@@ -45,7 +59,7 @@ duplicate.
 ## Requirements
 
 - Width and height are powers of two, at most 4096 (or the driver limit), and
-  exactly 1x, 2x or 4x the original size on both axes.
+  exactly 1x, 2x, 4x or 8x the original size on both axes.
 - Formats: DXT1/BC1, DXT3/BC2, DXT5/BC3 (legacy or DX10 header, sRGB variants
   accepted) and uncompressed 32-bit RGBA/BGRA. BC7, cube maps, volume
   textures and arrays are rejected.
@@ -64,7 +78,7 @@ Every decision is printed once with the prefix `TEXOVR`:
 ```
 TEXOVR 3 override(s) indexed from overrides (S3TC upload, budget 1536 MiB, max 4096)
 TEXOVR use D1C98E50 pack STREAML4RA 256x2048 (orig 64x512, x4) overrides/D1C98E50_road.dds
-TEXOVR skip 7AA659FF (...): size 64x64 is not 1x/2x/4x of original 64x512
+TEXOVR skip 7AA659FF (...): size 64x64 is not 1x/2x/4x/8x of original 64x512
 TEXOVR not applied 9A6D73B2@NOTAPACK (...): texture requested from pack GOLF
 ```
 
