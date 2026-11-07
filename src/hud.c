@@ -61,6 +61,8 @@ struct Hud {
  char *data_root;
  int race_map_event;
  Texture race_map;
+ const N2Scene *bake_scene; const float *bake_nav; const int *bake_start,*bake_list;
+ int bake_nnav,bake_size;
  Texture city_map;   /* baked, optional; replaces TRACKMAP4000 */
  double race_map_origin[3];
  double origin[3]; int track_ok,preview,skin; char missing[1024]; unsigned reported,resolved,drawn;
@@ -150,6 +152,29 @@ static int track_map_origin(const Pack *global, int event, double origin[3]) {
  return 0;
 }
 
+static Texture upload_baked(unsigned char *rgb,int size){
+ N2Tex baked;memset(&baked,0,sizeof baked);
+ baked.w=size;baked.h=size;baked.rgb=rgb;
+ RhiTexture id=upload_tex(&baked);
+ free(rgb);
+ if(!id.id)return (Texture){0};
+ render_texture_clamp_edges(id);
+ return (Texture){id,size,size};
+}
+
+/* City-wide race maps spend about 10 m on a texel. Rebuild those; the small
+ * maps are already as sharp as a baked one. */
+static Texture bake_race_map(Hud *h,int event,const HaPixels *pixels){
+ if(h->bake_size<=0||!h->bake_scene||h->race_map_origin[2]<MB_RACE_MIN_EXTENT)return (Texture){0};
+ Uint32 begin=SDL_GetTicks();
+ unsigned char *rgb=map_bake_city(h->bake_scene,h->bake_nav,h->bake_nnav,h->bake_start,h->bake_list,
+    h->race_map_origin,pixels->rgba,(int)pixels->width,(int)pixels->height,h->bake_size,1);
+ if(!rgb)return (Texture){0};
+ Texture t=upload_baked(rgb,h->bake_size);
+ if(t.id.id)printf("race map: event %d %dx%d baked in %u ms\n",event,h->bake_size,h->bake_size,SDL_GetTicks()-begin);
+ return t;
+}
+
 static void load_race_map(Hud *h, int event) {
  if(h->race_map_event==event)return;
  rhi_texture_destroy(h->race_map.id);
@@ -165,12 +190,13 @@ static void load_race_map(Hud *h, int event) {
  HaPixels pixels;
  if(data && track_map_origin(&h->packs[5],event,h->race_map_origin) &&
     ha_texture_find(data,len,ha_hash(name),&pixels)==1){
-  RhiTexture id=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
+  h->race_map=bake_race_map(h,event,&pixels);
+  RhiTexture id=h->race_map.id.id?(RhiTexture){0}:rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
      RHI_FORMAT_RGBA8,(int)pixels.width,(int)pixels.height,RHI_TEXTURE_SAMPLED});
   if(id.id && rhi_texture_upload(id,0,0,pixels.rgba,0)==RHI_OK){
    render_texture_clamp_linear(id);
    h->race_map=(Texture){id,(int)pixels.width,(int)pixels.height};
-  }else rhi_texture_destroy(id);
+  }else if(!h->race_map.id.id)rhi_texture_destroy(id);
   free(pixels.rgba);
  }
  free(data);
@@ -391,17 +417,17 @@ int hud_bake_city_map(Hud*h,const N2Scene*scene,const float*nav,int nnav,const i
  if(!data||ha_texture_find(data,len,ha_hash("TRACKMAP4000"),&pixels)!=1){
   free(data);diagnostic(h,"TRACKMAP4000 unavailable; retail map kept");return 0;
  }
- unsigned char *rgb=map_bake_city(scene,nav,nnav,start,list,h->origin,pixels.rgba,(int)pixels.width,(int)pixels.height,size);
+ unsigned char *rgb=map_bake_city(scene,nav,nnav,start,list,h->origin,pixels.rgba,(int)pixels.width,(int)pixels.height,size,0);
  free(pixels.rgba);free(data);
  if(!rgb)return 0;
- N2Tex baked;memset(&baked,0,sizeof baked);
- baked.w=size;baked.h=size;baked.rgb=rgb;
- RhiTexture id=upload_tex(&baked);
- free(rgb);
- if(!id.id)return 0;
- render_texture_clamp_edges(id);
- h->city_map=(Texture){id,size,size};
- return 1;
+ h->city_map=upload_baked(rgb,size);
+ return h->city_map.id.id!=0;
+}
+void hud_set_map_source(Hud*h,const N2Scene*scene,const float*nav,int nnav,const int*start,const int*list,int size){
+ if(!h)return;
+ h->bake_scene=scene;h->bake_nav=nav;h->bake_nnav=nnav;
+ h->bake_start=start;h->bake_list=list;h->bake_size=size;
+ h->race_map_event=-1;   /* a live race picks the new size up on its next frame */
 }
 void hud_free(Hud**hp){
  if(!hp||!*hp)return;Hud*h=*hp;release_layout(h);

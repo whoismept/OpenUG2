@@ -2223,6 +2223,7 @@ static int city_map_size_from_store(void) {
 
 /* TRACKMAP4000 covers L4RA only; other bundles keep their retail map. */
 static void city_map_apply(Hud *hud, const N2Scene *scene, const WorldCity *city, const char *track, int size) {
+    hud_set_map_source(hud, scene, city->nav, city->nnav, city->adjstart, city->adjlist, size);
     if (!hud || strcmp(track, "STREAML4RA")) return;
     Uint32 start = SDL_GetTicks();
     if (hud_bake_city_map(hud, scene, city->nav, city->nnav, city->adjstart, city->adjlist, size))
@@ -6900,8 +6901,7 @@ int main(int argc, char **argv) {
                                : map_bake_size_for_level(opt_gfx.v[ST_GFX_PERF_LEVEL]);
                 if (hud && wanted_map != city_map_size) {
                     city_map_size = wanted_map;
-                    if (wanted_map) city_map_apply(hud, &scene, &world.city, trackname, wanted_map);
-                    else hud_bake_city_map(hud, NULL, NULL, 0, NULL, NULL, 0);
+                    city_map_apply(hud, &scene, &world.city, trackname, wanted_map);
                 }
                 fprintf(stderr, "options: display re-init requested (resolution %d, vsync %d, filtering %d); renderer hook not wired\n",
                         opt_gfx.v[ST_GFX_RESOLUTION], opt_gfx.v[ST_GFX_VSYNC], opt_gfx.v[ST_GFX_TEXTURE_FILTERING]);

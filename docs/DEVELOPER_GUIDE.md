@@ -1617,8 +1617,14 @@ no separate performance path:
 | 1, 2 | retail 512, no bake |
 
 `--map-detail 512|1024|2048|4096` overrides the slider. A baked map replaces
-TRACKMAP4000. Races use their own TRACKMAP at every detail level when available.
-Only L4RA is baked, because TRACKMAP4000 covers that bundle.
+TRACKMAP4000 in free roam, on L4RA only, because that image covers that bundle.
+
+Races use their own TRACKMAP at every detail level. `GLOBALB` TrackInfo gives
+each map a frame, and they differ widely: about 11 m per texel for L4RA events,
+10 for L4RG, 7.6 for L4RB and L4RD, but only 1.3 to 1.4 for the L4RC and L4RF
+close-ups. Maps wider than `MB_RACE_MIN_EXTENT` (2000 m) are rebuilt when the
+race loads, in the same frame, keeping that map's colours, dim roads and bright
+route. Smaller maps are already as sharp as a baked one and stay as shipped.
 
 Routing-graph links bridge breaks in the road layer, because material names miss
 paved surfaces such as gravel lanes. A link is stroked only where no road mesh

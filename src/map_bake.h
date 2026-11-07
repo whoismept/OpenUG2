@@ -32,11 +32,19 @@ static int map_bake_is_secondary(uint32_t key) {
 #define MB_GATE_LOW   84    /* retail luminance: nothing drawn here */
 #define MB_GATE_HIGH 112    /* retail luminance: clearly a drawn line */
 #define MB_ROAD_GREY 205    /* one grey for every road */
+#define MB_RACE_DIM  112    /* race map: roads off the route */
+#define MB_RACE_LIT  242    /* race map: the route */
+#define MB_RACE_LOW  150    /* retail luminance where the route begins */
+#define MB_RACE_HIGH 200
+#define MB_RACE_MIN_EXTENT 2000.0  /* metres: smaller race maps are already sharp */
 #define MB_NAV_WIDTH 8.f    /* metres: stroke bridging a break in the road */
 #define MB_NAV_LIMIT 150.f  /* metres: longer links are not one road segment */
 #define MB_NAV_SAMPLE 4.f   /* metres: spacing of the on-road checks along a link */
 #define MB_DRIVE_REACH 20.f  /* metres: a mesh this far from any link needs retail support */
 #define MB_STROKE_CONTRAST 45 /* grey above the land: the retail map drew a line here */
+#define MB_RACE_CONTRAST 40   /* the same, for the dimmer roads of a race map */
+#define MB_RACE_GATE_LOW  64  /* race map versions of MB_GATE_*: roads sit near 95 */
+#define MB_RACE_GATE_HIGH 84
 #define MB_SEAM_AREA  320   /* texels at 4096: about 600 square metres */
 #define MB_SEAM_WIDTH 4.f   /* texels at 4096: about 5.5 metres */
 #define MB_GLOW     0.24f   /* strength of the soft band around a road */
@@ -293,10 +301,11 @@ static long map_bake_raster(const N2Scene *scene, const double origin[3], int s,
 
 /* Writes s*s*3 bytes. road and second are consumed. src is the retail map as
  * w*h RGBA. drive marks texels near a drivable link, or is NULL to keep every
- * mesh. Returns 0 when out of memory. */
+ * mesh. race keeps the event map's dim roads and bright route instead of the
+ * city map's single grey. Returns 0 when out of memory. */
 static int map_bake_compose(const unsigned char *src, int w, int h, unsigned char *road,
                             unsigned char *second, const unsigned char *drive, int s,
-                            unsigned char *out) {
+                            int race, unsigned char *out) {
     long n = (long)s * s;
     /* Everything smooth is filtered at 1024 and enlarged. The radii below are
        in those texels, so the look does not change between detail levels. */
@@ -307,12 +316,13 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
     unsigned char *small = (unsigned char *)malloc((size_t)w * h * 2);
     unsigned char *soft = (unsigned char *)malloc((size_t)nm);
     unsigned char *lum = (unsigned char *)malloc((size_t)n);
+    unsigned char *route = (unsigned char *)malloc((size_t)n);
     unsigned char *core = (unsigned char *)malloc((size_t)n);
     unsigned char *glow = (unsigned char *)malloc((size_t)n);
     unsigned char *near_road = (unsigned char *)malloc((size_t)n);
     unsigned char *clean = (unsigned char *)malloc((size_t)n * 3);
     unsigned char *plain = (unsigned char *)malloc((size_t)n * 3);
-    int ok = tmp.plane && tmp.column && full.plane && full.column && small && soft && lum &&
+    int ok = tmp.plane && tmp.column && full.plane && full.column && small && soft && lum && route &&
              core && glow && near_road && clean && plain;
     if (ok) {
         unsigned char *a = small, *b = small + (size_t)w * h;
@@ -335,16 +345,21 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
            lights its full geometric width, blurred so grey never steps. */
         for (long i = 0; i < (long)w * h; i++)
             a[i] = (unsigned char)((src[i*4] * 77 + src[i*4+1] * 150 + src[i*4+2] * 29) >> 8);
+        mb_upscale(a, w, h, soft, sm);       /* undilated: the route stays its own width */
+        mb_box(soft, &tmp, sm, grid);
+        mb_upscale(soft, sm, sm, route, s);
         mb_morph(a, b, w, h, 2, 1);
         mb_upscale(b, w, h, soft, sm);
         for (int pass = 0; pass < 2; pass++) mb_box(soft, &tmp, sm, grid * 2);
         mb_upscale(soft, sm, sm, lum, s);
 
+        int gate_low = race ? MB_RACE_GATE_LOW : MB_GATE_LOW;
+        int gate_high = race ? MB_RACE_GATE_HIGH : MB_GATE_HIGH;
         for (long i = 0; i < n; i++) {
-            float gated = second[i] * mb_smooth(MB_GATE_LOW, MB_GATE_HIGH, lum[i]);
+            float gated = second[i] * mb_smooth((float)gate_low, (float)gate_high, lum[i]);
             int mesh = road[i];
             /* Stubs the game keeps but neither the retail map nor traffic uses. */
-            if (drive && !drive[i] && lum[i] < MB_GATE_LOW) mesh = 0;
+            if (drive && !drive[i] && lum[i] < gate_low) mesh = 0;
             core[i] = mesh > gated ? (unsigned char)mesh : (unsigned char)gated;
         }
 
@@ -361,7 +376,7 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
                 for (long i = 0; i < n; i++) {
                     int line = plain[i*3] + plain[i*3+1] + plain[i*3+2];
                     int land = clean[i*3] + clean[i*3+1] + clean[i*3+2];
-                    stroke[i] = line - land > MB_STROKE_CONTRAST * 3 ? 255 : 0;
+                    stroke[i] = line - land > (race ? MB_RACE_CONTRAST : MB_STROKE_CONTRAST) * 3 ? 255 : 0;
                     seeds[i] = core[i] > 127 ? 255 : 0;
                 }
                 mb_dilate(seeds, &full, s, clear);
@@ -398,17 +413,19 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
             float keep = near_road[i] / 140.f;    /* retail strokes with no mesh stay */
             float edge = mb_smooth(50, 205, core[i]);
             float band = fminf(1.f, glow[i] / 90.f) * MB_GLOW;
+            float grey = race ? MB_RACE_DIM + (MB_RACE_LIT - MB_RACE_DIM) *
+                                mb_smooth(MB_RACE_LOW, MB_RACE_HIGH, route[i]) : MB_ROAD_GREY;
             keep = keep > 1 ? 1 : keep;
             for (int c = 0; c < 3; c++) {
                 float v = plain[i * 3 + c] + (clean[i * 3 + c] - plain[i * 3 + c]) * keep;
-                v += (MB_ROAD_GREY - v) * band;
-                v += (MB_ROAD_GREY - v) * edge;
+                v += (grey - v) * band;
+                v += (grey - v) * edge;
                 out[i * 3 + c] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v + .5f);
             }
         }
     }
     free(tmp.plane); free(tmp.column); free(full.plane); free(full.column); free(small); free(soft);
-    free(lum); free(core); free(glow); free(near_road); free(clean); free(plain);
+    free(lum); free(route); free(core); free(glow); free(near_road); free(clean); free(plain);
     return ok;
 }
 
@@ -416,7 +433,7 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
  * (a bundle this map does not cover) or memory ran out. */
 static unsigned char *map_bake_city(const N2Scene *scene, const float *nav, int nnav,
                                     const int *start, const int *list, const double origin[3],
-                                    const unsigned char *src, int w, int h, int s) {
+                                    const unsigned char *src, int w, int h, int s, int race) {
     long n = (long)s * s;
     unsigned char *road = (unsigned char *)calloc((size_t)n, 1);
     unsigned char *second = (unsigned char *)calloc((size_t)n, 1);
@@ -435,7 +452,7 @@ static unsigned char *map_bake_city(const N2Scene *scene, const float *nav, int 
                 map_bake_bridge_nav(nav, nnav, start, list, reach, origin, s, road);
                 map_bake_drive_plane(nav, nnav, start, list, origin, s, drive);
             }
-            ok = map_bake_compose(src, w, h, road, second, linked ? drive : NULL, s, out);
+            ok = map_bake_compose(src, w, h, road, second, linked ? drive : NULL, s, race, out);
         }
         free(work.plane); free(work.column); free(reach); free(drive);
     }

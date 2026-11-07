@@ -133,6 +133,10 @@ Hud *hud_init(const char *dataroot);
  * the retail 512 map. Returns 1 when a baked map is active. */
 int hud_bake_city_map(Hud *h, const N2Scene *scene, const float *nav, int nnav,
                       const int *start, const int *list, int size);
+/* What a race map is rebuilt from, and at what size; 0 keeps the retail image.
+ * Borrowed, and read when a race map loads. */
+void hud_set_map_source(Hud *h, const N2Scene *scene, const float *nav, int nnav,
+                        const int *start, const int *list, int size);
 void hud_free(Hud **h);
 #ifdef HUD_TEST_HOOKS
 /* Test only: a HUD with one white image node shown as the career widget backing; needs a GL context, no game data. */
