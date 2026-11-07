@@ -1557,25 +1557,26 @@ independent implementation.
   the P8 road-surface textures (which had otherwise looked like noise).
 - **[OpenNFSTools](https://github.com/MWisBest/OpenNFSTools)** — reference for
   the JDLZ decompression algorithm.
+- **[PryHUB](https://github.com/bdrtr/PryHUB)** — reference for GLOBALB car
+  records and powertrain upgrade layouts, checked against local game data.
+- **[noclip.website](https://github.com/magcius/noclip.website)** — the Most
+  Wanted viewer informed the [investigation of model identity and instance placement](#instance-driven-world-districts-0x341xx).
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — reference for the
   Gnsu20 table layout and the EA-XAS v0 frame format (`meta/gin.c`,
   `coding/ea_xas_decoder.c`).
 
-## Open: SFX_LIGHT_BEAMA pixel base (`GLOBAL/InGameCommon.bun`)
+## TPK pixel base (`GLOBAL/InGameCommon.bun`)
 
-Key `2e95ce7c`, name `SFX_LIGHT_BEAMA`, 32x256, format tag `0x24` (DXT3),
-`Offset = 166528`, `Size = 10752` (base level 8192 plus two mip levels),
-draw descriptor `(order,usage,blend,wz) = (7,2,2,0)` -> additive.
+Pixel data begins on a 128-byte file boundary after the `0x33320002` header and
+its `0x11` filler. The first block of `InGameCommon.bun` has payload at 45960 and
+pixels at 46080, where the first palette entry is RGBA `11 11 11 7f`. Skipping
+every `0x11` byte moved the base to 46083 and shifted all records in that block.
+`n2_tpk_pixel_base` stops at the boundary inside the run.
 
-Decoding at the block base `n2_tpk_open` derives (pixel block `0x33320002` at
-45960 plus a 123-byte `0x11` filler run -> `dbase` 46083) produces saturated
-per-block colour static. 46083 is not 16-byte aligned; the nearby 16-aligned
-bases decode to flat yellow, not a beam gradient. Every other measured
-consumer of this archive resolves correctly, so the filler rule is not
-obviously wrong in general.
+Measured over 918 chance-inclusive `0x33320002` matches in the supplied data: 914
+already agreed, this block was the only real mismatch, and three unaligned
+matches with no filler keep their position.
 
-UNPROVEN. Until the real base is established, `n2_tex_noise` correctly rejects
-the decode and the renderer skips the resulting untextured batches -- see
-`docs/DEVELOPER_GUIDE.md`, "Unresolvable textures and the black light-shaft
-wedges". The 747 authored `XO_*SPOTLIGHT*` / `*BEAMYA*` cones in L4RA are
-invisible until this is solved.
+Corrected records include `SFX_NEONBARB` and `OBJ_TRACKBARRIERB_NEON_` (red race
+barrier chevrons), and `SFX_LIGHT_BEAMA` (key `2e95ce7c`, a neutral black-to-grey
+additive beam).

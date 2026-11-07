@@ -1001,7 +1001,42 @@ int texture_record_tests(void) {
                 tex.alpha != NULL && tex.alpha[1] == 200);
             free(tex.rgb); free(tex.alpha); free(tex.dxt);
         }
-            }
+        patch_field(&tpk, t, 0x100Bu, 0x24, UINT32_MAX);
+        chk("T9 P8 out-of-range index offset is rejected",
+            !n2_tpk_decode(tpk.b, tpk.n, t, 0x100Bu, &tex));
+        free(tex.rgb); free(tex.alpha); free(tex.dxt);
+        patch_field(&tpk, t, 0x100Bu, 0x24, 1024);
+        patch_field(&tpk, t, 0x100Bu, 0x28, UINT32_MAX);
+        chk("T9 P8 out-of-range palette offset is rejected",
+            !n2_tpk_decode(tpk.b, tpk.n, t, 0x100Bu, &tex));
+        free(tex.rgb); free(tex.alpha); free(tex.dxt);
+        free(t.blk);
+    }
+
+    /* T9b: filler stops at the 128-byte boundary even when the pixels themselves
+       open with filler-valued bytes (InGameCommon block 0: RGBA 11 11 11 7f). */
+    {
+        unsigned char f[320]; memset(f, 0, sizeof f);
+        static const unsigned char hdr[4] = {0x00,0x00,0x31,0xb3}, px[4] = {0x02,0x00,0x32,0x33};
+        memcpy(f, hdr, 4);
+        memcpy(f + 120, px, 4);                 /* payload at 128: no filler needed */
+        f[128] = 0x11; f[129] = 0x11; f[130] = 0x11; f[131] = 0x7f;
+        N2Tpk t = n2_tpk_open(f, sizeof f);
+        chk("T9b a boundary payload keeps its leading 0x11 bytes", t.nblk == 1 && t.blk[0].dbase == 128);
+        free(t.blk);
+        memset(f + 120, 0, 12);
+        memcpy(f + 112, px, 4);                 /* payload at 120: 8 filler bytes */
+        memset(f + 120, 0x11, 11);              /* filler, then 3 pixel bytes */
+        f[131] = 0x7f;
+        t = n2_tpk_open(f, sizeof f);
+        chk("T9b leading 0x11 pixel bytes are not filler", t.nblk == 1 && t.blk[0].dbase == 128);
+        free(t.blk);
+        memset(f + 112, 0, 20);
+        memcpy(f + 96, px, 4);                  /* payload at 104, unaligned chance magic */
+        t = n2_tpk_open(f, sizeof f);
+        chk("T9b block without filler stays put", t.nblk == 1 && t.blk[0].dbase == 104);
+        free(t.blk);
+    }
 
     /* T10: fully-opaque source alpha -- the plane must be freed (NULL), the
        pre-existing M132-R2 behaviour, unaffected by the new order/usage/

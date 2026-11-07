@@ -346,19 +346,13 @@ region bytes alive after binding merely for lights.
 `XO_*SPOTLIGHT*` / `*BEAMYA*` submeshes (747 of them in L4RA) are the authored
 light shafts. They name texture key `2e95ce7c` = `SFX_LIGHT_BEAMA`, a 32x256
 DXT3 record in `GLOBAL/InGameCommon.bun` whose draw descriptor is
-`(order,usage,blend,wz) = (7,2,2,0)` -- a late-order additive layer. The key is
-rejected by `n2_tex_noise` and the meshes end up with no bound texture.
+`(order,usage,blend,wz) = (7,2,2,0)` -- a late-order additive layer.
 
-That rejection is correct. Dumping the decoded pixels shows saturated
-per-block colour static, the signature of DXT blocks read from a base the
-record's `Offset` does not actually address: `n2_tpk_open` puts this block's
-`dbase` at 46083 (pixel block at 45960 plus a 123-byte `0x11` filler run),
-which is not 16-byte aligned, and every 16-aligned base nearby decodes to flat
-yellow rather than a beam gradient. **The correct base for this archive is an
-open format question**; do not "fix" it by exempting the key from the noise
-filter, which only replaces black wedges with rainbow ones.
+The record once decoded to colour static because `n2_tpk_open` read pixels three
+bytes late. The base is now resolved; see "TPK pixel base" in `docs/FORMATS.md`.
+Do not exempt a key from `n2_tex_noise` to hide a decode failure.
 
-What the renderer does instead: a world batch with no bound texture whose
+When a texture stays unresolved, a world batch with no bound texture whose
 meshes did name one is **not drawn**. Untextured it falls back to flat grey,
 which under night ambient is the solid dark slab that made every light shaft
 look like a black wedge hanging off a building. Skipping it also drops their
@@ -1592,12 +1586,13 @@ sample values *and* paints a `PREVIEW SAMPLE VALUES` banner.
 
 ### Map placement
 
-There is no whole-city track map: `TRACKS/TRACKMAP<id>.BIN` is one 512×512
-texture per event with no world-coordinate metadata. The minimap therefore
-draws from world coordinates the engine already loads — the nav graph in free
-roam, the event route in a race — so placement is per-track measured data, not
-a fit to one district. `MINIMAP_MASK` is the panel disc (not a vignette) and
-`MINIMAP_BORDER` is one **quadrant** of the ring, drawn four times rotated.
+The minimap uses `TRACKS/TRACKMAP4000.BIN` in free roam and
+`TRACKS/TRACKMAP<id>.BIN` in race HUD layouts with a minimap. The matching
+TrackInfo row in `GLOBALB.BUN` supplies the map origin and world extent.
+Live markers share the same projection. If the race texture or its metadata
+is unavailable, the HUD uses the city map with the runtime route overlay. `MINIMAP_MASK`
+supplies the panel's circular coverage, and the four rotated
+`MINIMAP_BORDER` quadrants form its ring.
 
 Destination selection is a left-click on the minimap (`hud_map_pick` inverts
 the same transform the frame drew); `G` clears guidance. The arrow's bearing is
@@ -1605,6 +1600,44 @@ to the next node **along the solved route**, never the straight line to the
 target, and an unreachable destination leaves the route empty so nothing is
 drawn. `make hud-test` covers the angle wrap, the map round-trip, aspect
 invariance, the sprint/lap rule, money visibility and the art gate.
+
+### Baked city map
+
+The 500 m minimap window shows only 45 texels of the retail image, which is
+what made it blurry at modern resolutions. `src/map_bake.h` rebuilds the map at
+load time from the road meshes, the navigation links and the retail colours;
+nothing is shipped or cached. The size follows the Level Of Detail slider, with
+no separate performance path:
+
+| Level | Map |
+|---|---|
+| 5, or no saved setting | 4096 |
+| 4 | 2048 |
+| 3 | 1024 |
+| 1, 2 | retail 512, no bake |
+
+`--map-detail 512|1024|2048|4096` overrides the slider. A baked map replaces
+TRACKMAP4000 in free roam, on L4RA only, because that image covers that bundle.
+
+Races use their own TRACKMAP at every detail level. `GLOBALB` TrackInfo gives
+each map a frame, and they differ widely: about 11 m per texel for L4RA events,
+10 for L4RG, 7.6 for L4RB and L4RD, but only 1.3 to 1.4 for the L4RC and L4RF
+close-ups. Maps wider than `MB_RACE_MIN_EXTENT` (2000 m) are rebuilt when the
+race loads, in the same frame, keeping that map's colours, dim roads and bright
+route. Smaller maps are already as sharp as a baked one and stay as shipped.
+
+Routing-graph links bridge breaks in the road layer, because material names miss
+paved surfaces such as gravel lanes. A link is stroked only where no road mesh
+lies under it, so existing roads keep their shape. Thin seams between adjoining
+meshes are filled by size and width, which leaves junction islands alone.
+
+The retail image settles disagreements with the meshes. A road it draws with no
+mesh under it is added from the stroke, and a mesh stub with neither a retail
+line nor a nearby link is removed.
+Rail surfaces share their textures with an unlit yard on the south coast, so
+they are drawn only where the retail image shows a line. All roads use one grey
+rather than the retail brightness. `make map-bake-test` covers the levels, the
+world-to-texel frame, the links, that gate, the road colour and the road edge.
 
 ### Widescreen fitment (`--hud-fit`)
 
@@ -1637,13 +1670,10 @@ says turbo mapping and nitrous "remain pending". So today nitrous counts as
 fitted (the engine grants every car a working boost on `N`, which really does
 raise top speed) and a turbo never does.
 
-The standard HUD has **no turbo gauge at all**. The only turbo art in the game
-is `DRAG_TURBO_BACKING/LINES/NEEDLE` in `GLOBAL/InGameDrag.bun`, which belongs
-to the drag HUD and is out of scope here; `InGameDrag.bun` also holds the full
-numbered drag tachometer (`DRAG_RPM_BACKING`, `DRAG_RPM_{7000..10000}_LINES`,
-`DRAG_RPM_NEEDLE`) for whoever builds that mode. Note those records place their
-circle centre OUTSIDE the texture — `DRAG_RPM_8000_LINES` sits 1.336 widths to
-the right of its own left edge — so they cannot be positioned by eye.
+The Drift HUD uses its compact angle backing next to the tachometer when the
+turbo gauge is hidden. When a turbo is marked fitted, the split angle backing
+leaves room for the skin's turbo face and scale. The face has no live needle
+while boost telemetry is unavailable.
 
 `--hud-fitted nos,turbo|none` overrides fitment for review. It changes what is
 drawn, never a telemetry value.
@@ -1651,3 +1681,52 @@ drawn, never a telemetry value.
 One cosmetic limitation: the `N2O` legend is painted into `TACH_NOS_ALPHA`,
 which is also the rev-counter arc, so the word remains on the dial even with
 nitrous unfitted. Separating them needs art that does not ship.
+
+## Planned wheel and VR support
+
+### Steering wheels, pedals and force feedback
+
+`src/controls_sdl.c` already identifies SDL wheel devices and reads raw joystick
+axes and buttons. The current controls tests use an SDL virtual joystick.
+Physical wheel input, calibration and steering torque still need hardware
+validation. See the [controls implementation notes](cleanroom-settings/CONTROLS_IMPL_DESIGN.md).
+
+1. **Verify wheel input first.** Calibrate steering centre and travel, pedal
+   rest positions and inversion. Cover separate and combined pedal axes,
+   paddles and independently connected pedals or shifters. Persist calibration
+   per device and verify reconnects without changing existing bindings.
+2. **Probe force feedback separately.** Use the selected wheel's SDL haptic
+   capabilities to choose a supported steering torque effect. A wheel without
+   torque support still drives normally. Start with a low default gain and a
+   user-adjustable limit. Stop output on pause, focus loss, disconnect or
+   shutdown, and let effects expire if updates stop. [SDL2 haptics](https://wiki.libsdl.org/SDL2/CategoryHaptic)
+3. **Drive torque from vehicle contact.** Evaluate a bounded return-to-centre
+   signal from front tyre contact and load at the physics tick. Check polarity,
+   saturation and unloading before adding surface or impact effects. Keep
+   device output separate from simulation state so replays stay deterministic.
+
+Acceptance starts with synthetic axis, calibration and torque-limit tests.
+Then verify steering and pedals, torque direction, and force clearing on pause
+and disconnect with a physical wheel. Record the tested device, OS, driver
+and supported effects before claiming compatibility.
+
+### VR driving
+
+Start with an optional OpenXR prototype on one headset, runtime and graphics
+backend. Use the mounted camera frame as a starting point for head tracking.
+A complete cockpit, VR menus and motion controllers can follow the driving
+prototype. See [camera notes](CAMERA.md) and the [OpenXR specification](https://registry.khronos.org/OpenXR/specs/1.1-khr/pdf/xrspec.pdf).
+
+1. **Prove stereo presentation.** Add the runtime session and per-eye render
+   targets at the renderer boundary. Draw both eyes from one simulation snapshot
+   using the headset poses and projections for the predicted display time.
+   Keep the fixed physics tick independent of headset refresh and preserve the
+   normal desktop path when VR is disabled or unavailable.
+2. **Validate the mounted view.** Add recentering, seated camera placement and
+   a legible HUD. Disable artificial shake and chase-camera motion in the first
+   comfort profile. Handle tracking loss and session stop without leaving input
+   or graphics resources active.
+3. **Measure on hardware.** Check stereo alignment, scale, recentering and
+   headset reconnect in free roam and one race. Record per-eye frame time and
+   missed frames on the tested configuration, then rerun desktop camera and
+   rendering checks.

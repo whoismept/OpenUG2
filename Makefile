@@ -57,7 +57,12 @@ HDRS += src/ug2_track_collision.h src/drivetrain.h src/braking.h src/resistance.
 HDRS += src/drive_trace.h src/drive_presentation.h src/drive_session.h
 SRC += src/hud_race.c
 HDRS += src/hud_race.h src/dir_scan.h
-HDRS += src/player_motion.h
+HDRS += src/player_motion.h src/map_bake.h
+
+map-bake-test: tools/map_bake_test.c src/map_bake.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/map_bake_test.c -o build/map_bake_test -lm
+	./build/map_bake_test
 
 hud-race-test: tools/hud_race_test.c src/hud_race.c src/hud_race.h src/hud.h src/hud_asset.c src/hud_asset.h src/ugui/ugui_codec.c
 	@mkdir -p build
@@ -460,7 +465,7 @@ clean:
 	rm -f nfsu2 nfsu2.exe nfsu2-vk nfsu2-vk.exe *.png $(GEN) src/generated_shaders_vk.h
 	rm -rf build
 
-.PHONY: race-ai-test race-events-check run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
+.PHONY: map-bake-test race-ai-test race-events-check run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
 
 .PHONY: headlight-render-test
 headlight-render-test: tools/headlight_render_test.c tools/legacy_draw.h src/render.c src/render_params.c src/rhi_gl_state.c src/rhi_gl.c src/tex_override.c src/render.h src/nfsu2.h src/generated_shaders.h

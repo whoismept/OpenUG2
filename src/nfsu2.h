@@ -3752,7 +3752,8 @@ static int n2_load_texture(const unsigned char *d, long len, const char *name, N
 /* CONTRAST alone is not the test, and using it alone was throwing away real
  * assets. Measured over STREAML4RA's 1119 decoded textures: 21 tripped the >55
  * contrast rule, and dumping all 21 showed only FOUR are actually mis-decoded
- * (SFX_LIGHT_BEAMA and three barrier/beam surfaces -- rainbow confetti). The
+ * (SFX_LIGHT_BEAMA and three barrier/beam surfaces -- rainbow confetti, since
+ * traced to the pixel base handled by n2_tpk_pixel_base). The
  * other seventeen decode perfectly and are exactly the assets you would expect
  * to be high-contrast at a 4-pixel sample stride: neon shop signs (VICTOR,
  * ROYALE, PARKING, BURGER KING, W HARPER), a Chinese shop sign, an "M" letter
@@ -3811,6 +3812,16 @@ static int n2_tex_noise(const N2Tex *t) {
  * mmap'd and queried without re-scanning it per texture. */
 typedef struct { long hbeg, hsize, dbase; } N2TpkBlk;
 typedef struct { N2TpkBlk *blk; int nblk; } N2Tpk;
+/* Pixel data starts on a 128-byte file boundary, reached by 0x11 filler. A first
+ * palette entry or DXT block can begin with 0x11 too: InGameCommon's first block
+ * opens with RGBA 11 11 11 7f, and a plain filler skip consumed those three bytes,
+ * shifting every record in the block. Step back to the boundary inside the run.
+ * A block with no boundary in that run keeps its position. */
+static long n2_tpk_pixel_base(const unsigned char *d, long pbase, long room) {
+    long base = pbase + n2_skip_filler(d + pbase, (int)room);
+    long aligned = base & ~127L;
+    return aligned >= pbase ? aligned : base;
+}
 /* TPK rejection fixes adapted from luigiazoreng/OpenUG2 (MIT), addbcbe/55a53e5. */
 static N2Tpk n2_tpk_open(const unsigned char *d, long len) {
     N2Tpk t; t.blk = NULL; t.nblk = 0; int cap = 0;
@@ -3829,7 +3840,7 @@ static N2Tpk n2_tpk_open(const unsigned char *d, long len) {
             if (t.nblk == cap) { cap = cap ? cap*2 : 64;
                 t.blk = (N2TpkBlk *)realloc(t.blk, (size_t)cap*sizeof(N2TpkBlk)); }
             t.blk[t.nblk].hbeg = ph; t.blk[t.nblk].hsize = (long)phs;
-            t.blk[t.nblk].dbase = pbase + n2_skip_filler(d + pbase, (int)room);
+            t.blk[t.nblk].dbase = n2_tpk_pixel_base(d, pbase, room);
             t.nblk++; ph = -1;
         }
     }
@@ -3875,6 +3886,9 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
     memset(tex, 0, sizeof *tex);
     for (int b = 0; b < t.nblk; b++) {
         long hbeg = t.blk[b].hbeg, hend = hbeg + t.blk[b].hsize, dbase = t.blk[b].dbase;
+        if (dbase < 0 || dbase > len) continue;
+        /* File offsets are uint32_t, and long is only 32 bits on Windows. */
+        uint64_t available = (uint64_t)(len - dbase);
         for (long i = hbeg; i + 0x40 < hend; i++) {
             if (!((d[i] >= 'A' && d[i] <= 'Z') ||
                   (d[i] >= '0' && d[i] <= '9'))) continue;
@@ -3915,7 +3929,7 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                  * bounds-check the actual palette/index bytes -- a record
                  * whose declared offsets don't fit the file is corrupt, not
                  * decodable, regardless of what its tag claims. */
-                if (dbase+paloff+1024 > len || dbase+off+(long)w*hh > len) {
+                if ((uint64_t)paloff + 1024 > available || (uint64_t)off + (long)w*hh > available) {
                     free(tex->rgb); free(alf); continue;
                 }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
@@ -3936,7 +3950,7 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                 long dxt3 = is_dxt3;   /* format choice: from the proven +0x3e tag, not size */
                 long bx = ((long)w + 3) / 4, by = ((long)hh + 3) / 4;
                 long need = bx * by * (dxt3 ? 16 : 8);
-                if (dbase + off + need > len) { free(tex->rgb); free(alf); continue; }
+                if ((uint64_t)off + need > available) { free(tex->rgb); free(alf); continue; }
                 if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
                 else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
             }
