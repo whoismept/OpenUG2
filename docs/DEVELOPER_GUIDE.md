@@ -1651,3 +1651,52 @@ drawn, never a telemetry value.
 One cosmetic limitation: the `N2O` legend is painted into `TACH_NOS_ALPHA`,
 which is also the rev-counter arc, so the word remains on the dial even with
 nitrous unfitted. Separating them needs art that does not ship.
+
+## Planned wheel and VR support
+
+### Steering wheels, pedals and force feedback
+
+`src/controls_sdl.c` already identifies SDL wheel devices and reads raw joystick
+axes and buttons. The current controls tests use an SDL virtual joystick.
+Physical wheel input, calibration and steering torque still need hardware
+validation. See the [controls implementation notes](cleanroom-settings/CONTROLS_IMPL_DESIGN.md).
+
+1. **Verify wheel input first.** Calibrate steering centre and travel, pedal
+   rest positions and inversion. Cover separate and combined pedal axes,
+   paddles and independently connected pedals or shifters. Persist calibration
+   per device and verify reconnects without changing existing bindings.
+2. **Probe force feedback separately.** Use the selected wheel's SDL haptic
+   capabilities to choose a supported steering torque effect. A wheel without
+   torque support still drives normally. Start with a low default gain and a
+   user-adjustable limit. Stop output on pause, focus loss, disconnect or
+   shutdown, and let effects expire if updates stop. [SDL2 haptics](https://wiki.libsdl.org/SDL2/CategoryHaptic)
+3. **Drive torque from vehicle contact.** Evaluate a bounded return-to-centre
+   signal from front tyre contact and load at the physics tick. Check polarity,
+   saturation and unloading before adding surface or impact effects. Keep
+   device output separate from simulation state so replays stay deterministic.
+
+Acceptance starts with synthetic axis, calibration and torque-limit tests.
+Then verify steering and pedals, torque direction, and force clearing on pause
+and disconnect with a physical wheel. Record the tested device, OS, driver
+and supported effects before claiming compatibility.
+
+### VR driving
+
+Start with an optional OpenXR prototype on one headset, runtime and graphics
+backend. Use the mounted camera frame as a starting point for head tracking.
+A complete cockpit, VR menus and motion controllers can follow the driving
+prototype. See [camera notes](CAMERA.md) and the [OpenXR specification](https://registry.khronos.org/OpenXR/specs/1.1-khr/pdf/xrspec.pdf).
+
+1. **Prove stereo presentation.** Add the runtime session and per-eye render
+   targets at the renderer boundary. Draw both eyes from one simulation snapshot
+   using the headset poses and projections for the predicted display time.
+   Keep the fixed physics tick independent of headset refresh and preserve the
+   normal desktop path when VR is disabled or unavailable.
+2. **Validate the mounted view.** Add recentering, seated camera placement and
+   a legible HUD. Disable artificial shake and chase-camera motion in the first
+   comfort profile. Handle tracking loss and session stop without leaving input
+   or graphics resources active.
+3. **Measure on hardware.** Check stereo alignment, scale, recentering and
+   headset reconnect in free roam and one race. Record per-eye frame time and
+   missed frames on the tested configuration, then rerun desktop camera and
+   rendering checks.

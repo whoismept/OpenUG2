@@ -12,6 +12,7 @@ vehicle/lighting state.
 | ![Rainy fountain plaza at 4K](rainy-plaza-4k.png) | Supra beside the fountain plaza; native 3840×2160, maximum (High) vehicle and weather quality, rain intensity 1.0 and wetness 0.8, with lens droplets and wet reflections |
 | ![City plaza](showcase.png) | Plaza, fountain geometry and surrounding buildings; water animation remains work in progress |
 | ![Vehicle detail](detail_showcase.png) | Skyline body, glass, wheels and lamp presentation |
+| ![Golf vehicle detail](car_detail.png) | Golf bodywork and wheel detail |
 | ![Modification menu](imgui.png) | ImGui body-shop modification controls |
 | ![Texture filtering 16x](detail_16x.png) | Road scene with 16× texture filtering |
 | ![Street lighting first view](lightpool_mark1_after.png) | Lighting near a parking entrance |

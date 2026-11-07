@@ -1557,6 +1557,10 @@ independent implementation.
   the P8 road-surface textures (which had otherwise looked like noise).
 - **[OpenNFSTools](https://github.com/MWisBest/OpenNFSTools)** — reference for
   the JDLZ decompression algorithm.
+- **[PryHUB](https://github.com/bdrtr/PryHUB)** — reference for GLOBALB car
+  records and powertrain upgrade layouts, checked against local game data.
+- **[noclip.website](https://github.com/magcius/noclip.website)** — the Most
+  Wanted viewer informed the [investigation of model identity and instance placement](#instance-driven-world-districts-0x341xx).
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — reference for the
   Gnsu20 table layout and the EA-XAS v0 frame format (`meta/gin.c`,
   `coding/ea_xas_decoder.c`).
