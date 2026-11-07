@@ -97,6 +97,29 @@ int main(void) {
         chk("box filter keeps a flat plane flat", flat);
     }
 
+    /* Layers: everything the worker needs, for one frame and size. */
+    {
+        MbLayers layers;
+        mesh.cat = N2_ROAD; mesh.texkey = 0;
+        chk("layers build from a scene", map_bake_layers(&layers, &scene, NULL, 0, NULL, NULL, origin, S));
+        chk("layers carry the road", layers.road[(long)150 * S + 250] == 255);
+        chk("no nav graph means no drive plane", layers.drive == NULL);
+        chk("layers match their own frame", map_bake_layers_match(&layers, origin, S));
+        double other[3] = { 0, 100, 200 };
+        chk("layers reject another frame", !map_bake_layers_match(&layers, other, S));
+        chk("layers reject another size", !map_bake_layers_match(&layers, origin, S / 2));
+        fixture(rgba);
+        unsigned char *image = map_bake_from_layers(&layers, rgba, W, W, 0);
+        chk("a map bakes from layers alone", image != NULL);
+        chk("layers survive a bake for the next race", layers.road[(long)150 * S + 250] == 255);
+        free(image);
+        map_bake_layers_free(&layers);
+        chk("freed layers match nothing", !map_bake_layers_match(&layers, origin, S));
+        mesh.cat = N2_OTHER;
+        chk("a frame with no road gives no layers",
+            !map_bake_layers(&layers, &scene, NULL, 0, NULL, NULL, origin, S) && !layers.road);
+    }
+
     /* Links bridge breaks only: an existing road keeps its exact shape. */
     {
         float nav[] = { 20, 50,  60, 50,  60, 900,  500, 500,  540, 500,  600, 500,  640, 500 };

@@ -6,6 +6,13 @@
 #include "hud_race.h"
 #include "race.h"
 #include "map_bake.h"
+
+/* One bake on the worker. event>0 is a race map, 0 the free-roam map. */
+typedef struct {
+ SDL_Thread *thread; SDL_atomic_t done; Uint32 begin;
+ const MbLayers *layers;
+ unsigned char *src,*rgb; int w,h,event;
+} MapJob;
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -62,7 +69,10 @@ struct Hud {
  int race_map_event;
  Texture race_map;
  const N2Scene *bake_scene; const float *bake_nav; const int *bake_start,*bake_list;
- int bake_nnav,bake_size;
+ int bake_nnav,bake_size,map_sync,want_city;
+ MbLayers layers;
+ MapJob job,pending;  /* job runs on the worker; pending waits for it, src owned */
+ int job_busy;
  Texture city_map;   /* baked, optional; replaces TRACKMAP4000 */
  double race_map_origin[3];
  double origin[3]; int track_ok,preview,skin; char missing[1024]; unsigned reported,resolved,drawn;
@@ -162,17 +172,75 @@ static Texture upload_baked(unsigned char *rgb,int size){
  return (Texture){id,size,size};
 }
 
-/* City-wide race maps spend about 10 m on a texel. Rebuild those; the small
- * maps are already as sharp as a baked one. */
-static Texture bake_race_map(Hud *h,int event,const HaPixels *pixels){
- if(h->bake_size<=0||!h->bake_scene||h->race_map_origin[2]<MB_RACE_MIN_EXTENT)return (Texture){0};
- Uint32 begin=SDL_GetTicks();
- unsigned char *rgb=map_bake_city(h->bake_scene,h->bake_nav,h->bake_nnav,h->bake_start,h->bake_list,
-    h->race_map_origin,pixels->rgba,(int)pixels->width,(int)pixels->height,h->bake_size,1);
- if(!rgb)return (Texture){0};
- Texture t=upload_baked(rgb,h->bake_size);
- if(t.id.id)printf("race map: event %d %dx%d baked in %u ms\n",event,h->bake_size,h->bake_size,SDL_GetTicks()-begin);
- return t;
+static int map_job_run(void*data){
+ MapJob*job=data;
+ job->rgb=map_bake_from_layers(job->layers,job->src,job->w,job->h,job->event>0);
+ SDL_AtomicSet(&job->done,1);
+ return 0;
+}
+
+static void map_job_start(Hud*h,MapJob request){
+ h->job=request;
+ h->job.layers=&h->layers;h->job.rgb=NULL;h->job.begin=SDL_GetTicks();
+ SDL_AtomicSet(&h->job.done,0);
+ h->job.thread=SDL_CreateThread(map_job_run,"map-bake",&h->job);
+ h->job_busy=1;
+ if(!h->job.thread)map_job_run(&h->job);   /* no thread available: still correct, just blocking */
+}
+
+/* The texture upload stays here: GL belongs to the main thread. */
+static void map_job_finish(Hud*h){
+ MapJob*job=&h->job;
+ if(job->thread)SDL_WaitThread(job->thread,NULL);
+ free(job->src);
+ Uint32 baked=SDL_GetTicks()-job->begin,start=SDL_GetTicks();
+ int keep=job->rgb&&(job->event?job->event==h->race_map_event:h->want_city);
+ Texture t=keep?upload_baked(job->rgb,h->layers.size):(Texture){0};
+ if(!keep)free(job->rgb);
+ if(t.id.id&&job->event){
+  rhi_texture_destroy(h->race_map.id);h->race_map=t;
+  printf("race map: event %d %dx%d baked in %u ms, upload %u ms\n",job->event,t.w,t.h,baked,SDL_GetTicks()-start);
+ }else if(t.id.id){
+  h->city_map=t;h->want_city=0;
+  printf("city map: %dx%d baked in %u ms, upload %u ms\n",t.w,t.h,baked,SDL_GetTicks()-start);
+ }
+ h->job_busy=0;
+}
+
+/* Finish a done job, then start whatever waits. A race goes first; the free-roam
+ * map keeps waiting behind it. */
+static void map_jobs_pump(Hud*h,int wait){
+ for(;;){
+  if(h->job_busy&&(wait||SDL_AtomicGet(&h->job.done)))map_job_finish(h);
+  if(h->job_busy)return;
+  if(h->pending.src){MapJob next=h->pending;memset(&h->pending,0,sizeof h->pending);map_job_start(h,next);}
+  else if(h->want_city&&map_bake_layers_match(&h->layers,h->origin,h->bake_size)){
+   size_t len=0;unsigned char*data=readfile(h->data_root,"TRACKS/TRACKMAP4000.BIN",&len);
+   HaPixels pixels;
+   if(data&&ha_texture_find(data,len,ha_hash("TRACKMAP4000"),&pixels)==1)
+    map_job_start(h,(MapJob){.src=pixels.rgba,.w=(int)pixels.width,.h=(int)pixels.height});
+   else{diagnostic(h,"TRACKMAP4000 unavailable; retail map kept");h->want_city=0;}
+   free(data);
+  }
+  if(!h->job_busy||!wait)return;
+ }
+}
+
+/* Takes pixels when it returns 1. City-wide race maps spend about 10 m on a
+ * texel; the small ones are already as sharp as a baked map. */
+static int queue_race_bake(Hud*h,int event,HaPixels*pixels){
+ const double*frame=h->race_map_origin;
+ if(h->bake_size<=0||!h->bake_scene||frame[2]<MB_RACE_MIN_EXTENT)return 0;
+ if(!map_bake_layers_match(&h->layers,frame,h->bake_size)){
+  if(h->job_busy)map_job_finish(h);   /* the worker reads these layers */
+  map_bake_layers_free(&h->layers);
+  Uint32 begin=SDL_GetTicks();
+  if(!map_bake_layers(&h->layers,h->bake_scene,h->bake_nav,h->bake_nnav,h->bake_start,h->bake_list,frame,h->bake_size))return 0;
+  printf("map layers: %dx%d in %u ms\n",h->bake_size,h->bake_size,SDL_GetTicks()-begin);
+ }
+ free(h->pending.src);
+ h->pending=(MapJob){.src=pixels->rgba,.w=(int)pixels->width,.h=(int)pixels->height,.event=event};
+ return 1;
 }
 
 static void load_race_map(Hud *h, int event) {
@@ -190,14 +258,13 @@ static void load_race_map(Hud *h, int event) {
  HaPixels pixels;
  if(data && track_map_origin(&h->packs[5],event,h->race_map_origin) &&
     ha_texture_find(data,len,ha_hash(name),&pixels)==1){
-  h->race_map=bake_race_map(h,event,&pixels);
-  RhiTexture id=h->race_map.id.id?(RhiTexture){0}:rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
+  RhiTexture id=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
      RHI_FORMAT_RGBA8,(int)pixels.width,(int)pixels.height,RHI_TEXTURE_SAMPLED});
   if(id.id && rhi_texture_upload(id,0,0,pixels.rgba,0)==RHI_OK){
    render_texture_clamp_linear(id);
    h->race_map=(Texture){id,(int)pixels.width,(int)pixels.height};
-  }else if(!h->race_map.id.id)rhi_texture_destroy(id);
-  free(pixels.rgba);
+  }else rhi_texture_destroy(id);
+  if(!queue_race_bake(h,event,&pixels))free(pixels.rgba);
  }
  free(data);
  if(!h->race_map.id.id){
@@ -406,31 +473,29 @@ Hud *hud_init(const char*root){
  if(!h->track_ok)diagnostic(h,"city track metadata missing or invalid");
  load_layout(h,0);init_shader(h);return h;
 }
-int hud_bake_city_map(Hud*h,const N2Scene*scene,const float*nav,int nnav,const int*start,const int*list,int size){
- if(!h)return 0;
- if(h->city_map.id.id)rhi_texture_destroy(h->city_map.id);
- h->city_map=(Texture){0};
- if(size<=0||!scene||!h->track_ok)return 0;
- size_t len=0;
- unsigned char *data=readfile(h->data_root,"TRACKS/TRACKMAP4000.BIN",&len);
- HaPixels pixels;
- if(!data||ha_texture_find(data,len,ha_hash("TRACKMAP4000"),&pixels)!=1){
-  free(data);diagnostic(h,"TRACKMAP4000 unavailable; retail map kept");return 0;
- }
- unsigned char *rgb=map_bake_city(scene,nav,nnav,start,list,h->origin,pixels.rgba,(int)pixels.width,(int)pixels.height,size,0);
- free(pixels.rgba);free(data);
- if(!rgb)return 0;
- h->city_map=upload_baked(rgb,size);
- return h->city_map.id.id!=0;
-}
 void hud_set_map_source(Hud*h,const N2Scene*scene,const float*nav,int nnav,const int*start,const int*list,int size){
  if(!h)return;
+ h->want_city=0;free(h->pending.src);memset(&h->pending,0,sizeof h->pending);
+ if(h->job_busy)map_job_finish(h);
+ map_bake_layers_free(&h->layers);
+ if(h->city_map.id.id)rhi_texture_destroy(h->city_map.id);
+ h->city_map=(Texture){0};
  h->bake_scene=scene;h->bake_nav=nav;h->bake_nnav=nnav;
  h->bake_start=start;h->bake_list=list;h->bake_size=size;
  h->race_map_event=-1;   /* a live race picks the new size up on its next frame */
 }
+void hud_request_city_map(Hud*h){
+ if(!h||h->bake_size<=0||!h->bake_scene||!h->track_ok)return;
+ Uint32 begin=SDL_GetTicks();
+ if(!map_bake_layers(&h->layers,h->bake_scene,h->bake_nav,h->bake_nnav,h->bake_start,h->bake_list,h->origin,h->bake_size))return;
+ printf("map layers: %dx%d in %u ms\n",h->bake_size,h->bake_size,SDL_GetTicks()-begin);
+ h->want_city=1;
+}
+void hud_set_map_sync(Hud*h,int on){if(h)h->map_sync=on;}
 void hud_free(Hud**hp){
- if(!hp||!*hp)return;Hud*h=*hp;release_layout(h);
+ if(!hp||!*hp)return;Hud*h=*hp;
+ h->want_city=0;if(h->job_busy)map_job_finish(h);free(h->pending.src);map_bake_layers_free(&h->layers);
+ release_layout(h);
  rhi_texture_destroy(h->race_map.id);rhi_texture_destroy(h->city_map.id);free(h->data_root);
  if(h->centre_texture.id.id)rhi_texture_destroy(h->centre_texture.id);hud_baseline_free(&h->auxiliary);
  for(size_t i=0;i<h->font_count;i++){free(h->fonts[i].metrics.glyphs);free(h->fonts[i].cells);if(h->fonts[i].atlas.id.id)rhi_texture_destroy(h->fonts[i].atlas.id);}
@@ -598,6 +663,7 @@ void hud_draw(Hud*h,const RProg*rp,GpuMesh*unused,const HudState*s,int w,int hei
  RhiStateSnapshot hud_saved; rhi_cmd_save_state(&hud_saved);
  int city_map=h->city_map.id.id!=0;
  load_race_map(h,s->racing&&h->mapnode>=0?s->race_event_id:0);
+ map_jobs_pump(h,h->map_sync);
  int authored_map=h->race_map.id.id!=0;
  const double *origin=authored_map?h->race_map_origin:h->origin;
  double heading=s->map_heading_explicit?s->map_heading_clockwise:M_PI*.5-s->car_heading;

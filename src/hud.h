@@ -129,14 +129,16 @@ typedef struct Hud Hud;
  * missing container or texture is NOT fatal — the affected element is skipped
  * and named by hud_missing(). */
 Hud *hud_init(const char *dataroot);
-/* Replace the city minimap with one baked from `scene` at size*size; 0 restores
- * the retail 512 map. Returns 1 when a baked map is active. */
-int hud_bake_city_map(Hud *h, const N2Scene *scene, const float *nav, int nnav,
-                      const int *start, const int *list, int size);
-/* What a race map is rebuilt from, and at what size; 0 keeps the retail image.
- * Borrowed, and read when a race map loads. */
+/* Sharp minimaps. The size follows the detail setting; 0 keeps the retail
+ * images. The HUD reads the world only inside hud_set_map_source and when a race
+ * in another map frame starts. Everything else runs on a worker thread, and a
+ * finished map replaces the retail image on a later frame. Pointers are borrowed. */
 void hud_set_map_source(Hud *h, const N2Scene *scene, const float *nav, int nnav,
                         const int *start, const int *list, int size);
+/* Request the free-roam map, from the source above. */
+void hud_request_city_map(Hud *h);
+/* Block until a requested map is ready: for captures, which need one fixed frame. */
+void hud_set_map_sync(Hud *h, int on);
 void hud_free(Hud **h);
 #ifdef HUD_TEST_HOOKS
 /* Test only: a HUD with one white image node shown as the career widget backing; needs a GL context, no game data. */

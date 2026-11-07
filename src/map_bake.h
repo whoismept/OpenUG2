@@ -299,12 +299,12 @@ static long map_bake_raster(const N2Scene *scene, const double origin[3], int s,
     return triangles;
 }
 
-/* Writes s*s*3 bytes. road and second are consumed. src is the retail map as
+/* Writes s*s*3 bytes. src is the retail map as
  * w*h RGBA. drive marks texels near a drivable link, or is NULL to keep every
  * mesh. race keeps the event map's dim roads and bright route instead of the
  * city map's single grey. Returns 0 when out of memory. */
-static int map_bake_compose(const unsigned char *src, int w, int h, unsigned char *road,
-                            unsigned char *second, const unsigned char *drive, int s,
+static int map_bake_compose(const unsigned char *src, int w, int h, const unsigned char *road,
+                            const unsigned char *second, const unsigned char *drive, int s,
                             int race, unsigned char *out) {
     long n = (long)s * s;
     /* Everything smooth is filtered at 1024 and enlarged. The radii below are
@@ -429,35 +429,60 @@ static int map_bake_compose(const unsigned char *src, int w, int h, unsigned cha
     return ok;
 }
 
-/* The whole bake: a malloc'd s*s RGB image, or NULL when the scene holds no road
- * (a bundle this map does not cover) or memory ran out. */
-static unsigned char *map_bake_city(const N2Scene *scene, const float *nav, int nnav,
-                                    const int *start, const int *list, const double origin[3],
-                                    const unsigned char *src, int w, int h, int s, int race) {
+/* The part of a bake that reads the world, for one map frame and size. Built on
+ * the thread that owns the scene. Afterwards it needs nothing from the scene, so
+ * map_bake_from_layers can run on a worker while the world streams. */
+typedef struct {
+    unsigned char *road, *second, *drive;   /* drive is NULL without a nav graph */
+    double origin[3];
+    int size;
+} MbLayers;
+
+static void map_bake_layers_free(MbLayers *l) {
+    free(l->road); free(l->second); free(l->drive);
+    memset(l, 0, sizeof *l);
+}
+
+static int map_bake_layers_match(const MbLayers *l, const double origin[3], int s) {
+    return l->road && l->size == s && fabs(l->origin[0] - origin[0]) < .01 &&
+           fabs(l->origin[1] - origin[1]) < .01 && fabs(l->origin[2] - origin[2]) < .01;
+}
+
+/* Returns 0 when the scene holds no road (a bundle this frame does not cover) or
+ * memory ran out; l is then empty. */
+static int map_bake_layers(MbLayers *l, const N2Scene *scene, const float *nav, int nnav,
+                           const int *start, const int *list, const double origin[3], int s) {
     long n = (long)s * s;
-    unsigned char *road = (unsigned char *)calloc((size_t)n, 1);
-    unsigned char *second = (unsigned char *)calloc((size_t)n, 1);
-    unsigned char *out = (unsigned char *)malloc((size_t)n * 3);
-    int ok = road && second && out && map_bake_raster(scene, origin, s, road, second) > 0;
-    if (ok) {
-        MbWork work = { (unsigned char *)malloc((size_t)n), (int *)malloc((size_t)s * sizeof(int)) };
-        unsigned char *reach = (unsigned char *)malloc((size_t)n);
-        unsigned char *drive = (unsigned char *)calloc((size_t)n, 1);
-        ok = work.plane && work.column && reach && drive;
-        if (ok) {
-            memcpy(reach, road, (size_t)n);
-            mb_dilate(reach, &work, s, s * 4 / 4096 > 0 ? s * 4 / 4096 : 1);   /* about 5 m */
-            int linked = nav && start && list;
-            if (linked) {
-                map_bake_bridge_nav(nav, nnav, start, list, reach, origin, s, road);
-                map_bake_drive_plane(nav, nnav, start, list, origin, s, drive);
-            }
-            ok = map_bake_compose(src, w, h, road, second, linked ? drive : NULL, s, race, out);
-        }
-        free(work.plane); free(work.column); free(reach); free(drive);
+    MbWork work = { (unsigned char *)malloc((size_t)n), (int *)malloc((size_t)s * sizeof(int)) };
+    unsigned char *reach = (unsigned char *)malloc((size_t)n);
+    int linked = nav && start && list;
+    memset(l, 0, sizeof *l);
+    l->road = (unsigned char *)calloc((size_t)n, 1);
+    l->second = (unsigned char *)calloc((size_t)n, 1);
+    if (linked) l->drive = (unsigned char *)calloc((size_t)n, 1);
+    int ok = work.plane && work.column && reach && l->road && l->second && (!linked || l->drive) &&
+             map_bake_raster(scene, origin, s, l->road, l->second) > 0;
+    if (ok && linked) {
+        memcpy(reach, l->road, (size_t)n);
+        mb_dilate(reach, &work, s, s * 4 / 4096 > 0 ? s * 4 / 4096 : 1);   /* about 5 m */
+        map_bake_bridge_nav(nav, nnav, start, list, reach, origin, s, l->road);
+        map_bake_drive_plane(nav, nnav, start, list, origin, s, l->drive);
     }
-    free(road); free(second);
-    if (!ok) { free(out); out = NULL; }
+    free(work.plane); free(work.column); free(reach);
+    if (!ok) { map_bake_layers_free(l); return 0; }
+    memcpy(l->origin, origin, sizeof l->origin);
+    l->size = s;
+    return 1;
+}
+
+/* A malloc'd size*size RGB image, or NULL when memory ran out. Thread-safe: it
+ * reads only its arguments. */
+static unsigned char *map_bake_from_layers(const MbLayers *l, const unsigned char *src,
+                                           int w, int h, int race) {
+    unsigned char *out = (unsigned char *)malloc((size_t)l->size * l->size * 3);
+    if (out && !map_bake_compose(src, w, h, l->road, l->second, l->drive, l->size, race, out)) {
+        free(out); out = NULL;
+    }
     return out;
 }
 

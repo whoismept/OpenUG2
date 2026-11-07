@@ -1626,6 +1626,13 @@ close-ups. Maps wider than `MB_RACE_MIN_EXTENT` (2000 m) are rebuilt when the
 race loads, in the same frame, keeping that map's colours, dim roads and bright
 route. Smaller maps are already as sharp as a baked one and stay as shipped.
 
+A bake has two stages. `map_bake_layers` reads the scene on the main thread, once
+per map frame and size. `map_bake_from_layers` then runs on a worker and touches
+nothing else, so it stays safe while the world streams. A race shows its retail
+image at once and swaps in the sharp map when the worker finishes; the texture
+upload happens on the main thread. Captures set `hud_set_map_sync` so that a
+`--shot` always shows the finished map.
+
 Routing-graph links bridge breaks in the road layer, because material names miss
 paved surfaces such as gravel lanes. A link is stroked only where no road mesh
 lies under it, so existing roads keep their shape. Thin seams between adjoining

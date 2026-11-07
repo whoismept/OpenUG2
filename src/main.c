@@ -2221,13 +2221,10 @@ static int city_map_size_from_store(void) {
     return map_bake_size_for_level(gfx.v[ST_GFX_PERF_LEVEL]);
 }
 
-/* TRACKMAP4000 covers L4RA only; other bundles keep their retail map. */
+/* TRACKMAP4000 covers L4RA only; races elsewhere still get their own maps. */
 static void city_map_apply(Hud *hud, const N2Scene *scene, const WorldCity *city, const char *track, int size) {
     hud_set_map_source(hud, scene, city->nav, city->nnav, city->adjstart, city->adjlist, size);
-    if (!hud || strcmp(track, "STREAML4RA")) return;
-    Uint32 start = SDL_GetTicks();
-    if (hud_bake_city_map(hud, scene, city->nav, city->nnav, city->adjstart, city->adjlist, size))
-        printf("city map: %dx%d baked in %u ms\n", size, size, SDL_GetTicks() - start);
+    if (!strcmp(track, "STREAML4RA")) hud_request_city_map(hud);
 }
 
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
@@ -6281,6 +6278,7 @@ int main(int argc, char **argv) {
             hud_set_preview(hud, hud_preview_opt);
             hud_configure(hud, &hud_settings);
             city_map_size = map_detail_opt >= 0 ? map_detail_opt : city_map_size_from_store();
+            hud_set_map_sync(hud, shot != NULL);
             city_map_apply(hud, &scene, &world.city, trackname, city_map_size);
             const char *miss = hud_missing(hud);
             printf("player HUD: on%s%s, fit %s\n",
@@ -10697,6 +10695,7 @@ int main(int argc, char **argv) {
             if(hud){
                 hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);
                 city_map_size=map_detail_opt>=0?map_detail_opt:city_map_size_from_store();
+                hud_set_map_sync(hud,shot!=NULL);
                 city_map_apply(hud,&scene,&world.city,trackname,city_map_size);
             }
         }
