@@ -12,6 +12,7 @@ typedef struct {
  SDL_Thread *thread; SDL_atomic_t done; Uint32 begin;
  const MbLayers *layers;
  unsigned char *src,*rgb; int w,h,event,size,active,cached;
+ float *route; int route_n,route_loop;   /* the racing line, copied: owned here */
  char cache[1100];    /* empty: no cache. cached: read this; otherwise write it */
 } MapJob;
 #include <stddef.h>
@@ -177,7 +178,7 @@ static int map_job_run(void*data){
  MapJob*job=data;
  if(job->cached)job->rgb=map_cache_read(job->cache,job->size);
  else{
-  job->rgb=map_bake_from_layers(job->layers,job->src,job->w,job->h,job->event>0);
+  job->rgb=map_bake_from_layers(job->layers,job->src,job->w,job->h,job->event>0,job->route,job->route_n,job->route_loop);
   if(job->rgb&&job->cache[0])map_cache_write(job->cache,job->rgb,job->size);
  }
  SDL_AtomicSet(&job->done,1);
@@ -197,7 +198,7 @@ static void map_job_start(Hud*h,const MapJob*request){
 static void map_job_finish(Hud*h){
  MapJob*job=&h->job;
  if(job->thread)SDL_WaitThread(job->thread,NULL);
- free(job->src);
+ free(job->src);free(job->route);
  Uint32 worked=SDL_GetTicks()-job->begin,start=SDL_GetTicks();
  const char*how=job->cached?"loaded":"baked";
  if(job->cached&&!job->rgb){
@@ -218,7 +219,7 @@ static void map_job_finish(Hud*h){
  h->job_busy=0;
 }
 
-static void map_job_drop(MapJob*job){free(job->src);memset(job,0,sizeof *job);}
+static void map_job_drop(MapJob*job){free(job->src);free(job->route);memset(job,0,sizeof *job);}
 
 /* Finish a done job, then start whatever waits. A race goes first; the free-roam
  * map keeps waiting behind it. */
@@ -255,19 +256,24 @@ static int map_layers_ready(Hud*h,const double frame[3]){
 
 /* Takes pixels when it returns 1. City-wide race maps spend about 10 m on a
  * texel; the small ones are already as sharp as a baked map. */
-static int queue_race_bake(Hud*h,int event,const char*name,HaPixels*pixels){
+static int queue_race_bake(Hud*h,int event,const char*name,HaPixels*pixels,const HudState*s){
  if(h->bake_size<=0||!h->bake_scene||h->race_map_origin[2]<MB_RACE_MIN_EXTENT)return 0;
  MapJob job;memset(&job,0,sizeof job);
  job.event=event;
  if(map_job_locate(h,&job,name,pixels)){map_job_drop(&h->pending);h->pending=job;return 0;}
  if(!map_layers_ready(h,h->race_map_origin))return 0;
  job.src=pixels->rgba;job.w=(int)pixels->width;job.h=(int)pixels->height;
+ if(s->route_xy&&s->route_n>1){
+  size_t bytes=(size_t)s->route_n*2*sizeof(float);
+  job.route=malloc(bytes);
+  if(job.route){memcpy(job.route,s->route_xy,bytes);job.route_n=s->route_n;job.route_loop=s->route_loop;}
+ }
  map_job_drop(&h->pending);
  h->pending=job;
  return 1;
 }
 
-static void load_race_map(Hud *h, int event) {
+static void load_race_map(Hud *h, int event, const HudState *s) {
  if(h->race_map_event==event)return;
  rhi_texture_destroy(h->race_map.id);
  h->race_map=(Texture){0};
@@ -288,7 +294,7 @@ static void load_race_map(Hud *h, int event) {
    render_texture_clamp_linear(id);
    h->race_map=(Texture){id,(int)pixels.width,(int)pixels.height};
   }else rhi_texture_destroy(id);
-  if(!queue_race_bake(h,event,name,&pixels))free(pixels.rgba);
+  if(!queue_race_bake(h,event,name,&pixels,s))free(pixels.rgba);
  }
  free(data);
  if(!h->race_map.id.id){
@@ -698,7 +704,7 @@ void hud_draw(Hud*h,const RProg*rp,GpuMesh*unused,const HudState*s,int w,int hei
     the draws need (no depth/cull, source-over alpha). Restored at the end. */
  RhiStateSnapshot hud_saved; rhi_cmd_save_state(&hud_saved);
  int city_map=h->city_map.id.id!=0;
- load_race_map(h,s->racing&&h->mapnode>=0?s->race_event_id:0);
+ load_race_map(h,s->racing&&h->mapnode>=0?s->race_event_id:0,s);
  map_jobs_pump(h,h->map_sync);
  int authored_map=h->race_map.id.id!=0;
  const double *origin=authored_map?h->race_map_origin:h->origin;

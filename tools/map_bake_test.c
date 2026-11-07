@@ -58,18 +58,24 @@ int main(void) {
         for (int x = 256; x < 272; x++) second[(long)y * S + x] = 255;
     for (int y = 0; y < S; y++)
         for (int x = 700; x < 730; x++) road[(long)y * S + x] = 255;
-    chk("compose succeeds", map_bake_compose(rgba, W, W, road, second, NULL, S, 0, out));
+    chk("compose succeeds", map_bake_compose(rgba, W, W, road, second, NULL, NULL, S, 0, out));
     chk("secondary surface shows where retail draws it", pixel(out, 264, 200) > 90);
     chk("secondary surface vanishes where retail does not", pixel(out, 264, 800) < 60);
     chk("road shows without any retail stroke", pixel(out, 715, 800) > 80);
-    /* The edge must ramp over several texels: count those between land and road. */
-    int land = pixel(out, 560, 800), top = pixel(out, 715, 800), ramp = 0;
-    for (int x = 560; x < 715; x++) {
-        int v = pixel(out, x, 800);
-        ramp += v > land + (top - land) / 10 && v < top - (top - land) / 10;
+    /* The road edge is sharp: antialiased over a few texels, then a dark casing. */
+    {
+        int land = pixel(out, 560, 800), top = pixel(out, 715, 800), ramp = 0, darkest = 255;
+        for (int x = 560; x < 715; x++) {
+            int v = pixel(out, x, 800);
+            ramp += v > top / 4 && v < top - top / 10;
+            if (v < darkest) darkest = v;
+        }
+        printf("  land %d, road %d, casing %d, %d edge texels\n", land, top, darkest, ramp);
+        chk("road edge is sharp", ramp <= 4);
+        chk("a dark casing separates road and land", darkest < land - 8);
+        chk("land away from roads is one flat tone",
+            pixel(out, 500, 800) == pixel(out, 560, 900) && pixel(out, 500, 800) == pixel(out, 900, 500));
     }
-    printf("  land %d, road %d, %d texels between them\n", land, top, ramp);
-    chk("road edge is a gradient, not a hard step", ramp >= 4);
 
     /* The row-sweep filters must match a direct evaluation. */
     {
@@ -109,10 +115,24 @@ int main(void) {
         chk("layers reject another frame", !map_bake_layers_match(&layers, other, S));
         chk("layers reject another size", !map_bake_layers_match(&layers, origin, S / 2));
         fixture(rgba);
-        unsigned char *image = map_bake_from_layers(&layers, rgba, W, W, 0);
+        unsigned char *image = map_bake_from_layers(&layers, rgba, W, W, 0, NULL, 0, 0);
         chk("a map bakes from layers alone", image != NULL);
         chk("layers survive a bake for the next race", layers.road[(long)150 * S + 250] == 255);
         free(image);
+
+        /* Racing line: dense lines draw, gate lists would cut corners. */
+        float dense[] = { 10, 50,  40, 50,  70, 50 }, sparse[] = { 10, 50,  90, 50,  90, 90 };
+        double wide[3] = { 0, 1000, 1000 };
+        MbLayers frame = layers;
+        memcpy(frame.origin, wide, sizeof wide);
+        chk("no line, no plane", mb_route_line(&frame, NULL, 0, 0) == NULL);
+        unsigned char *line = mb_route_line(&frame, dense, 3, 0);
+        chk("a dense line draws", line && line[(long)974 * S + 41] == 255);
+        chk("a stroke stays on its line", line && line[(long)800 * S + 41] == 0);
+        free(line);
+        float gates[] = { 0, 50,  300, 50,  300, 400 };
+        chk("a sparse gate list is refused", mb_route_line(&frame, gates, 3, 0) == NULL);
+        (void)sparse;
         map_bake_layers_free(&layers);
         chk("freed layers match nothing", !map_bake_layers_match(&layers, origin, S));
         mesh.cat = N2_OTHER;
@@ -157,6 +177,26 @@ int main(void) {
         remove(path);
     }
 
+    /* Land zones: a road's shadow takes the zone around it, not a dark tone. */
+    {
+        enum { Z = 128 };
+        unsigned char *planes = (unsigned char *)calloc((size_t)Z * 8 * Z * 8, 1), *zones = (unsigned char *)calloc((size_t)Z * 8 * Z * 8, 1);
+        unsigned char land[Z * Z * 4];
+        int zs = Z * 8; MbWork work = { (unsigned char *)malloc((size_t)zs * zs), (int *)malloc((size_t)zs * sizeof(int)) };
+        for (int i = 0; i < Z * Z; i++) {
+            int x = i % Z, shadow = x >= 61 && x <= 66;
+            memcpy(land + i * 4, x < 30 ? mb_palette[0] : mb_palette[2], 3);
+            if (shadow) memset(land + i * 4, 10, 3);
+            land[i * 4 + 3] = 0;
+        }
+        for (int y = 0; y < zs; y++) for (int x = 62 * 8; x < 66 * 8; x++) planes[(long)y * zs + x] = 255;
+        chk("zones build", mb_land_zones(land, Z, Z, planes, zs, &work, zones));
+        chk("sea stays sea", zones[(long)300 * zs + 40] == 0);
+        chk("ground stays ground", zones[(long)300 * zs + 800] == 2);
+        chk("a shadow takes the surrounding zone", zones[(long)300 * zs + 61 * 8] == 2);
+        free(planes); free(zones); free(work.plane); free(work.column);
+    }
+
     /* Links bridge breaks only: an existing road keeps its exact shape. */
     {
         float nav[] = { 20, 50,  60, 50,  60, 900,  500, 500,  540, 500,  600, 500,  640, 500 };
@@ -195,7 +235,7 @@ int main(void) {
             for (int y = 300; y < 340; y++) road[(long)y * S + x] = 255;
         unsigned char bright[W * W * 4];
         fixture(bright);
-        chk("second compose succeeds", map_bake_compose(bright, W, W, road, second, NULL, S, 0, out));
+        chk("second compose succeeds", map_bake_compose(bright, W, W, road, second, NULL, NULL, S, 0, out));
         chk("road grey ignores retail brightness", abs(pixel(out, 800, 320) - pixel(out, 250, 320)) <= 1 &&
             abs(pixel(out, 320, 200) - pixel(out, 320, 800)) <= 1);
     }
@@ -210,11 +250,23 @@ int main(void) {
             for (int x = 600; x < 620; x++) { road[(long)y * S + x] = 255; drive[(long)y * S + x] = 255; }
         for (int x = 800; x < 820; x++)
             for (int y = 700; y < 760; y++) road[(long)y * S + x] = 255;   /* unlinked stub */
-        chk("third compose succeeds", map_bake_compose(lines, W, W, road, second, drive, S, 0, out));
+        chk("third compose succeeds", map_bake_compose(lines, W, W, road, second, drive, NULL, S, 0, out));
         chk("a retail road with no mesh is drawn", pixel(out, 264, 200) > 150);
         chk("that road does not extend past the retail line", pixel(out, 264, 800) < 60);
         chk("a stub with no link or retail line is removed", pixel(out, 810, 730) < 60);
         chk("a linked road stays", pixel(out, 610, 800) > 150);
+
+        /* Far beyond the loaded bundle, a faint retail road is still a road. */
+        unsigned char faint[W * W * 4];
+        for (int i = 0; i < W * W; i++) {
+            memset(faint + i * 4, i % W == 16 ? 70 : 44, 3);
+            faint[i * 4 + 3] = 0;
+        }
+        memset(road, 0, (size_t)S * S);
+        memset(drive, 0, (size_t)S * S);
+        for (int y = 0; y < S; y++) for (int x = 900; x < 920; x++) { road[(long)y * S + x] = 255; drive[(long)y * S + x] = 255; }
+        chk("fourth compose succeeds", map_bake_compose(faint, W, W, road, second, drive, NULL, S, 0, out));
+        chk("a faint road outside the bundle is drawn", pixel(out, 264, 500) > 150);
         free(drive);
     }
 
@@ -231,7 +283,7 @@ int main(void) {
         }
         for (int y = 0; y < S; y++) for (int x = 240; x < 280; x++) road[(long)y * S + x] = 255;
         for (int x = 0; x < S; x++) for (int y = 240; y < 280; y++) road[(long)y * S + x] = 255;
-        chk("race compose succeeds", map_bake_compose(event, W, W, road, second, NULL, S, 1, out));
+        chk("race compose succeeds", map_bake_compose(event, W, W, road, second, NULL, NULL, S, 1, out));
         chk("the route stays bright", pixel(out, 260, 800) > 215);
         chk("other roads stay dim", abs(pixel(out, 800, 260) - MB_RACE_DIM) <= 8);
         chk("land keeps the race map's colour", pixel(out, 700, 700) < 70);
@@ -239,7 +291,7 @@ int main(void) {
         /* Rail on a dim race road survives the gate that a bright city map needs. */
         memset(road, 0, (size_t)S * S); memset(second, 0, (size_t)S * S);
         for (int x = 0; x < S; x++) for (int y = 240; y < 280; y++) second[(long)y * S + x] = 255;
-        chk("rail compose succeeds", map_bake_compose(event, W, W, road, second, NULL, S, 1, out));
+        chk("rail compose succeeds", map_bake_compose(event, W, W, road, second, NULL, NULL, S, 1, out));
         chk("a secondary surface on a dim road is kept", pixel(out, 800, 260) > 90);
     }
 

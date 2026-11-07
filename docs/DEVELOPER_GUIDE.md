@@ -1645,6 +1645,14 @@ paved surfaces such as gravel lanes. A link is stroked only where no road mesh
 lies under it, so existing roads keep their shape. Thin seams between adjoining
 meshes are filled by size and width, which leaves junction islands alone.
 
+Baked maps use a deliberately crisp style: road edges come from the geometry and
+are antialiased over about a texel, with a thin dark casing, and land and sea are
+flat palette zones. A race route comes from the engine's racing line, clipped to
+the road; a race with no line falls back to the links that its map draws brightly.
+The 512 image never shapes a route edge. A bundle holds only its own roads while
+every map shows the whole city, so beyond the loaded links the retail strokes are
+used on their own.
+
 The retail image settles disagreements with the meshes. A road it draws with no
 mesh under it is added from the stroke, and a mesh stub with neither a retail
 line nor a nearby link is removed.
