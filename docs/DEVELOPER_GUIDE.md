@@ -346,19 +346,13 @@ region bytes alive after binding merely for lights.
 `XO_*SPOTLIGHT*` / `*BEAMYA*` submeshes (747 of them in L4RA) are the authored
 light shafts. They name texture key `2e95ce7c` = `SFX_LIGHT_BEAMA`, a 32x256
 DXT3 record in `GLOBAL/InGameCommon.bun` whose draw descriptor is
-`(order,usage,blend,wz) = (7,2,2,0)` -- a late-order additive layer. The key is
-rejected by `n2_tex_noise` and the meshes end up with no bound texture.
+`(order,usage,blend,wz) = (7,2,2,0)` -- a late-order additive layer.
 
-That rejection is correct. Dumping the decoded pixels shows saturated
-per-block colour static, the signature of DXT blocks read from a base the
-record's `Offset` does not actually address: `n2_tpk_open` puts this block's
-`dbase` at 46083 (pixel block at 45960 plus a 123-byte `0x11` filler run),
-which is not 16-byte aligned, and every 16-aligned base nearby decodes to flat
-yellow rather than a beam gradient. **The correct base for this archive is an
-open format question**; do not "fix" it by exempting the key from the noise
-filter, which only replaces black wedges with rainbow ones.
+The record once decoded to colour static because `n2_tpk_open` read pixels three
+bytes late. The base is now resolved; see "TPK pixel base" in `docs/FORMATS.md`.
+Do not exempt a key from `n2_tex_noise` to hide a decode failure.
 
-What the renderer does instead: a world batch with no bound texture whose
+When a texture stays unresolved, a world batch with no bound texture whose
 meshes did name one is **not drawn**. Untextured it falls back to flat grey,
 which under night ambient is the solid dark slab that made every light shaft
 look like a black wedge hanging off a building. Skipping it also drops their
