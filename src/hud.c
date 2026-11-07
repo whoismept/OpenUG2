@@ -5,6 +5,7 @@
 #include "hud_baseline.h"
 #include "hud_race.h"
 #include "race.h"
+#include "map_bake.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -55,6 +56,13 @@ struct Hud {
  struct { int node,skin,scale; Texture texture; } skin_cache[256]; size_t skin_cache_count;
  HaMapFrame pick_frame; unsigned char *mask_alpha; int mask_width,mask_height;
  int layout_mode,layout_ready,race_nodes[HR_FIELD_COUNT];
+ int drift_angle_left,drift_angle_right,drift_angle_compact;
+ int drift_turbo_fill,drift_turbo_lines,drift_turbo_red[2];
+ char *data_root;
+ int race_map_event;
+ Texture race_map;
+ Texture city_map;   /* baked, optional; replaces TRACKMAP4000 */
+ double race_map_origin[3];
  double origin[3]; int track_ok,preview,skin; char missing[1024]; unsigned reported,resolved,drawn;
  /* Capture-amendment targets resolved by the C3-8 key rule, and settings. */
  HudSettings settings;
@@ -121,7 +129,58 @@ static void font_atlas(Hud*h,Font*f){
 }
 static Texture named(Hud*h,const char*s,int first,int last){return lookup(h,ha_hash(s),first,last);}
 static int equalfont(const char*a,const char*b){size_t n=strlen(a),m=strlen(b);if(n>4&&!strcmp(a+n-4,".ffn"))n-=4;if(m>4&&!strcmp(b+m-4,".ffn"))m-=4;if(n!=m)return 0;for(size_t i=0;i<n;i++){unsigned char x=a[i],y=b[i];if(x>='A'&&x<='Z')x+=32;if(y>='A'&&y<='Z')y+=32;if(x!=y)return 0;}return 1;}
-static void metadata(Hud*h,const unsigned char*d,size_t n,unsigned depth){if(depth>HA_DEPTH){diagnostic(h,"archive depth limit");return;}for(size_t at=0;at<n;){if(n-at<8){diagnostic(h,"truncated archive");return;}uint32_t type=n2_u32(d+at);size_t z=n2_u32(d+at+4);if(z>n-at-8){diagnostic(h,"archive extent exceeds container");return;}const unsigned char*b=d+at+8;if(type==0x30201&&h->font_count<FONT_COUNT){Font*f=h->fonts+h->font_count;if(ha_font(b,z,&f->metrics)){font_atlas(h,f);h->font_count++;}else diagnostic(h,"unsupported font header; fallback required");}else if(type==0x34201){if(z%296)diagnostic(h,"unsupported track metadata extent");else for(size_t j=0;j<z;j+=296)if((int32_t)n2_u32(b+j+140)==4000){for(int k=0;k<3;k++){uint32_t q=n2_u32(b+j+172+4*k);float f;memcpy(&f,&q,4);h->origin[k]=f;}h->track_ok=isfinite(h->origin[0])&&isfinite(h->origin[1])&&isfinite(h->origin[2])&&h->origin[2]>0;}}else if(type&0x80000000u)metadata(h,b,z,depth+1);at+=8+z;}}
+static void metadata(Hud*h,const unsigned char*d,size_t n,unsigned depth){if(depth>HA_DEPTH){diagnostic(h,"archive depth limit");return;}for(size_t at=0;at<n;){if(n-at<8){diagnostic(h,"truncated archive");return;}uint32_t type=n2_u32(d+at);size_t z=n2_u32(d+at+4);if(z>n-at-8){diagnostic(h,"archive extent exceeds container");return;}const unsigned char*b=d+at+8;if(type==0x30201&&h->font_count<FONT_COUNT){Font*f=h->fonts+h->font_count;if(ha_font(b,z,&f->metrics)){font_atlas(h,f);h->font_count++;}else diagnostic(h,"unsupported font header; fallback required");}else if(type&0x80000000u)metadata(h,b,z,depth+1);at+=8+z;}}
+/* Each TRACKMAP uses the origin and square world extent in its TrackInfo row. */
+static int track_map_origin(const Pack *global, int event, double origin[3]) {
+ if(!global->data)return 0;
+ N2Leaf leaves[8];int count=0;
+ n2_find_leaves(global->data,0,(long)global->len,0x34201u,leaves,&count,8);
+ for(int i=0;i<count;i++){
+  if(leaves[i].size%296)continue;
+  const unsigned char *data=global->data+leaves[i].off;
+  for(size_t at=0;at<leaves[i].size;at+=296){
+   if(n2_u32(data+at+140)!=(uint32_t)event)continue;
+   for(int k=0;k<3;k++){
+    uint32_t bits=n2_u32(data+at+172+4*k);float value;
+    memcpy(&value,&bits,sizeof value);origin[k]=value;
+   }
+   return isfinite(origin[0])&&isfinite(origin[1])&&isfinite(origin[2])&&origin[2]>0;
+  }
+ }
+ return 0;
+}
+
+static void load_race_map(Hud *h, int event) {
+ if(h->race_map_event==event)return;
+ rhi_texture_destroy(h->race_map.id);
+ h->race_map=(Texture){0};
+ h->race_map_event=event;
+ if(event<=0 || !h->data_root)return;
+
+ char name[32],path[64];
+ snprintf(name,sizeof name,"TRACKMAP%d",event);
+ snprintf(path,sizeof path,"TRACKS/%s.BIN",name);
+ size_t len=0;
+ unsigned char *data=readfile(h->data_root,path,&len);
+ HaPixels pixels;
+ if(data && track_map_origin(&h->packs[5],event,h->race_map_origin) &&
+    ha_texture_find(data,len,ha_hash(name),&pixels)==1){
+  RhiTexture id=rhi_texture_create(&(RhiTextureDesc){RHI_TEXTURE_2D,
+     RHI_FORMAT_RGBA8,(int)pixels.width,(int)pixels.height,RHI_TEXTURE_SAMPLED});
+  if(id.id && rhi_texture_upload(id,0,0,pixels.rgba,0)==RHI_OK){
+   render_texture_clamp_linear(id);
+   h->race_map=(Texture){id,(int)pixels.width,(int)pixels.height};
+  }else rhi_texture_destroy(id);
+  free(pixels.rgba);
+ }
+ free(data);
+ if(!h->race_map.id.id){
+  char message[96];
+  snprintf(message,sizeof message,"%s unavailable; using route overlay",name);
+  diagnostic(h,message);
+ }
+}
+
 static int node_named(Hud*h,const char*s){uint32_t key=ha_hash(s);for(size_t i=0;i<h->package.count;i++)if(h->package.nodes[i].valid&&h->package.nodes[i].name==key)return (int)i;return -1;}
 static int node_key(Hud*h,uint32_t key,uint32_t kind){
  int found=-1;for(size_t i=0;i<h->package.count;i++)if(h->package.nodes[i].name==key){
@@ -135,8 +194,7 @@ static int skin_resource(const char*r);
 static int race_image(Hud*h,int i){
  const char*r=resource_name(h,h->package.nodes+i);if(!r)return 0;
  return !strcmp(r,"3rdperson_BoxCorner.tga")||(!strcmp(r,"3rdperson_BoxTime.tga")&&h->layout_mode!=3)||
-   !strncmp(r,"Drag_Position_Backing_",22)||
-   (h->layout_mode==3&&(!strcmp(r,"Drift_Angle_Backing1.tga")||!strcmp(r,"Drift_Angle_Backing2.tga")));
+   !strncmp(r,"Drag_Position_Backing_",22);
 }
 static int drag_gauge(Hud*h,int i){
  const char*r=resource_name(h,h->package.nodes+i);
@@ -155,6 +213,9 @@ static int fit_eligible(Hud*h,int i){
  if(n->kind==HA_KIND_TEXT){for(int k=0;k<HR_FIELD_COUNT;k++)if(i==h->race_nodes[k])return 1;return i==h->speed||i==h->gear||i==h->unit||i==h->bank_label||i==h->bank_value;}
  if(n->kind!=HA_KIND_IMAGE)return 0;
  if(race_image(h,i)||drag_gauge(h,i))return 1;
+ if(i==h->drift_angle_left||i==h->drift_angle_right||i==h->drift_angle_compact||
+    i==h->drift_turbo_fill||i==h->drift_turbo_lines||
+    i==h->drift_turbo_red[0]||i==h->drift_turbo_red[1])return 1;
  const char*r=resource_name(h,(HaNode*)n);
  if(i==h->needle||i==h->mapnode||i==h->masknode||i==h->north||i==h->player||descendant(h,i,h->border))return 1;
  if(i==h->bank_backing||i==h->widget_backing||i==h->widget_dpad||i==h->widget_highlight||i==h->widget_centre||i==h->widget_mail||i==h->nos_backing||i==h->nos_alpha||i==h->shift_icon||i==h->glow_node)return 1;
@@ -254,6 +315,8 @@ static void release_layout(Hud*h){
  free(h->textures);h->textures=NULL;free(h->mask_alpha);h->mask_alpha=NULL;h->mask_width=h->mask_height=0;
  free(h->group_cx);h->group_cx=NULL;ha_free(&h->package);h->skin_cache_count=0;
  h->speed=h->gear=h->needle=h->unit=h->mapnode=h->masknode=h->north=h->player=h->border=h->gauge_root=-1;
+ h->drift_angle_left=h->drift_angle_right=h->drift_angle_compact=-1;
+ h->drift_turbo_fill=h->drift_turbo_lines=h->drift_turbo_red[0]=h->drift_turbo_red[1]=-1;
  for(int k=0;k<HR_FIELD_COUNT;k++)h->race_nodes[k]=-1;
  h->shift_phase=(HaShiftPhase){0};h->glow_active=0;h->layout_ready=0;
 }
@@ -289,12 +352,22 @@ static int load_layout(Hud*h,int mode){
  resolve_amendment_targets(h);
  /* Drag's NOS targets belong to a separate group. */
  if(mode==2){h->shift_icon=node_key(h,0x25cf2f74,HA_KIND_IMAGE);h->nos_backing=node_resource(h,"Drag_NOS_Backing.tga");h->nos_alpha=node_key(h,0x11495cd6,HA_KIND_IMAGE);}
+ if(mode==3){
+  h->drift_angle_left=node_resource(h,"Drift_Angle_Backing1.tga");
+  h->drift_angle_right=node_resource(h,"Drift_Angle_Backing2.tga");
+  h->drift_angle_compact=node_resource(h,"Drift_Angle_Backing3.tga");
+  h->drift_turbo_fill=node_resource(h,"3rdperson_Turbofill.tga");
+  h->drift_turbo_lines=node_resource(h,"3rdperson_Turbolines.tga");
+  h->drift_turbo_red[0]=node_key(h,0x1a33cbb5,HA_KIND_IMAGE);
+  h->drift_turbo_red[1]=node_key(h,0x1a33cbb6,HA_KIND_IMAGE);
+ }
  for(int k=0;k<HR_FIELD_COUNT;k++)h->race_nodes[k]=mode?node_key(h,hud_race_field_key(kind,k),HA_KIND_TEXT):-1;
  fit_classify(h);h->layout_ready=1;return 1;
 }
 Hud *hud_init(const char*root){
  Hud*h=calloc(1,sizeof *h);if(!h)return NULL;hud_default_settings(&h->settings);h->layout_mode=-1;
  if(!root)root=".";h->auxiliary=hud_baseline_init(root);
+ h->data_root=strdup(root);
  const char*paths[]={"GLOBAL/InGameFreeRoam.bun","LANGUAGES/English.bin","LANGUAGES/LanguageTextures.bin","GLOBAL/GLOBALA.BUN","GLOBAL/HUD_CustomTextures_ALL.bin","GLOBAL/GLOBALB.BUN","TRACKS/TRACKMAP4000.BIN"};
  const char*events[]={"GLOBAL/InGameCommon.bun","GLOBAL/InGameRace.bun","GLOBAL/InGameDrag.bun","GLOBAL/InGameDrift.bun"};
  for(int i=0;i<PACK_COUNT;i++){char skin[128];const char*path;
@@ -303,11 +376,36 @@ Hud *hud_init(const char*root){
   if(h->packs[i].data){h->packs[i].tpk=n2_tpk_open(h->packs[i].data,(long)h->packs[i].len);catalog(h->packs+i,h->packs[i].data,h->packs[i].len,0);}else diagnostic(h,path);
  }
  for(int i=0;i<7;i++)if(h->packs[i].data)metadata(h,h->packs[i].data,h->packs[i].len,0);
+ h->track_ok=track_map_origin(&h->packs[5],4000,h->origin);
  if(!h->track_ok)diagnostic(h,"city track metadata missing or invalid");
  load_layout(h,0);init_shader(h);return h;
 }
+int hud_bake_city_map(Hud*h,const N2Scene*scene,const float*nav,int nnav,const int*start,const int*list,int size){
+ if(!h)return 0;
+ if(h->city_map.id.id)rhi_texture_destroy(h->city_map.id);
+ h->city_map=(Texture){0};
+ if(size<=0||!scene||!h->track_ok)return 0;
+ size_t len=0;
+ unsigned char *data=readfile(h->data_root,"TRACKS/TRACKMAP4000.BIN",&len);
+ HaPixels pixels;
+ if(!data||ha_texture_find(data,len,ha_hash("TRACKMAP4000"),&pixels)!=1){
+  free(data);diagnostic(h,"TRACKMAP4000 unavailable; retail map kept");return 0;
+ }
+ unsigned char *rgb=map_bake_city(scene,nav,nnav,start,list,h->origin,pixels.rgba,(int)pixels.width,(int)pixels.height,size);
+ free(pixels.rgba);free(data);
+ if(!rgb)return 0;
+ N2Tex baked;memset(&baked,0,sizeof baked);
+ baked.w=size;baked.h=size;baked.rgb=rgb;
+ RhiTexture id=upload_tex(&baked);
+ free(rgb);
+ if(!id.id)return 0;
+ render_texture_clamp_edges(id);
+ h->city_map=(Texture){id,size,size};
+ return 1;
+}
 void hud_free(Hud**hp){
  if(!hp||!*hp)return;Hud*h=*hp;release_layout(h);
+ rhi_texture_destroy(h->race_map.id);rhi_texture_destroy(h->city_map.id);free(h->data_root);
  if(h->centre_texture.id.id)rhi_texture_destroy(h->centre_texture.id);hud_baseline_free(&h->auxiliary);
  for(size_t i=0;i<h->font_count;i++){free(h->fonts[i].metrics.glyphs);free(h->fonts[i].cells);if(h->fonts[i].atlas.id.id)rhi_texture_destroy(h->fonts[i].atlas.id);}
  for(int i=0;i<PACK_COUNT;i++){free(h->packs[i].slots);free(h->packs[i].tpk.blk);free(h->packs[i].data);}
@@ -322,8 +420,48 @@ static int skin_resource(const char*r){
  const char*prefix="3rdperson_";if(strncmp(r,prefix,strlen(prefix)))return 0;r+=strlen(prefix);
  if(*r<'0'||*r>'9')return 0;while(*r>='0'&&*r<='9')r++;return !strcmp(r,"lines.tga");
 }
-static Texture image_texture(Hud*h,int i,int skin,int scale,int*owned){HaNode*n=h->package.nodes+i;const char*r=resource_name(h,n);*owned=0;Texture t={0};for(size_t c=0;c<h->skin_cache_count;c++)if(h->skin_cache[c].node==i&&h->skin_cache[c].skin==skin&&h->skin_cache[c].scale==scale)return h->skin_cache[c].texture;
- if(h->layout_mode!=2&&(i==h->needle||skin_resource(r))&&descendant(h,i,h->gauge_root)){char key[128];if(i==h->needle)snprintf(key,sizeof key,"3RDPERSON_RPMDIAL_CUSTOM_%02d",skin);else if(!strcmp(r,"Tach_Fill.tga"))snprintf(key,sizeof key,"TACH_FILL_CUSTOM_%02d",skin);else if(!strcmp(r,"3rdperson_rpmdial.tga"))snprintf(key,sizeof key,"3RDPERSON_RPMDIAL_CUSTOM_%02d",skin);else snprintf(key,sizeof key,"3RDPERSON_%dLINES_CUSTOM_%02d",scale,skin);t=named(h,key,4,5);if(!t.id.id)t=named(h,key,7+skin,8+skin);if(!t.id.id&&skin){diagnostic(h,"skin resource fallback to 00");if(i==h->needle)snprintf(key,sizeof key,"3RDPERSON_RPMDIAL_CUSTOM_00");else if(!strcmp(r,"Tach_Fill.tga"))snprintf(key,sizeof key,"TACH_FILL_CUSTOM_00");else if(!strcmp(r,"3rdperson_rpmdial.tga"))snprintf(key,sizeof key,"3RDPERSON_RPMDIAL_CUSTOM_00");else snprintf(key,sizeof key,"3RDPERSON_%dLINES_CUSTOM_00",scale);t=named(h,key,4,5);if(!t.id.id)t=named(h,key,7,8);}if(t.id.id){if(h->skin_cache_count<256){size_t c=h->skin_cache_count++;h->skin_cache[c].node=i;h->skin_cache[c].skin=skin;h->skin_cache[c].scale=scale;h->skin_cache[c].texture=t;}else *owned=1;}else diagnostic(h,"skin resource fallback to authored image");}if(!t.id.id)t=node_texture(h,i);return t;}
+static Texture image_texture(Hud*h,int i,int skin,int scale,int*owned){
+ *owned=0;
+ const char *resource=resource_name(h,h->package.nodes+i);
+ const char *family=NULL;
+ char rpm_lines[32];
+ if(i==h->drift_turbo_fill)family="3RDPERSON_TURBOFILL";
+ else if(i==h->drift_turbo_lines)family="3RDPERSON_TURBOLINES";
+ else if(h->layout_mode!=2&&descendant(h,i,h->gauge_root)&&(i==h->needle||skin_resource(resource))){
+  if(i==h->needle)family="3RDPERSON_RPMDIAL";
+  else if(!strcmp(resource,"Tach_Fill.tga"))family="TACH_FILL";
+  else{
+   snprintf(rpm_lines,sizeof rpm_lines,"3RDPERSON_%dLINES",scale);
+   family=rpm_lines;
+  }
+ }
+ if(!family)return node_texture(h,i);
+ if(family!=rpm_lines)scale=0;
+ for(size_t c=0;c<h->skin_cache_count;c++)
+  if(h->skin_cache[c].node==i&&h->skin_cache[c].skin==skin&&h->skin_cache[c].scale==scale)
+   return h->skin_cache[c].texture;
+
+ char key[64];
+ snprintf(key,sizeof key,"%s_CUSTOM_%02d",family,skin);
+ Texture t=named(h,key,4,5);
+ if(!t.id.id)t=named(h,key,7+skin,8+skin);
+ if(!t.id.id&&skin){
+  diagnostic(h,"skin resource fallback to 00");
+  snprintf(key,sizeof key,"%s_CUSTOM_00",family);
+  t=named(h,key,4,5);
+  if(!t.id.id)t=named(h,key,7,8);
+ }
+ if(!t.id.id){
+  diagnostic(h,"skin resource fallback to authored image");
+  return node_texture(h,i);
+ }
+ if(h->skin_cache_count<sizeof h->skin_cache/sizeof h->skin_cache[0]){
+  size_t c=h->skin_cache_count++;
+  h->skin_cache[c].node=i;h->skin_cache[c].skin=skin;
+  h->skin_cache[c].scale=scale;h->skin_cache[c].texture=t;
+ }else *owned=1;
+ return t;
+}
 /* Per-feature acceptance bits: needle/dial/scale/fill/font/road/mask/north/player/border. */
 static unsigned feature(Hud*h,int i){const char*r=resource_name(h,h->package.nodes+i);if(i==h->needle)return 1u<<0;if(i==h->bank_backing)return 1u<<10;if(i==h->widget_backing||i==h->widget_dpad)return 1u<<11;if(i==h->widget_centre)return 1u<<12;if(i==h->widget_mail)return 1u<<13;if(i==h->widget_highlight)return 1u<<14;if(i==h->nos_backing)return 1u<<15;if(i==h->nos_alpha)return 1u<<16;if(i==h->shift_icon)return 1u<<17;if(i==h->glow_node)return 1u<<18;if(i==h->mapnode)return 1u<<5;if(i==h->masknode)return 1u<<6;if(i==h->north)return 1u<<7;if(i==h->player)return 1u<<8;if(descendant(h,i,h->border))return 1u<<9;if(r&&!strcmp(r,"3rdperson_redline.tga"))return 1u<<1;if(r&&!strcmp(r,"3rdperson_10500lines.tga"))return 1u<<2;if(r&&!strcmp(r,"Tach_Fill.tga"))return 1u<<3;if(h->package.nodes[i].kind==2)return 1u<<4;return 0;}
 static void quad(Hud*h,int i,const float rect[4],const float uv[4],Texture t,float angle,int width,int height,int recenter,int roads,const double mapuv[3],double heading){if(!t.id.id)return;h->resolved|=feature(h,i);HaNode*n=h->package.nodes+i;float v[24],scale=fminf(width/640.0f,height/480.0f);float center[3]={0},old[3]={0};if(recenter&&h->mapnode>=0){ha_point(&h->package,(size_t)h->mapnode,old,center,0);ha_point(&h->package,(size_t)i,old,old,0);}
@@ -346,10 +484,11 @@ static HaGlyph *glyph(Font*f,unsigned char c){HaGlyph*question=NULL;for(size_t i
 static void text(Hud*h,int i,const char*s,int w,int height){if(i<0||!*s)return;HaNode*n=h->package.nodes+i;if(!n->valid||!n->appearance)return;if(n->resource>=h->package.resource_count||h->package.resources[n->resource].kind!=2||!resource_name(h,n)){diagnostic(h,"unresolved text resource; text omitted");return;}Font*f=font_for(h,n);if(!f)return;float advance=0;for(const char*q=s;*q;q++){HaGlyph*g=glyph(f,(unsigned char)*q);advance+=g?g->advance:f->metrics.line;}float x=ha_text_start(0,n->size[0],n->justification,advance);for(const char*q=s;*q;q++){HaGlyph*g=glyph(f,(unsigned char)*q);if(g){HaGlyph cell=*g;int inside;if(f->cells){const HaGlyphCell*c=f->cells+(g-f->metrics.glyphs);inside=c->ok;cell.x=c->x;cell.y=c->y;}else inside=(unsigned)g->x+g->width<=(unsigned)f->atlas.w&&(unsigned)g->y+g->height<=(unsigned)f->atlas.h;if(!inside){diagnostic(h,"glyph outside resolved atlas");}else{/* G3: whole cell, unclipped, independent of the advance; drawn in string order (provisional overlap order). G6: edge to edge, no inset unless the compatibility setting is on. */HaGlyphQuad gq;if(ha_glyph_quad(&cell,f->inv_w,f->inv_h,x,0,n->size[0],n->size[1],h->settings.glyph_half_texel_inset,&gq)){float rect[]={(float)gq.x0,(float)gq.y0,(float)gq.x1,(float)gq.y1},uv[]={(float)gq.u0,(float)gq.v0,(float)gq.u1,(float)gq.v1};quad(h,i,rect,uv,f->atlas,0,w,height,0,0,NULL,0);}}x+=g->advance*n->size[0];}else{x+=f->metrics.line*n->size[0];diagnostic(h,"missing font character; advance only");}}}
 /* Runtime event placement is project policy: the static rank/lap poses overlap.
  * Keep data anchors, combine the rank, and fit it into the supplied corner art. */
-static void race_text(Hud*h,const HudState*s,int w,int height){
+static void race_text(Hud*h,const HudState*s,int w,int height,int compact_angle){
  char buf[64];
  for(int k=0;k<HR_FIELD_COUNT;k++){
   int i=h->race_nodes[k];if(i<0||k==HR_ORDINAL||k==HR_CARS||!hud_race_text(s,k,buf))continue;
+  if(k==HR_DRIFT_ANGLE&&s->hide_gauge)continue;
   HaNode*n=h->package.nodes+i;unsigned justification=n->justification;
   if(k==HR_POSITION){
    char ordinal[64],cars[64];hud_race_text(s,HR_ORDINAL,ordinal);hud_race_text(s,HR_CARS,cars);
@@ -358,6 +497,13 @@ static void race_text(Hud*h,const HudState*s,int w,int height){
    int right=h->race_nodes[HR_TIME]>=0?h->race_nodes[HR_TIME]:h->race_nodes[HR_LAPS];
    if(corner>=0&&right>=0){float z[3]={0},p[3],c[3],r[3];ha_point(&h->package,i,z,p,0);ha_point(&h->package,corner,z,c,0);ha_point(&h->package,right,z,r,0);
     h->text_offset[0]=r[0]-p[0];h->text_offset[1]=c[1]-h->package.nodes[corner].size[1]*.25f-p[1];n->justification=2;}
+  }
+  if(k==HR_DRIFT_ANGLE&&compact_angle&&h->drift_angle_left>=0){
+   float zero[3]={0},split[3],compact[3];
+   ha_point(&h->package,(size_t)h->drift_angle_left,zero,split,0);
+   ha_point(&h->package,(size_t)h->drift_angle_compact,zero,compact,0);
+   h->text_offset[0]=compact[0]-split[0]+(float)(fit_shift(h,h->drift_angle_compact,w,height)-fit_shift(h,h->drift_angle_left,w,height));
+   h->text_offset[1]=compact[1]-split[1];
   }
   if(k==HR_BANNER){memset(h->tint_rgba,255,4);h->tint_on=1;}
   text(h,i,buf,w,height);h->tint_on=0;n->justification=justification;h->text_offset[0]=h->text_offset[1]=0;
@@ -386,11 +532,11 @@ static void map_vertices(Hud*h,const float*v,int count,int lines,float r,float g
  if(lines){rhi_cmd_bind_pipeline(h->line_pipe);rhi_cmd_bind_index_buffer(h->line_ibo);rhi_cmd_draw_indexed((uint32_t)(count-1)*2,0);}
  else{rhi_cmd_bind_pipeline(h->tri_pipe);rhi_cmd_bind_index_buffer(h->ibo);rhi_cmd_draw_indexed(6,0);}
 }
-static void map_overlay(Hud*h,const HudState*s){
+static void map_overlay(Hud*h,const HudState*s,int show_route){
  if(!h->pick_frame.enabled)return;
  float vertices[(HA_LIMIT+1)*6];
  /* shortcut: overlays accept up to HA_LIMIT points; stream larger decoded courses when needed. */
- if(s->racing&&s->route_xy&&s->route_n>1&&s->route_n<=HA_LIMIT){
+ if(show_route&&s->racing&&s->route_xy&&s->route_n>1&&s->route_n<=HA_LIMIT){
   int ok=1;for(int i=0;i<s->route_n;i++)if(!map_vertex(h,s->route_xy[i*2],s->route_xy[i*2+1],vertices+i*6)){ok=0;break;}
   if(ok){int n=s->route_n;if(s->route_loop){memcpy(vertices+n*6,vertices,6*sizeof(float));n++;}
    map_vertices(h,vertices,n,1,.2f,.8f,1);}
@@ -424,9 +570,24 @@ void hud_draw(Hud*h,const RProg*rp,GpuMesh*unused,const HudState*s,int w,int hei
  /* Save the caller's raster state and bindings; the pipelines set everything
     the draws need (no depth/cull, source-over alpha). Restored at the end. */
  RhiStateSnapshot hud_saved; rhi_cmd_save_state(&hud_saved);
- double mapuv[3];int mapon=!s->hide_map&&h->track_ok&&ha_map(h->origin[0],h->origin[1],h->origin[2],s->car_x,s->car_y,s->map_heading_explicit?s->map_heading_clockwise:(M_PI*.5-s->car_heading),s->map_window_world>0?s->map_window_world:500,mapuv);double heading=s->map_heading_explicit?s->map_heading_clockwise:M_PI*.5-s->car_heading;
+ int city_map=h->city_map.id.id!=0;
+ load_race_map(h,s->racing&&h->mapnode>=0?s->race_event_id:0);
+ int authored_map=h->race_map.id.id!=0;
+ const double *origin=authored_map?h->race_map_origin:h->origin;
+ double heading=s->map_heading_explicit?s->map_heading_clockwise:M_PI*.5-s->car_heading;
+ double map_window=s->map_window_world>0?s->map_window_world:500,mapuv[3];
+ int mapon=!s->hide_map&&(authored_map||h->track_ok)&&
+    ha_map(origin[0],origin[1],origin[2],s->car_x,s->car_y,heading,map_window,mapuv);
  if(!s->hide_map&&!mapon)diagnostic(h,"map suppressed: invalid input or metadata");
  int scale=ha_scale(s->rpm_maximum),skin=ha_skin(s->skin_index);
+ Texture turbo_fill={0},turbo_lines={0};
+ int own_fill=0,own_lines=0;
+ if(!s->hide_gauge&&s->have_turbo&&h->drift_turbo_fill>=0&&h->drift_turbo_lines>=0){
+  turbo_fill=image_texture(h,h->drift_turbo_fill,skin,scale,&own_fill);
+  turbo_lines=image_texture(h,h->drift_turbo_lines,skin,scale,&own_lines);
+ }
+ int turbo_visible=turbo_fill.id.id&&turbo_lines.id.id;
+ int compact_angle=!turbo_visible&&node_texture(h,h->drift_angle_compact).id.id;
  /* Capture amendments: per-frame element decisions from pure contracts. */
  const HudSettings*cfg=&h->settings;float dial[2]={0,0};int dial_ok=0;
  if(h->needle>=0&&h->package.nodes[h->needle].valid){float p[3];ha_point(&h->package,(size_t)h->needle,h->package.nodes[h->needle].pivot,p,0);float fit=fminf(w/640.0f,height/480.0f);dial[0]=(float)((p[0]+fit_shift(h,h->needle,w,height))*fit*2/w);dial[1]=-p[1]*fit*2/height;dial_ok=1;}
@@ -460,7 +621,11 @@ void hud_draw(Hud*h,const RProg*rp,GpuMesh*unused,const HudState*s,int w,int hei
  size_t count=h->package.count;size_t order[HA_LIMIT];float depthvalues[HA_LIMIT];for(size_t i=0;i<count;i++){float zero[3]={0},p[3];ha_point(&h->package,i,zero,p,0);order[i]=i;depthvalues[i]=p[2];size_t j=i;while(j&&depthvalues[order[j-1]]<depthvalues[i]){order[j]=order[j-1];j--;}order[j]=i;}
  for(size_t k=0;k<count;k++){int i=(int)order[k];HaNode*n=h->package.nodes+i;if(!n->valid||!n->appearance||n->kind!=1)continue;const char*r=resource_name(h,n);int gauge=!s->hide_gauge&&(drag_gauge(h,i)||i==h->needle||(descendant(h,i,h->gauge_root)&&r&&(skin_resource(r)||!strcmp(r,"3rdperson_rpmdial.tga")||(redline>0&&!strcmp(r,"3rdperson_redline.tga")))));int map=mapon&&(i==h->mapnode||i==h->north||i==h->player||descendant(h,i,h->border));
  int heat=!s->hide_gauge&&h->layout_mode==2&&s->have_rpm&&isfinite(s->engine_heat)&&r&&!strcmp(r,"Drag_HEAT_Fill.tga");
- int extra=heat||(bank>0&&i==h->bank_backing)||(wid.backing&&i==h->widget_backing)||(wid.dpad&&i==h->widget_dpad)||(wid.centre&&i==h->widget_centre)||(wid.mail&&i==h->widget_mail)||(wid.highlight_right&&i==h->widget_highlight)||(nos>=1&&i==h->nos_backing)||(nos==2&&i==h->nos_alpha)||(shift&&i==h->shift_icon)||(glow_on&&i==h->glow_node);
+ int drift_angle=!s->hide_gauge&&(compact_angle?i==h->drift_angle_compact:
+                 (i==h->drift_angle_left||i==h->drift_angle_right));
+ int drift_turbo=turbo_visible&&(i==h->drift_turbo_fill||i==h->drift_turbo_lines||
+                  i==h->drift_turbo_red[0]||i==h->drift_turbo_red[1]);
+ int extra=heat||drift_angle||drift_turbo||(bank>0&&i==h->bank_backing)||(wid.backing&&i==h->widget_backing)||(wid.dpad&&i==h->widget_dpad)||(wid.centre&&i==h->widget_centre)||(wid.mail&&i==h->widget_mail)||(wid.highlight_right&&i==h->widget_highlight)||(nos>=1&&i==h->nos_backing)||(nos==2&&i==h->nos_alpha)||(shift&&i==h->shift_icon)||(glow_on&&i==h->glow_node);
  if(!gauge&&!map&&!extra&&!(s->racing&&race_image(h,i)))continue;
  h->tint_on=0;h->clip[3]=0;
  if(i==h->widget_highlight){ha_setting_rgba(cfg->highlight_colour,h->tint_rgba);h->tint_on=1;}
@@ -473,12 +638,48 @@ void hud_draw(Hud*h,const RProg*rp,GpuMesh*unused,const HudState*s,int w,int hei
   float grect[]={(float)(-glow.width/2),(float)(-glow.height/2),(float)(glow.width/2),(float)(glow.height/2)};quad(h,i,grect,n->uv,gt,(float)(-glow.rotation_ccw_deg*M_PI/180),w,height,0,0,NULL,0);
   memcpy(n->pivot,pv,sizeof pv);if(owned_g)rhi_texture_destroy(gt.id);continue;}
  if(i==h->widget_centre){float full[4]={0,0,1,1},rect[]={-n->size[0]/2,-n->size[1]/2,n->size[0]/2,n->size[1]/2};quad(h,i,rect,full,h->centre_texture,0,w,height,0,0,NULL,0);continue;}
- int roads=i==h->mapnode,owned=0;Texture t=image_texture(h,i,skin,scale,&owned);float angle=0;if(i==h->needle)angle=h->layout_mode==2?hud_race_drag_angle(n,s->rpm):(float)(ha_rpm_angle(s->rpm,s->rpm_maximum,0)*M_PI/180);if(i==h->north)angle=(float)-heading;if(roads){Texture mask=node_texture(h,h->masknode);if(!mask.id.id){diagnostic(h,"map mask missing; roads omitted");if(owned)rhi_texture_destroy(t.id);continue;}rhi_cmd_bind_texture(1,mask.id);if(t.id.id&&h->mask_alpha){HaMapFrame*f=&h->pick_frame;float zero[3]={0},bx[3]={1,0,0},by[3]={0,1,0},o[3],x[3],y[3];ha_point(&h->package,(size_t)i,zero,o,0);ha_point(&h->package,(size_t)i,bx,x,0);ha_point(&h->package,(size_t)i,by,y,0);f->center[0]=o[0]+fit_shift(h,i,w,height);f->center[1]=o[1];f->basis[0]=x[0]-o[0];f->basis[1]=x[1]-o[1];f->basis[2]=y[0]-o[0];f->basis[3]=y[1]-o[1];f->size[0]=n->size[0];f->size[1]=n->size[1];f->world[0]=s->car_x;f->world[1]=s->car_y;f->heading=heading;f->window=s->map_window_world>0?s->map_window_world:500;f->enabled=1;}}float rect[]={-n->size[0]/2,-n->size[1]/2,n->size[0]/2,n->size[1]/2};float uv[4];memcpy(uv,n->uv,sizeof uv);
+ int roads=i==h->mapnode,owned=0;
+ Texture t;
+ if(i==h->drift_turbo_fill)t=turbo_fill;
+ else if(i==h->drift_turbo_lines)t=turbo_lines;
+ else if(roads&&authored_map)t=h->race_map;
+ else if(roads&&city_map)t=h->city_map;
+ else t=image_texture(h,i,skin,scale,&owned);
+ float angle=0;
+ if(i==h->needle)
+  angle=h->layout_mode==2?hud_race_drag_angle(n,s->rpm):(float)(ha_rpm_angle(s->rpm,s->rpm_maximum,0)*M_PI/180);
+ if(i==h->north)angle=(float)-heading;
+ if(roads){
+  Texture mask=node_texture(h,h->masknode);
+  if(!mask.id.id){
+   diagnostic(h,"map mask missing; roads omitted");
+   if(owned)rhi_texture_destroy(t.id);
+   continue;
+  }
+  rhi_cmd_bind_texture(1,mask.id);
+  if(t.id.id&&h->mask_alpha){
+   HaMapFrame*f=&h->pick_frame;
+   float zero[3]={0},bx[3]={1,0,0},by[3]={0,1,0},o[3],x[3],y[3];
+   ha_point(&h->package,(size_t)i,zero,o,0);
+   ha_point(&h->package,(size_t)i,bx,x,0);
+   ha_point(&h->package,(size_t)i,by,y,0);
+   f->center[0]=o[0]+fit_shift(h,i,w,height);f->center[1]=o[1];
+   f->basis[0]=x[0]-o[0];f->basis[1]=x[1]-o[1];
+   f->basis[2]=y[0]-o[0];f->basis[3]=y[1]-o[1];
+   f->size[0]=n->size[0];f->size[1]=n->size[1];
+   f->world[0]=s->car_x;f->world[1]=s->car_y;
+   f->heading=heading;f->window=map_window;f->enabled=1;
+  }
+ }
+ float rect[]={-n->size[0]/2,-n->size[1]/2,n->size[0]/2,n->size[1]/2};
+ float uv[4];memcpy(uv,n->uv,sizeof uv);
  if(heat||(h->layout_mode==2&&i==h->nos_alpha)){float fraction=heat?s->engine_heat:s->nitro_tank;fraction=fminf(1,fmaxf(0,fraction));rect[1]=rect[3]-(rect[3]-rect[1])*fraction;uv[1]=uv[3]-(uv[3]-uv[1])*fraction;}
- quad(h,i,rect,uv,t,angle,w,height,i==h->player,roads,mapuv,heading);if(owned)rhi_texture_destroy(t.id);if(roads)map_overlay(h,s);}
+ quad(h,i,rect,uv,t,angle,w,height,i==h->player,roads,mapuv,heading);if(owned)rhi_texture_destroy(t.id);if(roads)map_overlay(h,s,!authored_map);}
  h->tint_on=0;h->clip[3]=0;
  if(!s->hide_gauge){char buf[32];if(ha_speed(s->speed_kmh/3.6,!s->imperial_units,buf))text(h,h->speed,buf,w,height);else diagnostic(h,"speed suppressed: invalid or outside 0..INT_MAX");if(!ha_gear(s->gear,buf))diagnostic(h,"unsupported gear state");role_text(h,h->gear,HA_TEXT_GEAR,s->gear,s->gear_change_in_progress!=0,s->speed_kmh/3.6,buf,w,height);text(h,h->unit,s->imperial_units?"MPH":"KM/H",w,height);}
- if(s->racing)race_text(h,s,w,height);
+ if(s->racing)race_text(h,s,w,height,compact_angle);
+ if(own_fill)rhi_texture_destroy(turbo_fill.id);
+ if(own_lines)rhi_texture_destroy(turbo_lines.id);
  if(bank>0){role_text(h,h->bank_label,HA_TEXT_BANK_LABEL,0,0,0,ha_bank_label,w,height);role_text(h,h->bank_value,HA_TEXT_BANK_VALUE,0,0,0,bankbuf,w,height);}
  rhi_cmd_restore_state(&hud_saved);
 }

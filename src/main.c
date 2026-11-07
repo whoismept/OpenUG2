@@ -45,6 +45,7 @@
 #include "hud.h"          /* stage 8: opt-in in-game player HUD (--hud) */
 #include "hud_race.h"
 #include "hud_host.h"     /* GL-free HUD context/preview policy */
+#include "map_bake.h"     /* city minimap detail levels */
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
 #include "world_scenery.h"
@@ -2211,6 +2212,23 @@ static void stage1_presentation(const Stage1Drive *s,int *gear,int *changing) {
  * The situation is the career free-roam pause (Return to Explore Mode, Options, Replay, Quit to Main
  * Menu): this host exposes no race lifecycle (restart / leave race) and no replay data, so the race
  * entries and an enabled Replay are not offered; the catalogue itself covers every context. */
+/* The minimap follows the Level Of Detail slider; --map-detail overrides it. The
+ * pause menu loads settings lazily, so startup reads the store itself. */
+static int city_map_size_from_store(void) {
+    StRegStore store; StGraphics gfx;
+    st_gfx_defaults(&gfx);
+    if (st_reg_open_default(&store) == ST_OK) { st_gfx_load(&store, &gfx); st_reg_close(&store); }
+    return map_bake_size_for_level(gfx.v[ST_GFX_PERF_LEVEL]);
+}
+
+/* TRACKMAP4000 covers L4RA only; other bundles keep their retail map. */
+static void city_map_apply(Hud *hud, const N2Scene *scene, const WorldCity *city, const char *track, int size) {
+    if (!hud || strcmp(track, "STREAML4RA")) return;
+    Uint32 start = SDL_GetTicks();
+    if (hud_bake_city_map(hud, scene, city->nav, city->nnav, city->adjstart, city->adjlist, size))
+        printf("city map: %dx%d baked in %u ms\n", size, size, SDL_GetTicks() - start);
+}
+
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
 static PauseMenu *pause_menu_build(const char *dataroot, StGraphics *gfx, StGfxCaps *caps, StRegStore *store, int *store_open) {
     PauseMenu *pm = pause_menu_create(dataroot);
@@ -2276,6 +2294,8 @@ int main(int argc, char **argv) {
          --no-road-reflections  keep surface sheen without scene reflections
          --world-cull-off  diagnostic: submit offscreen world batches
          --hud            draw the in-game player HUD (dial, minimap, nav arrow)
+         --map-detail N   city minimap size: 512 (retail), 1024, 2048 or 4096;
+                          overrides the Level Of Detail setting
          --hud-mph        enable the player HUD with imperial speed units
          --hud-fitted L   which parts the HUD treats as fitted: nos,turbo | none
          --hud-fit P      widescreen HUD fitment, a project policy (not original
@@ -2414,6 +2434,7 @@ int main(int argc, char **argv) {
     const char *drive_trace_path = NULL;
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
+    int map_detail_opt = -1; /* --map-detail: 512 (retail), 1024, 2048 or 4096 */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
     int shotframes_set = 0;
     int pause_shot = 0, pause_reference=0;
@@ -2697,6 +2718,13 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "--hud-dest expects X,Y\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--hud-preview")) { hud_opt = 1; hud_preview_opt = 1; }
+        else if (!strcmp(argv[i], "--map-detail")) {
+            int value = i+1 < argc ? atoi(argv[++i]) : 0;
+            if (value != 512 && value != 1024 && value != 2048 && value != 4096) {
+                fprintf(stderr, "--map-detail requires 512, 1024, 2048 or 4096\n"); return 2;
+            }
+            map_detail_opt = value == 512 ? 0 : value;
+        }
         else if (!strcmp(argv[i], "--cam-at") && i+2 < argc) {
             camat = 1; camx = (float)atof(argv[++i]); camy = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--mesh-material") && i+2 < argc) {
@@ -6238,6 +6266,7 @@ int main(int argc, char **argv) {
     /* stage-8 player HUD: art comes straight from the shipped packs under
        dataroot; a missing pack is reported, not fatal. */
     Hud *hud = NULL;
+    int city_map_size = 0;
     /* Last frame's HUD state. The minimap pick must invert the SAME transform
        the player clicked on, so it reads the state that was actually drawn
        rather than re-deriving one from a half-updated frame. */
@@ -6250,6 +6279,8 @@ int main(int argc, char **argv) {
         if (hud) {
             hud_set_preview(hud, hud_preview_opt);
             hud_configure(hud, &hud_settings);
+            city_map_size = map_detail_opt >= 0 ? map_detail_opt : city_map_size_from_store();
+            city_map_apply(hud, &scene, &world.city, trackname, city_map_size);
             const char *miss = hud_missing(hud);
             printf("player HUD: on%s%s, fit %s\n",
                    hud_preview_opt ? " (PREVIEW sample values)" : "",
@@ -6865,6 +6896,13 @@ int main(int argc, char **argv) {
             OptionsMenu *om = pause_menu_options(pause_menu);
             if (om_take_reinit_request(om)) {
                 om_take_apply_request(om);
+                int wanted_map = map_detail_opt >= 0 ? map_detail_opt
+                               : map_bake_size_for_level(opt_gfx.v[ST_GFX_PERF_LEVEL]);
+                if (hud && wanted_map != city_map_size) {
+                    city_map_size = wanted_map;
+                    if (wanted_map) city_map_apply(hud, &scene, &world.city, trackname, wanted_map);
+                    else hud_bake_city_map(hud, NULL, NULL, 0, NULL, NULL, 0);
+                }
                 fprintf(stderr, "options: display re-init requested (resolution %d, vsync %d, filtering %d); renderer hook not wired\n",
                         opt_gfx.v[ST_GFX_RESOLUTION], opt_gfx.v[ST_GFX_VSYNC], opt_gfx.v[ST_GFX_TEXTURE_FILTERING]);
             } else if (om_take_apply_request(om)) {
@@ -10656,7 +10694,11 @@ int main(int argc, char **argv) {
 
         if(!hud && (world.city.race.active || (ai_race && race_state!=3))) {
             hud=hud_init(dataroot);
-            if(hud){hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);}
+            if(hud){
+                hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);
+                city_map_size=map_detail_opt>=0?map_detail_opt:city_map_size_from_store();
+                city_map_apply(hud,&scene,&world.city,trackname,city_map_size);
+            }
         }
         int hud_active=hud && race_state!=3 && (hud_opt || world.city.race.active || ai_race);
         /* HUD: race-position leaderboard — one colour bar per car, ordered by
@@ -11033,6 +11075,7 @@ int main(int argc, char **argv) {
                 hs.circuit = (ev >= 0 && ev < world.city.nev)
                            ? world.city.ev[ev].circuit : 1;
                 if(event_race) {
+                    if (ev >= 0 && ev < world.city.nev) hs.race_event_id = world.city.ev[ev].id;
                     hs.race_kind=wr->kind;hs.drift_score=wr->drift.bank;hs.drift_chain=wr->drift.chain;
                     hs.drift_angle=wr->drift.angle;
                     if(wr->kind==N2_RACE_DRAG && g_vehicle_source_valid) {

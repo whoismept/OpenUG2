@@ -1771,6 +1771,14 @@ void render_texture_clamp_linear(RhiTexture tex) {
     d.mip_filter = RHI_MIP_NONE;
     tex_change_sampler(tex, &d);
 }
+
+void render_texture_clamp_edges(RhiTexture tex) {
+    const RhiSamplerDesc *cur = rhi_sampler_desc(rhi_texture_sampler(tex));
+    if (!cur) return;
+    RhiSamplerDesc d = *cur;
+    d.wrap_u = d.wrap_v = RHI_WRAP_CLAMP;
+    tex_change_sampler(tex, &d);
+}
 void render_texture_detail(float aniso) {
     if (g_tex_aniso_max <= 1) { g_tex_aniso = 1.0f; return; }
     if (aniso < 1.0f) aniso = 1.0f;

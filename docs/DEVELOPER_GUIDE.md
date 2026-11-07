@@ -1586,12 +1586,13 @@ sample values *and* paints a `PREVIEW SAMPLE VALUES` banner.
 
 ### Map placement
 
-There is no whole-city track map: `TRACKS/TRACKMAP<id>.BIN` is one 512×512
-texture per event with no world-coordinate metadata. The minimap therefore
-draws from world coordinates the engine already loads — the nav graph in free
-roam, the event route in a race — so placement is per-track measured data, not
-a fit to one district. `MINIMAP_MASK` is the panel disc (not a vignette) and
-`MINIMAP_BORDER` is one **quadrant** of the ring, drawn four times rotated.
+The minimap uses `TRACKS/TRACKMAP4000.BIN` in free roam and
+`TRACKS/TRACKMAP<id>.BIN` in race HUD layouts with a minimap. The matching
+TrackInfo row in `GLOBALB.BUN` supplies the map origin and world extent.
+Live markers share the same projection. If the race texture or its metadata
+is unavailable, the HUD uses the city map with the runtime route overlay. `MINIMAP_MASK`
+supplies the panel's circular coverage, and the four rotated
+`MINIMAP_BORDER` quadrants form its ring.
 
 Destination selection is a left-click on the minimap (`hud_map_pick` inverts
 the same transform the frame drew); `G` clears guidance. The arrow's bearing is
@@ -1599,6 +1600,38 @@ to the next node **along the solved route**, never the straight line to the
 target, and an unreachable destination leaves the route empty so nothing is
 drawn. `make hud-test` covers the angle wrap, the map round-trip, aspect
 invariance, the sprint/lap rule, money visibility and the art gate.
+
+### Baked city map
+
+The 500 m minimap window shows only 45 texels of the retail image, which is
+what made it blurry at modern resolutions. `src/map_bake.h` rebuilds the map at
+load time from the road meshes, the navigation links and the retail colours;
+nothing is shipped or cached. The size follows the Level Of Detail slider, with
+no separate performance path:
+
+| Level | Map |
+|---|---|
+| 5, or no saved setting | 4096 |
+| 4 | 2048 |
+| 3 | 1024 |
+| 1, 2 | retail 512, no bake |
+
+`--map-detail 512|1024|2048|4096` overrides the slider. A baked map replaces
+TRACKMAP4000. Races use their own TRACKMAP at every detail level when available.
+Only L4RA is baked, because TRACKMAP4000 covers that bundle.
+
+Routing-graph links bridge breaks in the road layer, because material names miss
+paved surfaces such as gravel lanes. A link is stroked only where no road mesh
+lies under it, so existing roads keep their shape. Thin seams between adjoining
+meshes are filled by size and width, which leaves junction islands alone.
+
+The retail image settles disagreements with the meshes. A road it draws with no
+mesh under it is added from the stroke, and a mesh stub with neither a retail
+line nor a nearby link is removed.
+Rail surfaces share their textures with an unlit yard on the south coast, so
+they are drawn only where the retail image shows a line. All roads use one grey
+rather than the retail brightness. `make map-bake-test` covers the levels, the
+world-to-texel frame, the links, that gate, the road colour and the road edge.
 
 ### Widescreen fitment (`--hud-fit`)
 
@@ -1631,13 +1664,10 @@ says turbo mapping and nitrous "remain pending". So today nitrous counts as
 fitted (the engine grants every car a working boost on `N`, which really does
 raise top speed) and a turbo never does.
 
-The standard HUD has **no turbo gauge at all**. The only turbo art in the game
-is `DRAG_TURBO_BACKING/LINES/NEEDLE` in `GLOBAL/InGameDrag.bun`, which belongs
-to the drag HUD and is out of scope here; `InGameDrag.bun` also holds the full
-numbered drag tachometer (`DRAG_RPM_BACKING`, `DRAG_RPM_{7000..10000}_LINES`,
-`DRAG_RPM_NEEDLE`) for whoever builds that mode. Note those records place their
-circle centre OUTSIDE the texture — `DRAG_RPM_8000_LINES` sits 1.336 widths to
-the right of its own left edge — so they cannot be positioned by eye.
+The Drift HUD uses its compact angle backing next to the tachometer when the
+turbo gauge is hidden. When a turbo is marked fitted, the split angle backing
+leaves room for the skin's turbo face and scale. The face has no live needle
+while boost telemetry is unavailable.
 
 `--hud-fitted nos,turbo|none` overrides fitment for review. It changes what is
 drawn, never a telemetry value.

@@ -343,6 +343,7 @@ RhiTexture upload_tpk_keyed(uint32_t key, const char *pack, const N2Tex *t);
    _linear variant also samples level 0 only (bilinear), for 2D overlays. */
 void render_texture_clamp(RhiTexture tex);
 void render_texture_clamp_linear(RhiTexture tex);
+void render_texture_clamp_edges(RhiTexture tex);   /* clamp only: mipmaps stay */
 /* Anisotropic filtering, the one texture-detail knob this renderer was missing.
  * Trilinear alone samples a square footprint, so any surface seen at a grazing
  * angle -- which is most of a road, a kerb and a car's own flanks -- drops to a
