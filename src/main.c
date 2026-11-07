@@ -2294,6 +2294,7 @@ int main(int argc, char **argv) {
          --hud            draw the in-game player HUD (dial, minimap, nav arrow)
          --map-detail N   city minimap size: 512 (retail), 1024, 2048 or 4096;
                           overrides the Level Of Detail setting
+         --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
          --hud-mph        enable the player HUD with imperial speed units
          --hud-fitted L   which parts the HUD treats as fitted: nos,turbo | none
          --hud-fit P      widescreen HUD fitment, a project policy (not original
@@ -2433,6 +2434,7 @@ int main(int argc, char **argv) {
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int map_detail_opt = -1; /* --map-detail: 512 (retail), 1024, 2048 or 4096 */
+    int map_cache_opt = 1;   /* --no-map-cache: bake every run */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
     int shotframes_set = 0;
     int pause_shot = 0, pause_reference=0;
@@ -2716,6 +2718,7 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "--hud-dest expects X,Y\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--hud-preview")) { hud_opt = 1; hud_preview_opt = 1; }
+        else if (!strcmp(argv[i], "--no-map-cache")) map_cache_opt = 0;
         else if (!strcmp(argv[i], "--map-detail")) {
             int value = i+1 < argc ? atoi(argv[++i]) : 0;
             if (value != 512 && value != 1024 && value != 2048 && value != 4096) {
@@ -6279,6 +6282,7 @@ int main(int argc, char **argv) {
             hud_configure(hud, &hud_settings);
             city_map_size = map_detail_opt >= 0 ? map_detail_opt : city_map_size_from_store();
             hud_set_map_sync(hud, shot != NULL);
+            hud_set_map_cache(hud, map_cache_opt);
             city_map_apply(hud, &scene, &world.city, trackname, city_map_size);
             const char *miss = hud_missing(hud);
             printf("player HUD: on%s%s, fit %s\n",
@@ -10696,6 +10700,7 @@ int main(int argc, char **argv) {
                 hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);
                 city_map_size=map_detail_opt>=0?map_detail_opt:city_map_size_from_store();
                 hud_set_map_sync(hud,shot!=NULL);
+                hud_set_map_cache(hud,map_cache_opt);
                 city_map_apply(hud,&scene,&world.city,trackname,city_map_size);
             }
         }

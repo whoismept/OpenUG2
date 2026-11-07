@@ -120,6 +120,43 @@ int main(void) {
             !map_bake_layers(&layers, &scene, NULL, 0, NULL, NULL, origin, S) && !layers.road);
     }
 
+    /* Cache: a file either returns the exact image or nothing. */
+    {
+        enum { C = 64 };
+        char dir[] = "build/map_cache_test", path[256], other[256];
+        chk("cache path fits", map_cache_path(path, sizeof path, dir, "CITY", C, 0xabcd1234u));
+        chk("cache path names the source", strstr(path, "CITY_64_v") && strstr(path, "abcd1234.map") &&
+            strstr(path, "/" MB_CACHE_DIR "/"));
+        map_cache_path(other, sizeof other, dir, "CITY", C, 0xabcd1235u);
+        chk("another source is another file", strcmp(path, other));
+        chk("a one-byte source change changes the hash",
+            map_cache_hash((const unsigned char *)"ab", 2) != map_cache_hash((const unsigned char *)"ac", 2));
+        unsigned char image[C * C * 3], before[C * C * 3];
+        for (int i = 0; i < C * C * 3; i++) image[i] = (unsigned char)(i * 7 + i / 90);
+        memcpy(before, image, sizeof image);
+        remove(path);
+        chk("no file before writing", !map_cache_exists(path));
+#ifdef _WIN32
+        _mkdir(dir);
+#else
+        mkdir(dir, 0777);
+#endif
+        chk("cache writes", map_cache_write(path, image, C));
+        chk("writing leaves the image intact", !memcmp(image, before, sizeof image));
+        chk("the file now exists", map_cache_exists(path));
+        unsigned char *back = map_cache_read(path, C);
+        chk("cache returns the exact image", back && !memcmp(back, image, sizeof image));
+        free(back);
+        chk("a wrong size is refused", map_cache_read(path, C * 2) == NULL);
+        FILE *f = fopen(path, "r+b");
+        fseek(f, 40, SEEK_SET); fputc(0x5a, f); fclose(f);
+        chk("a damaged file is refused", map_cache_read(path, C) == NULL);
+        f = fopen(path, "r+b");
+        fputc(0, f); fclose(f);
+        chk("a foreign file is refused", map_cache_read(path, C) == NULL);
+        remove(path);
+    }
+
     /* Links bridge breaks only: an existing road keeps its exact shape. */
     {
         float nav[] = { 20, 50,  60, 50,  60, 900,  500, 500,  540, 500,  600, 500,  640, 500 };

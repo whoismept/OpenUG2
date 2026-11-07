@@ -3,13 +3,20 @@
  * TRACKMAP4000 spends 512 texels on 5.6 km, so the 500 m minimap window shows
  * only 45 of them. This rebuilds the same map on the player's machine: land and
  * sea colours come from the retail image, road shapes from the road meshes the
- * engine already holds. Nothing is shipped and nothing is written to disk.
+ * engine already holds. Nothing is shipped. Results are kept in a directory of
+ * our own inside the game folder; no game file is ever written.
  *
  * Header-only and GL-free, so tools/map_bake_test.c can drive it directly. */
 #ifndef OPENUG2_MAP_BAKE_H
 #define OPENUG2_MAP_BAKE_H
 
 #include "nfsu2.h"
+#include <zlib.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 /* Level Of Detail slider 1..5. 0 means no saved setting, which keeps the full
  * detail the rest of the engine runs at. Returns 0 for the retail 512 map. */
@@ -484,6 +491,101 @@ static unsigned char *map_bake_from_layers(const MbLayers *l, const unsigned cha
         free(out); out = NULL;
     }
     return out;
+}
+
+/* ---- cache ------------------------------------------------------------------
+ * <game>/OpenUG2Cache/<name>_<size>_v<version>_<source hash>.map
+ * The name holds everything that decides the image, so a stale file is simply
+ * never opened. Deleting the directory is always safe. Bump the version whenever
+ * the bake's output changes. */
+#define MB_CACHE_DIR "OpenUG2Cache"
+#define MB_CACHE_VERSION 1
+#define MB_CACHE_MAGIC 0x314D4755u    /* "UGM1" */
+
+static uint32_t map_cache_hash(const unsigned char *p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+static int map_cache_path(char *out, size_t cap, const char *root, const char *name,
+                          int size, uint32_t hash) {
+    int n = snprintf(out, cap, "%s/" MB_CACHE_DIR "/%s_%d_v%d_%08x.map",
+                     root, name, size, MB_CACHE_VERSION, (unsigned)hash);
+    return n > 0 && (size_t)n < cap;
+}
+
+static int map_cache_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* A left-neighbour delta makes the smooth image compress far better. */
+static void mb_delta(unsigned char *rgb, int s, int undo) {
+    for (int y = 0; y < s; y++) {
+        unsigned char *row = rgb + (size_t)y * s * 3;
+        if (undo) for (int i = 3; i < s * 3; i++) row[i] = (unsigned char)(row[i] + row[i - 3]);
+        else for (int i = s * 3 - 1; i >= 3; i--) row[i] = (unsigned char)(row[i] - row[i - 3]);
+    }
+}
+
+/* Best effort: a read-only game folder only means baking again next time. rgb is
+ * left unchanged. The rename keeps a crash from leaving half a file. */
+static int map_cache_write(const char *path, unsigned char *rgb, int s) {
+    size_t raw = (size_t)s * s * 3;
+    uLongf packed = compressBound((uLong)raw);
+    unsigned char *z = (unsigned char *)malloc((size_t)packed);
+    if (!z) return 0;
+    uint32_t sum = (uint32_t)adler32(adler32(0, NULL, 0), rgb, (uInt)raw);
+    mb_delta(rgb, s, 0);
+    int ok = compress2(z, &packed, rgb, (uLong)raw, 1) == Z_OK;
+    mb_delta(rgb, s, 1);
+    char dir[1100], tmp[1100];
+    const char *slash = strrchr(path, '/');
+    if (ok && slash && (size_t)(slash - path) < sizeof dir) {
+        memcpy(dir, path, (size_t)(slash - path));
+        dir[slash - path] = 0;
+#ifdef _WIN32
+        _mkdir(dir);
+#else
+        mkdir(dir, 0777);
+#endif
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        uint32_t head[4] = { MB_CACHE_MAGIC, (uint32_t)s, (uint32_t)packed, sum };
+        ok = f && fwrite(head, sizeof head, 1, f) == 1 && fwrite(z, 1, (size_t)packed, f) == (size_t)packed;
+        if (f && fclose(f)) ok = 0;
+        if (ok) { remove(path); ok = rename(tmp, path) == 0; }
+        else remove(tmp);
+    } else ok = 0;
+    free(z);
+    return ok;
+}
+
+/* The s*s RGB image, or NULL for anything short of an intact file of that size. */
+static unsigned char *map_cache_read(const char *path, int s) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t raw = (size_t)s * s * 3;
+    uint32_t head[4];
+    unsigned char *z = NULL, *rgb = NULL;
+    if (fread(head, sizeof head, 1, f) == 1 && head[0] == MB_CACHE_MAGIC && head[1] == (uint32_t)s &&
+        head[2] <= compressBound((uLong)raw)) {
+        z = (unsigned char *)malloc(head[2]);
+        rgb = (unsigned char *)malloc(raw);
+        uLongf out = (uLongf)raw;
+        if (!z || !rgb || fread(z, 1, head[2], f) != head[2] ||
+            uncompress(rgb, &out, z, head[2]) != Z_OK || out != raw) {
+            free(rgb); rgb = NULL;
+        } else {
+            mb_delta(rgb, s, 1);
+            if ((uint32_t)adler32(adler32(0, NULL, 0), rgb, (uInt)raw) != head[3]) { free(rgb); rgb = NULL; }
+        }
+    }
+    free(z);
+    fclose(f);
+    return rgb;
 }
 
 #endif

@@ -61,7 +61,7 @@ HDRS += src/player_motion.h src/map_bake.h
 
 map-bake-test: tools/map_bake_test.c src/map_bake.h src/nfsu2.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc tools/map_bake_test.c -o build/map_bake_test -lm
+	$(CC) $(CFLAGS) -Isrc tools/map_bake_test.c -o build/map_bake_test -lm -lz
 	./build/map_bake_test
 
 hud-race-test: tools/hud_race_test.c src/hud_race.c src/hud_race.h src/hud.h src/hud_asset.c src/hud_asset.h src/ugui/ugui_codec.c

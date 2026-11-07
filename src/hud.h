@@ -130,8 +130,8 @@ typedef struct Hud Hud;
  * and named by hud_missing(). */
 Hud *hud_init(const char *dataroot);
 /* Sharp minimaps. The size follows the detail setting; 0 keeps the retail
- * images. The HUD reads the world only inside hud_set_map_source and when a race
- * in another map frame starts. Everything else runs on a worker thread, and a
+ * images. The HUD reads the world only when a map must be baked and is not in the
+ * cache. Everything else runs on a worker thread, and a
  * finished map replaces the retail image on a later frame. Pointers are borrowed. */
 void hud_set_map_source(Hud *h, const N2Scene *scene, const float *nav, int nnav,
                         const int *start, const int *list, int size);
@@ -139,6 +139,8 @@ void hud_set_map_source(Hud *h, const N2Scene *scene, const float *nav, int nnav
 void hud_request_city_map(Hud *h);
 /* Block until a requested map is ready: for captures, which need one fixed frame. */
 void hud_set_map_sync(Hud *h, int on);
+/* Keep finished maps in <game>/OpenUG2Cache (default on). Off bakes every time. */
+void hud_set_map_cache(Hud *h, int on);
 void hud_free(Hud **h);
 #ifdef HUD_TEST_HOOKS
 /* Test only: a HUD with one white image node shown as the career widget backing; needs a GL context, no game data. */

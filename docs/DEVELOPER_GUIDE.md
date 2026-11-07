@@ -1606,7 +1606,7 @@ invariance, the sprint/lap rule, money visibility and the art gate.
 The 500 m minimap window shows only 45 texels of the retail image, which is
 what made it blurry at modern resolutions. `src/map_bake.h` rebuilds the map at
 load time from the road meshes, the navigation links and the retail colours;
-nothing is shipped or cached. The size follows the Level Of Detail slider, with
+nothing is shipped. The size follows the Level Of Detail slider, with
 no separate performance path:
 
 | Level | Map |
@@ -1632,6 +1632,13 @@ nothing else, so it stays safe while the world streams. A race shows its retail
 image at once and swaps in the sharp map when the worker finishes; the texture
 upload happens on the main thread. Captures set `hud_set_map_sync` so that a
 `--shot` always shows the finished map.
+
+Finished maps are kept in `<game>/OpenUG2Cache/`, a directory of our own; no game
+file is ever written. A name holds the map, size, `MB_CACHE_VERSION` and a hash of
+the source TRACKMAP, so a stale file is never opened. Bump the version whenever
+the bake's output changes. A cached map needs neither the layers nor the bake.
+Deleting the directory is always safe, a read-only game folder only means baking
+again, and a damaged file is removed. `--no-map-cache` bakes every run.
 
 Routing-graph links bridge breaks in the road layer, because material names miss
 paved surfaces such as gravel lanes. A link is stroked only where no road mesh
