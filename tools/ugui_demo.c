@@ -624,14 +624,29 @@ int main(int argc, char **argv) {
     }
     ug_gl_set_texlib(e->ugl, &e->app.assets.tex);
     printf("assets: %s\n", e->app.have_assets ? e->app.assets_msg : e->app.assets_msg[0] ? e->app.assets_msg : "none");
+    int rc = 0;
     if (page >= 0) demo_open_page(&e->app, page);
     if (screen) {
-        if (!demo_open_original_named(&e->app, screen)) fprintf(stderr, "screen '%s' not found in the install\n", screen);
+        if (!demo_open_original_named(&e->app, screen)) {
+            fprintf(stderr, "original screen '%s' unavailable: %s\n", screen,
+                    e->app.viewer.vw.err[0] ? e->app.viewer.vw.err : "not found or cannot be opened");
+            rc = 1;
+            goto cleanup;
+        }
     }
 
-    int rc = 0;
     if(gui_check) {rc=run_gui_check(e);
-    } else if(capture) { step(e,max_frames>0?max_frames:120,0);int shot_ok=save_shot(e,capture);rc=e->gl_errors?2:shot_ok?0:1;
+    } else if(capture) {
+        step(e,max_frames>0?max_frames:120,0);
+        if (screen && (e->gl_errors || !orig_viewer_active(&e->app) || !e->app.viewer.vw.loaded ||
+                       e->app.viewer.vw.missing_tex || !e->app.ui.cv.n ||
+                       ug_cv_visual_status(&e->app.ui.cv) != UG_VIS_OK)) {
+            fprintf(stderr, "original screen '%s': incomplete frame; capture not written\n", screen);
+            rc = 1;
+        } else {
+            int shot_ok=save_shot(e,capture);
+            rc=e->gl_errors?2:shot_ok?0:1;
+        }
     } else if (pillbox) {
         rc = run_pillbox_check(e);
     } else if (check) {
@@ -728,6 +743,7 @@ int main(int argc, char **argv) {
         rc = e->gl_errors ? 2 : 0;
     }
 
+cleanup:
     demo_free(&e->app);
     ug_gl_destroy(e->ugl);
     SDL_GL_DeleteContext(e->gl);

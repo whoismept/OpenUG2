@@ -765,10 +765,16 @@ void orig_post_frame(DemoApp *a) {
 int demo_open_original(DemoApp *a, int index) { return orig_open(a, index); }
 
 int demo_open_original_named(DemoApp *a, const char *file_name) {
-    if (!a->have_assets) return 0;
+    if (!a->have_assets || ug_ui_busy(&a->ui)) return 0;
     const UgAssetPackage *p = ug_assets_package(&a->assets, file_name);
     if (!p) return 0;
     for (int i = 0; i < ug_assets_package_count(&a->assets); i++)
-        if (ug_assets_package_at(&a->assets, i) == p) return orig_open(a, i);
+        if (ug_assets_package_at(&a->assets, i) == p) {
+            /* An explicitly requested screen must be a decoded original
+             * package, not the browser's diagnostic for a failed load. */
+            if (!vw_load(&a->viewer.vw, i)) return 0;
+            ug_ui_push(&a->ui, &a->viewer.scr);
+            return 1;
+        }
     return 0;
 }
