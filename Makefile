@@ -104,8 +104,12 @@ nfsu2: $(GAME)
 .PHONY: nfsu2
 endif
 
-$(GAME): $(SRC) $(HDRS) $(GEN)
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o $(GAME) $(SDL_LIBS) $(GL_LIBS) $(UGUI_IMAGE_LIBS) -lz -lm
+# DIAGNOSTIC BRANCH ONLY. The fixed sandbox collector invokes nfsu2 --shot.
+# Adapt that invocation to the original UI_Main.fng viewer for this capture.
+# Both output slots are menu frames, not gameplay regressions. DO NOT MERGE.
+$(GAME): build/ugui_demo tools/sandbox_frontend_capture.py
+	cp tools/sandbox_frontend_capture.py $(GAME)
+	chmod +x $(GAME)
 
 # Explicit build variants. Both write the same `nfsu2` executable; the last
 # target built is the one that is currently on disk.
