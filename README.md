@@ -58,3 +58,5 @@ Speed is a trademark of Electronic Arts.
 
 Thanks to the community projects credited in the [format notes](docs/FORMATS.md#credits--references)
 and to [Dear ImGui](third_party/imgui/LICENSE.txt), which powers the developer menu.
+
+<!-- ug2-ctl dev access test, PR will be closed without merge -->
