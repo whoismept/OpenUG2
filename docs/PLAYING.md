@@ -42,10 +42,11 @@ See [Contributing](../CONTRIBUTING.md) for updating an existing checkout.
 ## Pick a car or start a race
 
 With no track option, OpenUG2 starts in free roam on `STREAML4RA`. The asset HUD
-appears automatically in races. Use `--hud` to show it in free roam.
+and the stock drivetrain are on by default; `--no-hud` and `--no-drivetrain`
+turn them off.
 
 ```sh
-./nfsu2 --path "/path/to/Underground 2" --car MIATA --hud
+./nfsu2 --path "/path/to/Underground 2" --car MIATA
 ./nfsu2 --path "/path/to/Underground 2" --track STREAML4RA --event 4083
 ./nfsu2 --path "/path/to/Underground 2" --track STREAML4RB --event 4201
 ```
@@ -59,7 +60,8 @@ region with `--track`. For a closed-loop path directly, use
   See [widescreen HUD](HUD_WIDESCREEN.md).
 - `--map-detail 512` uses the original city minimap. See [map detail levels](DEVELOPER_GUIDE.md#baked-city-map).
 - `--camera 0` through `--camera 4` choose a starting view. See [camera controls](CAMERA.md).
-- `--drivetrain` enables the experimental [stock drivetrain model](DRIVETRAIN.md).
+- The [stock drivetrain model](DRIVETRAIN.md) is on by default; `--no-drivetrain`
+  uses the classic physics.
 - `--lighting original` uses the original game's projected headlight pool, as
   Level Of Detail 1 and 2 do; `--lighting modern` forces the per-pixel beams.
 - `--help` shows the command syntax. Select a single region for driving.

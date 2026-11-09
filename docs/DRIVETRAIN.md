@@ -1,9 +1,11 @@
-# Stock drivetrain opt-in
+# Stock drivetrain
 
-Run the independent native OpenUG2 executable with `--drivetrain` to select the
-approved bounded Stage1–5 engine, clutch, automatic gearbox, tyre, service brake,
-steering, resistance, suspension-contact, handbrake and dynamic body composition. The default
-without that flag remains the legacy model. Drag/drift race families use legacy
+The native OpenUG2 executable uses the approved bounded Stage1–5 engine, clutch,
+automatic gearbox, tyre, service brake, steering, resistance, suspension-contact,
+handbrake and dynamic body composition by default. `--no-drivetrain` selects the
+legacy model. Audits and captures keep the legacy model unless `--drivetrain` is
+given. Without `--drivetrain`, a car with no valid tuning falls back to the legacy
+model instead of exiting. Drag/drift race families use legacy
 physics because their alternate producers are outside these specifications.
 
 W accelerates forward; S brakes forward motion and selects reverse near rest.

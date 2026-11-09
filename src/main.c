@@ -2323,7 +2323,8 @@ int main(int argc, char **argv) {
          --road-reflections  opt in to expensive scene reflections (default off)
          --no-road-reflections  keep surface sheen without scene reflections
          --world-cull-off  diagnostic: submit offscreen world batches
-         --hud            draw the in-game player HUD (dial, minimap, nav arrow)
+         --hud            draw the in-game player HUD (on by default; --no-hud hides it)
+         --no-drivetrain  use the classic physics instead of the stock drivetrain (on by default)
          --map-detail N   city minimap size: 512 (retail), 1024, 2048 or 4096;
                           overrides the Level Of Detail setting
          --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
@@ -2375,7 +2376,8 @@ int main(int argc, char **argv) {
        overlay toggle, and it replaces the diagnostic overlay rather than
        stacking on top of it. --hud-preview additionally fills the readouts
        that have no live system with clearly-labelled sample values. */
-    int hud_opt = 0, hud_preview_opt = 0, hud_dest_set = 0;
+    int hud_opt = 1, hud_preview_opt = 0, hud_dest_set = 0;   /* --no-hud turns it off */
+    int drivetrain_explicit = 0, drivetrain_off = 0;          /* --drivetrain / --no-drivetrain */
     int hud_imperial = 0;
     int hud_skin = 0;
     int hud_fitted_set = 0, hud_fitted_nos = 0, hud_fitted_turbo = 0;
@@ -2699,12 +2701,14 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--b02-probe") && i+1 < argc) {
             b02probe = argv[++i]; fbcensus = 1; n2_m102 = 1; }
-        else if (!strcmp(argv[i], "--drivetrain")) g_stage1_requested = 1;
+        else if (!strcmp(argv[i], "--drivetrain")) { g_stage1_requested = 1; drivetrain_explicit = 1; }
+        else if (!strcmp(argv[i], "--no-drivetrain")) drivetrain_off = 1;
+        else if (!strcmp(argv[i], "--no-hud")) hud_opt = -1;
         else if (!strcmp(argv[i], "--drivetrain-trace")) {
             if(i+1>=argc || !argv[i+1][0] || argv[i+1][0]=='-') {
                 fprintf(stderr,"--drivetrain-trace requires a CSV file path\n");return 2;
             }
-            drive_trace_path=argv[++i];g_stage1_requested=1;
+            drive_trace_path=argv[++i];g_stage1_requested=1;drivetrain_explicit=1;
         }
         else if (!strcmp(argv[i], "--hud")) hud_opt = 1;
         else if (!strcmp(argv[i], "--hud-skin") && i + 1 < argc) {
@@ -2892,6 +2896,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
         return 2;
     }
+    /* The stock drivetrain and the HUD are on by default. Audits and captures keep
+       their recorded physics unless --drivetrain is asked for explicitly. */
+    if (hud_opt < 0) hud_opt = 0;
+    if (drivetrain_off) { g_stage1_requested = 0; drivetrain_explicit = 0; }
+    else if (!drivetrain_explicit &&
+             !(daudit || raudit || ai_drive_audit || resident_drive_audit || resident_route_audit ||
+               resident_audit || poseshot || shaudit || sshot || sspawn || sstack || smaudit ||
+               baudit || tpkrec || matdump))
+        g_stage1_requested = 1;
     if (scenery_preview_set &&
         (!world2 || (!instance_audit && !shot) || sshot || sspawn || sstack ||
          want_event_id || daudit || raudit || poseshot || shaudit)) {
@@ -4907,9 +4920,11 @@ int main(int argc, char **argv) {
                    stage5_drive_contacts(&g_stage1,&contacts,stage5_world_query,&g_stage5_world) ||
                    stage5_drive_body(&g_stage1,&body,1,0,0)) {
                     fprintf(stderr,"--drivetrain: no valid stock Stage-1/2/3/4/5 tuning for %s\n",carname);
-                    return 2;
+                    if (drivetrain_explicit) return 2;
+                    fprintf(stderr,"drivetrain: keeping the classic physics for %s\n",carname);
+                    g_stage1_requested = 0;
                 }
-                {
+                if (g_stage1_requested) {
                     tm_car_read(globdata,globlen,carname,g_tm_width);   /* TM-1.1; keeps defaults if absent */
                     printf("Stage-1/2/3/4/5 drivetrain enabled; W forward, S brake/reverse, Space handbrake.\n"
                            "  Geometric spring/aligned loads, frame handbrake/grip; full dynamic body momentum and orientation.\n"

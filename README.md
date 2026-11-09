@@ -19,7 +19,7 @@ installed. Windows users can follow the [MSYS2 guide](docs/WINDOWS.md).
 git clone --branch development https://github.com/whoismept/OpenUG2.git
 cd OpenUG2
 make debug
-./nfsu2 --path "/path/to/Underground 2" --hud
+./nfsu2 --path "/path/to/Underground 2"
 ```
 
 The source build is named `nfsu2`. Downloaded previews are named `openug2`
