@@ -764,6 +764,18 @@ static void texture_record_rejection_tests(void) {
 }
 
 int texture_record_tests(void) {
+    /* The unresolved skin slot takes the atlas, but body paint never does. */
+    g_car_skin_slot = 0x5ae81449u; g_car_skin_atlas = 0x4405f2a6u;
+    chk("skin slot on trim takes the atlas", n2_car_skin_key(0x5ae81449u, N2_MAT_DULLPLASTIC) == 0x4405f2a6u);
+    chk("skin slot on body paint keeps the paint", n2_car_skin_key(0x5ae81449u, N2_MAT_CARSKIN) == 0);
+    chk("another slot is left alone", n2_car_skin_key(0x12345678u, N2_MAT_DULLPLASTIC) == 0);
+    g_car_skin_slot = g_car_skin_atlas = 0;
+    chk("no atlas means no substitution", n2_car_skin_key(0x5ae81449u, N2_MAT_DULLPLASTIC) == 0);
+    g_car_lamp_off = 0x22d28901u; g_car_lamp_on = 0x257bb69au;
+    chk("off lamp slot takes the dim sheet", n2_car_skin_key(N2_SLOT_LAMP_OFF, 0x05bc3a3cu) == 0x22d28901u);
+    chk("lit lamp slot takes the bright sheet", n2_car_skin_key(N2_SLOT_LAMP_ON, 0x05bc3a3cu) == 0x257bb69au);
+    g_car_lamp_off = g_car_lamp_on = 0;
+
     printf("\n  T texture-record decode: authored format/draw-mode bytes\n");
     texture_record_rejection_tests();
 

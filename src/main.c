@@ -471,6 +471,7 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
         candidate->nkeys+=n2_tpk_keys(candidate->globaldata,candidate->globaltpk,
                                       candidate->keys+candidate->nkeys,2048-candidate->nkeys);
     candidate->config.body_kit = 0;
+    n2_car_skin_use(name, candidate->texdata, candidate->texlen);
     if (!candidate->data || candidate->len <= 0 ||
         n2_load_car_colored(candidate->data, candidate->len, &candidate->scene,
                     candidate->keys, candidate->nkeys, &candidate->config,
@@ -4797,6 +4798,7 @@ int main(int argc, char **argv) {
         printf("car kits: ");
         for (int q = 0; q < nkit_ids; q++) printf("KIT%02d%s", kit_ids[q], q+1<nkit_ids?" ":"");
         puts("");
+        n2_car_skin_use(carname, ctdata, ctlen);
         ncar = n2_load_car_colored(cdata, clen, &car, ckeys, nck, &carcfg,
                                    car_prelight);
         if(n2_mod_add_plate(dataroot,cdata,clen,&car)<0)
@@ -9997,6 +9999,9 @@ int main(int argc, char **argv) {
                     tex = maptex[j]; hasalpha = mapalpha[j]; texmode = mapmode[j]; break; }
                 uint32_t material=cgm[i].car_material;
                 int dark_trim=n2_car_dark_trim(material),metal_trim=n2_car_metal_trim(material);
+                /* Trim wearing the car's skin atlas carries authored art, such as
+                   the ECLIPSE tail panel: it is lit as a textured surface. */
+                if(tex.id && cgm[i].texkey==g_car_skin_atlas)dark_trim=metal_trim=0;
                 if((dark_trim || metal_trim) &&
                    (c==N2_CAR_BODY || c==N2_CAR_MISC || (is_light && !emitting))) {
                     /* Authored plastic/metal stays unpainted, including lamp

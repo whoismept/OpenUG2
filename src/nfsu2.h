@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 #include "asset_chunks.h"
 
 /* One drawable submesh: interleaved [px,py,pz,u,v] verts + u16 triangle list. */
@@ -1997,6 +1998,25 @@ static int n2_car_is_trim(const unsigned char *d, long beg, long end) {
  * forced (0.035, 0.032, 0.030) on all of them, which is where the black Hummer
  * roof came from. */
 
+/* <CAR>_SKIN1 names the car's badge and trim atlas in every geometry file, but no
+ * TEXTURES.BIN record carries that key: 0 of the 54 shipped cars. Unresolved, the
+ * ECLIPSE lettering on the tail panel drew as bare dark plastic. The art is there,
+ * under other keys, as the colour 512x512 sheet beside its grey masks. CARSKIN is
+ * body paint, so it never takes the atlas. Set by the caller before loading a car. */
+static uint32_t g_car_skin_slot, g_car_skin_atlas;
+/* The two tail-lamp slots are the same keys in every car (45 uses on ECLIPSE,
+ * SUPRA and RX7 alike) and are never a TEXTURES.BIN record either: the off and
+ * the lit lens. They take the car's red 4:1 lamp sheets, dimmer one first. */
+#define N2_SLOT_LAMP_OFF 0xd947f346u
+#define N2_SLOT_LAMP_ON  0x02b52399u
+static uint32_t g_car_lamp_off, g_car_lamp_on;
+static uint32_t n2_car_skin_key(uint32_t slot, uint32_t material) {
+    if (!slot) return 0;
+    if (slot == N2_SLOT_LAMP_OFF) return g_car_lamp_off;
+    if (slot == N2_SLOT_LAMP_ON) return g_car_lamp_on;
+    return slot == g_car_skin_slot && material != 0xd6d6080au ? g_car_skin_atlas : 0;
+}
+
 /* Find this mesh's bound diffuse: scan its 0x134012 texture-slot list (8-byte
  * entries: key + 0) for a key present in the car's TPK (keys[]). 0 if none. */
 static uint32_t n2_mesh_texkey(const unsigned char *d, long beg, long end,
@@ -2395,6 +2415,8 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                       ? (brake ? slots[sub[k].mat]
                                : n2_resolve_key(slots[sub[k].mat], keys, nkeys)) : 0;
             uint32_t mh = sub[k].matid < (uint32_t)nmslot ? mslots[sub[k].matid] : 0;
+            if (!subtex[k] && sub[k].mat < (uint32_t)nslot)
+                subtex[k] = n2_car_skin_key(slots[sub[k].mat], mh);
             submat[k] = mh;
             if (submat[k] != submat[0]) matdiffer = 1;
             matcls[k] = n2_mat_class(mh, cat);
@@ -2415,6 +2437,7 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
            per-car key list. Retain only validated slot ownership; the
            runtime resolves the exact key locally or in the shared pack. */
         if (brake && trust_cls && nsub >= 1 && !differ) tk = subtex[0];
+        if (!tk && !brake && trust_cls && nsub >= 1 && !differ) tk = subtex[0];
         /* One 0x80134010 occurrence, split or not, shares one tierid so
            n2_car_dedupe_lod can score and drop/keep its whole slice set
            atomically instead of resolving each split slice on its own. */
@@ -3573,6 +3596,54 @@ static int n2_car_tex_name_by_key(const unsigned char *d, long len, uint32_t key
 }
 
 /* Decode ONE car texture through its offset-slot table and embedded header. */
+static int n2_load_car_tex_by_key(const unsigned char*d,long len,uint32_t key,N2Tex*t);
+
+/* Point <CAR>_SKIN1 at this car's colour atlas: of the 512x512 sheets, the one
+ * with the most chroma, because the rest are grey masks. The lamp slots take the
+ * two reddest 4:1 sheets. */
+static void n2_car_skin_use(const char *car, const unsigned char *d, long len) {
+    g_car_skin_slot = g_car_skin_atlas = g_car_lamp_off = g_car_lamp_on = 0;
+    if (!car || !d) return;
+    char name[96];
+    snprintf(name, sizeof name, "%s_SKIN1", car);
+    uint32_t keys[512], slot = 0xFFFFFFFFu;
+    for (const char *p = name; *p; p++) slot = slot * 33 + (unsigned char)toupper((unsigned char)*p);
+    int count = n2_car_tex_keys(d, len, keys, 512);
+    long best = 0, lamp_red[2] = { 0, 0 }, lamp_bright[2] = { 0, 0 };
+    uint32_t lamp[2] = { 0, 0 };
+    for (int i = 0; i < count; i++) {
+        N2Tex t;
+        if (!n2_load_car_tex_by_key(d, len, keys[i], &t)) continue;
+        if (t.w == 512 && t.h == 512 && t.rgb) {
+            long chroma = 0;
+            for (long p = 0; p < 512L * 512; p += 7) {
+                const unsigned char *c = t.rgb + p * 3;
+                chroma += abs(c[0] - c[1]) + abs(c[1] - c[2]);
+            }
+            if (chroma > best) { best = chroma; g_car_skin_atlas = keys[i]; }
+        } else if (t.rgb && t.w == t.h * 4 && t.w >= 64) {
+            long red = 0, bright = 0, n = (long)t.w * t.h;
+            for (long p = 0; p < n; p++) {
+                const unsigned char *c = t.rgb + p * 3;
+                red += c[0] - (c[1] + c[2]) / 2;
+                bright += c[0];
+            }
+            red /= n; bright /= n;
+            if (red > 40 && red > lamp_red[1]) {
+                int slot_i = red > lamp_red[0] ? 0 : 1;
+                if (!slot_i) { lamp[1] = lamp[0]; lamp_red[1] = lamp_red[0]; lamp_bright[1] = lamp_bright[0]; }
+                lamp[slot_i] = keys[i]; lamp_red[slot_i] = red; lamp_bright[slot_i] = bright;
+            }
+        }
+        free(t.rgb); free(t.alpha); free(t.dxt);
+    }
+    if (g_car_skin_atlas) g_car_skin_slot = slot;
+    if (lamp[0] && lamp[1]) {
+        int dim = lamp_bright[0] <= lamp_bright[1] ? 0 : 1;
+        g_car_lamp_off = lamp[dim]; g_car_lamp_on = lamp[!dim];
+    } else g_car_lamp_off = g_car_lamp_on = lamp[0];
+}
+
 static int n2_load_car_tex_from_slots(const unsigned char *d,long len,
         const unsigned char *p,uint32_t sz,uint32_t key,N2Tex *t) {
     memset(t,0,sizeof *t);
