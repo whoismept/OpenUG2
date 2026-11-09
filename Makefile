@@ -57,7 +57,7 @@ HDRS += src/ug2_track_collision.h src/drivetrain.h src/braking.h src/resistance.
 HDRS += src/drive_trace.h src/drive_presentation.h src/drive_session.h
 SRC += src/hud_race.c
 HDRS += src/hud_race.h src/dir_scan.h
-HDRS += src/player_motion.h src/map_bake.h
+HDRS += src/player_motion.h src/map_bake.h src/lighting_policy.h
 
 map-bake-test: tools/map_bake_test.c src/map_bake.h src/nfsu2.h
 	@mkdir -p build
@@ -535,7 +535,7 @@ SETTINGS_SPEC ?= docs/cleanroom-settings
 ifeq ($(OS),Windows_NT)
 SETTINGS_LIBS := -ladvapi32
 endif
-settings-test: tools/settings_test.c src/settings.c src/settings.h
+settings-test: tools/settings_test.c src/settings.c src/settings.h src/lighting_policy.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/settings_test.c src/settings.c -o build/settings_test $(SETTINGS_LIBS) -lm
 	./build/settings_test "$(SETTINGS_SPEC)/test-vectors" build/settings_test_tmp

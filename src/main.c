@@ -46,6 +46,7 @@
 #include "hud_race.h"
 #include "hud_host.h"     /* GL-free HUD context/preview policy */
 #include "map_bake.h"     /* city minimap detail levels */
+#include "lighting_policy.h"
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
@@ -2249,14 +2250,13 @@ static int event_has_authored_barriers(const char *troot, const char *track, int
     return cached;
 }
 
-/* Level Of Detail 1-2 switch the lights to the original game's manner: projected
- * headlight pool, no per-pixel beams or beam shadows. 0 means no saved setting. */
-static int lighting_original_from_store(void) {
+/* The lighting the saved graphics settings ask for. The pause menu loads its own
+ * copy lazily, so startup reads the store here. */
+static LightingPolicy lighting_policy_from_store(void) {
     StRegStore store; StGraphics gfx;
     st_gfx_defaults(&gfx);
     if (st_reg_open_default(&store) == ST_OK) { st_gfx_load(&store, &gfx); st_reg_close(&store); }
-    int level = gfx.v[ST_GFX_PERF_LEVEL];
-    return level >= 1 && level <= 2;
+    return lighting_policy(&gfx);
 }
 
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
@@ -6344,7 +6344,7 @@ int main(int argc, char **argv) {
        dataroot; a missing pack is reported, not fatal. */
     Hud *hud = NULL;
     int city_map_size = 0;
-    int lighting_original_level = lighting_original_from_store();
+    LightingPolicy lighting = lighting_policy_from_store();
     /* Last frame's HUD state. The minimap pick must invert the SAME transform
        the player clicked on, so it reads the state that was actually drawn
        rather than re-deriving one from a half-updated frame. */
@@ -6971,11 +6971,13 @@ int main(int argc, char **argv) {
             gamecam_save(&gc);saved_mouse_look=gc.settings.mouse_look;
         }
         if (pause_menu) {
-            /* Apply / re-init hook (SPEC_GUI 5.4). Changes in opt_gfx are requested immediately; the renderer
-             * is meant to service them here, at the start of the frame after the change. Not wired yet. */
+            /* Apply / re-init hook (SPEC_GUI 5.4). Changes in opt_gfx are requested immediately and
+             * serviced here, at the start of the frame after the change. Lighting and the minimap follow
+             * the settings; the display re-init and the remaining values are not wired yet. */
             OptionsMenu *om = pause_menu_options(pause_menu);
             if (om_take_reinit_request(om)) {
                 om_take_apply_request(om);
+                lighting = lighting_policy(&opt_gfx);
                 int wanted_map = map_detail_opt >= 0 ? map_detail_opt
                                : map_bake_size_for_level(opt_gfx.v[ST_GFX_PERF_LEVEL]);
                 if (hud && wanted_map != city_map_size) {
@@ -6985,7 +6987,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "options: display re-init requested (resolution %d, vsync %d, filtering %d); renderer hook not wired\n",
                         opt_gfx.v[ST_GFX_RESOLUTION], opt_gfx.v[ST_GFX_VSYNC], opt_gfx.v[ST_GFX_TEXTURE_FILTERING]);
             } else if (om_take_apply_request(om)) {
-                fprintf(stderr, "options: graphics values changed; renderer hook not wired\n");
+                lighting = lighting_policy(&opt_gfx);
+                fprintf(stderr, "options: lighting updated; other graphics values are not wired yet\n");
             }
         }
         if (pause_action == FE_ACTION_QUIT) running = 0;
@@ -9366,7 +9369,8 @@ int main(int argc, char **argv) {
         int long_beam=beam_high || beam_flash;
         float beam_gain = ncar && !follow_roam_ai && race_state!=3 && g_dbg.show_lights && headlights_on
                           ? g_dbg.headlight_gain*light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT]) : 0.0f;
-        int original_lights = lighting_opt >= 0 ? lighting_opt : lighting_original_level;
+        int original_lights = lighting_opt >= 0 ? lighting_opt : lighting.original;
+        if (!lighting.headlight) beam_gain = 0.0f;   /* lenses still glow */
         render_headlights(&rp,lamp_model,bloomc,long_beam,
                           long_beam?g_dbg.high_beam_pitch:g_dbg.low_beam_pitch,
                           long_beam?g_dbg.high_beam_range:g_dbg.low_beam_range,
@@ -10420,7 +10424,7 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (!player_hidden && g_dbg.show_lights && (tail_on || headlights_on)) {
+            if (!player_hidden && g_dbg.show_lights && lighting.glow && (tail_on || headlights_on)) {
                 rhi_cmd_bind_pipeline(cpipe.halo);
                 rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 1.0f;
                 for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f || (b<2?!headlights_on:!tail_on)) continue;
@@ -10755,7 +10759,7 @@ int main(int argc, char **argv) {
 
         /* Authored point lights are render-only; gameplay owns no part of this pass. */
         if (world.neighborhood.nlights && district_light_tex.id && g_dbg.show_track &&
-            g_dbg.night_mode && (passmode == 0 || passmode == 2)) {
+            g_dbg.night_mode && lighting.glow && (passmode == 0 || passmode == 2)) {
             districtdraws = render_district_lights(&rp, &quad, district_light_tex,
                 world.neighborhood.lights, world.neighborhood.nlights, cam, look, MVP,
                 VIEW_DIST, g_dbg.light_halo, g_dbg.light_gain);

@@ -1613,6 +1613,13 @@ and `HeadlightWVP`: the additive pool texture `2PLAYERHEADLIGHT1` (GLOBALB, key
 shadows are off. `--lighting original|modern` overrides the setting. Higher levels
 are unchanged.
 
+`src/lighting_policy.h` turns the graphics settings into what is drawn, and the
+pause-menu apply hook refreshes it, so changes take effect on the next frame.
+`Car Headlight` off leaves the lenses lit but no light on the road, and `Light
+Glow` off drops the lamp halos and district flares. Level 1's preset turns both
+off, as the original does, so the projected pool first appears at level 2. With
+no saved level every value reads 0, so the full lighting is kept instead.
+
 The pool is one shared-vertex grid of `RENDER_POOL_ROWS` x `RENDER_POOL_COLS`
 quads whose corners take the road height, drawn in one call with the car halo
 pipeline. Redrawing the nearby world batches instead looked the same but cost

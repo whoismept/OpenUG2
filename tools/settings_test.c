@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "settings.h"
+#include "lighting_policy.h"
 
 static int g_checks, g_fail;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
@@ -865,6 +866,28 @@ static void test_profile_files(void) {
     CHECK(!st_profiles_exist(root), "root empty again");
 }
 
+/* Which lights each detail level draws (lighting_policy.h). */
+static void test_lighting_policy(void) {
+    StGraphics g; StGfxCaps caps;
+    st_gfx_defaults(&g);
+    LightingPolicy p = lighting_policy(&g);
+    CHECK(!p.original && p.headlight && p.glow, "no saved level keeps the full lighting");
+    CHECK(lighting_policy(NULL).headlight, "missing settings keep the headlights");
+    st_gfx_caps_full(&caps, 5);
+    st_gfx_set_level(&g, &caps, 1, 1.0);
+    p = lighting_policy(&g);
+    CHECK(p.original && !p.headlight && !p.glow, "level 1: original manner, preset turns headlight and glow off");
+    st_gfx_set_level(&g, &caps, 2, 1.0);
+    p = lighting_policy(&g);
+    CHECK(p.original && p.headlight && p.glow, "level 2: original headlight pool");
+    st_gfx_set_level(&g, &caps, 3, 1.0);
+    p = lighting_policy(&g);
+    CHECK(!p.original && p.headlight && p.glow, "level 3 and up: per-pixel beams");
+    g.v[ST_GFX_CAR_HEADLIGHT] = 0; g.v[ST_GFX_LIGHT_GLOW] = 0;
+    p = lighting_policy(&g);
+    CHECK(!p.headlight && !p.glow, "customized Car Headlight and Light Glow are honoured");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1] && *argv[1]) g_dir = argv[1];
     if (argc > 2 && argv[2] && *argv[2]) g_tmp = argv[2];
@@ -874,6 +897,7 @@ int main(int argc, char **argv) {
     test_helpers();
     test_presets();
     test_graphics_logic();
+    test_lighting_policy();
     test_install_and_language();
     test_graphics_store();
     test_ini_store();
