@@ -47,6 +47,37 @@ int render_world_glows(const RProg *r,const N2Batch *batches,int count,
     return draws;
 }
 
+/* District flares, all in one draw: each sprite's corners, colour and strength are
+ * written to a streamed buffer, so 700+ city lights cost one call instead of one
+ * each (2 ms of CPU on an Intel HD 520). The sprite maths is unchanged. */
+static GpuMesh g_flares;
+static int g_flare_cap;
+static int flare_mesh_reserve(int count) {
+    if (count <= g_flare_cap) return 1;
+    int cap = g_flare_cap ? g_flare_cap : 256;
+    while (cap < count) cap *= 2;
+    if (cap > 16383) cap = 16383;   /* 16-bit indices: four vertices a sprite */
+    if (count > cap) return 0;
+    uint16_t *index = (uint16_t *)malloc((size_t)cap * 6 * sizeof *index);
+    float *normal = (float *)malloc((size_t)cap * 4 * 3 * sizeof *normal);
+    if (!index || !normal) { free(index); free(normal); return 0; }
+    for (int i = 0; i < cap; i++) {
+        uint16_t v = (uint16_t)(i * 4);
+        uint16_t q[6] = { v, (uint16_t)(v+1), (uint16_t)(v+2), v, (uint16_t)(v+2), (uint16_t)(v+3) };
+        memcpy(index + i * 6, q, sizeof q);
+        for (int k = 0; k < 4; k++) { float *n = normal + (i * 4 + k) * 3; n[0] = 0; n[1] = 0; n[2] = 1; }
+    }
+    rhi_buffer_destroy(g_flares.vbo); rhi_buffer_destroy(g_flares.nbo);
+    rhi_buffer_destroy(g_flares.cbo); rhi_buffer_destroy(g_flares.ibo);
+    g_flares.vbo = rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX, RHI_UPDATE_STREAM, (size_t)cap*4*5*sizeof(float), NULL});
+    g_flares.cbo = rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX, RHI_UPDATE_STREAM, (size_t)cap*4*4, NULL});
+    g_flares.nbo = rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX, RHI_UPDATE_STATIC, (size_t)cap*4*3*sizeof(float), normal});
+    g_flares.ibo = rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_INDEX, RHI_UPDATE_STATIC, (size_t)cap*6*sizeof(uint16_t), index});
+    free(index); free(normal);
+    g_flare_cap = g_flares.vbo.id && g_flares.cbo.id && g_flares.nbo.id && g_flares.ibo.id ? cap : 0;
+    return g_flare_cap >= count;
+}
+
 int render_district_lights(const RProg *r, GpuMesh *quad, RhiTexture texture,
                            const N2LightSrc *lights, int nlights,
                            const float cam[3], const float look[3],
@@ -79,6 +110,17 @@ int render_district_lights(const RProg *r, GpuMesh *quad, RhiTexture texture,
     ug2_vec3(rp.p->uFogColor, 0.0f, 0.0f, 0.0f);
     rhi_cmd_bind_texture(0,texture);
     float maxd2 = viewdist * viewdist;
+    int batched = flare_mesh_reserve(nlights);
+    static float *vertex; static unsigned char *colour; static int stash;
+    if (batched && stash < nlights) {
+        float *v = (float *)realloc(vertex, (size_t)nlights * 4 * 5 * sizeof(float));
+        unsigned char *c = (unsigned char *)realloc(colour, (size_t)nlights * 4 * 4);
+        if (v) vertex = v;
+        if (c) colour = c;
+        batched = v && c;
+        if (batched) stash = nlights;
+    }
+    float saved_vcolor = rp.p->uVColor;
     for (int i = 0; i < nlights; i++) {
         const N2LightSrc *light = &lights[i];
         float dx = light->pos[0]-cam[0], dy = light->pos[1]-cam[1],
@@ -110,6 +152,26 @@ int render_district_lights(const RProg *r, GpuMesh *quad, RhiTexture texture,
             light->pos[1]+oy-(rt[1]+up[1])*s*0.5f,
             light->pos[2]+oz-(rt[2]+up[2])*s*0.5f,1
         };
+        float rgb[3] = { (float)( light->rgba        & 0xffu) / 255.0f,
+                         (float)((light->rgba >> 8)  & 0xffu) / 255.0f,
+                         (float)((light->rgba >> 16) & 0xffu) / 255.0f };
+        float strength = (float)((light->rgba >> 24) & 0xffu) / 255.0f * gain * fade;
+        if (strength > 1.0f) strength = 1.0f;
+        if (batched) {
+            if (strength <= 0.002f) continue;
+            static const float corner[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+            for (int k = 0; k < 4; k++) {
+                float *p = vertex + (draws * 4 + k) * 5;
+                for (int a = 0; a < 3; a++)
+                    p[a] = M[12+a] + M[a]*corner[k][0] + M[4+a]*corner[k][1];
+                p[3] = corner[k][0]; p[4] = corner[k][1];
+                unsigned char *c = colour + (draws * 4 + k) * 4;
+                for (int a = 0; a < 3; a++) c[a] = (unsigned char)(rgb[a] * 255.0f + .5f);
+                c[3] = (unsigned char)(strength * 255.0f + .5f);
+            }
+            draws++;
+            continue;
+        }
         float LMVP[16]; mat_mul(MVP, M, LMVP);
         ug2_copy(rp.p->uMVP, LMVP, 16);
         ug2_vec3(rp.p->uColor, (float)( light->rgba        & 0xffu) / 255.0f, (float)((light->rgba >> 8)  & 0xffu) / 255.0f, (float)((light->rgba >> 16) & 0xffu) / 255.0f);
@@ -119,6 +181,17 @@ int render_district_lights(const RProg *r, GpuMesh *quad, RhiTexture texture,
         rp.p->uAlpha = a;
         render_draw_gpumesh(quad); draws++;
     }
+    if (batched && draws > 0) {
+        rhi_buffer_replace(g_flares.vbo, (size_t)draws * 4 * 5 * sizeof(float), vertex);
+        rhi_buffer_replace(g_flares.cbo, (size_t)draws * 4 * 4, colour);
+        g_flares.nidx = draws * 6;
+        render_model(&rp, NULL);
+        ug2_copy(rp.p->uMVP, MVP, 16);
+        ug2_vec3(rp.p->uColor, 1.0f, 1.0f, 1.0f);
+        rp.p->uAlpha = 1.0f; rp.p->uVColor = 3.0f;
+        render_draw_gpumesh(&g_flares);
+    }
+    rp.p->uVColor = saved_vcolor;
     for (int i=0; i<5; i++) *scalar_loc[i] = scalars[i];
     ug2_copy(rp.p->uColor, color, 3);
     ug2_copy(rp.p->uFogColor, fog_color, 3);

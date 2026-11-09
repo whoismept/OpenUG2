@@ -169,8 +169,10 @@ void main(){
   }
   if(u.uEmissiveTex>0.5){
     vec4 t=texture(uTex,vUV);
-    float a=t.a*u.uAlpha; if(a<0.02) discard;
-    oColor=vec4(mix(u.uFogColor,t.rgb*u.uColor,fog),a); return;
+    /* uVColor 3: batched flares carry their own colour and strength per vertex */
+    vec4 tint=u.uVColor>2.5?vColor:vec4(1.0);
+    float a=t.a*u.uAlpha*tint.a; if(a<0.02) discard;
+    oColor=vec4(mix(u.uFogColor,t.rgb*u.uColor*tint.rgb,fog),a); return;
   }
   if(u.uUnlit>0.5){ float a=u.uAlpha;
 /* Shadow footprints need a filled rounded rectangle; lamp/neon sprites
