@@ -954,7 +954,10 @@ static contacts and race-generated closure barriers must be logged separately.
 Generated race-corridor closures are approximate 18 m visual guides inferred
 from navigation links. Their dedicated collision/push has been removed: these
 estimates must not create additional walls across a drivable race course.
-Authored scenery barriers, walls and vehicle contacts remain physical.
+Authored scenery barriers, walls and vehicle contacts remain physical. The
+guides are drawn only for an event without its own `BARRIERS_<id>` group; every
+shipped event has one, and the guides otherwise added an invented glowing fence,
+for example across the 4311 drift stadium.
 
 ## 10. Racing, navigation and AI
 

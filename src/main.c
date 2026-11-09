@@ -2229,6 +2229,26 @@ static void city_map_apply(Hud *hud, const N2Scene *scene, const WorldCity *city
     if (!strcmp(track, "STREAML4RA")) hud_request_city_map(hud);
 }
 
+/* Does the event author its own BARRIERS_<id> group? Every shipped event does,
+ * and those placements are real scenery; the inferred closure guides then only
+ * drew a second, invented fence across courses such as the 4311 stadium. */
+static int event_has_authored_barriers(const char *troot, const char *track, int event) {
+    static char cached_track[64]; static int cached_event = -1, cached = 0;
+    if (event == cached_event && !strcmp(track, cached_track)) return cached;
+    snprintf(cached_track, sizeof cached_track, "%s", track);
+    cached_event = event; cached = 0;
+    const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%.*s.BUN", troot,
+             (int)(strstr(stem, ".BUN") ? strstr(stem, ".BUN") - stem : (long)strlen(stem)), stem);
+    long len = 0;
+    unsigned char *data = n2_read_file(path, &len);
+    WGTable table;
+    if (data && wg_open_file(data, (size_t)len, &table)) cached = wg_event_group_present(&table, event);
+    free(data);
+    return cached;
+}
+
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
 static PauseMenu *pause_menu_build(const char *dataroot, StGraphics *gfx, StGfxCaps *caps, StRegStore *store, int *store_open) {
     PauseMenu *pm = pause_menu_create(dataroot);
@@ -9655,7 +9675,9 @@ int main(int argc, char **argv) {
         /* Inferred route closures are visual guides only. Their approximate
            positions/widths must not create collision across the real course.
            Authored meshes still use the ordinary body collision solver. */
-        if (world.city.mode == MODE_RACE_EVENT && world.city.nbar > 0 && race_state != 3) {
+        if (world.city.mode == MODE_RACE_EVENT && world.city.nbar > 0 && race_state != 3 &&
+            !(world.city.active_ev >= 0 && world.city.active_ev < world.city.nev &&
+              event_has_authored_barriers(troot, trackname, world.city.ev[world.city.active_ev].id))) {
             rhi_cmd_bind_pipeline(cpipe.halo);   /* additive, depth tested, no write */
             rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 0.0f;
             ug2_vec3(rp.p->uColor, 1.0f, 0.10f, 0.03f); rp.p->uAlpha = 0.78f;
