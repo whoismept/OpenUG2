@@ -107,9 +107,6 @@ endif
 # DIAGNOSTIC BRANCH ONLY. The fixed sandbox collector invokes nfsu2 --shot.
 # Adapt that invocation to the original UI_Main.fng viewer for this capture.
 # Both output slots are menu frames, not gameplay regressions. DO NOT MERGE.
-# The CLI test builds debug into the same path; reinstall this adapter when
-# the later resolution test requests nfsu2, before scene collection starts.
-.PHONY: $(GAME)
 $(GAME): build/ugui_demo tools/sandbox_frontend_capture.py
 	cp tools/sandbox_frontend_capture.py $(GAME)
 	chmod +x $(GAME)
