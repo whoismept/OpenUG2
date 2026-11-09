@@ -1604,6 +1604,22 @@ target, and an unreachable destination leaves the route empty so nothing is
 drawn. `make hud-test` covers the angle wrap, the map round-trip, aspect
 invariance, the sprint/lap rule, money visibility and the art gate.
 
+### Original-style lighting
+
+Level Of Detail 1 and 2 light the car in the original game's manner, which the
+retail executable names `worldheadlight.efx` with `HeadlightTex`, `HeadlightClipTex`
+and `HeadlightWVP`: the additive pool texture `2PLAYERHEADLIGHT1` (GLOBALB, key
+`0x45374719`) is laid on the road ahead instead of the per-pixel beams, and beam
+shadows are off. `--lighting original|modern` overrides the setting. Higher levels
+are unchanged.
+
+The pool is one shared-vertex grid of `RENDER_POOL_ROWS` x `RENDER_POOL_COLS`
+quads whose corners take the road height, drawn in one call with the car halo
+pipeline. Redrawing the nearby world batches instead looked the same but cost
+more than the beams on dense city blocks. On an Intel HD 520 at 1080p the pool
+saves 0.7 ms of GPU time in the city and 1.35 ms in a three-car race. Its size,
+offset and the absent clip texture are guesses from the pool texture's shape.
+
 ### Baked city map
 
 The 500 m minimap window shows only 45 texels of the retail image, which is

@@ -811,6 +811,76 @@ void render_headlights(const RProg *r, const float model[16], const float anchor
     r->p->uHeadShadow = 0.0f; /* maps must be refreshed for this pose */
 }
 
+/* Low-detail headlights in the original game's manner: the pool texture laid on
+ * the road ahead of the car, additive. The caller samples the road height at the
+ * grid corners from render_headlight_pool_frame, so the pool follows slopes while
+ * only its own pixels are shaded; redrawing the nearby world cost more than the
+ * per-pixel beams on dense city blocks. Pool size and offset are guessed from the
+ * texture's shape. */
+void render_headlight_pool_frame(const float model[16],int high,float origin[3],
+                                 float fwd[3],float right[3],float size[2]) {
+    fwd[0]=model[0];fwd[1]=model[1];fwd[2]=0;right[0]=model[4];right[1]=model[5];right[2]=0;
+    float lf=sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]),lr=sqrtf(right[0]*right[0]+right[1]*right[1]);
+    for(int i=0;i<2;i++){fwd[i]/=lf>1e-4f?lf:1;right[i]/=lr>1e-4f?lr:1;}
+    const float lead=1.6f;
+    size[0]=high?36.0f:26.0f;size[1]=high?20.0f:18.0f;
+    origin[0]=model[12]+fwd[0]*lead;origin[1]=model[13]+fwd[1]*lead;origin[2]=model[14];
+}
+
+int render_headlight_pool(const RProg *r,const float model[16],const float mvp[16],
+                          RhiTexture texture,float gain,int high,const float *corners) {
+    enum { W = RENDER_POOL_COLS + 1, NV = (RENDER_POOL_ROWS + 1) * W,
+           NI = RENDER_POOL_ROWS * RENDER_POOL_COLS * 6 };
+    static GpuMesh mesh;   /* one shared grid: no overlap, so additive light never doubles */
+    if(!texture.id || gain<=0.0f || !corners)return 0;
+    if(!mesh.vbo.id) {
+        float normals[NV*3];uint16_t index[NI];int n=0;
+        for(int v=0;v<NV;v++){normals[v*3]=0;normals[v*3+1]=0;normals[v*3+2]=1;}
+        for(int a=0;a<RENDER_POOL_ROWS;a++)
+            for(int b=0;b<RENDER_POOL_COLS;b++) {
+                uint16_t p=(uint16_t)(a*W+b),f=(uint16_t)(p+W);
+                /* right before forward so the grid faces up through culling */
+                index[n++]=p;index[n++]=(uint16_t)(p+1);index[n++]=(uint16_t)(f+1);
+                index[n++]=p;index[n++]=(uint16_t)(f+1);index[n++]=f;
+            }
+        mesh.vbo=rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX,RHI_UPDATE_STREAM,NV*5*sizeof(float),NULL});
+        mesh.nbo=rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_VERTEX,RHI_UPDATE_STATIC,sizeof normals,normals});
+        mesh.ibo=rhi_buffer_create(&(RhiBufferDesc){RHI_BUFFER_INDEX,RHI_UPDATE_STATIC,sizeof index,index});
+        mesh.nidx=NI;
+        if(!mesh.vbo.id || !mesh.nbo.id || !mesh.ibo.id)return 0;
+    }
+    float vertex[NV*5];
+    for(int v=0;v<NV;v++){
+        vertex[v*5]=corners[v*3];vertex[v*5+1]=corners[v*3+1];vertex[v*5+2]=corners[v*3+2];
+        vertex[v*5+3]=vertex[v*5+4]=0;
+    }
+    rhi_buffer_replace(mesh.vbo,sizeof vertex,vertex);
+    float origin[3],fwd[3],right[3],size[2];
+    render_headlight_pool_frame(model,high,origin,fwd,right,size);
+    float saved_head[2][4],saved_shape[4],saved_fwd[3],saved_right[3],saved_color[3];
+    ug2_copy(saved_head[0],r->p->uHeadPos[0],8);ug2_copy(saved_shape,r->p->uHeadShape,4);
+    ug2_copy(saved_fwd,r->p->uHeadForward,3);ug2_copy(saved_right,r->p->uHeadRight,3);
+    ug2_copy(saved_color,r->p->uColor,3);
+    RhiStateSnapshot saved;rhi_cmd_save_state(&saved);
+    /* GpuMesh vertex layout: the car halo pipeline, additive, depth tested, no write */
+    rhi_cmd_bind_pipeline(pipelines_of(r)->car.halo);
+    render_model(r,NULL);ug2_copy(r->p->uMVP,mvp,16);
+    float head[4]={origin[0],origin[1],origin[2],0};
+    ug2_copy(r->p->uHeadPos[0],head,4);
+    ug2_copy(r->p->uHeadForward,fwd,3);ug2_copy(r->p->uHeadRight,right,3);
+    ug2_vec4(r->p->uHeadShape,size[0],size[1],RENDER_POOL_BAND,0.0f);
+    ug2_vec3(r->p->uColor,gain,gain*.94f,gain*.82f);
+    r->p->uVista=3.0f;r->p->uUseTex=1.0f;r->p->uAlpha=1.0f;r->p->uHeadGain=0.0f;
+    rhi_cmd_bind_texture(0,texture);
+    render_draw_gpumesh(&mesh);
+    r->p->uVista=0.0f;
+    ug2_copy(r->p->uHeadPos[0],saved_head[0],8);ug2_copy(r->p->uHeadShape,saved_shape,4);
+    ug2_copy(r->p->uHeadForward,saved_fwd,3);ug2_copy(r->p->uHeadRight,saved_right,3);
+    ug2_copy(r->p->uColor,saved_color,3);
+    rhi_cmd_restore_state(&saved);
+    return 1;
+}
+
 void render_tail_lamp(const RProg *r,RhiTexture texture,int running,int braking,
                       int boost,float gain) {
     int on=running || braking,hot=braking || boost;

@@ -145,6 +145,15 @@ void main(){
    doubled, alpha NOT doubled, no lighting/tint/alpha test, world fog on the
    colour only. Vertex bytes are RGB 128 and alpha 0..127, so out.rgb is the
    texel colour x 256/255 and out.a = texel alpha x vertexAlpha/255. */
+/* Original-style headlight (low detail); mirrors the GL shader. */
+  if(u.uVista>2.5){
+    vec3 d=vPos-u.uHeadPos[0].xyz;
+    float f=dot(d,u.uHeadForward)/u.uHeadShape.x, s=dot(d,u.uHeadRight)/u.uHeadShape.y+0.5;
+    if(f<0.0||f>1.0||s<0.0||s>1.0||abs(d.z)>u.uHeadShape.z)discard;
+    float facing=smoothstep(0.35,0.8,normalize(vN).z);
+    oColor=vec4(texture(uTex,vec2(f,s)).rgb*u.uColor*facing*fog,1.0);
+    return;
+  }
   if(u.uVista>1.5){
     vec4 t = texture(uTex, vUV);
     oColor = vec4(mix(u.uFogColor, clamp(2.0*t.rgb*vColor.rgb, 0.0, 1.0), fog), t.a*vColor.a);

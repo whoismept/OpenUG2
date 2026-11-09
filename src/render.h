@@ -103,6 +103,17 @@ typedef struct {
 int render_headlight_shadows(const RProg *r, HeadlightShadows *s, const N2Batch *batches, int count);
 void free_headlight_shadows(HeadlightShadows *s);
 
+/* Original-style headlight pool: a ROWS x COLS grid laid on the road. corners
+ * holds (ROWS+1)*(COLS+1) world points, row-major from the near edge, sampled at
+ * origin + fwd*size[0]*row/ROWS + right*size[1]*(col/COLS - 0.5). */
+#define RENDER_POOL_ROWS 12
+#define RENDER_POOL_COLS 8
+#define RENDER_POOL_BAND 3.0f
+#define RENDER_POOL_LIFT 0.08f
+void render_headlight_pool_frame(const float model[16], int high, float origin[3],
+                                 float fwd[3], float right[3], float size[2]);
+int render_headlight_pool(const RProg *r, const float model[16], const float mvp[16],
+                          RhiTexture texture, float gain, int high, const float *corners);
 void render_headlights(const RProg *r, const float model[16], const float anchors[4][4],
                        int high, float pitch, float range, float gain);
 

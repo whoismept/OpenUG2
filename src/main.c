@@ -2249,6 +2249,16 @@ static int event_has_authored_barriers(const char *troot, const char *track, int
     return cached;
 }
 
+/* Level Of Detail 1-2 switch the lights to the original game's manner: projected
+ * headlight pool, no per-pixel beams or beam shadows. 0 means no saved setting. */
+static int lighting_original_from_store(void) {
+    StRegStore store; StGraphics gfx;
+    st_gfx_defaults(&gfx);
+    if (st_reg_open_default(&store) == ST_OK) { st_gfx_load(&store, &gfx); st_reg_close(&store); }
+    int level = gfx.v[ST_GFX_PERF_LEVEL];
+    return level >= 1 && level <= 2;
+}
+
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
 static PauseMenu *pause_menu_build(const char *dataroot, StGraphics *gfx, StGfxCaps *caps, StRegStore *store, int *store_open) {
     PauseMenu *pm = pause_menu_create(dataroot);
@@ -2317,6 +2327,8 @@ int main(int argc, char **argv) {
          --map-detail N   city minimap size: 512 (retail), 1024, 2048 or 4096;
                           overrides the Level Of Detail setting
          --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
+         --lighting MODE  original (projected headlight pool, as the original
+                          game) or modern; default follows Level Of Detail 1-2
          --hud-mph        enable the player HUD with imperial speed units
          --hud-fitted L   which parts the HUD treats as fitted: nos,turbo | none
          --hud-fit P      widescreen HUD fitment, a project policy (not original
@@ -2457,6 +2469,7 @@ int main(int argc, char **argv) {
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int map_detail_opt = -1; /* --map-detail: 512 (retail), 1024, 2048 or 4096 */
     int map_cache_opt = 1;   /* --no-map-cache: bake every run */
+    int lighting_opt = -1;   /* --lighting original|modern; -1 follows Level Of Detail */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
     int shotframes_set = 0;
     int pause_shot = 0, pause_reference=0;
@@ -2741,6 +2754,12 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--hud-preview")) { hud_opt = 1; hud_preview_opt = 1; }
         else if (!strcmp(argv[i], "--no-map-cache")) map_cache_opt = 0;
+        else if (!strcmp(argv[i], "--lighting")) {
+            const char *mode = i+1 < argc ? argv[++i] : "";
+            if (!strcmp(mode, "original")) lighting_opt = 1;
+            else if (!strcmp(mode, "modern")) lighting_opt = 0;
+            else { fprintf(stderr, "--lighting requires original or modern\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--map-detail")) {
             int value = i+1 < argc ? atoi(argv[++i]) : 0;
             if (value != 512 && value != 1024 && value != 2048 && value != 4096) {
@@ -4032,6 +4051,7 @@ int main(int argc, char **argv) {
     render_car_pipelines(&rp, &cpipe);
     const UG2OverlayPipelines *ovp = render_overlay_pipelines(&rp);   /* HUD, menu, nitro */
     HeadlightShadows headlight_shadows = {0};
+    RhiTexture headlight_pool_tex = {0};   /* 2PLAYERHEADLIGHT1, original-style lights */
     RhiBuffer rain_vbo = {0};
     RhiBuffer wall_debug_vbo = {0};
     RoadReflections road_reflections = {0};
@@ -4806,6 +4826,14 @@ int main(int argc, char **argv) {
         long globlen=0; unsigned char *globdata=load_global_car_data(dataroot,&globlen);
         N2Tpk globaltpk = globdata ? n2_tpk_open(globdata, globlen) : (N2Tpk){0};
         if(globdata)nck+=n2_tpk_keys(globdata,globaltpk,ckeys+nck,2048-nck);
+        if(globdata && !headlight_pool_tex.id) {
+            N2Tex pool;
+            if(n2_tpk_decode(globdata,globlen,globaltpk,0x45374719u,&pool)) {
+                headlight_pool_tex=upload_tex(&pool);
+                render_texture_clamp_edges(headlight_pool_tex);
+                free(pool.rgb);free(pool.alpha);free(pool.dxt);
+            }
+        }
         nkit_ids = n2_car_variant_numbers(cdata, clen, 1, kit_ids,
                                           (int)(sizeof kit_ids / sizeof kit_ids[0]));
         /* KIT00 is the stock anchor and is implicit even when the archive only
@@ -4881,10 +4909,12 @@ int main(int argc, char **argv) {
                     fprintf(stderr,"--drivetrain: no valid stock Stage-1/2/3/4/5 tuning for %s\n",carname);
                     return 2;
                 }
-                tm_car_read(globdata,globlen,carname,g_tm_width);   /* TM-1.1; keeps defaults if absent */
-                printf("Stage-1/2/3/4/5 drivetrain enabled; W forward, S brake/reverse, Space handbrake.\n"
-                       "  Geometric spring/aligned loads, frame handbrake/grip; full dynamic body momentum and orientation.\n"
-                       "  Independent host policy: c=1 p=1, session status from ordinary host lifecycle, surface ID from the hit collision polygon attribute (identity 0..28, fixed fallback 1), q=1 X/event=0, G=1 reduction=0, initial locks=0; bottom impulses enabled. Drag/drift use legacy.\n");
+                {
+                    tm_car_read(globdata,globlen,carname,g_tm_width);   /* TM-1.1; keeps defaults if absent */
+                    printf("Stage-1/2/3/4/5 drivetrain enabled; W forward, S brake/reverse, Space handbrake.\n"
+                           "  Geometric spring/aligned loads, frame handbrake/grip; full dynamic body momentum and orientation.\n"
+                           "  Independent host policy: c=1 p=1, session status from ordinary host lifecycle, surface ID from the hit collision polygon attribute (identity 0..28, fixed fallback 1), q=1 X/event=0, G=1 reduction=0, initial locks=0; bottom impulses enabled. Drag/drift use legacy.\n");
+                }
             }
             g_vehicle_source_valid=physics_from_global;
             if(physics_from_global)g_vehicle_source=pa;
@@ -6299,6 +6329,7 @@ int main(int argc, char **argv) {
        dataroot; a missing pack is reported, not fatal. */
     Hud *hud = NULL;
     int city_map_size = 0;
+    int lighting_original_level = lighting_original_from_store();
     /* Last frame's HUD state. The minimap pick must invert the SAME transform
        the player clicked on, so it reads the state that was actually drawn
        rather than re-deriving one from a half-updated frame. */
@@ -9318,12 +9349,14 @@ int main(int argc, char **argv) {
         mat_car(render_player.pos,render_player.head,body_up,car_body_ride,lamp_model);
         if(render_dynamic_body){memcpy(body_up,dynamic_render.axes.up,sizeof body_up);drive_presentation_model(&dynamic_render,car_body_ride-car_ride,lamp_model);}
         int long_beam=beam_high || beam_flash;
+        float beam_gain = ncar && !follow_roam_ai && race_state!=3 && g_dbg.show_lights && headlights_on
+                          ? g_dbg.headlight_gain*light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT]) : 0.0f;
+        int original_lights = lighting_opt >= 0 ? lighting_opt : lighting_original_level;
         render_headlights(&rp,lamp_model,bloomc,long_beam,
                           long_beam?g_dbg.high_beam_pitch:g_dbg.low_beam_pitch,
                           long_beam?g_dbg.high_beam_range:g_dbg.low_beam_range,
-                          ncar && !follow_roam_ai && race_state!=3 && g_dbg.show_lights && headlights_on
-                          ? g_dbg.headlight_gain*light_variant_gain(carcfg.parts[N2_PART_HEADLIGHT]) : 0.0f);
-        g_dbg.headlight_shadow_draws = g_dbg.headlight_shadows
+                          original_lights ? 0.0f : beam_gain);
+        g_dbg.headlight_shadow_draws = g_dbg.headlight_shadows && !original_lights
             ? render_headlight_shadows(&rp,&headlight_shadows,wbatch,nbatch) : 0;
 
         /* M132-R: ONE reset for the whole frame, before any pass. The old reset
@@ -9670,6 +9703,20 @@ int main(int argc, char **argv) {
             ndrawn += nbatch; g_dbg.drawn += nbatch; wbdrawn += nbatch;
         }
 
+        if (original_lights && beam_gain > 0 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
+            float origin[3], fwd[3], right[3], size[2];
+            float corners[(RENDER_POOL_ROWS+1)*(RENDER_POOL_COLS+1)*3];
+            render_headlight_pool_frame(lamp_model, long_beam, origin, fwd, right, size);
+            for (int a = 0; a <= RENDER_POOL_ROWS; a++)
+                for (int b = 0; b <= RENDER_POOL_COLS; b++) {
+                    float *c = corners + (a*(RENDER_POOL_COLS+1)+b)*3;
+                    float f = size[0]*a/RENDER_POOL_ROWS, s = size[1]*((float)b/RENDER_POOL_COLS-0.5f);
+                    c[0] = origin[0]+fwd[0]*f+right[0]*s; c[1] = origin[1]+fwd[1]*f+right[1]*s;
+                    c[2] = world_ground_z(&scene, c[0], c[1], origin[2]) + RENDER_POOL_LIFT;
+                }
+            g_dbg.drawn += render_headlight_pool(&rp, lamp_model, MVP, headlight_pool_tex,
+                                                 beam_gain, long_beam, corners);
+        }
         rp.p->uHeadGain = 0.0f; /* player beams illuminate the world; vehicle receivers are separate work */
 
         /* Inferred route closures are visual guides only. Their approximate

@@ -117,6 +117,19 @@ void main(){
    doubled, alpha NOT doubled, no lighting/tint/alpha test, world fog on the
    colour only. Vertex bytes are RGB 128 and alpha 0..127, so out.rgb is the
    texel colour x 256/255 and out.a = texel alpha x vertexAlpha/255. */
+/* Original-style headlight (low detail): the pool texture is projected down onto
+   the road ahead of the car, as the retail worldheadlight effect does, instead
+   of the per-pixel beams below. uHeadPos[0] is the pool's near edge on the
+   ground, uHeadForward/uHeadRight its axes, uHeadShape length, width and the
+   height band it may touch. Additive, so it fades to black with fog. */
+  if(uVista>2.5){
+    vec3 d=vPos-uHeadPos[0].xyz;
+    float f=dot(d,uHeadForward)/uHeadShape.x, s=dot(d,uHeadRight)/uHeadShape.y+0.5;
+    if(f<0.0||f>1.0||s<0.0||s>1.0||abs(d.z)>uHeadShape.z)discard;
+    float facing=smoothstep(0.35,0.8,normalize(vN).z);
+    gl_FragColor=vec4(texture2D(uTex,vec2(f,s)).rgb*uColor*facing*fog,1.0);
+    return;
+  }
   if(uVista>1.5){
     vec4 t = texture2D(uTex, vUV);
     gl_FragColor = vec4(mix(uFogColor, clamp(2.0*t.rgb*vColor.rgb, 0.0, 1.0), fog), t.a*vColor.a);
