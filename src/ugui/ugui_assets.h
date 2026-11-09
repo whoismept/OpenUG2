@@ -25,7 +25,7 @@ typedef struct UgAssets {
     UgAssetPackage *pk; int npk, pk_cap;
     UgFace *face; int nface, face_cap;
     UgStrTab strings;
-    int have_strings;
+    int have_strings;        /* nonempty table from the requested LANGUAGES file */
     int main_face;            /* index of the main UI font in face[] or -1 */
     int n_global_tex, n_front_tex;
     char log[1024];           /* human-readable summary / warnings */

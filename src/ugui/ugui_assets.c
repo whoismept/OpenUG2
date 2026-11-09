@@ -101,7 +101,7 @@ static int load_first(UgAssets *a, const char *const *cands, int ncand, const ch
     return 0;
 }
 
-typedef struct { UgAssets *a; int file; } WalkCtx;
+typedef struct { UgAssets *a; int file; int language_file; } WalkCtx;
 
 static int add_package(UgAssets *a, UgPackageBlob *b, int file) {
     for (int i = 0; i < a->npk; i++)
@@ -159,9 +159,14 @@ static int visit(void *u, const UgChunkRef *c) {
         return 1;
     }
     case UG_CHUNK_STRINGS:
-        if (!a->have_strings) {
-            if (ug_strtab_load(&a->strings, c->hdr, (size_t)(c->payload - c->hdr) + c->size, err, sizeof err))
-                a->have_strings = 1;
+        /* Shared bundles may contain unrelated or empty tables. Only the
+         * requested LANGUAGES file supplies the UI's localized labels. */
+        if (w->language_file && !a->have_strings) {
+            if (ug_strtab_load(&a->strings, c->hdr, (size_t)(c->payload - c->hdr) + c->size, err, sizeof err)) {
+                a->have_strings = a->strings.n > 0;
+                if (!a->have_strings)
+                    logf_(a, "warning: empty language table in %s\n", a->file_names[w->file], 0);
+            }
             else logf_(a, "warning: string table: %s\n", err, 0);
         }
         return 1;
@@ -169,10 +174,10 @@ static int visit(void *u, const UgChunkRef *c) {
     }
 }
 
-static void walk_file(UgAssets *a, UgBuf *b, const char *name) {
+static void walk_file(UgAssets *a, UgBuf *b, const char *name, int language_file) {
     int fi = add_file(a, name, b);
     if (fi < 0) return;
-    WalkCtx w = {a, fi};
+    WalkCtx w = {a, fi, language_file};
     char err[160];
     if (!ug_chunks_walk(a->files[fi].data, a->files[fi].len, visit, &w, err, sizeof err))
         logf_(a, "warning: bundle walk stopped early: %s\n", err, 0);
@@ -198,21 +203,22 @@ static int assets_open(UgAssets *a, const char *dir, const char *language, char 
     static const char *GLOBAL_B[] = {"GLOBAL/GLOBALB.LZC.bacc", "GLOBAL/GlobalB.lzc", "GLOBAL/GLOBALB.BUN"};
     static const char *FRONT_B[] = {"FRONTEND/FRONTB.LZC.bacc", "FRONTEND/FrontB.lzc"};
     static const char *GLOBAL_A[] = {"GLOBAL/GLOBALA.BUN.bacc", "GLOBAL/GLOBALA.BUN"};
-    if (load_first(a, FRONT_B, 2, "FRONTEND/FrontB.lzc", &b, used, sizeof used)) walk_file(a, &b, used);
-    if (load_first(a, GLOBAL_B, 3, "GLOBAL/GlobalB.lzc", &b, used, sizeof used)) walk_file(a, &b, used);
-    if (load_first(a, GLOBAL_A, 2, "GLOBAL/GLOBALA.BUN", &b, used, sizeof used)) walk_file(a, &b, used);
+    if (load_first(a, FRONT_B, 2, "FRONTEND/FrontB.lzc", &b, used, sizeof used)) walk_file(a, &b, used, 0);
+    if (load_first(a, GLOBAL_B, 3, "GLOBAL/GlobalB.lzc", &b, used, sizeof used)) walk_file(a, &b, used, 0);
+    if (load_first(a, GLOBAL_A, 2, "GLOBAL/GLOBALA.BUN", &b, used, sizeof used)) walk_file(a, &b, used, 0);
 
     snprintf(rel, sizeof rel, "LANGUAGES/%s.bin", a->language);
     char rel2[110];
     snprintf(rel2, sizeof rel2, "%s.bacc", rel);
     const char *LANG[] = {rel2, rel};
-    if (load_first(a, LANG, 2, rel, &b, used, sizeof used)) walk_file(a, &b, used);
+    if (load_first(a, LANG, 2, rel, &b, used, sizeof used)) walk_file(a, &b, used, 1);
+    if (!a->have_strings) logf_(a, "warning: requested language table unavailable: %s\n", rel, 0);
     static const char *LT[] = {"LANGUAGES/LanguageTextures.bin"};
-    if (load_first(a, LT, 1, "LANGUAGES/LanguageTextures.bin", &b, used, sizeof used)) walk_file(a, &b, used);
+    if (load_first(a, LT, 1, "LANGUAGES/LanguageTextures.bin", &b, used, sizeof used)) walk_file(a, &b, used, 0);
 
     if (ingame) {
         static const char *COMMON[] = {"GLOBAL/InGameCommon.lzc", "GLOBAL/InGameCommon.bun"};
-        if (load_first(a, COMMON, 2, "GLOBAL/InGameCommon", &b, used, sizeof used)) walk_file(a, &b, used);
+        if (load_first(a, COMMON, 2, "GLOBAL/InGameCommon", &b, used, sizeof used)) walk_file(a, &b, used, 0);
     }
 
     ug_texlib_index(&a->tex);

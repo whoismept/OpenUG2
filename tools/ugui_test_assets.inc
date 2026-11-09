@@ -507,6 +507,82 @@ static void test_assets_synthetic_install(void) {
     syn_install_remove(&si);
 }
 
+/* Language labels come from the requested LANGUAGES file, not a table that
+ * happened to appear earlier in a frontend/global bundle. Fixtures are derived
+ * only from the approved synthetic string-table/font vectors above. */
+static int change_synthetic_ok(uint8_t *bytes, size_t size, const char text[3]) {
+    for (size_t i = 0; i + 3 <= size; i++)
+        if (!memcmp(bytes + i, "OK\0", 3)) { memcpy(bytes + i, text, 3); return 1; }
+    return 0;
+}
+
+static void test_assets_selected_language_source(void) {
+    SynInstall si;
+    syn_install_make(&si);
+    CHECK(si.ok);
+    if (!si.ok) return;
+    size_t sl, fl;
+    uint8_t *strings = read_hex("string_table.hex", &sl);
+    uint8_t *font = read_hex("font_chunk.hex", &fl);
+    CHECK(strings && font);
+    if (!strings || !font) { free(strings); free(font); syn_install_remove(&si); return; }
+    uint8_t *shared = malloc(sl), *selected = malloc(sl);
+    CHECK(shared && selected);
+    if (!shared || !selected) { free(shared); free(selected); free(strings); free(font); syn_install_remove(&si); return; }
+    memcpy(shared, strings, sl);
+    CHECK(change_synthetic_ok(shared, sl, "XX"));
+    for (int empty = 0; empty < 2; empty++) {
+        if (empty) memset(shared + 12, 0, 4); /* valid zero-entry synthetic table */
+        CHECK(write_file(si.dir, "global/GLOBALA.BUN", font, fl, shared, sl));
+        UgAssets a; char msg[256];
+        CHECK(ug_assets_open(&a, si.dir, NULL, msg, sizeof msg));
+        const char *text = ug_strtab_get(&a.strings, ug_hash_upper("COMMON_OK"));
+        CHECK_MSG(a.have_strings && a.strings.n == 4 && text && !strcmp(text, "OK"), "%s", msg);
+        ug_assets_close(&a);
+    }
+    memcpy(shared + 12, strings + 12, 4); /* restore nonempty unrelated table */
+    CHECK(write_file(si.dir, "global/GLOBALA.BUN", font, fl, shared, sl));
+    memcpy(selected, strings, sl);
+    CHECK(change_synthetic_ok(selected, sl, "FR"));
+    CHECK(write_file(si.dir, "LANGUAGES/French.bin", selected, sl, NULL, 0));
+    UgAssets a; char msg[256];
+    CHECK(ug_assets_open(&a, si.dir, "French", msg, sizeof msg));
+    const char *text = ug_strtab_get(&a.strings, ug_hash_upper("COMMON_OK"));
+    CHECK(a.have_strings && text && !strcmp(text, "FR"));
+    ug_assets_close(&a);
+    char path[600];
+    snprintf(path, sizeof path, "%s/LANGUAGES/French.bin", si.dir);
+    CHECK(!remove(path));
+    CHECK(ug_assets_open(&a, si.dir, "French", msg, sizeof msg));
+    CHECK(!a.have_strings && a.strings.n == 0);
+    CHECK(strstr(a.log, "requested language table unavailable") != NULL);
+    ug_assets_close(&a);
+    CHECK(write_file(si.dir, "global/InGameCommon.bun", shared, sl, NULL, 0));
+    CHECK(ug_assets_open_ingame(&a, si.dir, "French", msg, sizeof msg));
+    CHECK(!a.have_strings && a.strings.n == 0);
+    ug_assets_close(&a);
+    char common_path[600];
+    snprintf(common_path, sizeof common_path, "%s/global/InGameCommon.bun", si.dir);
+    CHECK(!remove(common_path));
+    /* A malformed selected table must not silently use the unrelated one. */
+    selected[8] = 0;
+    CHECK(write_file(si.dir, "LANGUAGES/French.bin", selected, sl, NULL, 0));
+    CHECK(ug_assets_open(&a, si.dir, "French", msg, sizeof msg));
+    CHECK(!a.have_strings && a.strings.n == 0);
+    CHECK(strstr(a.log, "bad header size") != NULL);
+    ug_assets_close(&a);
+    CHECK(!remove(path));
+    /* Empty chunks inside the requested file must not hide a later table. */
+    memcpy(selected, strings, sl); memset(selected + 12, 0, 4);
+    CHECK(write_file(si.dir, "LANGUAGES/english.BIN", selected, sl, strings, sl));
+    CHECK(ug_assets_open(&a, si.dir, NULL, msg, sizeof msg));
+    text = ug_strtab_get(&a.strings, ug_hash_upper("COMMON_OK"));
+    CHECK(a.have_strings && text && !strcmp(text, "OK"));
+    ug_assets_close(&a);
+    free(shared); free(selected); free(strings); free(font);
+    syn_install_remove(&si);
+}
+
 /* image resources resolve to textures, negative sizes mirror, text uses the face quads (SPEC 1.2, 15.9, 16.5) */
 static int count_mode(const UgCanvas *cv, int mode, int tex) {
     int n = 0;
@@ -647,6 +723,7 @@ static void run_asset_tests(void) {
     RUN(test_font_chunk_and_layout);
     RUN(test_face_text_metrics);
     RUN(test_assets_synthetic_install);
+    RUN(test_assets_selected_language_source);
     RUN(test_scene_with_assets);
     RUN(test_demo_original_screens);
 }
