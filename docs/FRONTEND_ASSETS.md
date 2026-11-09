@@ -8,10 +8,50 @@ asset, texture, font or disassembly output is copied into the repository.
 
 The temporary OpenUG2 frontend that was previously wired into `main.c` exposed
 only `FREE ROAM`, `RACE SELECT` and `QUIT`. It was not a retail Underground 2
-menu. The game now boots directly into the authored free-roam pose (`race_state
-== 1`); the standalone files under `src/frontend/` remain available for a
-later, data-backed menu implementation but are no longer called by the game
-loop.
+menu. Normal builds boot directly into the authored free-roam pose (`race_state
+== 1`); `make menu` still opts into the provisional three-entry frontend.
+That bitmap-font/rectangle presentation is not the basis for the retail main
+menu or career screens.
+
+## Existing authored-screen implementation
+
+The asset inventory below predates the current `src/ugui` implementation. Its
+bundle/JDLZ reader, FNG parser, texture/font resolution, language table and scene
+runtime already exist in `ugui_assets`, `ugui_bundle`, `ugui_fng`, `ugui_tex`,
+`ugui_ffont`, `ugui_strtab` and `ugui_scene`. Reuse them rather than drawing a
+replacement interface or writing another frontend indexer.
+
+`tools/ugui_demo_orig.c` already opens original screen packages, evaluates their
+authored animation and message responses, and binds application-controlled icon
+scrollers. `UI_Main.fng` uses the `MAIN_ICON_*` family; the viewer resolves its
+icons and language labels. This is an inspection tool, not a complete career
+controller: displaying `UI_StartCareer.fng` or `UI_CareerSelect.fng` does not
+establish their live application transitions or save behavior.
+
+Build the existing viewer with `make ugui-demo`. In the game-data environment:
+
+```sh
+./build/ugui_demo --data GAME_DIR --list
+./build/ugui_demo --data GAME_DIR --dump UI_Main.fng
+./build/ugui_demo --data GAME_DIR --screen UI_Main.fng --size 640 480
+./build/ugui_demo --data GAME_DIR --screen UI_StartCareer.fng --size 640 480
+./build/ugui_demo --data GAME_DIR --screen UI_CareerSelect.fng --size 640 480
+```
+
+For a single deterministic capture, create an output directory and add
+`--frames 120 --capture main --shots OUTPUT_DIR` to the `UI_Main.fng` command.
+The output is `OUTPUT_DIR/main.bmp`. Missing/unparseable named packages and
+incomplete frames fail without saving a substitute screen. On headless Linux,
+use Xvfb in the game-data sandbox. This machine has no game assets; synthetic
+tests establish parser/runtime behavior, not the original screen's appearance.
+
+The existing authored presentation contract in
+`docs/cleanroom-settings/SPEC_GUI_ART.md` and its amendment is the reference
+for the shared machinery: package geometry, the application's base-key property
+writes, fonts, texture keys and scripts. `gui_view` uses that machinery for the
+pause/options screens and omits an unavailable screen rather than drawing a
+native fallback. The main/career application bindings still need their own
+verified contract; pause-screen coordinates do not establish those bindings.
 
 ## Retail data inventory
 
@@ -90,10 +130,12 @@ correct platform/showroom scene where the screen uses a 3D model.
 
 ## Next implementation order
 
-1. Add a GL-free JDLZ/frontend index reader that reports FNG names, resource
-   paths and screen-local references without loading retail bytes into Git.
-2. Decode the frontend TPK and language records using the existing texture
-   safety checks; add one small parser test for bounds, JDLZ and DXT records.
+1. Use the existing asset loader and original-screen viewer to verify
+   `UI_Main.fng`, `UI_StartCareer.fng` and `UI_CareerSelect.fng`, including their
+   required textures, fonts, language labels and application-bound objects.
+2. Record the verified main/career bindings and transitions separately from
+   package-name inventory. Preserve unknowns; do not infer career behavior
+   from screen names or use the provisional frontend as a retail reference.
 3. Load `PLATFORMS/Showroom.BIN` and `ENVMAPS/Showroom.bin` behind a diagnostic
    capture, keeping the normal world renderer untouched.
 4. Rebuild `UI_Main.fng` from the measured screen graph and U2 icon set; only

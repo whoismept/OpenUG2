@@ -707,6 +707,18 @@ static void test_demo_original_screens(void) {
     CHECK(ug_ui_top(&app->ui) == &app->orig.scr);
     /* opening an unknown name fails cleanly */
     CHECK(!demo_open_original_named(app, "nothing.fng"));
+    /* A named capture must not report a malformed package as opened merely
+     * because the browser can show a diagnostic in its place. */
+    UgAssetPackage *broken = &app->assets.pk[0];
+    size_t saved_len = broken->len;
+    broken->len = 0;
+    int stack_before = app->ui.sp;
+    CHECK(!demo_open_original_named(app, broken->name));
+    CHECK(app->ui.sp == stack_before && !app->viewer.vw.loaded);
+    broken->len = saved_len;
+    CHECK(demo_open_original_named(app, broken->name));
+    for (int i = 0; i < 120; i++) demo_update(app, 16);
+    CHECK(orig_viewer_active(app) && app->viewer.vw.loaded);
     demo_free(app);
     free(app);
     syn_install_remove(&si);
