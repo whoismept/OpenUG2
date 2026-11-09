@@ -1632,18 +1632,10 @@ offset and the absent clip texture are guesses from the pool texture's shape.
 The 500 m minimap window shows only 45 texels of the retail image, which is
 what made it blurry at modern resolutions. `src/map_bake.h` rebuilds the map at
 load time from the road meshes, the navigation links and the retail colours;
-nothing is shipped. The size follows the Level Of Detail slider, with
-no separate performance path:
-
-| Level | Map |
-|---|---|
-| 5, or no saved setting | 4096 |
-| 4 | 2048 |
-| 3 | 1024 |
-| 1, 2 | retail 512, no bake |
-
-`--map-detail 512|1024|2048|4096` overrides the slider. A baked map replaces
-TRACKMAP4000 in free roam, on L4RA only, because that image covers that bundle.
+nothing is shipped. It is opt-in: the game shows the retail 512 maps unless
+`--map-detail 1024|2048|4096` asks for a bake. The detail setting does not change
+it. A baked map replaces TRACKMAP4000 in free roam, on L4RA only, because that
+image covers that bundle.
 
 Races use their own TRACKMAP at every detail level. `GLOBALB` TrackInfo gives
 each map a frame, and they differ widely: about 11 m per texel for L4RA events,

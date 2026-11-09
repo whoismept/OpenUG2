@@ -18,12 +18,6 @@
 #include <sys/stat.h>
 #endif
 
-/* Level Of Detail slider 1..5. 0 means no saved setting, which keeps the full
- * detail the rest of the engine runs at. Returns 0 for the retail 512 map. */
-static int map_bake_size_for_level(int level) {
-    if (level <= 0 || level >= 5) return 4096;
-    return level == 4 ? 2048 : level == 3 ? 1024 : 0;
-}
 
 /* Paved surfaces the material rules class as terrain: train tracks, loading
  * bays and five unnamed records that the retail map draws as lines. The same

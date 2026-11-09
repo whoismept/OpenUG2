@@ -23,12 +23,6 @@ static int pixel(const unsigned char *out, int x, int y) { return out[((long)y *
 
 int main(void) {
     printf("map bake\n");
-    chk("top level is 4096", map_bake_size_for_level(5) == 4096);
-    chk("no saved setting keeps full detail", map_bake_size_for_level(0) == 4096);
-    chk("level 4 is 2048", map_bake_size_for_level(4) == 2048);
-    chk("level 3 is 1024", map_bake_size_for_level(3) == 1024);
-    chk("levels 1 and 2 keep the retail map",
-        map_bake_size_for_level(2) == 0 && map_bake_size_for_level(1) == 0);
 
     /* World -> texel uses the frame ha_map samples: +X east, +Y north. */
     float verts[] = { 10,90,0,0,0,  30,90,0,0,0,  30,70,0,0,0,  90,10,0,0,0 };

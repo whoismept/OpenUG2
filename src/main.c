@@ -2215,14 +2215,6 @@ static void stage1_presentation(const Stage1Drive *s,int *gear,int *changing) {
  * The situation is the career free-roam pause (Return to Explore Mode, Options, Replay, Quit to Main
  * Menu): this host exposes no race lifecycle (restart / leave race) and no replay data, so the race
  * entries and an enabled Replay are not offered; the catalogue itself covers every context. */
-/* The minimap follows the Level Of Detail slider; --map-detail overrides it. The
- * pause menu loads settings lazily, so startup reads the store itself. */
-static int city_map_size_from_store(void) {
-    StRegStore store; StGraphics gfx;
-    st_gfx_defaults(&gfx);
-    if (st_reg_open_default(&store) == ST_OK) { st_gfx_load(&store, &gfx); st_reg_close(&store); }
-    return map_bake_size_for_level(gfx.v[ST_GFX_PERF_LEVEL]);
-}
 
 /* TRACKMAP4000 covers L4RA only; races elsewhere still get their own maps. */
 static void city_map_apply(Hud *hud, const N2Scene *scene, const WorldCity *city, const char *track, int size) {
@@ -2325,8 +2317,7 @@ int main(int argc, char **argv) {
          --world-cull-off  diagnostic: submit offscreen world batches
          --hud            draw the in-game player HUD (on by default; --no-hud hides it)
          --no-drivetrain  use the classic physics instead of the stock drivetrain (on by default)
-         --map-detail N   city minimap size: 512 (retail), 1024, 2048 or 4096;
-                          overrides the Level Of Detail setting
+         --map-detail N   minimap size: 512 (retail, default), 1024, 2048 or 4096
          --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
          --lighting MODE  original (projected headlight pool, as the original
                           game) or modern; default follows Level Of Detail 1-2
@@ -2469,7 +2460,7 @@ int main(int argc, char **argv) {
     const char *drive_trace_path = NULL;
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
-    int map_detail_opt = -1; /* --map-detail: 512 (retail), 1024, 2048 or 4096 */
+    int map_detail_opt = 0;  /* --map-detail: 512 (retail, default), 1024, 2048 or 4096 */
     int map_cache_opt = 1;   /* --no-map-cache: bake every run */
     int lighting_opt = -1;   /* --lighting original|modern; -1 follows Level Of Detail */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
@@ -6357,7 +6348,7 @@ int main(int argc, char **argv) {
         if (hud) {
             hud_set_preview(hud, hud_preview_opt);
             hud_configure(hud, &hud_settings);
-            city_map_size = map_detail_opt >= 0 ? map_detail_opt : city_map_size_from_store();
+            city_map_size = map_detail_opt;   /* the retail maps unless --map-detail asks */
             hud_set_map_sync(hud, shot != NULL);
             hud_set_map_cache(hud, map_cache_opt);
             city_map_apply(hud, &scene, &world.city, trackname, city_map_size);
@@ -6978,12 +6969,6 @@ int main(int argc, char **argv) {
             if (om_take_reinit_request(om)) {
                 om_take_apply_request(om);
                 lighting = lighting_policy(&opt_gfx);
-                int wanted_map = map_detail_opt >= 0 ? map_detail_opt
-                               : map_bake_size_for_level(opt_gfx.v[ST_GFX_PERF_LEVEL]);
-                if (hud && wanted_map != city_map_size) {
-                    city_map_size = wanted_map;
-                    city_map_apply(hud, &scene, &world.city, trackname, wanted_map);
-                }
                 fprintf(stderr, "options: display re-init requested (resolution %d, vsync %d, filtering %d); renderer hook not wired\n",
                         opt_gfx.v[ST_GFX_RESOLUTION], opt_gfx.v[ST_GFX_VSYNC], opt_gfx.v[ST_GFX_TEXTURE_FILTERING]);
             } else if (om_take_apply_request(om)) {
@@ -10800,7 +10785,7 @@ int main(int argc, char **argv) {
             hud=hud_init(dataroot);
             if(hud){
                 hud_configure(hud,&hud_settings);hud_set_preview(hud,hud_preview_opt);
-                city_map_size=map_detail_opt>=0?map_detail_opt:city_map_size_from_store();
+                city_map_size=map_detail_opt;
                 hud_set_map_sync(hud,shot!=NULL);
                 hud_set_map_cache(hud,map_cache_opt);
                 city_map_apply(hud,&scene,&world.city,trackname,city_map_size);

@@ -58,7 +58,7 @@ region with `--track`. For a closed-loop path directly, use
 - `--car NAME` selects a folder under `CARS`.
 - `--hud-mph` displays speed in MPH. `--hud-fit 4:3` centres the HUD in a 4:3 frame.
   See [widescreen HUD](HUD_WIDESCREEN.md).
-- `--map-detail 512` uses the original city minimap. See [map detail levels](DEVELOPER_GUIDE.md#baked-city-map).
+- The minimap is the original game's. `--map-detail 4096` bakes a sharper one. See [baked maps](DEVELOPER_GUIDE.md#baked-city-map).
 - `--camera 0` through `--camera 4` choose a starting view. See [camera controls](CAMERA.md).
 - The [stock drivetrain model](DRIVETRAIN.md) is on by default; `--no-drivetrain`
   uses the classic physics.
