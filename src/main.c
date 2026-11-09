@@ -7300,7 +7300,7 @@ int main(int argc, char **argv) {
         /* Race-grid placement may be kilometres from the menu resident.
          * Prepare it during countdown, then keep following the player. */
         int resident_enabled = world2 && (race_state == 0 || race_state == 1) &&
-            (!shot || daudit || resident_drive_audit) && !sstatic &&
+            (!shot || want_event_id || daudit || resident_drive_audit) && !sstatic &&
             (!capture_policy.freeze_motion || resident_route_audit || resident_drive_audit);
         int wanted_scenery=world.city.mode==MODE_RACE_EVENT && world.city.active_ev>=0
             ?world.city.ev[world.city.active_ev].id:runtime_scenery_event;
