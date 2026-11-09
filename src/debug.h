@@ -135,6 +135,7 @@ typedef struct {
     int headlight_shadows, headlight_shadow_draws;
     float rain_intensity, road_wetness;
     int road_reflections, road_reflection_draws;
+    int road_reflection_quality; /* 1: 16 trace steps, 2: 32; 0 follows weather_quality */
     int weather_quality; /* 0/1/2: 12/24/48 screen droplets, 0/4/8 wet lamp highlights */
     float ambient, diffuse, body_spec;
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
@@ -150,7 +151,10 @@ typedef struct {
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
-    int   vehicle_quality;       /* 0 Low, 1 Medium, 2 High: paint/glass, scene capture and car shadows */
+    int   vehicle_quality;       /* 0 Low, 1 Medium, 2 High: paint and glass response */
+    int   car_reflection_rate;   /* 0 no scene capture; 1..3 refresh a face every 3rd/2nd/frame */
+    int   car_reflection_detail; /* 0 64 px capture faces, 1 128 px */
+    int   car_shadow_quality;    /* 0 square footprint, 1 projected body and wheel shadows */
     int   paint_shine;           /* authored streetlight highlights on painted panels */
     int   paint_override;        /* 1 = use paint[] below instead of the per-car hash */
     float paint[3];
@@ -312,6 +316,16 @@ typedef struct {
 } DbgState;
 
 extern DbgState g_dbg;
+
+/* One Vehicle detail step sets the paint response, the scene capture and the car
+ * shadows together; the graphics settings can then set the latter two apart. */
+static inline void dbg_set_vehicle_quality(DbgState *d, int q) {
+    q = q < 0 ? 0 : q > 2 ? 2 : q;
+    d->vehicle_quality = q;
+    d->car_reflection_rate = q == 0 ? 0 : q == 1 ? 2 : 3;
+    d->car_reflection_detail = q == 2;
+    d->car_shadow_quality = q > 0;
+}
 
 /* Dear ImGui bridge — no-ops unless DEBUG_UI is compiled in. Declared always so
  * main.c can call them unconditionally behind a single #ifdef. */

@@ -343,9 +343,15 @@ extern "C" void dbgui_frame(void) {
         }
         if (ImGui::CollapsingHeader("Body paint", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char *quality[] = { "Low", "Medium", "High" };
-            ImGui::Combo("Vehicle detail", &g_dbg.vehicle_quality, quality, 3);
+            int vehicle_quality=g_dbg.vehicle_quality;
+            if(ImGui::Combo("Vehicle detail", &vehicle_quality, quality, 3))
+                dbg_set_vehicle_quality(&g_dbg,vehicle_quality);
             ImGui::TextDisabled("Low: square shadow. Medium/High: mesh shadows and local city reflections.");
             ImGui::TextDisabled("Controls paint, clear coat and glass reflections for every car.");
+            ImGui::Combo("Reflection updates", &g_dbg.car_reflection_rate,
+                         "Off\0Every third frame\0Every other frame\0Every frame\0");
+            ImGui::Combo("Reflection detail", &g_dbg.car_reflection_detail, "64 px\0128 px\0");
+            ImGui::Combo("Car shadows", &g_dbg.car_shadow_quality, "Square\0Projected\0");
             /* body paint -> u_PaintColor (uColor) when override is on; the draw
                loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
             ImGui::Checkbox("custom paint (override per-car colour)", (bool *)&g_dbg.paint_override);
@@ -546,6 +552,8 @@ extern "C" void dbgui_frame(void) {
             ImGui::Combo("Weather detail", &g_dbg.weather_quality, "Low\0Medium\0High\0");
             bool reflections=g_dbg.road_reflections!=0;
             if(ImGui::Checkbox("Road scene reflections (expensive)",&reflections))g_dbg.road_reflections=reflections;
+            ImGui::Combo("Road reflection detail", &g_dbg.road_reflection_quality,
+                         "Follow weather\0Medium\0High\0");
             if(ImGui::IsItemHovered())ImGui::SetTooltip("Reflects objects visible on screen. Low detail keeps surface highlights only.");
             if(g_dbg.road_reflection_draws<0)ImGui::TextDisabled("Scene reflections unavailable; using surface highlights.");
             else ImGui::TextDisabled("Visible-scene reflections: %d road draws (Medium/High)",g_dbg.road_reflection_draws);

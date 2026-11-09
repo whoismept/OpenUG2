@@ -46,7 +46,7 @@
 #include "hud_race.h"
 #include "hud_host.h"     /* GL-free HUD context/preview policy */
 #include "map_bake.h"     /* city minimap detail levels */
-#include "lighting_policy.h"
+#include "graphics_policy.h"
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
@@ -97,6 +97,7 @@ DbgState g_dbg = {
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
     .tex_detail = 16.0f,   /* clamped to the GL maximum once the context exists */
     .vehicle_quality = 1, .paint_shine = 1, .weather_quality = 1, .road_reflections = 0,
+    .car_reflection_rate = 2, .car_reflection_detail = 0, .car_shadow_quality = 1,
     .paint_override = 0, .paint = { 0.68f, 0.09f, 0.08f },
     .show_body = 1, .show_glass = 1, .show_lights = 1, .show_tires = 1,
     .show_misc = 1, .show_track = 1,
@@ -2242,13 +2243,26 @@ static int event_has_authored_barriers(const char *troot, const char *track, int
     return cached;
 }
 
-/* The lighting the saved graphics settings ask for. The pause menu loads its own
- * copy lazily, so startup reads the store here. */
-static LightingPolicy lighting_policy_from_store(void) {
+/* The saved graphics settings. The pause menu loads its own copy lazily, so
+ * startup reads the store here. */
+static StGraphics graphics_from_store(void) {
     StRegStore store; StGraphics gfx;
     st_gfx_defaults(&gfx);
     if (st_reg_open_default(&store) == ST_OK) { st_gfx_load(&store, &gfx); st_reg_close(&store); }
-    return lighting_policy(&gfx);
+    return gfx;
+}
+
+/* Car reflection, car shadow and road reflection from the settings. A command-line
+ * --vehicle-quality or --[no-]road-reflections keeps its value. */
+static void apply_detail_policy(DetailPolicy p, int vehicle_explicit, int road_explicit) {
+    if (!p.apply) return;
+    if (!vehicle_explicit) {
+        g_dbg.car_reflection_rate = p.car_reflection_rate;
+        g_dbg.car_reflection_detail = p.car_reflection_detail;
+        g_dbg.car_shadow_quality = p.car_shadow;
+    }
+    if (!road_explicit) g_dbg.road_reflections = p.road_reflections;
+    g_dbg.road_reflection_quality = p.road_reflection_quality;
 }
 
 static CxInput g_cx;                                     /* key/button bindings (Controls screen) and joysticks */
@@ -2462,6 +2476,7 @@ int main(int argc, char **argv) {
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int map_detail_opt = 0;  /* --map-detail: 512 (retail, default), 1024, 2048 or 4096 */
     int map_cache_opt = 1;   /* --no-map-cache: bake every run */
+    int vehicle_quality_explicit = 0, road_reflections_explicit = 0;  /* CLI beats saved settings */
     int lighting_opt = -1;   /* --lighting original|modern; -1 follows Level Of Detail */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
     int shotframes_set = 0;
@@ -2513,15 +2528,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vehicle-quality")) {
             if(i+1>=argc){fprintf(stderr,"--vehicle-quality expects low, medium or high\n");return 2;}
             const char *q=argv[++i];
-            if(!strcmp(q,"low"))g_dbg.vehicle_quality=0;
-            else if(!strcmp(q,"medium"))g_dbg.vehicle_quality=1;
-            else if(!strcmp(q,"high"))g_dbg.vehicle_quality=2;
+            if(!strcmp(q,"low")){dbg_set_vehicle_quality(&g_dbg,0);vehicle_quality_explicit=1;}
+            else if(!strcmp(q,"medium")){dbg_set_vehicle_quality(&g_dbg,1);vehicle_quality_explicit=1;}
+            else if(!strcmp(q,"high")){dbg_set_vehicle_quality(&g_dbg,2);vehicle_quality_explicit=1;}
             else {fprintf(stderr,"--vehicle-quality expects low, medium or high\n");return 2;}
         }
         else if (!strcmp(argv[i], "--no-paint-shine")) g_dbg.paint_shine=0;
         else if (!strcmp(argv[i], "--world-cull-off")) world_cull_off=1;
-        else if (!strcmp(argv[i], "--road-reflections")) g_dbg.road_reflections=1;
-        else if (!strcmp(argv[i], "--no-road-reflections")) g_dbg.road_reflections=0;
+        else if (!strcmp(argv[i], "--road-reflections")) {g_dbg.road_reflections=1;road_reflections_explicit=1;}
+        else if (!strcmp(argv[i], "--no-road-reflections")) {g_dbg.road_reflections=0;road_reflections_explicit=1;}
         else if (!strcmp(argv[i], "--weather-quality")) {
             if(i+1>=argc){fprintf(stderr,"--weather-quality expects low, medium or high\n");return 2;}
             const char *q=argv[++i];
@@ -6335,7 +6350,9 @@ int main(int argc, char **argv) {
        dataroot; a missing pack is reported, not fatal. */
     Hud *hud = NULL;
     int city_map_size = 0;
-    LightingPolicy lighting = lighting_policy_from_store();
+    StGraphics saved_gfx = graphics_from_store();
+    LightingPolicy lighting = lighting_policy(&saved_gfx);
+    apply_detail_policy(detail_policy(&saved_gfx), vehicle_quality_explicit, road_reflections_explicit);
     /* Last frame's HUD state. The minimap pick must invert the SAME transform
        the player clicked on, so it reads the state that was actually drawn
        rather than re-deriving one from a half-updated frame. */
@@ -6963,17 +6980,20 @@ int main(int argc, char **argv) {
         }
         if (pause_menu) {
             /* Apply / re-init hook (SPEC_GUI 5.4). Changes in opt_gfx are requested immediately and
-             * serviced here, at the start of the frame after the change. Lighting and the minimap follow
-             * the settings; the display re-init and the remaining values are not wired yet. */
+             * serviced here, at the start of the frame after the change. Lighting, car reflection and
+             * shadow, road reflection and the minimap follow the settings; the display re-init and the
+             * remaining values are not wired yet. */
             OptionsMenu *om = pause_menu_options(pause_menu);
             if (om_take_reinit_request(om)) {
                 om_take_apply_request(om);
                 lighting = lighting_policy(&opt_gfx);
+                apply_detail_policy(detail_policy(&opt_gfx), vehicle_quality_explicit, road_reflections_explicit);
                 fprintf(stderr, "options: display re-init requested (resolution %d, vsync %d, filtering %d); renderer hook not wired\n",
                         opt_gfx.v[ST_GFX_RESOLUTION], opt_gfx.v[ST_GFX_VSYNC], opt_gfx.v[ST_GFX_TEXTURE_FILTERING]);
             } else if (om_take_apply_request(om)) {
                 lighting = lighting_policy(&opt_gfx);
-                fprintf(stderr, "options: lighting updated; other graphics values are not wired yet\n");
+                apply_detail_policy(detail_policy(&opt_gfx), vehicle_quality_explicit, road_reflections_explicit);
+                fprintf(stderr, "options: lighting, car reflection/shadow and road reflection updated\n");
             }
         }
         if (pause_action == FE_ACTION_QUIT) running = 0;
@@ -9342,9 +9362,9 @@ int main(int argc, char **argv) {
             g_dbg.night_mode && g_dbg.road_wetness>0 ? g_dbg.light_gain : 0,g_dbg.weather_quality);
         render_model(&rp,NULL);
         float probe_pos[3]={render_player.pos[0],render_player.pos[1],render_player.pos[2]+car_body_ride+(carbb[2]+carbb[5])*.5f};
-        int environment_draws=render_car_environment(&rp,&car_environment,wbatch,
+        int environment_draws=render_car_environment_rate(&rp,&car_environment,wbatch,
             g_dbg.show_track && !g_debug_mode && !g_dbg.show_uv_checker?nbatch:0,
-            skybatch,nsky,probe_pos,g_dbg.vehicle_quality);
+            skybatch,nsky,probe_pos,g_dbg.car_reflection_detail,g_dbg.car_reflection_rate);
 
         float lamp_model[16],body_up[3]={render_up[0],render_up[1],render_up[2]};
         if(render_player.ride_ready && (follow_roam_ai || (!sstatic && !capture_policy.freeze_motion)))
@@ -9767,7 +9787,7 @@ int main(int argc, char **argv) {
             rhi_cmd_bind_pipeline(cpipe.glass);   /* alpha blend, depth tested, no write */
             rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 0.0f;
             ug2_vec3(rp.p->uColor, 0.0f, 0.0f, 0.0f); rp.p->uAlpha = 0.5f;
-            for (int c=0; g_dbg.vehicle_quality<=0 && c<=draw_nai; c++) {
+            for (int c=0; g_dbg.car_shadow_quality<=0 && c<=draw_nai; c++) {
                 if((c==0 && player_hidden) ||
                    (c>0 && !ai_actor_present(c-1,ai_race,nai,traffic_routes)) ||
                    (c>0 && !render_ais[c-1].render_visible))continue;
@@ -9979,7 +9999,7 @@ int main(int argc, char **argv) {
                 float gp[3]={render_player.pos[0],render_player.pos[1],shadow_ground.z};
                 const N2Scene *rims=nwheelgm>0 && (wheel_brand!=0 || wheel_style!=1)?&wheellib:NULL;
                 int casts=render_car_shadow(&rp,&player_shadow,&car,cgm,stock_wheel,rims,wheelgm,
-                    Model,(const float (*)[16])wheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
+                    Model,(const float (*)[16])wheelWorld,MVP,gp,shadow_ground.normal,g_dbg.car_shadow_quality);
                 if(casts>0)g_dbg.drawn+=casts;
                 ug2_copy(rp.p->uMVP, MVPc, 16);render_model(&rp,Model);
             }
@@ -10246,7 +10266,7 @@ int main(int argc, char **argv) {
                     float gp[3]={render_ais[k].pos[0],render_ais[k].pos[1],shadow_ground.z};
                     CarShadow *cache=tv?&traffic[visual].shadow:&opponent_shadow;
                     int casts=render_car_shadow(&rp,cache,draw_scene,draw_gpu,draw_stock_wheel,NULL,NULL,
-                        AIModel,(const float (*)[16])aiWheelWorld,MVP,gp,shadow_ground.normal,g_dbg.vehicle_quality);
+                        AIModel,(const float (*)[16])aiWheelWorld,MVP,gp,shadow_ground.normal,g_dbg.car_shadow_quality);
                     if(casts>0)g_dbg.drawn+=casts;
                 }
                 ug2_copy(rp.p->uMVP, AIMVPc, 16);
@@ -10757,7 +10777,8 @@ int main(int argc, char **argv) {
         g_dbg.road_reflection_draws=0;
         if(g_dbg.show_track && passmode==0 && !g_debug_mode && !g_dbg.show_uv_checker && g_dbg.road_reflections) {
             g_dbg.road_reflection_draws=render_road_reflections(&rp,&road_reflections,wbatch,nbatch,
-                view_cam,MVP,P,g_dbg.road_wetness,g_dbg.weather_quality);
+                view_cam,MVP,P,g_dbg.road_wetness,
+                g_dbg.road_reflection_quality>0?g_dbg.road_reflection_quality:g_dbg.weather_quality);
             if(g_dbg.road_reflection_draws>0)g_dbg.drawn+=g_dbg.road_reflection_draws;
         }
 

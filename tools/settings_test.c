@@ -15,7 +15,7 @@
 #include <string.h>
 
 #include "settings.h"
-#include "lighting_policy.h"
+#include "graphics_policy.h"
 
 static int g_checks, g_fail;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
@@ -866,7 +866,7 @@ static void test_profile_files(void) {
     CHECK(!st_profiles_exist(root), "root empty again");
 }
 
-/* Which lights each detail level draws (lighting_policy.h). */
+/* Which lights each detail level draws (graphics_policy.h). */
 static void test_lighting_policy(void) {
     StGraphics g; StGfxCaps caps;
     st_gfx_defaults(&g);
@@ -888,6 +888,36 @@ static void test_lighting_policy(void) {
     CHECK(!p.headlight && !p.glow, "customized Car Headlight and Light Glow are honoured");
 }
 
+/* Car reflection, car shadow and road reflection per detail level. */
+static void test_detail_policy(void) {
+    StGraphics g; StGfxCaps caps;
+    st_gfx_defaults(&g);
+    DetailPolicy p = detail_policy(&g);
+    CHECK(!p.apply && p.car_reflection_rate == 2 && p.car_shadow && !p.road_reflections,
+          "no saved level keeps the built-in vehicle and road detail");
+    CHECK(!detail_policy(NULL).apply, "missing settings change nothing");
+    st_gfx_caps_full(&caps, 5);
+    st_gfx_set_level(&g, &caps, 1, 1.0);
+    p = detail_policy(&g);
+    CHECK(p.apply && !p.car_reflection_rate && !p.car_shadow && !p.road_reflections,
+          "level 1: no capture, square shadow, surface highlights");
+    st_gfx_set_level(&g, &caps, 2, 1.0);
+    p = detail_policy(&g);
+    CHECK(!p.car_reflection_rate && p.car_shadow && !p.road_reflections, "level 2: projected shadows only");
+    st_gfx_set_level(&g, &caps, 3, 1.0);
+    p = detail_policy(&g);
+    CHECK(p.car_reflection_rate == 1 && p.car_reflection_detail && p.road_reflections &&
+          p.road_reflection_quality == 1, "level 3: 128 px capture every third frame, scene reflections");
+    st_gfx_set_level(&g, &caps, 5, 1.0);
+    p = detail_policy(&g);
+    CHECK(p.car_reflection_rate == 3 && p.road_reflection_quality == 2, "level 5: every frame, fine trace");
+    g.v[ST_GFX_CAR_ENV_MAP] = 9; g.v[ST_GFX_CAR_ENV_MAP_UPDATE] = 0; g.v[ST_GFX_CAR_SHADOW] = 0;
+    g.v[ST_GFX_ROAD_REFLECTION] = 1;
+    p = detail_policy(&g);
+    CHECK(p.car_reflection_rate == 3 && !p.car_reflection_detail && !p.car_shadow && !p.road_reflections,
+          "customized rows are honoured and clamped");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1] && *argv[1]) g_dir = argv[1];
     if (argc > 2 && argv[2] && *argv[2]) g_tmp = argv[2];
@@ -898,6 +928,7 @@ int main(int argc, char **argv) {
     test_presets();
     test_graphics_logic();
     test_lighting_policy();
+    test_detail_policy();
     test_install_and_language();
     test_graphics_store();
     test_ini_store();

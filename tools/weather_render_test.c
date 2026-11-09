@@ -226,6 +226,14 @@ static void car_render_test(const RProg *r) {
     assert(env.size==128 && !env.ready && env.origin[0]==.5f);
     assert(!render_car_environment(r,&env,batches,count,NULL,0,origin,0));
     float ready;ug2_copy(&ready, &r->p->uEnvReady, 1);assert(ready==0);
+    CarEnvironment slow={0};
+    for(int face=0;face<6;face++)assert(render_car_environment_rate(r,&slow,batches,count,NULL,0,origin,0,1)>0);
+    assert(slow.ready && slow.size==64);
+    assert(!render_car_environment_rate(r,&slow,batches,count,NULL,0,origin,0,1));
+    assert(!render_car_environment_rate(r,&slow,batches,count,NULL,0,origin,0,1));
+    assert(render_car_environment_rate(r,&slow,batches,count,NULL,0,origin,0,1)>0);
+    for(int i=0;i<3;i++)assert(render_car_environment_rate(r,&slow,batches,count,NULL,0,origin,1,3)>0);
+    assert(slow.size==128);free_car_environment(&slow);
     GLuint cube=rhi_gl_texture_name(env.cube[0]);free_car_environment(&env);assert(cube && !glIsTexture(cube));
     render_batch_array_free(&batches,&count);for(int i=0;i<6;i++)rhi_texture_destroy(textures[i]);
     glActiveTexture(GL_TEXTURE0);r->p->uEnvReady = 0;

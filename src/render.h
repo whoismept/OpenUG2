@@ -145,6 +145,10 @@ typedef struct {
  * Shared local probe: far traffic fades to the sky, no per-car scene passes. */
 int render_car_environment(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
                            const N2Batch *sky,int nsky,const float pos[3],int quality);
+/* The same capture with the menu's two controls: detail 0 is 64 px faces and 1 is
+ * 128 px; rate 0 skips capture, 1..3 refresh a face every third, second or frame. */
+int render_car_environment_rate(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
+                                const N2Batch *sky,int nsky,const float pos[3],int detail,int rate);
 void free_car_environment(CarEnvironment *s);
 
 typedef struct { RhiBuffer body, wheel; uint32_t body_key, wheel_key; int body_count, wheel_count; } CarShadow;

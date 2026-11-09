@@ -1613,7 +1613,7 @@ and `HeadlightWVP`: the additive pool texture `2PLAYERHEADLIGHT1` (GLOBALB, key
 shadows are off. `--lighting original|modern` overrides the setting. Higher levels
 are unchanged.
 
-`src/lighting_policy.h` turns the graphics settings into what is drawn, and the
+`src/graphics_policy.h` turns the graphics settings into what is drawn, and the
 pause-menu apply hook refreshes it, so changes take effect on the next frame.
 `Car Headlight` off leaves the lenses lit but no light on the road, and `Light
 Glow` off drops the lamp halos and district flares. Level 1's preset turns both
@@ -1626,6 +1626,27 @@ pipeline. Redrawing the nearby world batches instead looked the same but cost
 more than the beams on dense city blocks. On an Intel HD 520 at 1080p the pool
 saves 0.7 ms of GPU time in the city and 1.35 ms in a three-car race. Its size,
 offset and the absent clip texture are guesses from the pool texture's shape.
+
+### Vehicle and road detail settings
+
+`detail_policy` in `src/graphics_policy.h` maps three more option rows, at startup
+and from the same apply hook. With no saved level the built-in defaults stay.
+
+| Setting | Engine control |
+| --- | --- |
+| Car Reflection Update Rate | 0 skips the city capture; 1, 2 and 3 refresh a cube face every third frame, every other frame and every frame |
+| Car Reflection Detail | Low captures 64 px faces, High 128 px |
+| Car Shadow / Neon | 0 draws the square footprint; 1 and 2 project the body and wheels |
+| Road Reflection Detail | 0 and 1 keep the wet surface highlights; 2 adds the scene reflections and 3 traces them with 32 steps instead of 16 |
+
+`--vehicle-quality` keeps its car reflection and shadow values over the settings,
+and `--road-reflections` or `--no-road-reflections` keeps its on/off choice. The
+paint response still follows `--vehicle-quality` alone. In a rainy city at 720p
+on an Intel HD 520, Level Of Detail 5 costs 1.0 ms of GPU time more than the
+built-in defaults, and level 3 saves 0.4 ms. Level 1 saves 1.7 ms, including its
+lighting changes. Fog, Horizon Fog and the remaining rows are not wired: the view
+distance is derived from the fog density, so turning fog off would show the edge
+where distant geometry is culled.
 
 ### Baked city map
 

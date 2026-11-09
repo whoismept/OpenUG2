@@ -423,13 +423,21 @@ void free_car_environment(CarEnvironment *s) {
 
 int render_car_environment(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
                            const N2Batch *sky,int nsky,const float pos[3],int quality) {
+    return render_car_environment_rate(r,s,world,count,sky,nsky,pos,
+                                       quality>=2,quality<=0?0:quality==1?2:3);
+}
+
+int render_car_environment_rate(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
+                                const N2Batch *sky,int nsky,const float pos[3],int detail,int rate) {
     r->p->uEnvReady = 0;
-    if(quality<=0 || count<=0 || s->failed)return 0;
-    if(quality==1 && s->size==64 && s->ready && (++s->ticks&1)) {
+    if(rate<=0 || count<=0 || s->failed)return 0;
+    int size=detail?128:64,draws=0;
+    /* Rate 3 captures a face every frame, 2 every other frame, 1 every third. */
+    int interval=rate>=3?1:4-rate;
+    if(interval>1 && s->size==size && s->ready && (++s->ticks%interval)!=0) {
         r->p->uEnvReady = 1;ug2_copy(r->p->uEnvOrigin, s->published, 3);return 0;
     }
     RhiStateSnapshot saved; rhi_cmd_save_state(&saved);
-    int size=quality==1?64:128,draws=0;
     if(s->size!=size) {
         free_car_environment(s);s->size=size;s->capture=render_program();
         if(!s->capture.shader.id){free_car_environment(s);s->failed=1;draws=-1;goto restore;}
