@@ -110,6 +110,10 @@ void free_headlight_shadows(HeadlightShadows *s);
 #define RENDER_POOL_COLS 8
 #define RENDER_POOL_BAND 3.0f
 #define RENDER_POOL_LIFT 0.08f
+/* Low-beam pool on the road: length ahead and width in metres, distance of its
+ * near edge from the car origin, and light colour. High beam is 1.4x longer. */
+typedef struct { float length, width, lead, tint[3]; } RenderPool;
+extern RenderPool render_pool;
 void render_headlight_pool_frame(const float model[16], int high, float origin[3],
                                  float fwd[3], float right[3], float size[2]);
 int render_headlight_pool(const RProg *r, const float model[16], const float mvp[16],

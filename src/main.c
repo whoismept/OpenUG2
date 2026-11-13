@@ -90,6 +90,7 @@ DbgState g_dbg = {
     .low_beam_range = 35.0f, .high_beam_range = 85.0f,
     .headlight_gain = 1.0f, .headlight_lens_alpha = 0.16f,
     .headlight_shadows = 1,
+    .pool_length = 15.0f, .pool_width = 8.0f, .pool_lead = 1.6f, .pool_tint = { 0.84f, 0.92f, 1.0f },
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint (night) */
     .body_env = 1.0f,                                          /* 1.0 = tuned clearcoat reflection */
     .vcolor = 1.0f,   /* full source prelight on world geometry */
@@ -9730,6 +9731,8 @@ int main(int argc, char **argv) {
         if (original_lights && beam_gain > 0 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
             float origin[3], fwd[3], right[3], size[2];
             float corners[(RENDER_POOL_ROWS+1)*(RENDER_POOL_COLS+1)*3];
+            render_pool = (RenderPool){ g_dbg.pool_length, g_dbg.pool_width, g_dbg.pool_lead,
+                { g_dbg.pool_tint[0], g_dbg.pool_tint[1], g_dbg.pool_tint[2] } };
             render_headlight_pool_frame(lamp_model, long_beam, origin, fwd, right, size);
             for (int a = 0; a <= RENDER_POOL_ROWS; a++)
                 for (int b = 0; b <= RENDER_POOL_COLS; b++) {

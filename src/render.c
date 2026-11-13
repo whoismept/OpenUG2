@@ -896,15 +896,17 @@ void render_headlights(const RProg *r, const float model[16], const float anchor
  * the road ahead of the car, additive. The caller samples the road height at the
  * grid corners from render_headlight_pool_frame, so the pool follows slopes while
  * only its own pixels are shaded; redrawing the nearby world cost more than the
- * per-pixel beams on dense city blocks. Pool size and offset are guessed from the
- * texture's shape. */
+ * per-pixel beams on dense city blocks. Pool size and offset come from render_pool. */
+/* Matched by eye to a retail night capture: a cool white patch about two and a
+ * half car widths across that fades out three car lengths ahead. */
+RenderPool render_pool = { 15.0f, 8.0f, 1.6f, { 0.84f, 0.92f, 1.0f } };
 void render_headlight_pool_frame(const float model[16],int high,float origin[3],
                                  float fwd[3],float right[3],float size[2]) {
     fwd[0]=model[0];fwd[1]=model[1];fwd[2]=0;right[0]=model[4];right[1]=model[5];right[2]=0;
     float lf=sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]),lr=sqrtf(right[0]*right[0]+right[1]*right[1]);
     for(int i=0;i<2;i++){fwd[i]/=lf>1e-4f?lf:1;right[i]/=lr>1e-4f?lr:1;}
-    const float lead=1.6f;
-    size[0]=high?36.0f:26.0f;size[1]=high?20.0f:18.0f;
+    const float lead=render_pool.lead;
+    size[0]=render_pool.length*(high?1.4f:1.0f);size[1]=render_pool.width*(high?1.1f:1.0f);
     origin[0]=model[12]+fwd[0]*lead;origin[1]=model[13]+fwd[1]*lead;origin[2]=model[14];
 }
 
@@ -950,7 +952,7 @@ int render_headlight_pool(const RProg *r,const float model[16],const float mvp[1
     ug2_copy(r->p->uHeadPos[0],head,4);
     ug2_copy(r->p->uHeadForward,fwd,3);ug2_copy(r->p->uHeadRight,right,3);
     ug2_vec4(r->p->uHeadShape,size[0],size[1],RENDER_POOL_BAND,0.0f);
-    ug2_vec3(r->p->uColor,gain,gain*.94f,gain*.82f);
+    ug2_vec3(r->p->uColor,gain*render_pool.tint[0],gain*render_pool.tint[1],gain*render_pool.tint[2]);
     r->p->uVista=3.0f;r->p->uUseTex=1.0f;r->p->uAlpha=1.0f;r->p->uHeadGain=0.0f;
     rhi_cmd_bind_texture(0,texture);
     render_draw_gpumesh(&mesh);
