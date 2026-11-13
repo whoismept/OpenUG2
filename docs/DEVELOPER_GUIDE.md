@@ -377,7 +377,9 @@ instead of popping. Occlusion behind buildings still comes from the ordinary
 depth test. `Lighting & Environment -> District lights` scales both size and
 brightness at runtime; neither knob changes which sources are selected.
 
-At night, sources inside the ordinary fog-derived view distance draw as
+At night, sources within 200 m (the distance at which the original drops lamp
+flares, per the [research notes](LIGHTING_RESEARCH.md); `flare range` in the
+developer menu) and inside the fog-derived view distance draw as
 camera-facing quads in `render_district_lights`. This late additive pass enables
 depth testing, turns depth writes off, consumes texture alpha through
 `uEmissiveTex`, and restores the incoming uniforms, texture, blend factors and
@@ -387,9 +389,9 @@ emission fades toward zero, not fog RGB, so distant black sprite edges do not
 add colored rectangles. `make light-state-test` verifies this on a real SDL/GL
 context with synthetic textures, including an occluded light and deliberately
 different incoming state; it requires no retail assets. Daylight
-draws zero authored light quads. Fixed M136 reference poses draw 197 of 2,228
-L4RA sources and 64 of 193 L4RB sources; these numbers prove distance culling,
-not a universal visibility count for every camera.
+draws zero authored light quads. Before the 200 m range, fixed M136 reference
+poses drew 197 of 2,228 L4RA sources and 64 of 193 L4RB sources; the counts are
+lower now and have not been re-measured.
 
 ### Next lighting-fidelity milestone
 

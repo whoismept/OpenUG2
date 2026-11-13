@@ -56,8 +56,9 @@ high-contrast look of the capture, which more likely comes from section 4.
 | On screen: lamp flares are large, pink to magenta, with star-shaped rays; tail lights throw red light on the road under the car. | [capture] |
 | Flare size rule, occlusion rule, how trails are built. | [unknown] |
 
-**OpenUG2 today:** authored `0x135003` lights draw as small white camera-facing
-quads out to the fog-derived view distance. No trails, no tail-light road glow.
+**OpenUG2 today:** authored `0x135003` lights draw as small camera-facing quads in
+their authored colour, fading out by 200 m. A red pool under the rear bumper stands
+in for the tail lights on the road; its size and strength are by eye. No trails.
 
 ## 4. Whole-frame effects
 
@@ -100,9 +101,9 @@ partly Enhanced Contrast and Over Bright, both on at Level Of Detail 4 and 5.
    real projection so walls and kerbs receive light, with a per-vertex falloff ramp
    and no shadow. An earlier attempt at redrawing nearby world batches cost more
    than the per-pixel beams, so this needs a tight receiver list.
-3. **Flares.** Pink-tinted, larger lamp flares with a 200 m fade; headlight inner and
-   outer flares from the named textures.
-4. **Tail-light road glow** under the car.
+3. **Flares.** The 200 m fade is done. Larger flares with rays and the headlight
+   inner and outer flares from the named textures remain.
+4. **Tail-light road glow** under the car. Done, by eye.
 5. **Enhanced Contrast and Over Bright** as a final full-screen pass, driven by the
    two existing settings rows.
 6. **Light Trails.**

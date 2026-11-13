@@ -601,6 +601,8 @@ extern "C" void dbgui_frame(void) {
         if (ImGui::CollapsingHeader("District lights", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("flare size", &g_dbg.light_halo, 0.2f, 3.0f, "%.2fx");
             ImGui::SliderFloat("flare brightness", &g_dbg.light_gain, 0.0f, 3.0f, "%.2fx");
+            ImGui::SliderFloat("flare range", &g_dbg.flare_range, 50.0f, 1000.0f, "%.0f m");
+            ImGui::SliderFloat("tail-light road glow", &g_dbg.tail_glow, 0.0f, 1.5f, "%.2f");
             ImGui::TextDisabled("authored street/district lamps; Night Mode must be on");
         }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -81,6 +81,8 @@ DbgState g_dbg = {
     .insp_sel = -1,
     .car_cull = 1, .body_clearcoat = 0.70f, .body_drop = 0.0f,
     .light_halo = 1.0f, .light_gain = 1.0f,
+    .flare_range = 200.0f,   /* the original drops lamp flares at 200 m */
+    .tail_glow = 0.5f,
     /* underglow is an OWNED customization, not a stock fitting: off until the
        player buys/enables it. The colour/strength tunables stay live. */
     .neon_on = 0, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
@@ -9877,6 +9879,27 @@ int main(int argc, char **argv) {
                 rp.p->uAlpha = 1.0f; rp.p->uSoft = 0.0f;
                 ug2_copy(rp.p->uMVP, MVP, 16);
             }
+            /* Tail lights on the road: a soft red pool behind and under the rear
+               bumper, as the retail night capture shows, brighter under braking.
+               Night only; an additive pool in daylight reads as a bug. */
+            if (!player_hidden && g_dbg.night_mode && g_dbg.show_lights && lighting.glow &&
+                g_dbg.tail_glow > 0.001f) {
+                int braking = stage1_active ? g_stage1.drivetrain.brake>.1f || handbrake
+                                            : (throttle < -0.1f && speed > 0.01f) || handbrake;
+                float rear[6] = { carbb[0]-1.3f, carbb[1], carbb[2], carbb[0]+0.7f, carbb[4], carbb[5] };
+                rhi_cmd_bind_pipeline(cpipe.halo);   /* additive, depth tested, no write */
+                rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 1.0f;
+                ug2_vec3(rp.p->uColor, 1.0f, 0.07f, 0.04f);
+                float gp[3]={render_player.pos[0],render_player.pos[1],render_player.pos[2]},up[3],M[16];
+                world_ground_pose(&scene,gp[0],gp[1],gp[2],&gp[2],up);
+                mat_car_footprint(gp,render_player.head,up,rear,1.0f,1.3f,.025f,M);
+                float MV[16]; mat_mul(MVP,M,MV);
+                ug2_copy(rp.p->uMVP, MV, 16);
+                rp.p->uAlpha = g_dbg.tail_glow * (braking ? 1.0f : 0.45f);
+                render_draw_gpumesh(&quad); g_dbg.drawn++;
+                rp.p->uAlpha = 1.0f; rp.p->uSoft = 0.0f;
+                ug2_copy(rp.p->uMVP, MVP, 16);
+            }
         }
 
         pf_mark(PF_CAR_SHADOW);
@@ -10808,7 +10831,7 @@ int main(int argc, char **argv) {
             g_dbg.night_mode && lighting.glow && (passmode == 0 || passmode == 2)) {
             districtdraws = render_district_lights(&rp, &quad, district_light_tex,
                 world.neighborhood.lights, world.neighborhood.nlights, cam, look, MVP,
-                VIEW_DIST, g_dbg.light_halo, g_dbg.light_gain);
+                fminf(VIEW_DIST, g_dbg.flare_range), g_dbg.light_halo, g_dbg.light_gain);
             g_dbg.drawn += districtdraws;
         }
 

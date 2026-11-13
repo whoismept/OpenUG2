@@ -151,6 +151,8 @@ typedef struct {
  * and it is what stops road, kerb and car flanks smearing at grazing angles. */
     float tex_detail;
     float light_halo, light_gain;  /* district flare sprite size / emission scale */
+    float flare_range;             /* district flares fade out by this distance, metres */
+    float tail_glow;               /* red tail-light pool on the road at night; 0 = off */
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
