@@ -1633,9 +1633,9 @@ quads whose corners take the road height, drawn in one call with the car halo
 pipeline. Redrawing the nearby world batches instead looked the same but cost
 more than the beams on dense city blocks. On an Intel HD 520 at 1080p the pool
 saves 0.7 ms of GPU time in the city and 1.35 ms in a three-car race. Its 15 m by
-8 m size, 1.6 m offset and cool white colour were matched by eye to one retail
-night capture; the absent clip texture is still a guess. `Lighting & Environment
--> Headlights -> Road pool` changes all four live.
+10 m size, 1.6 m offset, cool white colour and 0.55 brightness were matched by eye
+to one retail night capture; the absent clip texture is still a guess. `Lighting &
+Environment -> Headlights -> Road pool` changes all five live.
 
 ### Vehicle and road detail settings
 

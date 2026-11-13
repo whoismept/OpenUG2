@@ -572,6 +572,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("Pool width", &g_dbg.pool_width, 2.0f, 24.0f, "%.1f m");
             ImGui::SliderFloat("Pool start ahead of car centre", &g_dbg.pool_lead, -2.0f, 6.0f, "%.1f m");
             ImGui::ColorEdit3("Pool colour", g_dbg.pool_tint);
+            ImGui::SliderFloat("Pool brightness", &g_dbg.pool_strength, 0.1f, 2.0f, "%.2fx");
             ImGui::SliderFloat("Clear lens opacity", &g_dbg.headlight_lens_alpha, 0.0f, 0.6f);
             bool shadows = g_dbg.headlight_shadows != 0;
             if (ImGui::Checkbox("Headlight shadows", &shadows)) g_dbg.headlight_shadows = shadows;
