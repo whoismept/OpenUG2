@@ -2998,6 +2998,14 @@ int main(int argc, char **argv) {
     const int runtime_scenery_event = world2
         ? wg_runtime_selection(scenery_preview_set, scenery_event, want_event_id)
         : 0;
+    /* DIAGNOSTIC BRANCH ONLY, never merge: the sandbox scenes are fixed side
+       views, so both are re-aimed from behind the car to show the headlight
+       pool, flares and tail-light glow. car_only becomes a steeper street view. */
+    if (shot && !sshot) {
+        shotyaw = 0.0f; shotyaw_set = 1;
+        shotpitch = (shot_empty ? 42.0f : 14.0f) * 3.14159265f / 180.0f;
+        shot_empty = 0;
+    }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
        capture tail, but every dynamic subsystem below is gated off it — no
        circuit load, no AI, no start-line snap, no autopilot, no throttle, no
