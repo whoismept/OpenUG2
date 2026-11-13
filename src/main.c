@@ -48,6 +48,7 @@
 #include "map_bake.h"     /* city minimap detail levels */
 #include "graphics_policy.h"
 #include "career.h"
+static float g_diag_chase = 1.0f;   /* DIAGNOSTIC BRANCH ONLY */
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
@@ -3003,7 +3004,8 @@ int main(int argc, char **argv) {
        pool, flares and tail-light glow. car_only becomes a steeper street view. */
     if (shot && !sshot) {
         shotyaw = 0.0f; shotyaw_set = 1;
-        shotpitch = (shot_empty ? 42.0f : 14.0f) * 3.14159265f / 180.0f;
+        shotpitch = (shot_empty ? 32.0f : 13.0f) * 3.14159265f / 180.0f;
+        g_diag_chase = shot_empty ? 3.6f : 2.2f;
         shot_empty = 0;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
@@ -9141,6 +9143,7 @@ int main(int argc, char **argv) {
             want[1] = render_player.pos[1] + sinf(menuspin)*16.0f;
             want[2] = render_player.pos[2] + 8.0f;
         } else if (shotyaw < 1e8f) {        /* --shot-yaw/pitch: fixed camera */
+            chase *= g_diag_chase;
             float horizontal = chase * cosf(shotpitch);
             want[0] = render_player.pos[0]-cosf(shotyaw)*horizontal;
             want[1] = render_player.pos[1]-sinf(shotyaw)*horizontal;
