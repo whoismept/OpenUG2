@@ -92,6 +92,7 @@ DbgState g_dbg = {
     .headlight_shadows = 1,
     .pool_length = 15.0f, .pool_width = 8.0f, .pool_lead = 1.6f, .pool_tint = { 0.84f, 0.92f, 1.0f },
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint (night) */
+    .world_prelit = 1, .world_gain = 1.0f,
     .body_env = 1.0f,                                          /* 1.0 = tuned clearcoat reflection */
     .vcolor = 1.0f,   /* full source prelight on world geometry */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
@@ -9605,6 +9606,12 @@ int main(int argc, char **argv) {
         RhiTexture lasttex = {UINT32_MAX};
         int lastmode = -1;
         rp.p->uVColor = g_dbg.vcolor;   /* apply source prelight to world geom */
+        /* Night world is its baked vertex light alone, as the original's world
+           shaders start from it: no sun term, and 1/1.35 cancels the shader's
+           exposure. Cars keep the shared pair, restored after the world. */
+        if (g_dbg.night_mode && g_dbg.world_prelit && g_dbg.vcolor > 0.001f) {
+            rp.p->uAmbient = g_dbg.world_gain / 1.35f; rp.p->uDiffuse = 0.0f;
+        }
         rhi_cmd_bind_pipeline(wpipe.opaque);
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
@@ -9720,6 +9727,7 @@ int main(int argc, char **argv) {
             rp.p->uUnlit = 0.0f;
         }
         rp.p->uVColor = 0.0f;   /* per-car prelight is set by each car mesh */
+        rp.p->uAmbient = g_dbg.ambient; rp.p->uDiffuse = g_dbg.diffuse;
         } else if (g_dbg.show_track) {   /* --- F3 debug view: prelight/normals/wire --- */
             /* draw every world batch with the debug shader (no distance cull),
                then restore the main program for the car/glow/HUD passes below. */

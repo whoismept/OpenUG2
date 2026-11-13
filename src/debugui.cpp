@@ -604,6 +604,9 @@ extern "C" void dbgui_frame(void) {
             ImGui::TextDisabled("authored street/district lamps; Night Mode must be on");
         }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
+            bool prelit = g_dbg.world_prelit != 0;
+            if (ImGui::Checkbox("Night world: baked light only", &prelit)) g_dbg.world_prelit = prelit;
+            ImGui::SliderFloat("Night world brightness", &g_dbg.world_gain, 0.2f, 2.0f, "%.2fx");
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);
             ImGui::SliderFloat("fog density", &g_dbg.fog_density, 0.0f, 0.01f, "%.4f");

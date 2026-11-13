@@ -139,6 +139,8 @@ typedef struct {
     int road_reflection_quality; /* 1: 16 trace steps, 2: 32; 0 follows weather_quality */
     int weather_quality; /* 0/1/2: 12/24/48 screen droplets, 0/4/8 wet lamp highlights */
     float ambient, diffuse, body_spec;
+    int world_prelit;   /* night world uses its baked vertex light only, no sun term */
+    float world_gain;   /* brightness of that baked light; 1 = as authored */
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
     float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */
     float fog_density;          /* exp^2 fog: f = exp(-(depth*density)^2) */

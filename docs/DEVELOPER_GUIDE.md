@@ -1613,6 +1613,12 @@ and `HeadlightWVP`: the additive pool texture `2PLAYERHEADLIGHT1` (GLOBALB, key
 shadows are off. `--lighting modern` brings back the per-pixel beams and their
 shadow maps.
 
+At night the world is shaded by its baked vertex light alone: the sun term and the
+shader's 1.35 exposure are cancelled for world batches, and cars keep the shared
+ambient and diffuse pair. `Lighting / Fog -> Night world: baked light only` turns
+this off and `Night world brightness` scales it. Whether the original adds any
+directional light at night is not established; see [the research notes](LIGHTING_RESEARCH.md).
+
 `src/graphics_policy.h` turns the graphics settings into what is drawn, and the
 pause-menu apply hook refreshes it, so changes take effect on the next frame.
 `Car Headlight` off leaves the lenses lit but no light on the road, and `Light
