@@ -9887,7 +9887,7 @@ int main(int argc, char **argv) {
                 g_dbg.tail_glow > 0.001f) {
                 int braking = stage1_active ? g_stage1.drivetrain.brake>.1f || handbrake
                                             : (throttle < -0.1f && speed > 0.01f) || handbrake;
-                float rear[6] = { carbb[0]-2.4f, carbb[1], carbb[2], carbb[0]+0.8f, carbb[4], carbb[5] };
+                float rear[6] = { carbb[0]-1.7f, carbb[1], carbb[2], carbb[0]+0.8f, carbb[4], carbb[5] };
                 rhi_cmd_bind_pipeline(cpipe.halo);   /* additive, depth tested, no write */
                 rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 1.0f;
                 ug2_vec3(rp.p->uColor, 1.0f, 0.07f, 0.04f);
