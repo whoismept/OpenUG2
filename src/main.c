@@ -48,6 +48,7 @@
 #include "map_bake.h"     /* city minimap detail levels */
 #include "graphics_policy.h"
 #include "career.h"
+static float g_diag_chase = 1.0f;   /* DIAGNOSTIC BRANCH ONLY */
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
@@ -2907,6 +2908,11 @@ int main(int argc, char **argv) {
         }
         world2 = 0; /* explicit legacy research union */
     }
+    /* DIAGNOSTIC BRANCH ONLY: start at the documented city comparison pose. */
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--shot")) {
+        world2_spawn_xy[0] = 1837.844f; world2_spawn_xy[1] = -791.08f; world2_spawn_set = 1;
+        world2_heading_deg = 90.0f; world2_heading_set = 1;
+    }
     if ((world2_spawn_set || world2_heading_set) && !world2) {
         fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
         return 2;
@@ -2999,6 +3005,15 @@ int main(int argc, char **argv) {
     const int runtime_scenery_event = world2
         ? wg_runtime_selection(scenery_preview_set, scenery_event, want_event_id)
         : 0;
+    /* DIAGNOSTIC BRANCH ONLY, never merge: the sandbox scenes are fixed side
+       views, so both are re-aimed from behind the car to show the headlight
+       pool, flares and tail-light glow. car_only becomes a steeper street view. */
+    if (shot && !sshot) {
+        shotyaw = (world2_heading_deg + (shot_empty ? 150.0f : 0.0f)) * 3.14159265f / 180.0f; shotyaw_set = 1;
+        shotpitch = (shot_empty ? 9.0f : 11.0f) * 3.14159265f / 180.0f;
+        g_diag_chase = shot_empty ? 2.6f : 2.4f;
+        shot_empty = 0;
+    }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
        capture tail, but every dynamic subsystem below is gated off it — no
        circuit load, no AI, no start-line snap, no autopilot, no throttle, no
@@ -4618,6 +4633,26 @@ int main(int argc, char **argv) {
                    active_resident->resources.obstacle_count,
                    world2_support_cat == WSURF_ROAD ? "ROAD" : "TERRAIN",
                    world2_spawn_z);
+            {   /* DIAGNOSTIC BRANCH ONLY: where the district lights cluster */
+                int best[3] = {-1,-1,-1}, score[3] = {0,0,0}, nl = world.neighborhood.nlights;
+                const N2LightSrc *L = world.neighborhood.lights;
+                for (int a = 0; a < nl; a++) {
+                    int n = 0;
+                    for (int b = 0; b < nl; b++)
+                        if (hypotf(L[a].pos[0]-L[b].pos[0], L[a].pos[1]-L[b].pos[1]) < 60.0f) n++;
+                    int far = 1;
+                    for (int k = 0; k < 3; k++)
+                        if (best[k] >= 0 && hypotf(L[a].pos[0]-L[best[k]].pos[0], L[a].pos[1]-L[best[k]].pos[1]) < 200.0f) far = 0;
+                    for (int k = 0; far && k < 3; k++) if (n > score[k]) {
+                        for (int j = 2; j > k; j--) { best[j] = best[j-1]; score[j] = score[j-1]; }
+                        best[k] = a; score[k] = n; break;
+                    }
+                }
+                for (int k = 0; k < 3; k++) if (best[k] >= 0)
+                    printf("DIAG lightcluster %d count=%d at %.1f,%.1f,%.1f rgba=%08x\n", k, score[k],
+                           L[best[k]].pos[0], L[best[k]].pos[1], L[best[k]].pos[2], (unsigned)L[best[k]].rgba);
+                printf("DIAG lights=%d glow_batches_pending\n", nl);
+            }
             world_resident_free(active_resident);
             active_resident = NULL;
             memset(&world.neighborhood, 0, sizeof world.neighborhood);
@@ -6363,6 +6398,53 @@ int main(int argc, char **argv) {
     LightingPolicy lighting = lighting_policy(&saved_gfx);
     /* Career state (career.h). Captures never read or write it, so evidence
        frames do not depend on the machine's save. */
+    {   /* DIAGNOSTIC BRANCH ONLY: where saturated lights cluster, by colour, and shop-like mesh names */
+        static const char *const cname[4] = { "green", "blue", "red", "yellow" };
+        int nl = world.neighborhood.nlights; const N2LightSrc *L = world.neighborhood.lights;
+        unsigned char *cls = (unsigned char *)calloc((size_t)(nl > 0 ? nl : 1), 1);
+        int total[5] = {0};
+        for (int a = 0; a < nl; a++) {
+            int r = L[a].rgba & 255, g = (L[a].rgba >> 8) & 255, b = (L[a].rgba >> 16) & 255, c = 0;
+            if (g > 150 && r < g*0.6f && b < g*0.6f) c = 1;
+            else if (b > 150 && r < b*0.5f && g < b*0.75f) c = 2;
+            else if (r > 150 && g < r*0.4f && b < r*0.4f) c = 3;
+            else if (r > 170 && g > 150 && b < 0.45f*(r < g ? r : g)) c = 4;
+            cls[a] = (unsigned char)c; total[c]++;
+        }
+        printf("DIAG lights total=%d other=%d green=%d blue=%d red=%d yellow=%d\n", nl, total[0], total[1], total[2], total[3], total[4]);
+        for (int c = 1; c <= 4; c++) {
+            int best[4] = {-1,-1,-1,-1}, score[4] = {0,0,0,0};
+            for (int a = 0; a < nl; a++) if (cls[a] == c) {
+                int n = 0, far = 1;
+                for (int b = 0; b < nl; b++)
+                    if (cls[b] == c && hypotf(L[a].pos[0]-L[b].pos[0], L[a].pos[1]-L[b].pos[1]) < 30.0f) n++;
+                for (int k = 0; k < 4; k++)
+                    if (best[k] >= 0 && hypotf(L[a].pos[0]-L[best[k]].pos[0], L[a].pos[1]-L[best[k]].pos[1]) < 120.0f) {
+                        far = 0; if (n > score[k]) { best[k] = a; score[k] = n; }
+                    }
+                for (int k = 0; far && k < 4; k++) if (n > score[k]) {
+                    for (int j = 3; j > k; j--) { best[j] = best[j-1]; score[j] = score[j-1]; }
+                    best[k] = a; score[k] = n; break;
+                }
+            }
+            for (int k = 0; k < 4; k++) if (best[k] >= 0)
+                printf("DIAG cluster %s %d count=%d at %.1f,%.1f,%.1f rgba=%08x rin=%.1f\n", cname[c-1], k, score[k],
+                       L[best[k]].pos[0], L[best[k]].pos[1], L[best[k]].pos[2], (unsigned)L[best[k]].rgba, L[best[k]].r_in);
+        }
+        free(cls);
+        int shown = 0;
+        for (int i = 0; i < scene.count && shown < 60; i++) {
+            const char *n = scene.meshes[i].sname; char up[32]; int k = 0;
+            for (; n[k] && k < 31; k++) up[k] = (char)(n[k] >= 'a' && n[k] <= 'z' ? n[k]-32 : n[k]);
+            up[k] = 0;
+            if ((strstr(up, "SHOP") || strstr(up, "MARKER") || strstr(up, "CARLOT") || strstr(up, "GARAGE") ||
+                 strstr(up, "TRIGGER") || strstr(up, "ICON")) && scene.meshes[i].verts && scene.meshes[i].nidx > 0) {
+                printf("DIAG mesh %s at %.1f,%.1f,%.1f\n", up, scene.meshes[i].verts[0], scene.meshes[i].verts[1], scene.meshes[i].verts[2]);
+                shown++;
+            }
+        }
+        printf("DIAG scene meshes=%d\n", scene.count);
+    }
     Career career; char career_file[512] = "";
     int career_on = career_opt && !shot, career_writable = 0, career_recorded = 0, career_pay = 0;
     career_new(&career);
@@ -9134,6 +9216,7 @@ int main(int argc, char **argv) {
             want[1] = render_player.pos[1] + sinf(menuspin)*16.0f;
             want[2] = render_player.pos[2] + 8.0f;
         } else if (shotyaw < 1e8f) {        /* --shot-yaw/pitch: fixed camera */
+            chase *= g_diag_chase;
             float horizontal = chase * cosf(shotpitch);
             want[0] = render_player.pos[0]-cosf(shotyaw)*horizontal;
             want[1] = render_player.pos[1]-sinf(shotyaw)*horizontal;
