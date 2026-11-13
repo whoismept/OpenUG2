@@ -114,7 +114,7 @@ int cam_settings_load(CamSettings *s, const char *path) {
     fclose(f);
     return 1;
 }
-static void mkdir_parents(const char *path) {
+void cam_mkdir_parents(const char *path) {
 #ifndef _WIN32
     char tmp[1024];
     size_t n = strlen(path);
@@ -128,7 +128,7 @@ static void mkdir_parents(const char *path) {
 }
 int cam_settings_save(const CamSettings *s, const char *path) {
     if (!path) return 0;
-    mkdir_parents(path);
+    cam_mkdir_parents(path);
     FILE *f = fopen(path, "w");
     if (!f) return 0;
     for (int i = 0; i < CAM_PLAYERS; i++) fprintf(f, "camera_option_p%d=%d\n", i + 1, s->opt[i]);

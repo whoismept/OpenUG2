@@ -49,6 +49,7 @@ void cam_settings_defaults(CamSettings *s);
 /* Default location: $OPENUG2_CONFIG_DIR, else $XDG_CONFIG_HOME/openug2, else
  * $HOME/.config/openug2, file camera.cfg. Returns 0 if no location is known. */
 int  cam_settings_path(char *out, size_t cap);
+void cam_mkdir_parents(const char *path);   /* create the folders above a config file */
 int  cam_settings_load(CamSettings *s, const char *path); /* 1 = read; defaults otherwise */
 int  cam_settings_save(const CamSettings *s, const char *path);
 

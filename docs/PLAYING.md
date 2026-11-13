@@ -62,6 +62,8 @@ region with `--track`. For a closed-loop path directly, use
 - `--camera 0` through `--camera 4` choose a starting view. See [camera controls](CAMERA.md).
 - The [stock drivetrain model](DRIVETRAIN.md) is on by default; `--no-drivetrain`
   uses the classic physics.
+- Winning a race event adds prize money to the Bank shown in free roam. The
+  balance is kept in `career.sav` in the config folder; `--no-career` turns it off.
 - The headlights use the original game's projected pool on the road.
   `--lighting modern` switches to the per-pixel beams with shadows.
 - `--help` shows the command syntax. Select a single region for driving.

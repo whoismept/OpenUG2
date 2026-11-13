@@ -163,6 +163,17 @@ Tier 4, least to most important:
 All driving items share one gap: no retail runtime trace validates any per-tick behaviour (U-16). The
 best value for effort is PHY-13 (bounded static work) and PHY-01.
 
+## Career
+
+OpenUG2's own state (`src/career.h`), not the retail career; see `docs/GAME_FLOW.md` for the research.
+
+| ID | Item | Status | Code | Ref |
+|---|---|---|---|---|
+| CAR-01 | Starting balance 0 | guessed | `src/career.h` | GAME_FLOW open items |
+| CAR-02 | Only first place pays; amount by race kind (400/300/250/350/400/1000) | guessed | `src/career.h` | GAME_FLOW "reward amounts" |
+| CAR-03 | A repeat win pays a quarter | guessed | `src/career.h` | — |
+| CAR-04 | State kept in `career.sav`, separate from the retail profile | choice | `src/career.h` | Settings SPEC 3, 5 |
+
 ## Not covered
 
 Not audited: world, AI, rendering, audio, resource loading, `main.c` outside the sites above, and the

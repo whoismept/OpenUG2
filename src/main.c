@@ -47,6 +47,7 @@
 #include "hud_host.h"     /* GL-free HUD context/preview policy */
 #include "map_bake.h"     /* city minimap detail levels */
 #include "graphics_policy.h"
+#include "career.h"
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
 #include "world_capture_policy.h"
@@ -2337,6 +2338,7 @@ int main(int argc, char **argv) {
          --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
          --lighting MODE  original (projected headlight pool, as the original
                           game; default) or modern (per-pixel beams with shadows)
+         --no-career      do not keep a bank balance or write career.sav
          --hud-mph        enable the player HUD with imperial speed units
          --hud-fitted L   which parts the HUD treats as fitted: nos,turbo | none
          --hud-fit P      widescreen HUD fitment, a project policy (not original
@@ -2384,6 +2386,7 @@ int main(int argc, char **argv) {
        stacking on top of it. --hud-preview additionally fills the readouts
        that have no live system with clearly-labelled sample values. */
     int hud_opt = 1, hud_preview_opt = 0, hud_dest_set = 0;   /* --no-hud turns it off */
+    int career_opt = 1;   /* --no-career: no bank balance, no career.sav */
     int drivetrain_explicit = 0, drivetrain_off = 0;          /* --drivetrain / --no-drivetrain */
     int hud_imperial = 0;
     int hud_skin = 0;
@@ -2712,6 +2715,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--drivetrain")) { g_stage1_requested = 1; drivetrain_explicit = 1; }
         else if (!strcmp(argv[i], "--no-drivetrain")) drivetrain_off = 1;
         else if (!strcmp(argv[i], "--no-hud")) hud_opt = -1;
+        else if (!strcmp(argv[i], "--no-career")) career_opt = 0;
         else if (!strcmp(argv[i], "--drivetrain-trace")) {
             if(i+1>=argc || !argv[i+1][0] || argv[i+1][0]=='-') {
                 fprintf(stderr,"--drivetrain-trace requires a CSV file path\n");return 2;
@@ -6354,6 +6358,18 @@ int main(int argc, char **argv) {
     int city_map_size = 0;
     StGraphics saved_gfx = graphics_from_store();
     LightingPolicy lighting = lighting_policy(&saved_gfx);
+    /* Career state (career.h). Captures never read or write it, so evidence
+       frames do not depend on the machine's save. */
+    Career career; char career_file[512] = "";
+    int career_on = career_opt && !shot, career_writable = 0, career_recorded = 0, career_pay = 0;
+    career_new(&career);
+    if (career_on && career_path(career_file, sizeof career_file)) {
+        int loaded = career_load(&career, career_file);
+        career_writable = loaded >= 0;
+        if (loaded < 0) fprintf(stderr, "Career: %s is unreadable; playing without saving over it.\n", career_file);
+        else printf("Career: $%lld, %d events won (%s)\n", (long long)career.money, career_wins(&career),
+                    loaded ? career_file : "new");
+    }
     apply_detail_policy(detail_policy(&saved_gfx), vehicle_quality_explicit, road_reflections_explicit);
     /* Last frame's HUD state. The minimap pick must invert the SAME transform
        the player clicked on, so it reads the state that was actually drawn
@@ -8972,6 +8988,20 @@ int main(int argc, char **argv) {
             race_state = 2;
         }
 
+        /* Bank an authored event's result once, on the tick it finishes. */
+        if (race_state != 2) career_recorded = 0;
+        else if (!career_recorded) {
+            career_recorded = 1; career_pay = 0;
+            if (career_on && world.city.race.active) {
+                int pay = career_race_result(&career, world.city.ev[world.city.race.ev].id,
+                    world.city.race.kind, finish_place, world.city.race.failed);
+                if (pay > 0) career_pay = pay;
+                if (pay >= 0 && career_writable) cam_mkdir_parents(career_file);
+                if (pay >= 0 && career_writable && !career_save(&career, career_file))
+                    fprintf(stderr, "Career: could not write %s\n", career_file);
+            }
+        }
+
         if(race_log.file) {
             race_log.tick++;
             if(nwc || race_contact>0)race_log_write(&race_log,"CONTACT,%ld,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
@@ -11020,6 +11050,11 @@ int main(int argc, char **argv) {
             else snprintf(b,sizeof b,"P%d/%d", finish_place, nai+1);
             ug2_vec3(rp.p->uColor, 1, 1, 1);
             draw_text(&quad, &rp, b, -text_width(b,0.05f)/2, 0.14f, 0.05f, 0.075f);
+            if (career_pay > 0) {
+                snprintf(b, sizeof b, "PRIZE %d", career_pay);   /* the 3x5 font has no $ or + */
+                ug2_vec3(rp.p->uColor, 0.3f, 0.95f, 0.4f);
+                draw_text(&quad, &rp, b, -text_width(b,0.035f)/2, 0.0f, 0.035f, 0.052f);
+            }
         }
 
         g_dbg.nav = world.city.nav; g_dbg.nnav = world.city.nnav;
@@ -11165,7 +11200,8 @@ int main(int argc, char **argv) {
             }
             hs.have_nitro_tank = 0;   /* no capacity/depletion system exists */
             hs.have_boost = 0;        /* no turbo pressure anywhere in src/ */
-            hs.have_money = 0;        /* no career economy exists */
+            hs.have_money = (unsigned char)career_on;   /* career.h bank balance */
+            hs.money = (long)career.money;
 
             /* Two independent things can mean "in a race": the authored event
                tracker (gates + laps, which needs no AI opponents at all) and
@@ -11301,8 +11337,8 @@ int main(int argc, char **argv) {
                 }
             }
             /* Context and sample inputs (hud_host.h). Free roam supplies the
-               career/free-roam context only; money, messages and the tank stay
-               absent unless --hud-preview supplies labelled samples. */
+               career/free-roam context and the career.h balance; messages and the
+               tank stay absent unless --hud-preview supplies labelled samples. */
             hud_host_context(&hs);
             if (hud_preview_opt && !hs.racing) {
                 double now = hs.clock_ms;

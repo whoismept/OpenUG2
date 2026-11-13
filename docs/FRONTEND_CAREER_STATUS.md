@@ -62,6 +62,16 @@ particular retail-data failure.
 Validation: `make ugui-test`. The test is
 `test_assets_selected_language_source` in `tools/ugui_test_assets.inc`.
 
+## Engine-side career state
+
+`src/career.h` keeps a bank balance and per-event results (best place, wins,
+starts) in `career.sav` beside `camera.cfg`. Finishing an authored event records
+the result and banks a payout for first place; the free-roam HUD Bank shows the
+balance. `--no-career` and every capture run leave it out. It is OpenUG2's own
+state: payouts and the starting balance are guesses (`PROVENANCE.md` CAR-01..04),
+nothing is read from or written to the retail profile's career region, and it
+has no stages, unlocks, cars or shops yet. `make career-test` needs no game data.
+
 ## Contract still needed for New Game / Continue
 
 Before connecting gameplay or profile writes, establish from reviewed evidence:
