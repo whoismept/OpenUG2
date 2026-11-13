@@ -2334,7 +2334,7 @@ int main(int argc, char **argv) {
          --map-detail N   minimap size: 512 (retail, default), 1024, 2048 or 4096
          --no-map-cache   bake minimaps every run; ignore OpenUG2Cache
          --lighting MODE  original (projected headlight pool, as the original
-                          game) or modern; default follows Level Of Detail 1-2
+                          game; default) or modern (per-pixel beams with shadows)
          --hud-mph        enable the player HUD with imperial speed units
          --hud-fitted L   which parts the HUD treats as fitted: nos,turbo | none
          --hud-fit P      widescreen HUD fitment, a project policy (not original
@@ -2477,7 +2477,7 @@ int main(int argc, char **argv) {
     int map_detail_opt = 0;  /* --map-detail: 512 (retail, default), 1024, 2048 or 4096 */
     int map_cache_opt = 1;   /* --no-map-cache: bake every run */
     int vehicle_quality_explicit = 0, road_reflections_explicit = 0;  /* CLI beats saved settings */
-    int lighting_opt = -1;   /* --lighting original|modern; -1 follows Level Of Detail */
+    int lighting_opt = -1;   /* --lighting original|modern; -1 is the default, original */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
     int shotframes_set = 0;
     int pause_shot = 0, pause_reference=0;

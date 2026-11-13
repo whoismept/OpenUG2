@@ -1606,19 +1606,19 @@ invariance, the sprint/lap rule, money visibility and the art gate.
 
 ### Original-style lighting
 
-Level Of Detail 1 and 2 light the car in the original game's manner, which the
+Every Level Of Detail lights the road in the original game's manner, which the
 retail executable names `worldheadlight.efx` with `HeadlightTex`, `HeadlightClipTex`
 and `HeadlightWVP`: the additive pool texture `2PLAYERHEADLIGHT1` (GLOBALB, key
 `0x45374719`) is laid on the road ahead instead of the per-pixel beams, and beam
-shadows are off. `--lighting original|modern` overrides the setting. Higher levels
-are unchanged.
+shadows are off. `--lighting modern` brings back the per-pixel beams and their
+shadow maps.
 
 `src/graphics_policy.h` turns the graphics settings into what is drawn, and the
 pause-menu apply hook refreshes it, so changes take effect on the next frame.
 `Car Headlight` off leaves the lenses lit but no light on the road, and `Light
 Glow` off drops the lamp halos and district flares. Level 1's preset turns both
 off, as the original does, so the projected pool first appears at level 2. With
-no saved level every value reads 0, so the full lighting is kept instead.
+no saved level every value reads 0, so the pool and the glow are kept instead.
 
 The pool is one shared-vertex grid of `RENDER_POOL_ROWS` x `RENDER_POOL_COLS`
 quads whose corners take the road height, drawn in one call with the car halo

@@ -62,8 +62,8 @@ region with `--track`. For a closed-loop path directly, use
 - `--camera 0` through `--camera 4` choose a starting view. See [camera controls](CAMERA.md).
 - The [stock drivetrain model](DRIVETRAIN.md) is on by default; `--no-drivetrain`
   uses the classic physics.
-- `--lighting original` uses the original game's projected headlight pool, as
-  Level Of Detail 1 and 2 do; `--lighting modern` forces the per-pixel beams.
+- The headlights use the original game's projected pool on the road.
+  `--lighting modern` switches to the per-pixel beams with shadows.
 - `--help` shows the command syntax. Select a single region for driving.
   `--track ALL` is a diagnostic mode.
 

@@ -871,7 +871,7 @@ static void test_lighting_policy(void) {
     StGraphics g; StGfxCaps caps;
     st_gfx_defaults(&g);
     LightingPolicy p = lighting_policy(&g);
-    CHECK(!p.original && p.headlight && p.glow, "no saved level keeps the full lighting");
+    CHECK(p.original && p.headlight && p.glow, "no saved level keeps the headlight pool and glow");
     CHECK(lighting_policy(NULL).headlight, "missing settings keep the headlights");
     st_gfx_caps_full(&caps, 5);
     st_gfx_set_level(&g, &caps, 1, 1.0);
@@ -882,7 +882,7 @@ static void test_lighting_policy(void) {
     CHECK(p.original && p.headlight && p.glow, "level 2: original headlight pool");
     st_gfx_set_level(&g, &caps, 3, 1.0);
     p = lighting_policy(&g);
-    CHECK(!p.original && p.headlight && p.glow, "level 3 and up: per-pixel beams");
+    CHECK(p.original && p.headlight && p.glow, "level 3 and up keep the original headlight pool");
     g.v[ST_GFX_CAR_HEADLIGHT] = 0; g.v[ST_GFX_LIGHT_GLOW] = 0;
     p = lighting_policy(&g);
     CHECK(!p.headlight && !p.glow, "customized Car Headlight and Light Glow are honoured");
