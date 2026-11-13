@@ -2908,6 +2908,11 @@ int main(int argc, char **argv) {
         }
         world2 = 0; /* explicit legacy research union */
     }
+    /* DIAGNOSTIC BRANCH ONLY: start at the documented city comparison pose. */
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--shot")) {
+        world2_spawn_xy[0] = 1837.844f; world2_spawn_xy[1] = -791.08f; world2_spawn_set = 1;
+        world2_heading_deg = 90.0f; world2_heading_set = 1;
+    }
     if ((world2_spawn_set || world2_heading_set) && !world2) {
         fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
         return 2;
@@ -3004,9 +3009,9 @@ int main(int argc, char **argv) {
        views, so both are re-aimed from behind the car to show the headlight
        pool, flares and tail-light glow. car_only becomes a steeper street view. */
     if (shot && !sshot) {
-        shotyaw = 0.0f; shotyaw_set = 1;
-        shotpitch = (shot_empty ? 32.0f : 13.0f) * 3.14159265f / 180.0f;
-        g_diag_chase = shot_empty ? 3.6f : 2.2f;
+        shotyaw = (world2_heading_deg + (shot_empty ? 150.0f : 0.0f)) * 3.14159265f / 180.0f; shotyaw_set = 1;
+        shotpitch = (shot_empty ? 9.0f : 11.0f) * 3.14159265f / 180.0f;
+        g_diag_chase = shot_empty ? 2.6f : 2.4f;
         shot_empty = 0;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
@@ -4628,6 +4633,26 @@ int main(int argc, char **argv) {
                    active_resident->resources.obstacle_count,
                    world2_support_cat == WSURF_ROAD ? "ROAD" : "TERRAIN",
                    world2_spawn_z);
+            {   /* DIAGNOSTIC BRANCH ONLY: where the district lights cluster */
+                int best[3] = {-1,-1,-1}, score[3] = {0,0,0}, nl = world.neighborhood.nlights;
+                const N2LightSrc *L = world.neighborhood.lights;
+                for (int a = 0; a < nl; a++) {
+                    int n = 0;
+                    for (int b = 0; b < nl; b++)
+                        if (hypotf(L[a].pos[0]-L[b].pos[0], L[a].pos[1]-L[b].pos[1]) < 60.0f) n++;
+                    int far = 1;
+                    for (int k = 0; k < 3; k++)
+                        if (best[k] >= 0 && hypotf(L[a].pos[0]-L[best[k]].pos[0], L[a].pos[1]-L[best[k]].pos[1]) < 200.0f) far = 0;
+                    for (int k = 0; far && k < 3; k++) if (n > score[k]) {
+                        for (int j = 2; j > k; j--) { best[j] = best[j-1]; score[j] = score[j-1]; }
+                        best[k] = a; score[k] = n; break;
+                    }
+                }
+                for (int k = 0; k < 3; k++) if (best[k] >= 0)
+                    printf("DIAG lightcluster %d count=%d at %.1f,%.1f,%.1f rgba=%08x\n", k, score[k],
+                           L[best[k]].pos[0], L[best[k]].pos[1], L[best[k]].pos[2], (unsigned)L[best[k]].rgba);
+                printf("DIAG lights=%d glow_batches_pending\n", nl);
+            }
             world_resident_free(active_resident);
             active_resident = NULL;
             memset(&world.neighborhood, 0, sizeof world.neighborhood);
