@@ -899,7 +899,7 @@ void render_headlights(const RProg *r, const float model[16], const float anchor
  * per-pixel beams on dense city blocks. Pool size and offset come from render_pool. */
 /* Matched by eye to a retail night capture: a cool white patch about two and a
  * half car widths across that fades out three car lengths ahead. */
-RenderPool render_pool = { 15.0f, 8.0f, 1.6f, { 0.84f, 0.92f, 1.0f } };
+RenderPool render_pool = { 15.0f, 10.0f, 1.6f, { 0.84f, 0.92f, 1.0f }, 0.55f };
 void render_headlight_pool_frame(const float model[16],int high,float origin[3],
                                  float fwd[3],float right[3],float size[2]) {
     fwd[0]=model[0];fwd[1]=model[1];fwd[2]=0;right[0]=model[4];right[1]=model[5];right[2]=0;
@@ -952,6 +952,7 @@ int render_headlight_pool(const RProg *r,const float model[16],const float mvp[1
     ug2_copy(r->p->uHeadPos[0],head,4);
     ug2_copy(r->p->uHeadForward,fwd,3);ug2_copy(r->p->uHeadRight,right,3);
     ug2_vec4(r->p->uHeadShape,size[0],size[1],RENDER_POOL_BAND,0.0f);
+    gain*=render_pool.strength;
     ug2_vec3(r->p->uColor,gain*render_pool.tint[0],gain*render_pool.tint[1],gain*render_pool.tint[2]);
     r->p->uVista=3.0f;r->p->uUseTex=1.0f;r->p->uAlpha=1.0f;r->p->uHeadGain=0.0f;
     rhi_cmd_bind_texture(0,texture);

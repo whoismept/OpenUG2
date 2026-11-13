@@ -83,7 +83,7 @@ DbgState g_dbg = {
     .car_cull = 1, .body_clearcoat = 0.70f, .body_drop = 0.0f,
     .light_halo = 1.0f, .light_gain = 1.0f,
     .flare_range = 200.0f,   /* the original drops lamp flares at 200 m */
-    .tail_glow = 0.5f,
+    .tail_glow = 0.9f,
     /* underglow is an OWNED customization, not a stock fitting: off until the
        player buys/enables it. The colour/strength tunables stay live. */
     .neon_on = 0, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
@@ -94,7 +94,8 @@ DbgState g_dbg = {
     .low_beam_range = 35.0f, .high_beam_range = 85.0f,
     .headlight_gain = 1.0f, .headlight_lens_alpha = 0.16f,
     .headlight_shadows = 1,
-    .pool_length = 15.0f, .pool_width = 8.0f, .pool_lead = 1.6f, .pool_tint = { 0.84f, 0.92f, 1.0f },
+    .pool_length = 15.0f, .pool_width = 10.0f, .pool_lead = 1.6f, .pool_tint = { 0.84f, 0.92f, 1.0f },
+    .pool_strength = 0.55f,
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint (night) */
     .world_prelit = 1, .world_gain = 1.0f,
     .body_env = 1.0f,                                          /* 1.0 = tuned clearcoat reflection */
@@ -9783,7 +9784,7 @@ int main(int argc, char **argv) {
             float origin[3], fwd[3], right[3], size[2];
             float corners[(RENDER_POOL_ROWS+1)*(RENDER_POOL_COLS+1)*3];
             render_pool = (RenderPool){ g_dbg.pool_length, g_dbg.pool_width, g_dbg.pool_lead,
-                { g_dbg.pool_tint[0], g_dbg.pool_tint[1], g_dbg.pool_tint[2] } };
+                { g_dbg.pool_tint[0], g_dbg.pool_tint[1], g_dbg.pool_tint[2] }, g_dbg.pool_strength };
             render_headlight_pool_frame(lamp_model, long_beam, origin, fwd, right, size);
             for (int a = 0; a <= RENDER_POOL_ROWS; a++)
                 for (int b = 0; b <= RENDER_POOL_COLS; b++) {
@@ -9897,7 +9898,7 @@ int main(int argc, char **argv) {
                 g_dbg.tail_glow > 0.001f) {
                 int braking = stage1_active ? g_stage1.drivetrain.brake>.1f || handbrake
                                             : (throttle < -0.1f && speed > 0.01f) || handbrake;
-                float rear[6] = { carbb[0]-1.3f, carbb[1], carbb[2], carbb[0]+0.7f, carbb[4], carbb[5] };
+                float rear[6] = { carbb[0]-2.4f, carbb[1], carbb[2], carbb[0]+0.8f, carbb[4], carbb[5] };
                 rhi_cmd_bind_pipeline(cpipe.halo);   /* additive, depth tested, no write */
                 rp.p->uUnlit = 1.0f; rp.p->uUseTex = 0.0f; rp.p->uSoft = 1.0f;
                 ug2_vec3(rp.p->uColor, 1.0f, 0.07f, 0.04f);

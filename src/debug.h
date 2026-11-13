@@ -133,7 +133,7 @@ typedef struct {
     float low_beam_pitch, high_beam_pitch, low_beam_range, high_beam_range;
     float headlight_gain, headlight_lens_alpha;
     int headlight_shadows, headlight_shadow_draws;
-    float pool_length, pool_width, pool_lead, pool_tint[3];  /* original-style headlight pool */
+    float pool_length, pool_width, pool_lead, pool_tint[3], pool_strength;  /* original-style headlight pool */
     float rain_intensity, road_wetness;
     int road_reflections, road_reflection_draws;
     int road_reflection_quality; /* 1: 16 trace steps, 2: 32; 0 follows weather_quality */
