@@ -1257,6 +1257,114 @@ separately sold engine, ECU and induction products is not yet proven, so OpenUG2
 levels rather than inventing category-specific percentages. Brake, tyre and
 suspension upgrade fields remain undecoded.
 
+### Stock drivetrain and axle-force fields — local aggregate verification
+
+**Interpretation evidence `[inf]`; no retail runtime observed.** The offsets
+below come from the Stage-1 static-evidence spec; their semantics are not
+retail-proven. Local aggregate checks across the 46 local records (no
+per-car values committed anywhere) support the framing:
+
+| record offset | type | reading | Local aggregate (46 records) |
+|---:|---|---|---|
+| `+0x1E0` / `+0x200` | `f32` | axle slip-angle threshold (front / rear) | 12.0 in all 46 (inactive per the analyst note) |
+| `+0x1EC` / `+0x20C` | `f32` | axle peak-grip multiplier | front 1.425–2.5; rear 1.425–3.0 |
+| `+0x1F0` / `+0x210` | `f32` | axle sliding-grip multiplier | front 1.2–1.7; rear 1.2–2.8 |
+| `+0x2C0` | `f32` | launch fraction (stock block) | 0.8 in all 46 |
+| `+0x2C4` | `f32` | unnamed, stock block | 500.0 in all 46 |
+| `+0x2C8` / `+0x2CC` | `f32` | final-drive ratio (stock block) | 3.27–4.8; equal per record in 46/46 |
+| `+0x2D0` | `f32` | rear drive share | values {0.0 (×10), 0.4 (×1), 0.5 (×23), 0.575 (×1), 1.0 (×11)} |
+| `+0x2D4` | `f32` | clutch coupling coefficient | 0.04–0.05 |
+| `+0x2D8` | `u32` | forward gear count (stock block) | 4 (×3), 5 (×29), 6 (×14) |
+| `+0x2DC` | `f32` | clutch rate | 2.0 / 4.0 in every record |
+| `+0x2E0…+0x2FC` | `8*f32` | reverse, neutral, six forward ratios | forward ratios strictly descend in 46/46 |
+| `+0x300` / `+0x304` / `+0x308` | `f32` | idle / redline / limiter RPM | 800–1000 / 5000–8500 / 6000–9000 |
+| `+0x30C` | `f32` | engine rotational inertia | 19 distinct values, ~2e-4–7e-4 tonne·m² |
+| `+0x358…+0x360` | `3*f32` | engine-braking samples | 0.065–0.41; present in all 46 |
+| `+0x398` / `+0x39C` | `f32` | slip-dependent vertical-torque restriction scalars | 17.0 and 0.0 in all 46 |
+| `+0x270` | `f32` | yaw-inertia multiplier kI (Stage 5 BR-1) | 2.0–2.28, 11 distinct |
+| `+0x370` | `f32` | unknown (tiny) | 3e-4–5e-4, 11 distinct |
+| `+0x374` / `+0x378` | `f32` | aero coefficients cF / cR (Stage 2) | 0.13–0.185 / 0.14–0.18 |
+| `+0x37C` | `f32` | aero-to-preload factor kA (Stage 2) | 0–0.03, 5 distinct |
+| `+0x384` / `+0x388` / `+0x38C` | `f32` | brake strengths Kb / Kh and rear share beta (Stage 3) | 0.4–1.0 / 0.3–0.67 / 0.47–0.6 |
+| `+0x390` / `+0x394` | `f32` | rear slip-bonus b0 / b1 (Stage 5) | 0.0 and 2.5 in all 46 |
+
+Cross-checks: inertia matches the solid-box relation within 1% in 46/46;
+the forward-ratio sequence descends strictly in 46/46; the stock and L1–L3
+gearbox blocks share framing. The local drive-share values suggest three
+coarse classes (0.0 / 0.5 / 1.0) plus two intermediate records; the class
+mapping is **not** proven.
+
+**Provenance boundary.** Every offset above lies below `+0x3E0` and is
+therefore identical to retail in the local image. The L1–L3 blocks (`+0x460`
+onwards) are inside the local installation's modified region
+(`GlobalB.lzc`/`GLOBALB.BUN` bytes `+0x3E0…+0x5AE` differ from retail), so
+local L1–L3 observations are **install-specific** and must not be cited as
+retail evidence. Common constants (0.8, 500.0, 12.0, 17.0, 0.0) may be
+engine-wide defaults rather than per-car tuning; their producers are
+unresolved.
+
+### `steer_ratio` (`+0x380`) — correlation survey (2026-11-04)
+
+**Aggregates only; meaning unverified.** Correlations across the 46 local
+records: with kI 0.47, with Izz 0.41, with mass 0.37, with wheelbase 0.26,
+with rear share 0.06 (none). Traffic records average 1.017 (fourteen at
+exactly 1.0; the heavy traffic record is 1.25); racers average 1.106
+(range 1.01–1.25). Values are consistent with a discrete,
+handling-family-flavoured multiplier but equally fit other bucketings;
+no consumer is wired and no behavioural correlation exists. Keep the
+"steering response" label provisional. Per-car values are not committed;
+reproduction needs the local data root.
+
+### Unmapped record regions — structural survey (2026-11-04)
+
+**Structure `[obs]`; semantics unknown unless tagged.** Local
+`GLOBAL/GLOBALB.BUN` only. The local image is documented to diverge from
+retail in record bytes `+0x3E0…+0x5AE`; offsets outside that window match
+retail in the local copy. Aggregates only; nothing here is a per-car dump.
+"Traffic" below means the pooled records for TAXI, TAXI02, AMBULANCE,
+FIRETRUCK, PANELVAN, PARCELVAN, PICKUP, 4DR_SEDAN, 4DR_SEDAN02, SUV,
+MINIVAN, HATCHBACK, HATCHBACK02, BUS and COUPE.
+
+| record offset | observation (aggregate) | reading |
+|---:|---|---|
+| `+0x340…+0x354` | 6 floats, ≤8 distinct each, range 0–0.1 | unknown; possible damage/wear factors |
+| `+0x370` | 3e-4…5e-4, 13 distinct | unknown |
+| `+0x3A0` | integer-valued, {0, 125…159}, 14 distinct; 0×15 and 155×11 dominate | candidate handling-class/preset ID; not correlated with rear share; unresolved `[inf]` |
+| `+0x3C0` | 0.015 (all 46) | constant, unknown |
+| `+0x3C4` | {0.199, 0.6, 0.801} | enum-like; unknown |
+| `+0x3C8` | 0.125 (all 46) | constant, unknown |
+| `+0x3CC` | {0.05, 0.06, 0.2} | enum-like; unknown |
+| `+0x3D0…+0x3DC` | 0.05 (all 46) | constant, unknown |
+| `+0x6A4…+0x6AC` | duplicated **exactly** at `+0x6B4…+0x6BC` in 46/46; one trailing zero each | unknown paired block |
+| `+0x650`, `+0x670` | `(12.0, 1.0, 1.0)` constant pair + two ≈1.5–2.13 floats (differ between copies); traffic shares one default (2.0/1.5) | unknown paired block; 12.0 matches the axle slip-angle sentinel |
+| `+0x6C0…+0x6CC` | four floats on the same scale as stock brakes (`+0x384`) and steer (`+0x380`); per-car values, **not** a constant multiple of stock; `+0x6CC == +0x380` in 24/46 | candidate upgraded brakes; no mapping proven `[inf]` |
+| **`+0x6D0…+0x6EC`, `+0x6F0…+0x70C`** | two 8-float blocks, 0x20 stride, **identical field layout and scale to the stock axle suspension blocks** (j, k, d+, d−, a, U, L, ref); stiffer progression/stiffness/damping in every record; all traffic records carry one shared default (1.0/100.0/5.0/5.0/0.0/0.15/−0.15/0.15) | **strongest structural candidate for the upgraded suspension package (single tier, front+rear)** `[inf]`; no retail-name mapping, no second tier found |
+| `+0x734…+0x738` | {−5.8, 1.7} in 44/46; heavy vehicles {−6.7, 2.3} | unknown constant pair |
+| `+0x744…+0x748` | {−4.7, 1.7} in 44/46 (3 variants total) | unknown constant pair |
+| `+0x754…+0x758`, `+0x7B4…+0x7B8`, `+0x7D4…+0x7D8` | three float pairs on similar scale; traffic shares one default (0.716/1.09/0.94 and 0.25/1.5); racers differ; `+0x754 != +0x7B4` per record | duplicated-style calibration blocks; unresolved |
+| `+0x7F4` | 7 (racers) / 85 (traffic) — binary split by segment | unknown integer flag; candidate traffic/racer class |
+| `+0x7F8` | 135–275 | unknown |
+| `+0x7FC`, `+0x800` | −43 / +43 (all 46) | constant pair, unknown |
+| `+0x808` | 7000 (racers) / 8000 (traffic) | unknown large-integer flag |
+| `+0x810…+0x834` | paired sequences 48…53 / 200…360 | unknown; possibly paired limits |
+| `+0x860…+0x870` | 2…120, traffic distinct from racers (e.g. 5.0/2.0/30.0 patterns) | unknown |
+| `+0x7B0`, `+0x84C…+0x850` | bytes do not decode as finite float32 in all records | likely non-float data (integer/hash); float interpretation invalid here |
+
+**What this survey does not prove**
+
+- No name mapping from any block to a retail upgrade product
+  ("sport suspension", brake kit, …) and no upgrade-tier ladder; only one
+  suspension-shaped upgrade tier is visible.
+- No separate tyre-upgrade grip block has been identified.
+- The suspension candidate blocks are above `+0x5AE` and therefore outside
+  the documented divergent window (retail-identical locally); the
+  semantics remain unproven either way.
+- Brake/tyre/suspension upgrade graph, purchase flow and tuning variants
+  remain undecoded `[inf]`.
+- Everything in the survey is a **structural** observation. Promotion to a
+  named field requires cross-car analysis, behavioural correlation and a
+  reviewed amendment before any engine use.
+
 ### `0x00135200` AttribSys records
 
 The file also contains standard chunk-framed records with magic
