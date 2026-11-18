@@ -48,6 +48,7 @@
 #include "map_bake.h"     /* city minimap detail levels */
 #include "graphics_policy.h"
 #include "career.h"
+#include <dirent.h>
 static float g_diag_chase = 1.0f;   /* DIAGNOSTIC BRANCH ONLY */
 #include <sys/stat.h>
 #include "tex_override.h" /* --tex-overrides DIR: optional HD DDS replacements */
@@ -2910,8 +2911,12 @@ int main(int argc, char **argv) {
     }
     /* DIAGNOSTIC BRANCH ONLY: start at the documented city comparison pose. */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--shot")) {
-        world2_spawn_xy[0] = 1837.844f; world2_spawn_xy[1] = -791.08f; world2_spawn_set = 1;
-        world2_heading_deg = 90.0f; world2_heading_set = 1;
+        int second = 0;
+        for (int j = 1; j < argc; j++) if (!strcmp(argv[j], "--shot-empty")) second = 1;
+        /* 10 m short of a shop beam, facing the shop building behind it */
+        world2_spawn_xy[0] = second ? 843.3f : 729.3f; world2_spawn_xy[1] = second ? -1407.2f : -1172.9f;
+        world2_heading_deg = second ? 164.0f : -61.0f;
+        world2_spawn_set = 1; world2_heading_set = 1;
     }
     if ((world2_spawn_set || world2_heading_set) && !world2) {
         fprintf(stderr, "--spawn/--heading require one STREAM bundle\n");
@@ -3009,9 +3014,9 @@ int main(int argc, char **argv) {
        views, so both are re-aimed from behind the car to show the headlight
        pool, flares and tail-light glow. car_only becomes a steeper street view. */
     if (shot && !sshot) {
-        shotyaw = (world2_heading_deg + (shot_empty ? 150.0f : 0.0f)) * 3.14159265f / 180.0f; shotyaw_set = 1;
-        shotpitch = (shot_empty ? 9.0f : 11.0f) * 3.14159265f / 180.0f;
-        g_diag_chase = shot_empty ? 2.6f : 2.4f;
+        shotyaw = world2_heading_deg * 3.14159265f / 180.0f; shotyaw_set = 1;
+        shotpitch = 10.0f * 3.14159265f / 180.0f;
+        g_diag_chase = 2.6f;
         shot_empty = 0;
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
@@ -6437,13 +6442,15 @@ int main(int argc, char **argv) {
             const char *n = scene.meshes[i].sname; char up[32]; int k = 0;
             for (; n[k] && k < 31; k++) up[k] = (char)(n[k] >= 'a' && n[k] <= 'z' ? n[k]-32 : n[k]);
             up[k] = 0;
-            if ((strstr(up, "SHOP") || strstr(up, "MARKER") || strstr(up, "CARLOT") || strstr(up, "GARAGE") ||
-                 strstr(up, "TRIGGER") || strstr(up, "ICON")) && scene.meshes[i].verts && scene.meshes[i].nidx > 0) {
+            if (strstr(up, "BEAM_") && !strstr(up, "SPOTLIGHT") && !strstr(up, "BEAMY") && scene.meshes[i].verts && scene.meshes[i].nidx > 0) {
                 printf("DIAG mesh %s at %.1f,%.1f,%.1f\n", up, scene.meshes[i].verts[0], scene.meshes[i].verts[1], scene.meshes[i].verts[2]);
                 shown++;
             }
         }
         printf("DIAG scene meshes=%d\n", scene.count);
+        { DIR *d = opendir(troot); struct dirent *e; int n = 0;
+          while (d && (e = readdir(d)) && n < 80) if (e->d_name[0] != '.') { printf("DIAG track %s\n", e->d_name); n++; }
+          if (d) closedir(d); }
     }
     Career career; char career_file[512] = "";
     int career_on = career_opt && !shot, career_writable = 0, career_recorded = 0, career_pay = 0;
